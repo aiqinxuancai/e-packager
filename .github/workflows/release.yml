@@ -20,6 +20,18 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
+      - name: Set Version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          Set-Content -Path src\version.h -Value "#pragma once`n`n#define APP_VERSION `"$tag`""
+
+          if ($tag -match '(?i)(alpha|beta|pre|rc)') {
+            "IS_PRERELEASE=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } else {
+            "IS_PRERELEASE=false" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+
       - name: Build x64 Release
         shell: pwsh
         run: |
@@ -49,4 +61,5 @@ jobs:
           name: ${{ github.ref_name }}
           tag_name: ${{ github.ref_name }}
           generate_release_notes: true
+          prerelease: ${{ env.IS_PRERELEASE }}
           files: ${{ env.ASSET_ZIP }}

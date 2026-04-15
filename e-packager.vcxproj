@@ -165,6 +165,7 @@
     <ClCompile Include="src\EFolderCodec.cpp">
       <ObjectFileName>$(IntDir)EFolderCodecCore.obj</ObjectFileName>
     </ClCompile>
+    <ClCompile Include="src\UpdateCheck.cpp" />
     <ClCompile Include="src\WorkspaceProjectSupport.cpp" />
     <ClCompile Include="src\e2txt.cpp" />
     <ClCompile Include="src\e2txt_restore.cpp" />
@@ -172,6 +173,8 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\EFolderCodec.h" />
+    <ClInclude Include="src\UpdateCheck.h" />
+    <ClInclude Include="src\version.h" />
     <ClInclude Include="src\WorkspaceProjectSupport.h" />
     <ClInclude Include="src\e2txt.h" />
     <ClInclude Include="src\PathHelper.h" />

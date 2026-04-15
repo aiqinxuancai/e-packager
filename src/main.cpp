@@ -2,8 +2,10 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <map>
 #include <string>
@@ -11,8 +13,10 @@
 
 #include "..\thirdparty\json.hpp"
 #include "EFolderCodec.h"
+#include "UpdateCheck.h"
 #include "WorkspaceProjectSupport.h"
 #include "e2txt.h"
+#include "version.h"
 
 namespace {
 
@@ -766,19 +770,19 @@ int RunDragDropUnpack(const char* inputPath)
 
 void PrintUsage()
 {
-	std::cout << "e-packager commands:" << std::endl;
-	std::cout << "  e-packager                           # pack current project to .\\pack\\<info.json sourceFileName>" << std::endl;
-	std::cout << "  e-packager <input.e>                 # unpack .e to a same-named directory beside it (drag-and-drop)" << std::endl;
-	std::cout << "  e-packager unpack <input.e> <output-dir>" << std::endl;
-	std::cout << "  e-packager pack <input-dir> <output.e>" << std::endl;
-	std::cout << "  e-packager compare-bundle <input.e> <input-dir>" << std::endl;
-	std::cout << "  e-packager roundtrip <input.e> <work-dir> <output.e>" << std::endl;
-	std::cout << "  e-packager verify-roundtrip <input.e> <work-dir> <output.e>" << std::endl;
+	std::cout << "e-packager 用法:" << std::endl;
+	std::cout << "  e-packager                           # 封包当前项目到 .\\pack\\<info.json sourceFileName>" << std::endl;
+	std::cout << "  e-packager <input.e>                 # 拆包 .e 文件到同目录下同名文件夹（拖放直接打开）" << std::endl;
+	std::cout << "  e-packager unpack <input.e> <output-dir>    # 拆包到指定目录" << std::endl;
+	std::cout << "  e-packager pack <input-dir> <output.e>      # 将目录封包为 .e 文件" << std::endl;
+	std::cout << "  e-packager compare-bundle <input.e> <input-dir>           # 比较 .e 与目录" << std::endl;
+	std::cout << "  e-packager roundtrip <input.e> <work-dir> <output.e>      # 拆包再封包" << std::endl;
+	std::cout << "  e-packager verify-roundtrip <input.e> <work-dir> <output.e>  # 验证往返一致性" << std::endl;
 }
 
 }  // namespace
 
-int main(int argc, char* argv[])
+int RunCommand(int argc, char* argv[])
 {
 	if (argc < 2) {
 		return RunDefaultPack();
@@ -837,4 +841,31 @@ int main(int argc, char* argv[])
 
 	PrintUsage();
 	return EXIT_FAILURE;
+}
+
+int main(int argc, char* argv[])
+{
+	std::cerr << "e-packager " << APP_VERSION << std::endl;
+
+	// 后台异步检查更新（预发布版本跳过）。
+	std::future<std::string> updateFuture;
+	if (!update_check::IsPreRelease(APP_VERSION)) {
+		updateFuture = std::async(std::launch::async, update_check::FetchLatestTag);
+	}
+
+	const int result = RunCommand(argc, argv);
+
+	// 主命令执行完毕后，检查是否有可用的新版本。
+	if (updateFuture.valid()) {
+		if (updateFuture.wait_for(std::chrono::milliseconds(1500)) == std::future_status::ready) {
+			const std::string latest = updateFuture.get();
+			if (!latest.empty() && update_check::IsNewer(latest, APP_VERSION)) {
+				std::cerr << "提示: 新版本可用 " << latest
+					<< " -> https://github.com/aiqinxuancai/e-packager/releases/latest"
+					<< std::endl;
+			}
+		}
+	}
+
+	return result;
 }
