@@ -293,6 +293,7 @@ std::filesystem::path GetCurrentExecutablePath()
 json BuildInfoJson(const SourceFileInfo& info)
 {
 	json infoJson;
+	infoJson["version"] = 1;
 	infoJson["sourceFileName"] = info.fileName;
 	infoJson["sourcePath"] = info.fullPath;
 	infoJson["sourceModifiedTimeUtc"] = info.modifiedTimeUtc;
@@ -427,6 +428,8 @@ bool CopyExecutableToToolDirectory(const std::filesystem::path& outputDir, std::
 
 }  // namespace
 
+static constexpr int kSupportedInfoVersion = 1;
+
 bool WriteWorkspaceFiles(
 	const std::filesystem::path& inputFile,
 	const std::filesystem::path& outputDir,
@@ -510,6 +513,32 @@ bool ResolveDefaultPackOutput(
 	}
 
 	outOutputFile = outProjectRoot / "pack" / std::filesystem::path(Utf8ToWide(outputFileName));
+	return true;
+}
+
+bool ValidateInfoJsonVersion(const std::filesystem::path& projectRoot, std::string& outError)
+{
+	outError.clear();
+
+	json infoJson;
+	if (!ReadInfoJson(projectRoot, infoJson, outError)) {
+		return false;
+	}
+
+	if (!infoJson.contains("version")) {
+		outError = "info_json_missing_version: " + PathToUtf8(projectRoot / "info.json");
+		return false;
+	}
+
+	const int version = infoJson.value("version", -1);
+	if (version != kSupportedInfoVersion) {
+		outError =
+			"info_json_version_unsupported: version=" + std::to_string(version) +
+			", supported=" + std::to_string(kSupportedInfoVersion) +
+			", file=" + PathToUtf8(projectRoot / "info.json");
+		return false;
+	}
+
 	return true;
 }
 

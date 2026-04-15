@@ -17,4 +17,8 @@ bool ResolveDefaultPackOutput(
 	std::filesystem::path& outOutputFile,
 	std::string& outError);
 
+bool ValidateInfoJsonVersion(
+	const std::filesystem::path& projectRoot,
+	std::string& outError);
+
 }  // namespace workspace_support

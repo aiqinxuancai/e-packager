@@ -102,6 +102,10 @@ bool DoUnpack(const std::string& inputPath, const std::string& outputDir, std::s
 
 bool DoPack(const std::string& inputDir, const std::string& outputPath, std::string& outSummary, std::string& outError)
 {
+	if (!workspace_support::ValidateInfoJsonVersion(std::filesystem::path(inputDir), outError)) {
+		return false;
+	}
+
 	e2txt::BundleDirectoryCodec codec;
 	e2txt::ProjectBundle bundle;
 	if (!codec.ReadBundle(inputDir, bundle, &outError)) {
