@@ -11,6 +11,12 @@
 e-packager unpack <input.e> <output-dir>
 ```
 
+或直接将 `.e` 文件拖放到 `e-packager.exe` 上，自动在 `.e` 文件所在目录创建同名子目录并解包：
+
+```
+e-packager MyApp.e   # 解包到 MyApp\
+```
+
 将 `.e` 文件解包到指定目录。解包后的目录结构如下：
 
 | 路径 | 内容 |

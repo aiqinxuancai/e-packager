@@ -746,10 +746,25 @@ int RunVerifyRoundTrip(const char* inputPath, const char* workDir, const char* o
 	return PrintStringResult("verify-roundtrip", 0, compareSummary.c_str());
 }
 
+int RunDragDropUnpack(const char* inputPath)
+{
+	const std::filesystem::path input(inputPath);
+	const std::filesystem::path outputDir = input.parent_path() / input.stem();
+	const std::string outputDirStr = outputDir.string();
+
+	std::string summary;
+	std::string error;
+	if (!DoUnpack(inputPath, outputDirStr, summary, error)) {
+		return PrintStringResult("unpack", -1, error.c_str());
+	}
+	return PrintStringResult("unpack", 0, summary.c_str());
+}
+
 void PrintUsage()
 {
 	std::cout << "e-packager commands:" << std::endl;
 	std::cout << "  e-packager                           # pack current project to .\\pack\\<info.json sourceFileName>" << std::endl;
+	std::cout << "  e-packager <input.e>                 # unpack .e to a same-named directory beside it (drag-and-drop)" << std::endl;
 	std::cout << "  e-packager unpack <input.e> <output-dir>" << std::endl;
 	std::cout << "  e-packager pack <input-dir> <output.e>" << std::endl;
 	std::cout << "  e-packager compare-bundle <input.e> <input-dir>" << std::endl;
@@ -804,6 +819,16 @@ int main(int argc, char* argv[])
 			return EXIT_FAILURE;
 		}
 		return RunVerifyRoundTrip(argv[2], argv[3], argv[4]);
+	}
+
+	// Drag-and-drop: a single .e file path passed directly
+	if (argc == 2) {
+		std::filesystem::path inputPath(command);
+		std::string ext = inputPath.extension().string();
+		std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+		if (ext == ".e") {
+			return RunDragDropUnpack(argv[1]);
+		}
 	}
 
 	PrintUsage();
