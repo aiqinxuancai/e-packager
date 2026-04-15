@@ -298,6 +298,7 @@ json BuildInfoJson(const SourceFileInfo& info)
 	infoJson["sourceModifiedTimeUtc"] = info.modifiedTimeUtc;
 	infoJson["sourceSize"] = info.fileSize;
 	infoJson["sourceMd5"] = info.md5;
+	infoJson["toolUrl"] = "https://github.com/aiqinxuancai/e-packager";
 	return infoJson;
 }
 
@@ -342,7 +343,11 @@ std::string BuildAgentsMarkdown(const SourceFileInfo& info)
 		<< L"- `source_syntax_error: file=src/某页面.txt, line=行号, ...`\r\n"
 		<< L"- `xml_syntax_error: file=src/某窗口.xml, line=行号, ...`\r\n"
 		<< L"\r\n"
-		<< L"请按报错中的文件与行号修正后再重新回包。\r\n";
+		<< L"请按报错中的文件与行号修正后再重新回包。\r\n"
+		<< L"\r\n"
+		<< L"## 工具来源\r\n"
+		<< L"\r\n"
+		<< L"本目录由 [e-packager](https://github.com/aiqinxuancai/e-packager) 解包生成。\r\n";
 	return WideToUtf8(stream.str());
 }
 
