@@ -25,6 +25,7 @@
 
 #include <lib2.h>
 
+#include "BundlePathUtils.h"
 #include "PathHelper.h"
 
 namespace e2txt {
@@ -5816,6 +5817,9 @@ bool BuildBundleFromSections(
 		}
 	}
 
+	std::unordered_set<std::string> usedRelativePaths;
+	ReserveBundleRelativePaths(usedRelativePaths);
+
 	size_t programPageIndex = 0;
 	size_t formXmlIndex = 0;
 	for (const auto& page : document.pages) {
@@ -5837,11 +5841,13 @@ bool BuildBundleFromSections(
 			BundleSourceFile file;
 			file.key = itemKeys[pageInfo.header.dwId];
 			file.logicalName = TrimAsciiCopy(page.name);
-			file.relativePath = BuildRelativePath(
-				folderByKey,
-				itemFolderKey.contains(pageInfo.header.dwId) ? itemFolderKey[pageInfo.header.dwId] : 0,
-				"src",
-				file.logicalName + ".txt");
+			file.relativePath = MakeUniqueRelativePath(
+				BuildRelativePath(
+					folderByKey,
+					itemFolderKey.contains(pageInfo.header.dwId) ? itemFolderKey[pageInfo.header.dwId] : 0,
+					"src",
+					file.logicalName + ".txt"),
+				usedRelativePaths);
 			file.content = JoinPageLines(page.lines);
 			bundle.sourceFiles.push_back(std::move(file));
 
@@ -5966,11 +5972,13 @@ bool BuildBundleFromSections(
 		BundleFormFile file;
 		file.key = itemKeys[form.header.dwId];
 		file.logicalName = TrimAsciiCopy(formXml.name);
-		file.relativePath = BuildRelativePath(
-			folderByKey,
-			itemFolderKey.contains(form.header.dwId) ? itemFolderKey[form.header.dwId] : 0,
-			"src",
-			file.logicalName + ".xml");
+		file.relativePath = MakeUniqueRelativePath(
+			BuildRelativePath(
+				folderByKey,
+				itemFolderKey.contains(form.header.dwId) ? itemFolderKey[form.header.dwId] : 0,
+				"src",
+				file.logicalName + ".xml"),
+			usedRelativePaths);
 		file.xmlText = JoinPageLines(formXml.lines);
 		bundle.formFiles.push_back(std::move(file));
 
@@ -5996,12 +6004,14 @@ bool BuildBundleFromSections(
 		resource.kind = item.pageType == kConstPageImage ? BundleResourceKind::Image : BundleResourceKind::Sound;
 		resource.key = itemKeys[item.marker];
 		resource.logicalName = TrimAsciiCopy(item.name);
-		resource.relativePath = JoinStrings(
-			{
-				item.pageType == kConstPageImage ? "image" : "audio",
-				resource.logicalName + ".bin",
-			},
-			"/");
+		resource.relativePath = MakeUniqueRelativePath(
+			JoinStrings(
+				{
+					item.pageType == kConstPageImage ? "image" : "audio",
+					resource.logicalName + ".bin",
+				},
+				"/"),
+			usedRelativePaths);
 		resource.comment = TrimAsciiCopy(item.comment);
 		resource.isPublic = (item.attr & 0x2) != 0;
 		resource.data = item.rawData;

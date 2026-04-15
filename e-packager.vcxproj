@@ -90,6 +90,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="src\BundlePathUtils.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\EFolderCodec.cpp">
       <ObjectFileName>$(IntDir)EFolderCodecCore.obj</ObjectFileName>
@@ -101,6 +102,7 @@
     <ClCompile Include="src\PathHelper.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\BundlePathUtils.h" />
     <ClInclude Include="src\EFolderCodec.h" />
     <ClInclude Include="src\UpdateCheck.h" />
     <ClInclude Include="src\version.h" />

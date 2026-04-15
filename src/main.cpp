@@ -128,11 +128,23 @@ std::string ResourceDataDigest(const e2txt::BundleBinaryResource& resource)
 	return e2txt::ComputeTextDigest(std::string(resource.data.begin(), resource.data.end()));
 }
 
+void NormalizeBundleForDigestCompare(e2txt::ProjectBundle& bundle)
+{
+	if (!bundle.projectNameStored) {
+		bundle.projectName.clear();
+	}
+}
+
 std::string BuildBundleDigestCompareText(const e2txt::ProjectBundle& fromE, const e2txt::ProjectBundle& fromDir)
 {
+	e2txt::ProjectBundle normalizedFromE = fromE;
+	e2txt::ProjectBundle normalizedFromDir = fromDir;
+	NormalizeBundleForDigestCompare(normalizedFromE);
+	NormalizeBundleForDigestCompare(normalizedFromDir);
+
 	std::ostringstream stream;
-	const std::string digestFromE = e2txt::ComputeBundleDigest(fromE);
-	const std::string digestFromDir = e2txt::ComputeBundleDigest(fromDir);
+	const std::string digestFromE = e2txt::ComputeBundleDigest(normalizedFromE);
+	const std::string digestFromDir = e2txt::ComputeBundleDigest(normalizedFromDir);
 	stream
 		<< "digest_from_e=" << digestFromE << "\n"
 		<< "digest_from_dir=" << digestFromDir << "\n"
@@ -148,22 +160,22 @@ std::string BuildBundleDigestCompareText(const e2txt::ProjectBundle& fromE, cons
 				<< "right=" << right << "\n";
 		};
 
-	if (fromE.projectName != fromDir.projectName) {
-		appendValueMismatch("projectName", fromE.projectName, fromDir.projectName);
+	if (normalizedFromE.projectName != normalizedFromDir.projectName) {
+		appendValueMismatch("projectName", normalizedFromE.projectName, normalizedFromDir.projectName);
 		return stream.str();
 	}
-	if (fromE.versionText != fromDir.versionText) {
-		appendValueMismatch("versionText", fromE.versionText, fromDir.versionText);
+	if (normalizedFromE.versionText != normalizedFromDir.versionText) {
+		appendValueMismatch("versionText", normalizedFromE.versionText, normalizedFromDir.versionText);
 		return stream.str();
 	}
-	if (fromE.dependencies.size() != fromDir.dependencies.size()) {
-		stream << "mismatch=dependencies.size\nleft=" << fromE.dependencies.size()
-			<< "\nright=" << fromDir.dependencies.size() << "\n";
+	if (normalizedFromE.dependencies.size() != normalizedFromDir.dependencies.size()) {
+		stream << "mismatch=dependencies.size\nleft=" << normalizedFromE.dependencies.size()
+			<< "\nright=" << normalizedFromDir.dependencies.size() << "\n";
 		return stream.str();
 	}
-	for (size_t index = 0; index < fromE.dependencies.size(); ++index) {
-		const auto& left = fromE.dependencies[index];
-		const auto& right = fromDir.dependencies[index];
+	for (size_t index = 0; index < normalizedFromE.dependencies.size(); ++index) {
+		const auto& left = normalizedFromE.dependencies[index];
+		const auto& right = normalizedFromDir.dependencies[index];
 		if (left.kind != right.kind ||
 			left.name != right.name ||
 			left.fileName != right.fileName ||
@@ -187,14 +199,14 @@ std::string BuildBundleDigestCompareText(const e2txt::ProjectBundle& fromE, cons
 			return stream.str();
 		}
 	}
-	if (fromE.sourceFiles.size() != fromDir.sourceFiles.size()) {
-		stream << "mismatch=sourceFiles.size\nleft=" << fromE.sourceFiles.size()
-			<< "\nright=" << fromDir.sourceFiles.size() << "\n";
+	if (normalizedFromE.sourceFiles.size() != normalizedFromDir.sourceFiles.size()) {
+		stream << "mismatch=sourceFiles.size\nleft=" << normalizedFromE.sourceFiles.size()
+			<< "\nright=" << normalizedFromDir.sourceFiles.size() << "\n";
 		return stream.str();
 	}
-	for (size_t index = 0; index < fromE.sourceFiles.size(); ++index) {
-		const auto& left = fromE.sourceFiles[index];
-		const auto& right = fromDir.sourceFiles[index];
+	for (size_t index = 0; index < normalizedFromE.sourceFiles.size(); ++index) {
+		const auto& left = normalizedFromE.sourceFiles[index];
+		const auto& right = normalizedFromDir.sourceFiles[index];
 		if (left.key != right.key ||
 			left.logicalName != right.logicalName ||
 			left.relativePath != right.relativePath ||
@@ -211,14 +223,14 @@ std::string BuildBundleDigestCompareText(const e2txt::ProjectBundle& fromE, cons
 			return stream.str();
 		}
 	}
-	if (fromE.formFiles.size() != fromDir.formFiles.size()) {
-		stream << "mismatch=formFiles.size\nleft=" << fromE.formFiles.size()
-			<< "\nright=" << fromDir.formFiles.size() << "\n";
+	if (normalizedFromE.formFiles.size() != normalizedFromDir.formFiles.size()) {
+		stream << "mismatch=formFiles.size\nleft=" << normalizedFromE.formFiles.size()
+			<< "\nright=" << normalizedFromDir.formFiles.size() << "\n";
 		return stream.str();
 	}
-	for (size_t index = 0; index < fromE.formFiles.size(); ++index) {
-		const auto& left = fromE.formFiles[index];
-		const auto& right = fromDir.formFiles[index];
+	for (size_t index = 0; index < normalizedFromE.formFiles.size(); ++index) {
+		const auto& left = normalizedFromE.formFiles[index];
+		const auto& right = normalizedFromDir.formFiles[index];
 		if (left.key != right.key ||
 			left.logicalName != right.logicalName ||
 			left.relativePath != right.relativePath ||
@@ -235,30 +247,30 @@ std::string BuildBundleDigestCompareText(const e2txt::ProjectBundle& fromE, cons
 			return stream.str();
 		}
 	}
-	if (fromE.dataTypeText != fromDir.dataTypeText) {
-		appendValueMismatch("dataTypeText.digest", e2txt::ComputeTextDigest(fromE.dataTypeText), e2txt::ComputeTextDigest(fromDir.dataTypeText));
+	if (normalizedFromE.dataTypeText != normalizedFromDir.dataTypeText) {
+		appendValueMismatch("dataTypeText.digest", e2txt::ComputeTextDigest(normalizedFromE.dataTypeText), e2txt::ComputeTextDigest(normalizedFromDir.dataTypeText));
 		return stream.str();
 	}
-	if (fromE.dllDeclareText != fromDir.dllDeclareText) {
-		appendValueMismatch("dllDeclareText.digest", e2txt::ComputeTextDigest(fromE.dllDeclareText), e2txt::ComputeTextDigest(fromDir.dllDeclareText));
+	if (normalizedFromE.dllDeclareText != normalizedFromDir.dllDeclareText) {
+		appendValueMismatch("dllDeclareText.digest", e2txt::ComputeTextDigest(normalizedFromE.dllDeclareText), e2txt::ComputeTextDigest(normalizedFromDir.dllDeclareText));
 		return stream.str();
 	}
-	if (fromE.constantText != fromDir.constantText) {
-		appendValueMismatch("constantText.digest", e2txt::ComputeTextDigest(fromE.constantText), e2txt::ComputeTextDigest(fromDir.constantText));
+	if (normalizedFromE.constantText != normalizedFromDir.constantText) {
+		appendValueMismatch("constantText.digest", e2txt::ComputeTextDigest(normalizedFromE.constantText), e2txt::ComputeTextDigest(normalizedFromDir.constantText));
 		return stream.str();
 	}
-	if (fromE.globalText != fromDir.globalText) {
-		appendValueMismatch("globalText.digest", e2txt::ComputeTextDigest(fromE.globalText), e2txt::ComputeTextDigest(fromDir.globalText));
+	if (normalizedFromE.globalText != normalizedFromDir.globalText) {
+		appendValueMismatch("globalText.digest", e2txt::ComputeTextDigest(normalizedFromE.globalText), e2txt::ComputeTextDigest(normalizedFromDir.globalText));
 		return stream.str();
 	}
-	if (fromE.resources.size() != fromDir.resources.size()) {
-		stream << "mismatch=resources.size\nleft=" << fromE.resources.size()
-			<< "\nright=" << fromDir.resources.size() << "\n";
+	if (normalizedFromE.resources.size() != normalizedFromDir.resources.size()) {
+		stream << "mismatch=resources.size\nleft=" << normalizedFromE.resources.size()
+			<< "\nright=" << normalizedFromDir.resources.size() << "\n";
 		return stream.str();
 	}
-	for (size_t index = 0; index < fromE.resources.size(); ++index) {
-		const auto& left = fromE.resources[index];
-		const auto& right = fromDir.resources[index];
+	for (size_t index = 0; index < normalizedFromE.resources.size(); ++index) {
+		const auto& left = normalizedFromE.resources[index];
+		const auto& right = normalizedFromDir.resources[index];
 		if (left.kind != right.kind ||
 			left.key != right.key ||
 			left.logicalName != right.logicalName ||
@@ -282,32 +294,32 @@ std::string BuildBundleDigestCompareText(const e2txt::ProjectBundle& fromE, cons
 			return stream.str();
 		}
 	}
-	if (fromE.folderAllocatedKey != fromDir.folderAllocatedKey) {
-		stream << "mismatch=folderAllocatedKey\nleft=" << fromE.folderAllocatedKey
-			<< "\nright=" << fromDir.folderAllocatedKey << "\n";
+	if (normalizedFromE.folderAllocatedKey != normalizedFromDir.folderAllocatedKey) {
+		stream << "mismatch=folderAllocatedKey\nleft=" << normalizedFromE.folderAllocatedKey
+			<< "\nright=" << normalizedFromDir.folderAllocatedKey << "\n";
 		return stream.str();
 	}
-	if (fromE.rootChildKeys != fromDir.rootChildKeys) {
-		stream << "mismatch=rootChildKeys\nleft_count=" << fromE.rootChildKeys.size()
-			<< "\nright_count=" << fromDir.rootChildKeys.size() << "\n";
-		for (size_t index = 0; index < (std::min)(fromE.rootChildKeys.size(), fromDir.rootChildKeys.size()); ++index) {
-			if (fromE.rootChildKeys[index] != fromDir.rootChildKeys[index]) {
+	if (normalizedFromE.rootChildKeys != normalizedFromDir.rootChildKeys) {
+		stream << "mismatch=rootChildKeys\nleft_count=" << normalizedFromE.rootChildKeys.size()
+			<< "\nright_count=" << normalizedFromDir.rootChildKeys.size() << "\n";
+		for (size_t index = 0; index < (std::min)(normalizedFromE.rootChildKeys.size(), normalizedFromDir.rootChildKeys.size()); ++index) {
+			if (normalizedFromE.rootChildKeys[index] != normalizedFromDir.rootChildKeys[index]) {
 				stream << "first_diff_index=" << index << "\n"
-					<< "left=" << fromE.rootChildKeys[index] << "\n"
-					<< "right=" << fromDir.rootChildKeys[index] << "\n";
+					<< "left=" << normalizedFromE.rootChildKeys[index] << "\n"
+					<< "right=" << normalizedFromDir.rootChildKeys[index] << "\n";
 				return stream.str();
 			}
 		}
 		return stream.str();
 	}
-	if (fromE.folders.size() != fromDir.folders.size()) {
-		stream << "mismatch=folders.size\nleft=" << fromE.folders.size()
-			<< "\nright=" << fromDir.folders.size() << "\n";
+	if (normalizedFromE.folders.size() != normalizedFromDir.folders.size()) {
+		stream << "mismatch=folders.size\nleft=" << normalizedFromE.folders.size()
+			<< "\nright=" << normalizedFromDir.folders.size() << "\n";
 		return stream.str();
 	}
-	for (size_t index = 0; index < fromE.folders.size(); ++index) {
-		const auto& left = fromE.folders[index];
-		const auto& right = fromDir.folders[index];
+	for (size_t index = 0; index < normalizedFromE.folders.size(); ++index) {
+		const auto& left = normalizedFromE.folders[index];
+		const auto& right = normalizedFromDir.folders[index];
 		if (left.key != right.key ||
 			left.parentKey != right.parentKey ||
 			left.expand != right.expand ||
@@ -325,14 +337,14 @@ std::string BuildBundleDigestCompareText(const e2txt::ProjectBundle& fromE, cons
 			return stream.str();
 		}
 	}
-	if (fromE.windowBindings.size() != fromDir.windowBindings.size()) {
-		stream << "mismatch=windowBindings.size\nleft=" << fromE.windowBindings.size()
-			<< "\nright=" << fromDir.windowBindings.size() << "\n";
+	if (normalizedFromE.windowBindings.size() != normalizedFromDir.windowBindings.size()) {
+		stream << "mismatch=windowBindings.size\nleft=" << normalizedFromE.windowBindings.size()
+			<< "\nright=" << normalizedFromDir.windowBindings.size() << "\n";
 		return stream.str();
 	}
-	for (size_t index = 0; index < fromE.windowBindings.size(); ++index) {
-		const auto& left = fromE.windowBindings[index];
-		const auto& right = fromDir.windowBindings[index];
+	for (size_t index = 0; index < normalizedFromE.windowBindings.size(); ++index) {
+		const auto& left = normalizedFromE.windowBindings[index];
+		const auto& right = normalizedFromDir.windowBindings[index];
 		if (left.formName != right.formName || left.className != right.className) {
 			stream << "mismatch=windowBindings[" << index << "]\n"
 				<< "left_form=" << left.formName << "\n"

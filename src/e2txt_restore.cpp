@@ -4595,9 +4595,6 @@ bool CanReuseNativeBundleSnapshot(const ProjectBundle& bundle)
 	if (bundle.nativeSourceBytes.empty() || bundle.nativeBundleDigest.empty()) {
 		return false;
 	}
-	if (!bundle.projectNameStored && !TrimAsciiCopy(bundle.projectName).empty()) {
-		return false;
-	}
 	return ComputeBundleDigest(bundle) == bundle.nativeBundleDigest;
 }
 
