@@ -1,0 +1,52 @@
+﻿name: Release
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build And Publish x64
+    runs-on: windows-2025-vs2026
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build x64 Release
+        shell: pwsh
+        run: |
+          msbuild .\e-packager.sln /t:Build "/p:Configuration=Release;Platform=x64" /m
+
+      - name: Package Release Files
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $assetRoot = Join-Path $env:GITHUB_WORKSPACE "release-assets"
+          $packageRoot = Join-Path $assetRoot "e-packager-$tag-windows-x64"
+          $zipPath = Join-Path $assetRoot "e-packager-$tag-windows-x64.zip"
+
+          if (Test-Path $assetRoot) {
+            Remove-Item -LiteralPath $assetRoot -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path $packageRoot | Out-Null
+          Copy-Item .\bin\x64\Release\* $packageRoot -Recurse -Force
+          Compress-Archive -Path (Join-Path $packageRoot '*') -DestinationPath $zipPath -Force
+
+          "ASSET_ZIP=$($zipPath -replace '\\','/')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: ${{ env.ASSET_ZIP }}
