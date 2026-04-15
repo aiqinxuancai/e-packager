@@ -11,6 +11,7 @@
 
 #include "..\thirdparty\json.hpp"
 #include "EFolderCodec.h"
+#include "WorkspaceProjectSupport.h"
 #include "e2txt.h"
 
 namespace {
@@ -85,6 +86,9 @@ bool DoUnpack(const std::string& inputPath, const std::string& outputDir, std::s
 
 	e2txt::BundleDirectoryCodec codec;
 	if (!codec.WriteBundle(bundle, outputDir, &outError)) {
+		return false;
+	}
+	if (!workspace_support::WriteWorkspaceFiles(std::filesystem::path(inputPath), std::filesystem::path(outputDir), outError)) {
 		return false;
 	}
 
@@ -351,6 +355,28 @@ int RunPack(const char* inputDir, const char* outputPath)
 	std::string error;
 	if (!DoPack(inputDir, outputPath, summary, error)) {
 		return PrintStringResult("pack", -1, error.c_str());
+	}
+	return PrintStringResult("pack", 0, summary.c_str());
+}
+
+int RunDefaultPack()
+{
+	std::filesystem::path projectRoot;
+	std::filesystem::path outputPath;
+	std::string error;
+	if (!workspace_support::ResolveDefaultPackOutput(std::filesystem::current_path(), projectRoot, outputPath, error)) {
+		return PrintStringResult("pack", -1, error.c_str());
+	}
+
+	std::string summary;
+	if (!DoPack(PathToUtf8(projectRoot), PathToUtf8(outputPath), summary, error)) {
+		return PrintStringResult("pack", -1, error.c_str());
+	}
+	if (summary.find("output=") == std::string::npos) {
+		if (!summary.empty()) {
+			summary += ", ";
+		}
+		summary += "output=" + PathToUtf8(outputPath);
 	}
 	return PrintStringResult("pack", 0, summary.c_str());
 }
@@ -723,6 +749,7 @@ int RunVerifyRoundTrip(const char* inputPath, const char* workDir, const char* o
 void PrintUsage()
 {
 	std::cout << "e-packager commands:" << std::endl;
+	std::cout << "  e-packager                           # pack current project to .\\pack\\<info.json sourceFileName>" << std::endl;
 	std::cout << "  e-packager unpack <input.e> <output-dir>" << std::endl;
 	std::cout << "  e-packager pack <input-dir> <output.e>" << std::endl;
 	std::cout << "  e-packager compare-bundle <input.e> <input-dir>" << std::endl;
@@ -735,11 +762,14 @@ void PrintUsage()
 int main(int argc, char* argv[])
 {
 	if (argc < 2) {
-		PrintUsage();
-		return EXIT_FAILURE;
+		return RunDefaultPack();
 	}
 
 	const std::string command = argv[1];
+	if (command == "help" || command == "--help" || command == "/?") {
+		PrintUsage();
+		return EXIT_SUCCESS;
+	}
 	if (command == "unpack") {
 		if (argc != 4) {
 			PrintUsage();

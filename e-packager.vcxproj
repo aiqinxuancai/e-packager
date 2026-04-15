@@ -165,12 +165,14 @@
     <ClCompile Include="src\EFolderCodec.cpp">
       <ObjectFileName>$(IntDir)EFolderCodecCore.obj</ObjectFileName>
     </ClCompile>
+    <ClCompile Include="src\WorkspaceProjectSupport.cpp" />
     <ClCompile Include="src\e2txt.cpp" />
     <ClCompile Include="src\e2txt_restore.cpp" />
     <ClCompile Include="src\PathHelper.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\EFolderCodec.h" />
+    <ClInclude Include="src\WorkspaceProjectSupport.h" />
     <ClInclude Include="src\e2txt.h" />
     <ClInclude Include="src\PathHelper.h" />
     <ClInclude Include="elib\lib2.h" />
