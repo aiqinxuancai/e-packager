@@ -10,7 +10,7 @@ std::string GetBasePath();
 std::string ExtractBetweenDashes(const std::string& text);
 
 /// <summary>
-/// ��ȡ
+/// 查找文件中指定字节序列的偏移量
 /// </summary>
 /// <param name="filename"></param>
 /// <param name="search_bytes"></param>
@@ -19,7 +19,7 @@ std::optional<size_t> FindByteInFile(const std::string& filename, const std::vec
 
 
 /// <summary>
-/// ��ȡout���ļ���
+/// 解析链接器命令中 /out: 参数的文件名
 /// </summary>
 /// <param name="s"></param>
 /// <returns></returns>

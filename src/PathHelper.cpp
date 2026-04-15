@@ -19,45 +19,45 @@ std::string GetBasePath() {
 std::string ExtractBetweenDashes(const std::string& text) {
     std::string delimiter = " - ";
 
-    // �ҵ���һ��" - "��λ��
+    // 找到第一个 " - " 的位置
     size_t start = text.find(delimiter);
     if (start == std::string::npos) {
-        // û���ҵ�" - "�����ؿ��ַ���
+        // 没有找到 " - "，返回空字符串
         return "";
     }
-    start += delimiter.length(); // ����" - "����ʼ�ڵ�һ��" - "֮����ַ�
+    start += delimiter.length(); // 跳过 " - "，从第一个 " - " 之后的字符开始
 
-    // ��startλ�ÿ�ʼ���ҵ���һ��" - "��λ��
+    // 从 start 位置开始，找到第二个 " - " 的位置
     size_t end = text.find(delimiter, start);
     if (end == std::string::npos) {
-        // û���ҵ��ڶ���" - "�����ؿ��ַ���
+        // 没有找到第二个 " - "，返回空字符串
         return "";
     }
 
-    // ȡ������" - "֮������ַ���
+    // 取两个 " - " 之间的字符串
     return text.substr(start, end - start);
 }
 
 /// <summary>
-/// ��ȡ
+/// 查找文件中指定字节序列的偏移量
 /// </summary>
 /// <param name="filename"></param>
 /// <param name="search_bytes"></param>
 /// <returns></returns>
 std::optional<size_t> FindByteInFile(const std::string& filename, const std::vector<char>& search_bytes) {
-    // ���ļ�����ȡ����
+    // 从文件中读取数据
     std::ifstream file(filename, std::ios::binary);
     std::vector<char> file_contents((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
-    // �����ֽ�����
+    // 查找字节序列
     auto it = std::search(file_contents.begin(), file_contents.end(), search_bytes.begin(), search_bytes.end());
 
     if (it != file_contents.end()) {
-        // ����ҵ��ˣ�����λ��
+        // 找到了，返回位置
         return std::distance(file_contents.begin(), it);
     }
     else {
-        // ���û���ҵ������� std::nullopt
+        // 没有找到，返回 std::nullopt
         return std::nullopt;
     }
 }
@@ -66,7 +66,7 @@ std::optional<size_t> FindByteInFile(const std::string& filename, const std::vec
 
 
 /// <summary>
-/// ��ȡout���ļ���
+/// 解析链接器命令中 /out: 参数的文件名
 /// </summary>
 /// <param name="s"></param>
 /// <returns></returns>
@@ -86,17 +86,17 @@ std::string GetLinkerCommandOutFileName(const std::string& s) {
 
 
 
-// ���������������ı�����ȡ�����ض�������·��
+// 从命令行字符串中提取包含特定目标关键字的路径
 std::string ExtractPathFromCommand(const std::string& commandLine, const std::string& target) {
     std::string foundPath;
     size_t pos = commandLine.find(target);
     if (pos != std::string::npos) {
-        // �������ַ�����λ����ǰ���ҵ�һ��˫����
+        // 在目标字符串位置之前找到最近的双引号
         size_t start = commandLine.rfind('"', pos);
-        // �������ַ�����λ�������ҵ�һ��˫����
+        // 在目标字符串位置之后找到下一个双引号
         size_t end = commandLine.find('"', pos + target.length());
 
-        // ����ҵ���˫���ţ���ȡ·��
+        // 如果找到了双引号，提取路径
         if (start != std::string::npos && end != std::string::npos) {
             foundPath = commandLine.substr(start + 1, end - start - 1);
         }
