@@ -1,4 +1,4 @@
-#include "UpdateCheck.h"
+﻿#include "UpdateCheck.h"
 
 #include <Windows.h>
 #include <winhttp.h>

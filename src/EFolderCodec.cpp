@@ -934,6 +934,20 @@ bool IsAutoDiscoverableSourceTextPath(const std::filesystem::path& relativePath)
 	return !fileName.empty() && fileName.front() != '.';
 }
 
+bool IsAutoDiscoverableFormXmlPath(const std::filesystem::path& relativePath)
+{
+	const std::string normalized = NormalizeRelativePathKey(relativePath);
+	if (!normalized.starts_with("src/")) {
+		return false;
+	}
+	if (ToLowerAscii(relativePath.extension().generic_string()) != ".xml") {
+		return false;
+	}
+
+	const std::string fileName = relativePath.filename().generic_string();
+	return !fileName.empty() && fileName.front() != '.';
+}
+
 BundleFolder* FindFolderByKey(std::vector<BundleFolder>& folders, const std::int32_t key)
 {
 	for (auto& folder : folders) {
@@ -1078,6 +1092,37 @@ void AttachSourceFileToTree(
 	}
 }
 
+void AttachFormFileToTree(
+	const BundleFormFile& file,
+	std::vector<BundleFolder>& folders,
+	std::vector<std::string>& rootChildKeys,
+	std::int32_t& folderAllocatedKey)
+{
+	if (file.key.empty() || ContainsAssignedTreeKey(folders, rootChildKeys, file.key)) {
+		return;
+	}
+
+	const std::vector<std::string> folderSegments = GetFolderSegmentsFromRelativePath(
+		file.relativePath.empty() ? (std::string("src/") + file.logicalName + ".xml") : file.relativePath);
+	if (folderSegments.empty()) {
+		AppendUniqueKey(rootChildKeys, file.key);
+		return;
+	}
+
+	const std::int32_t folderKey = EnsureFolderPath(folderSegments, folders, rootChildKeys, folderAllocatedKey);
+	if (folderKey == 0) {
+		AppendUniqueKey(rootChildKeys, file.key);
+		return;
+	}
+
+	if (BundleFolder* folder = FindFolderByKey(folders, folderKey); folder != nullptr) {
+		AppendUniqueKey(folder->childKeys, file.key);
+	}
+	else {
+		AppendUniqueKey(rootChildKeys, file.key);
+	}
+}
+
 bool ReadAutoDiscoveredSourceFiles(
 	const std::filesystem::path& root,
 	ProjectBundle& bundle,
@@ -1153,6 +1198,86 @@ bool ReadAutoDiscoveredSourceFiles(
 		knownRelativePaths.insert(NormalizeRelativePathKey(relativePath));
 		bundle.sourceFiles.push_back(std::move(file));
 		AttachSourceFileToTree(bundle.sourceFiles.back(), bundle.folders, bundle.rootChildKeys, bundle.folderAllocatedKey);
+	}
+
+	return true;
+}
+
+bool ReadAutoDiscoveredFormFiles(
+	const std::filesystem::path& root,
+	ProjectBundle& bundle,
+	std::string* outError)
+{
+	const std::filesystem::path sourceRoot = root / "src";
+	std::error_code ec;
+	if (!std::filesystem::exists(sourceRoot, ec) || ec) {
+		return !ec;
+	}
+
+	std::unordered_set<std::string> knownRelativePaths;
+	std::unordered_map<std::string, int> formKeyCounters;
+	for (const auto& file : bundle.formFiles) {
+		knownRelativePaths.insert(NormalizeRelativePathKey(
+			file.relativePath.empty() ? (std::string("src/") + file.logicalName + ".xml") : file.relativePath));
+		ObserveBundleItemKeyBase("form", file.logicalName, formKeyCounters);
+	}
+
+	for (const auto& file : bundle.formFiles) {
+		AttachFormFileToTree(file, bundle.folders, bundle.rootChildKeys, bundle.folderAllocatedKey);
+	}
+
+	std::vector<std::filesystem::path> pendingRelativePaths;
+	for (std::filesystem::recursive_directory_iterator it(sourceRoot, ec), end; it != end; it.increment(ec)) {
+		if (ec) {
+			if (outError != nullptr) {
+				*outError = "enumerate_form_files_failed";
+			}
+			return false;
+		}
+		if (!it->is_regular_file()) {
+			continue;
+		}
+
+		const std::filesystem::path relativePath = std::filesystem::relative(it->path(), root, ec);
+		if (ec) {
+			if (outError != nullptr) {
+				*outError = "relative_form_path_failed";
+			}
+			return false;
+		}
+		if (!IsAutoDiscoverableFormXmlPath(relativePath)) {
+			continue;
+		}
+
+		const std::string relativeKey = NormalizeRelativePathKey(relativePath);
+		if (knownRelativePaths.contains(relativeKey)) {
+			continue;
+		}
+		pendingRelativePaths.push_back(relativePath);
+	}
+
+	std::sort(
+		pendingRelativePaths.begin(),
+		pendingRelativePaths.end(),
+		[](const std::filesystem::path& left, const std::filesystem::path& right) {
+			return NormalizeRelativePathKey(left) < NormalizeRelativePathKey(right);
+		});
+
+	for (const auto& relativePath : pendingRelativePaths) {
+		BundleFormFile file;
+		file.logicalName = relativePath.stem().string();
+		file.relativePath = relativePath.generic_string();
+		file.key = BuildBundleItemKey("form", file.logicalName, formKeyCounters);
+		if (!ReadTextFileUtf8ToLocal(root / relativePath, file.xmlText)) {
+			if (outError != nullptr) {
+				*outError = "read_auto_discovered_form_file_failed";
+			}
+			return false;
+		}
+
+		knownRelativePaths.insert(NormalizeRelativePathKey(relativePath));
+		bundle.formFiles.push_back(std::move(file));
+		AttachFormFileToTree(bundle.formFiles.back(), bundle.folders, bundle.rootChildKeys, bundle.folderAllocatedKey);
 	}
 
 	return true;
@@ -1563,6 +1688,9 @@ bool BundleDirectoryCodec::ReadBundle(const std::string& inputDir, ProjectBundle
 	}
 
 	if (!ReadAutoDiscoveredSourceFiles(root, bundle, outError)) {
+		return false;
+	}
+	if (!ReadAutoDiscoveredFormFiles(root, bundle, outError)) {
 		return false;
 	}
 
