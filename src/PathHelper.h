@@ -3,9 +3,11 @@
 #include <string>
 #include <vector>
 #include <optional>
+#include <filesystem>
 #include <Windows.h>
 
 std::string GetBasePath();
+std::vector<std::filesystem::path> GetRegisteredEplOpenCommandBaseDirs();
 
 std::string ExtractBetweenDashes(const std::string& text);
 

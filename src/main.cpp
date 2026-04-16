@@ -80,19 +80,29 @@ std::string PathToUtf8(const std::filesystem::path& path)
 	return WideToUtf8(path.wstring());
 }
 
+std::filesystem::path ResolveAbsolutePath(const std::filesystem::path& path)
+{
+	std::error_code ec;
+	const std::filesystem::path absolutePath = std::filesystem::absolute(path, ec);
+	return ec ? path : absolutePath;
+}
+
 bool DoUnpack(const std::string& inputPath, const std::string& outputDir, std::string& outSummary, std::string& outError)
 {
+	const std::filesystem::path effectiveInputPath = ResolveAbsolutePath(std::filesystem::path(inputPath));
+	const std::filesystem::path effectiveOutputDir = ResolveAbsolutePath(std::filesystem::path(outputDir));
+
 	e2txt::Generator generator;
 	e2txt::ProjectBundle bundle;
-	if (!generator.GenerateBundle(inputPath, bundle, &outError)) {
+	if (!generator.GenerateBundle(PathToUtf8(effectiveInputPath), bundle, &outError)) {
 		return false;
 	}
 
 	e2txt::BundleDirectoryCodec codec;
-	if (!codec.WriteBundle(bundle, outputDir, &outError)) {
+	if (!codec.WriteBundle(bundle, PathToUtf8(effectiveOutputDir), &outError)) {
 		return false;
 	}
-	if (!workspace_support::WriteWorkspaceFiles(std::filesystem::path(inputPath), std::filesystem::path(outputDir), outError)) {
+	if (!workspace_support::WriteWorkspaceFiles(effectiveInputPath, effectiveOutputDir, outError)) {
 		return false;
 	}
 
@@ -100,24 +110,27 @@ bool DoUnpack(const std::string& inputPath, const std::string& outputDir, std::s
 		"source_files=" + std::to_string(bundle.sourceFiles.size()) +
 		", form_files=" + std::to_string(bundle.formFiles.size()) +
 		", resources=" + std::to_string(bundle.resources.size()) +
-		", output=" + outputDir;
+		", output=" + PathToUtf8(effectiveOutputDir);
 	return true;
 }
 
 bool DoPack(const std::string& inputDir, const std::string& outputPath, std::string& outSummary, std::string& outError)
 {
-	if (!workspace_support::ValidateInfoJsonVersion(std::filesystem::path(inputDir), outError)) {
+	const std::filesystem::path effectiveInputDir = ResolveAbsolutePath(std::filesystem::path(inputDir));
+	const std::filesystem::path effectiveOutputPath = ResolveAbsolutePath(std::filesystem::path(outputPath));
+
+	if (!workspace_support::ValidateInfoJsonVersion(effectiveInputDir, outError)) {
 		return false;
 	}
 
 	e2txt::BundleDirectoryCodec codec;
 	e2txt::ProjectBundle bundle;
-	if (!codec.ReadBundle(inputDir, bundle, &outError)) {
+	if (!codec.ReadBundle(PathToUtf8(effectiveInputDir), bundle, &outError)) {
 		return false;
 	}
 
 	e2txt::Restorer restorer;
-	if (!restorer.RestoreBundleToFile(bundle, outputPath, &outSummary, &outError)) {
+	if (!restorer.RestoreBundleToFile(bundle, PathToUtf8(effectiveOutputPath), &outSummary, &outError)) {
 		return false;
 	}
 	return true;
@@ -408,10 +421,12 @@ int RunCompareBundle(const char* inputPath, const char* inputDir)
 	e2txt::ProjectBundle bundleFromE;
 	e2txt::ProjectBundle bundleFromDir;
 	std::string error;
-	if (!generator.GenerateBundle(inputPath, bundleFromE, &error)) {
+	const std::filesystem::path effectiveInputPath = ResolveAbsolutePath(std::filesystem::path(inputPath));
+	const std::filesystem::path effectiveInputDir = ResolveAbsolutePath(std::filesystem::path(inputDir));
+	if (!generator.GenerateBundle(PathToUtf8(effectiveInputPath), bundleFromE, &error)) {
 		return PrintStringResult("compare-bundle", -1, error.c_str());
 	}
-	if (!codec.ReadBundle(inputDir, bundleFromDir, &error)) {
+	if (!codec.ReadBundle(PathToUtf8(effectiveInputDir), bundleFromDir, &error)) {
 		return PrintStringResult("compare-bundle", -1, error.c_str());
 	}
 	const std::string summary = BuildBundleDigestCompareText(bundleFromE, bundleFromDir);
@@ -420,7 +435,9 @@ int RunCompareBundle(const char* inputPath, const char* inputDir)
 
 int RunRoundTrip(const char* inputPath, const char* workDir, const char* outputPath)
 {
-	const std::filesystem::path root(workDir);
+	const std::filesystem::path root = ResolveAbsolutePath(std::filesystem::path(workDir));
+	const std::filesystem::path effectiveInputPath = ResolveAbsolutePath(std::filesystem::path(inputPath));
+	const std::filesystem::path effectiveOutputPath = ResolveAbsolutePath(std::filesystem::path(outputPath));
 	const std::filesystem::path unpackDir = root / "unpacked";
 	std::error_code ec;
 	std::filesystem::remove_all(unpackDir, ec);
@@ -428,10 +445,10 @@ int RunRoundTrip(const char* inputPath, const char* workDir, const char* outputP
 
 	std::string summary;
 	std::string error;
-	if (!DoUnpack(inputPath, unpackDir.string(), summary, error)) {
+	if (!DoUnpack(PathToUtf8(effectiveInputPath), PathToUtf8(unpackDir), summary, error)) {
 		return PrintStringResult("roundtrip", -1, error.c_str());
 	}
-	if (!DoPack(unpackDir.string(), outputPath, summary, error)) {
+	if (!DoPack(PathToUtf8(unpackDir), PathToUtf8(effectiveOutputPath), summary, error)) {
 		return PrintStringResult("roundtrip", -1, error.c_str());
 	}
 	return PrintStringResult("roundtrip", 0, summary.c_str());
@@ -865,7 +882,11 @@ int main(int argc, char* argv[])
 		updateFuture = std::async(std::launch::async, update_check::FetchLatestTag);
 	}
 
+	e2txt::ClearRuntimeWarnings();
 	const int result = RunCommand(argc, argv);
+	for (const auto& warning : e2txt::ConsumeRuntimeWarnings()) {
+		std::cerr << "提示: " << warning << std::endl;
+	}
 
 	// 主命令执行完毕后，检查是否有可用的新版本。
 	if (updateFuture.valid()) {

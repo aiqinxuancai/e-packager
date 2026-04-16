@@ -15,6 +15,7 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -2291,18 +2292,6 @@ std::string ResolveCoreLibraryFallbackMemberName(std::int32_t typeId, std::int32
 	return std::string();
 }
 
-std::string GetUserProfilePath()
-{
-	char* raw = nullptr;
-	size_t size = 0;
-	if (_dupenv_s(&raw, &size, "USERPROFILE") != 0 || raw == nullptr || size == 0) {
-		return std::string();
-	}
-	std::string value(raw);
-	free(raw);
-	return value;
-}
-
 void PushUniqueCandidate(std::vector<std::filesystem::path>& candidates, const std::filesystem::path& candidate)
 {
 	if (candidate.empty()) {
@@ -2360,13 +2349,79 @@ std::vector<std::filesystem::path> BuildSupportLibraryCandidatePaths(
 	}
 	addBaseCandidates(std::filesystem::current_path(ec));
 	addBaseCandidates(std::filesystem::path(GetBasePath()));
-
-	const std::string userProfile = GetUserProfilePath();
-	if (!userProfile.empty()) {
-		addBaseCandidates(std::filesystem::path(userProfile) / "OneDrive" / "e5.6");
+	for (const auto& registeredBaseDir : GetRegisteredEplOpenCommandBaseDirs()) {
+		addBaseCandidates(registeredBaseDir);
 	}
 
 	return candidates;
+}
+
+bool IsCoreSupportLibraryFileName(const std::string& fileName)
+{
+	std::filesystem::path path(fileName);
+	std::string normalized = TrimAsciiCopy(path.filename().string());
+	if (normalized.empty()) {
+		normalized = TrimAsciiCopy(fileName);
+	}
+	std::transform(
+		normalized.begin(),
+		normalized.end(),
+		normalized.begin(),
+		[](const unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+	if (normalized == "krnln" || normalized == "krnln.fne") {
+		return true;
+	}
+	const std::filesystem::path normalizedPath(normalized);
+	return normalizedPath.stem().string() == "krnln";
+}
+
+enum class CoreSupportLibraryIssue {
+	NotFound,
+	LoadFailed,
+	SymbolReadFailed,
+};
+
+std::string BuildCoreSupportLibraryWarning(
+	const CoreSupportLibraryIssue issue,
+	const std::string& fileName,
+	const std::string& candidatePath,
+	const DWORD errorCode)
+{
+	const std::string displayName = fileName.empty() ? "krnln.fne" : fileName;
+	std::ostringstream stream;
+	switch (issue) {
+	case CoreSupportLibraryIssue::NotFound:
+		stream << "未找到核心支持库 " << displayName
+			<< "。它是所有易语言源码都必须引用的核心支持库。当前仍会继续处理，但支持库命令名可能退化为 _Lib0CmdXXX，AI 解读和部分回包场景会受影响。"
+			<< "请检查易语言安装目录及其上级 lib，或注册表 E.Document\\Shell\\Open\\Command。";
+		break;
+	case CoreSupportLibraryIssue::LoadFailed:
+		stream << "已找到核心支持库 " << displayName;
+		if (!candidatePath.empty()) {
+			stream << "（" << candidatePath << "）";
+		}
+		stream << "，但加载失败";
+		if (errorCode != ERROR_SUCCESS) {
+			stream << "，Win32 错误=" << errorCode;
+		}
+		stream << "。";
+		if (errorCode == ERROR_BAD_EXE_FORMAT) {
+			stream << "这通常表示当前 e-packager 与支持库位数不匹配，例如 x64 的 e-packager 尝试加载 x86 的 krnln.fne。";
+		}
+		else {
+			stream << "这通常表示文件损坏、依赖缺失，或当前进程无法直接加载该支持库。";
+		}
+		stream << "当前仍会继续处理，但支持库命令名可能退化为 _Lib0CmdXXX。";
+		break;
+	case CoreSupportLibraryIssue::SymbolReadFailed:
+		stream << "已加载核心支持库 " << displayName;
+		if (!candidatePath.empty()) {
+			stream << "（" << candidatePath << "）";
+		}
+		stream << "，但无法读取 GetLibInfo 导出的命令/类型符号。当前仍会继续处理，但支持库命令名可能退化为 _Lib0CmdXXX。";
+		break;
+	}
+	return stream.str();
 }
 
 class SymbolResolver {
@@ -2707,16 +2762,24 @@ private:
 
 		const auto candidates = BuildSupportLibraryCandidatePaths(m_sourcePath, symbols.fileName);
 		HMODULE module = nullptr;
+		bool candidateExists = false;
+		bool moduleLoaded = false;
+		DWORD lastLoadError = ERROR_SUCCESS;
+		std::string lastCandidatePath;
 		for (const auto& path : candidates) {
 			std::error_code ec;
 			if (!std::filesystem::exists(path, ec)) {
 				continue;
 			}
+			candidateExists = true;
+			lastCandidatePath = path.string();
 			module = LoadLibraryExA(path.string().c_str(), nullptr, 0);
 			if (module != nullptr) {
 				symbols.filePath = path.string();
+				moduleLoaded = true;
 				break;
 			}
+			lastLoadError = GetLastError();
 		}
 
 		if (module != nullptr) {
@@ -2765,10 +2828,34 @@ private:
 					}
 				}
 			}
-			FreeLibrary(module);
+			// Intentionally keep the module loaded for the rest of the process lifetime.
+			// Some third-party .fne libraries corrupt the process heap during DLL detach.
 		}
 
 		const bool loaded = !symbols.dataTypes.empty() || !symbols.commandNames.empty() || !symbols.constantNames.empty();
+		if (!loaded && IsCoreSupportLibraryFileName(symbols.fileName)) {
+			if (!candidateExists) {
+				AddRuntimeWarning(BuildCoreSupportLibraryWarning(
+					CoreSupportLibraryIssue::NotFound,
+					symbols.fileName,
+					std::string(),
+					ERROR_SUCCESS));
+			}
+			else if (!moduleLoaded) {
+				AddRuntimeWarning(BuildCoreSupportLibraryWarning(
+					CoreSupportLibraryIssue::LoadFailed,
+					symbols.fileName,
+					lastCandidatePath,
+					lastLoadError));
+			}
+			else {
+				AddRuntimeWarning(BuildCoreSupportLibraryWarning(
+					CoreSupportLibraryIssue::SymbolReadFailed,
+					symbols.fileName,
+					symbols.filePath.empty() ? lastCandidatePath : symbols.filePath,
+					ERROR_SUCCESS));
+			}
+		}
 		m_supportCache.emplace(supportIndex, std::move(symbols));
 		return loaded;
 	}
@@ -2977,10 +3064,8 @@ std::vector<std::filesystem::path> BuildModuleCandidatePaths(
 	}
 	addBaseCandidates(std::filesystem::current_path(ec));
 	addBaseCandidates(std::filesystem::path(GetBasePath()));
-
-	const std::string userProfile = GetUserProfilePath();
-	if (!userProfile.empty()) {
-		addBaseCandidates(std::filesystem::path(userProfile) / "OneDrive" / "e5.6");
+	for (const auto& registeredBaseDir : GetRegisteredEplOpenCommandBaseDirs()) {
+		addBaseCandidates(registeredBaseDir);
 	}
 
 	return candidates;
@@ -6160,6 +6245,42 @@ private:
 };
 
 }  // namespace
+
+namespace {
+
+std::mutex g_runtimeWarningMutex;
+std::vector<std::string> g_runtimeWarnings;
+std::unordered_set<std::string> g_runtimeWarningSet;
+
+}  // namespace
+
+void ClearRuntimeWarnings()
+{
+	std::lock_guard<std::mutex> lock(g_runtimeWarningMutex);
+	g_runtimeWarnings.clear();
+	g_runtimeWarningSet.clear();
+}
+
+void AddRuntimeWarning(const std::string& warning)
+{
+	if (warning.empty()) {
+		return;
+	}
+	std::lock_guard<std::mutex> lock(g_runtimeWarningMutex);
+	if (!g_runtimeWarningSet.insert(warning).second) {
+		return;
+	}
+	g_runtimeWarnings.push_back(warning);
+}
+
+std::vector<std::string> ConsumeRuntimeWarnings()
+{
+	std::lock_guard<std::mutex> lock(g_runtimeWarningMutex);
+	std::vector<std::string> warnings = std::move(g_runtimeWarnings);
+	g_runtimeWarnings.clear();
+	g_runtimeWarningSet.clear();
+	return warnings;
+}
 
 bool CaptureNativeSectionSnapshots(
 	const std::vector<std::uint8_t>& inputBytes,

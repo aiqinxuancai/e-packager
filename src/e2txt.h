@@ -206,6 +206,10 @@ struct ProjectBundle {
 std::string ComputeBundleDigest(const ProjectBundle& bundle);
 // 计算文本内容的稳定摘要。
 std::string ComputeTextDigest(const std::string& text);
+// 运行期警告收集。
+void ClearRuntimeWarnings();
+void AddRuntimeWarning(const std::string& warning);
+std::vector<std::string> ConsumeRuntimeWarnings();
 // 从原生 .e 二进制提取段快照。
 bool CaptureNativeSectionSnapshots(
 	const std::vector<std::uint8_t>& inputBytes,

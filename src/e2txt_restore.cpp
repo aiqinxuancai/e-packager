@@ -1015,18 +1015,6 @@ std::vector<std::string> BuildSupportTypeMemberNames(const LIB_DATA_TYPE_INFO& d
 	return memberNames;
 }
 
-std::string GetUserProfilePath()
-{
-	char* raw = nullptr;
-	size_t size = 0;
-	if (_dupenv_s(&raw, &size, "USERPROFILE") != 0 || raw == nullptr || size == 0) {
-		return std::string();
-	}
-	std::string value(raw);
-	free(raw);
-	return value;
-}
-
 void PushUniqueCandidate(std::vector<std::filesystem::path>& candidates, const std::filesystem::path& candidate)
 {
 	if (candidate.empty()) {
@@ -1084,12 +1072,78 @@ std::vector<std::filesystem::path> BuildSupportLibraryCandidatePaths(
 	}
 	addBaseCandidates(std::filesystem::current_path(ec));
 	addBaseCandidates(std::filesystem::path(GetBasePath()));
-
-	const std::string userProfile = GetUserProfilePath();
-	if (!userProfile.empty()) {
-		addBaseCandidates(std::filesystem::path(userProfile) / "OneDrive" / "e5.6");
+	for (const auto& registeredBaseDir : GetRegisteredEplOpenCommandBaseDirs()) {
+		addBaseCandidates(registeredBaseDir);
 	}
 	return candidates;
+}
+
+bool IsCoreSupportLibraryFileName(const std::string& fileName)
+{
+	std::filesystem::path path(fileName);
+	std::string normalized = TrimAsciiCopy(path.filename().string());
+	if (normalized.empty()) {
+		normalized = TrimAsciiCopy(fileName);
+	}
+	std::transform(
+		normalized.begin(),
+		normalized.end(),
+		normalized.begin(),
+		[](const unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+	if (normalized == "krnln" || normalized == "krnln.fne") {
+		return true;
+	}
+	const std::filesystem::path normalizedPath(normalized);
+	return normalizedPath.stem().string() == "krnln";
+}
+
+enum class CoreSupportLibraryIssue {
+	NotFound,
+	LoadFailed,
+	SymbolReadFailed,
+};
+
+std::string BuildCoreSupportLibraryWarning(
+	const CoreSupportLibraryIssue issue,
+	const std::string& fileName,
+	const std::string& candidatePath,
+	const DWORD errorCode)
+{
+	const std::string displayName = fileName.empty() ? "krnln.fne" : fileName;
+	std::ostringstream stream;
+	switch (issue) {
+	case CoreSupportLibraryIssue::NotFound:
+		stream << "未找到核心支持库 " << displayName
+			<< "。它是所有易语言源码都必须引用的核心支持库。当前仍会继续处理，但支持库命令名可能退化为 _Lib0CmdXXX，AI 解读和部分回包场景会受影响。"
+			<< "请检查易语言安装目录及其上级 lib，或注册表 E.Document\\Shell\\Open\\Command。";
+		break;
+	case CoreSupportLibraryIssue::LoadFailed:
+		stream << "已找到核心支持库 " << displayName;
+		if (!candidatePath.empty()) {
+			stream << "（" << candidatePath << "）";
+		}
+		stream << "，但加载失败";
+		if (errorCode != ERROR_SUCCESS) {
+			stream << "，Win32 错误=" << errorCode;
+		}
+		stream << "。";
+		if (errorCode == ERROR_BAD_EXE_FORMAT) {
+			stream << "这通常表示当前 e-packager 与支持库位数不匹配，例如 x64 的 e-packager 尝试加载 x86 的 krnln.fne。";
+		}
+		else {
+			stream << "这通常表示文件损坏、依赖缺失，或当前进程无法直接加载该支持库。";
+		}
+		stream << "当前仍会继续处理，但支持库命令名可能退化为 _Lib0CmdXXX。";
+		break;
+	case CoreSupportLibraryIssue::SymbolReadFailed:
+		stream << "已加载核心支持库 " << displayName;
+		if (!candidatePath.empty()) {
+			stream << "（" << candidatePath << "）";
+		}
+		stream << "，但无法读取 GetLibInfo 导出的命令/类型符号。当前仍会继续处理，但支持库命令名可能退化为 _Lib0CmdXXX。";
+		break;
+	}
+	return stream.str();
 }
 
 const std::vector<std::pair<std::string, std::int32_t>>& GetBuiltinTypes()
@@ -1266,25 +1320,45 @@ private:
 	void LoadSupportLibrary(const RestoreDependencyInfo& dependency, const int supportIndex)
 	{
 		constexpr int kMaxSupportLibraryArrayCount = 16384;
+		const bool isCoreSupportLibrary = IsCoreSupportLibraryFileName(dependency.fileName);
 		const auto candidates = BuildSupportLibraryCandidatePaths(m_sourcePath, dependency.fileName);
 		HMODULE module = nullptr;
+		bool candidateExists = false;
+		DWORD lastLoadError = ERROR_SUCCESS;
+		std::string lastCandidatePath;
 		for (const auto& path : candidates) {
 			std::error_code ec;
 			if (!std::filesystem::exists(path, ec)) {
 				continue;
 			}
+			candidateExists = true;
+			lastCandidatePath = path.string();
 			module = LoadLibraryExA(path.string().c_str(), nullptr, 0);
 			if (module != nullptr) {
 				break;
 			}
+			lastLoadError = GetLastError();
 		}
 		if (module == nullptr) {
+			if (isCoreSupportLibrary) {
+				AddRuntimeWarning(BuildCoreSupportLibraryWarning(
+					candidateExists ? CoreSupportLibraryIssue::LoadFailed : CoreSupportLibraryIssue::NotFound,
+					dependency.fileName,
+					lastCandidatePath,
+					lastLoadError));
+			}
 			return;
 		}
 
 		const auto* getInfoProc = reinterpret_cast<PFN_GET_LIB_INFO>(GetProcAddress(module, FUNCNAME_GET_LIB_INFO));
 		if (getInfoProc == nullptr) {
-			FreeLibrary(module);
+			if (isCoreSupportLibrary) {
+				AddRuntimeWarning(BuildCoreSupportLibraryWarning(
+					CoreSupportLibraryIssue::SymbolReadFailed,
+					dependency.fileName,
+					lastCandidatePath,
+					ERROR_SUCCESS));
+			}
 			return;
 		}
 
@@ -1297,7 +1371,13 @@ private:
 			!IsReadableMemoryRange(
 				libInfo->m_pDataType,
 				sizeof(LIB_DATA_TYPE_INFO) * static_cast<size_t>(libInfo->m_nDataTypeCount))) {
-			FreeLibrary(module);
+			if (isCoreSupportLibrary) {
+				AddRuntimeWarning(BuildCoreSupportLibraryWarning(
+					CoreSupportLibraryIssue::SymbolReadFailed,
+					dependency.fileName,
+					lastCandidatePath,
+					ERROR_SUCCESS));
+			}
 			return;
 		}
 
@@ -1311,7 +1391,9 @@ private:
 				m_supportTypes.insert_or_assign(name, info);
 			}
 		}
-		FreeLibrary(module);
+		// Intentionally keep support-library modules loaded for the rest of the process
+		// lifetime. Some third-party .fne libraries corrupt the process heap during
+		// DLL detach.
 	}
 
 	std::string m_sourcePath;
@@ -3507,10 +3589,8 @@ std::vector<std::filesystem::path> BuildDependencyModuleCandidatePaths(
 	}
 	addBaseCandidates(std::filesystem::current_path(ec));
 	addBaseCandidates(std::filesystem::path(GetBasePath()));
-
-	const std::string userProfile = GetUserProfilePath();
-	if (!userProfile.empty()) {
-		addBaseCandidates(std::filesystem::path(userProfile) / "OneDrive" / "e5.6");
+	for (const auto& registeredBaseDir : GetRegisteredEplOpenCommandBaseDirs()) {
+		addBaseCandidates(registeredBaseDir);
 	}
 
 	return candidates;

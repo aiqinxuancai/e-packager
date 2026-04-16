@@ -1,12 +1,129 @@
 ﻿
 #include "PathHelper.h"
+#include <cwctype>
 #include <optional>
 #include <vector>
 #include <regex>
 #include <fstream>
 #include <algorithm>
+#include <utility>
 #include <regex>
 #include <filesystem>
+
+namespace {
+
+std::wstring ExpandEnvironmentStringsCopy(const std::wstring& value) {
+    if (value.empty()) {
+        return value;
+    }
+
+    const DWORD required = ExpandEnvironmentStringsW(value.c_str(), nullptr, 0);
+    if (required == 0) {
+        return value;
+    }
+
+    std::wstring expanded(required, L'\0');
+    const DWORD written = ExpandEnvironmentStringsW(value.c_str(), expanded.data(), required);
+    if (written == 0 || written > expanded.size()) {
+        return value;
+    }
+    if (!expanded.empty() && expanded.back() == L'\0') {
+        expanded.pop_back();
+    }
+    return expanded;
+}
+
+std::optional<std::wstring> ReadRegistryDefaultString(const HKEY root, const wchar_t* subKey, const REGSAM wowFlags = 0) {
+    HKEY key = nullptr;
+    const LONG openResult = RegOpenKeyExW(root, subKey, 0, KEY_QUERY_VALUE | wowFlags, &key);
+    if (openResult != ERROR_SUCCESS || key == nullptr) {
+        return std::nullopt;
+    }
+
+    DWORD valueType = 0;
+    DWORD valueSize = 0;
+    const LONG sizeResult = RegQueryValueExW(key, nullptr, nullptr, &valueType, nullptr, &valueSize);
+    if (sizeResult != ERROR_SUCCESS || valueSize == 0 || (valueType != REG_SZ && valueType != REG_EXPAND_SZ)) {
+        RegCloseKey(key);
+        return std::nullopt;
+    }
+
+    std::wstring value(valueSize / sizeof(wchar_t), L'\0');
+    const LONG readResult = RegQueryValueExW(
+        key,
+        nullptr,
+        nullptr,
+        &valueType,
+        reinterpret_cast<LPBYTE>(value.data()),
+        &valueSize);
+    RegCloseKey(key);
+    if (readResult != ERROR_SUCCESS) {
+        return std::nullopt;
+    }
+
+    value.resize(valueSize / sizeof(wchar_t));
+    while (!value.empty() && value.back() == L'\0') {
+        value.pop_back();
+    }
+    if (value.empty()) {
+        return std::nullopt;
+    }
+    if (valueType == REG_EXPAND_SZ) {
+        value = ExpandEnvironmentStringsCopy(value);
+    }
+    return value;
+}
+
+std::wstring TrimLeftWhitespaceCopy(std::wstring value) {
+    value.erase(
+        value.begin(),
+        std::find_if(value.begin(), value.end(), [](const wchar_t ch) { return !std::iswspace(ch); }));
+    return value;
+}
+
+std::wstring ExtractExecutablePathFromCommand(std::wstring commandText) {
+    commandText = TrimLeftWhitespaceCopy(std::move(commandText));
+    if (commandText.empty()) {
+        return std::wstring();
+    }
+
+    if (commandText.front() == L'"') {
+        const size_t endQuote = commandText.find(L'"', 1);
+        if (endQuote == std::wstring::npos) {
+            return commandText.substr(1);
+        }
+        return commandText.substr(1, endQuote - 1);
+    }
+
+    std::wstring lowered = commandText;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(), towlower);
+    const size_t exePos = lowered.find(L".exe");
+    if (exePos != std::wstring::npos) {
+        return commandText.substr(0, exePos + 4);
+    }
+
+    size_t end = 0;
+    while (end < commandText.size() && !std::iswspace(commandText[end])) {
+        ++end;
+    }
+    return commandText.substr(0, end);
+}
+
+void PushUniquePath(std::vector<std::filesystem::path>& paths, const std::filesystem::path& path) {
+    if (path.empty()) {
+        return;
+    }
+
+    const std::filesystem::path normalized = path.lexically_normal();
+    for (const auto& existing : paths) {
+        if (existing.lexically_normal() == normalized) {
+            return;
+        }
+    }
+    paths.push_back(normalized);
+}
+
+} // namespace
 
 
 std::string GetBasePath() {
@@ -14,6 +131,43 @@ std::string GetBasePath() {
     GetModuleFileName(NULL, buffer, MAX_PATH);
     std::string::size_type pos = std::string(buffer).find_last_of("\\/");
     return std::string(buffer).substr(0, pos);
+}
+
+std::vector<std::filesystem::path> GetRegisteredEplOpenCommandBaseDirs() {
+    std::vector<std::filesystem::path> baseDirs;
+    const std::pair<HKEY, const wchar_t*> registryLocations[] = {
+        { HKEY_CLASSES_ROOT, L"E.Document\\Shell\\Open\\Command" },
+        { HKEY_LOCAL_MACHINE, L"SOFTWARE\\Classes\\E.Document\\Shell\\Open\\Command" },
+    };
+    const REGSAM registryViews[] = {
+        0,
+        KEY_WOW64_64KEY,
+        KEY_WOW64_32KEY,
+    };
+
+    for (const auto& [root, subKey] : registryLocations) {
+        for (const auto view : registryViews) {
+            if (root == HKEY_CLASSES_ROOT && view != 0) {
+                continue;
+            }
+
+            const std::optional<std::wstring> commandText = ReadRegistryDefaultString(root, subKey, view);
+            if (!commandText.has_value()) {
+                continue;
+            }
+
+            std::wstring executablePath = ExtractExecutablePathFromCommand(*commandText);
+            if (executablePath.empty()) {
+                continue;
+            }
+            executablePath = ExpandEnvironmentStringsCopy(executablePath);
+
+            std::filesystem::path exePath(executablePath);
+            PushUniquePath(baseDirs, exePath.parent_path());
+        }
+    }
+
+    return baseDirs;
 }
 
 std::string ExtractBetweenDashes(const std::string& text) {
