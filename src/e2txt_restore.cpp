@@ -422,7 +422,7 @@ bool EndsWith(const std::string_view text, const std::string_view suffix)
 bool ReadFileBytes(const std::string& path, std::vector<std::uint8_t>& outBytes)
 {
 	outBytes.clear();
-	std::ifstream in(path, std::ios::binary);
+	std::ifstream in(Utf8PathToPath(path), std::ios::binary);
 	if (!in.is_open()) {
 		return false;
 	}
@@ -1068,7 +1068,7 @@ std::vector<std::filesystem::path> BuildSupportLibraryCandidatePaths(
 
 	std::error_code ec;
 	if (!sourcePath.empty()) {
-		addBaseCandidates(std::filesystem::path(sourcePath).parent_path());
+		addBaseCandidates(Utf8PathToPath(sourcePath).parent_path());
 	}
 	addBaseCandidates(std::filesystem::current_path(ec));
 	addBaseCandidates(std::filesystem::path(GetBasePath()));
@@ -3585,7 +3585,7 @@ std::vector<std::filesystem::path> BuildDependencyModuleCandidatePaths(
 
 	std::error_code ec;
 	if (!sourcePath.empty()) {
-		addBaseCandidates(std::filesystem::path(sourcePath).parent_path());
+		addBaseCandidates(Utf8PathToPath(sourcePath).parent_path());
 	}
 	addBaseCandidates(std::filesystem::current_path(ec));
 	addBaseCandidates(std::filesystem::path(GetBasePath()));
@@ -6032,7 +6032,7 @@ bool Restorer::RestoreToFile(
 		return false;
 	}
 
-	std::ofstream out(outputPath, std::ios::binary);
+	std::ofstream out(Utf8PathToPath(outputPath), std::ios::binary);
 	if (!out.is_open()) {
 		if (outError != nullptr) {
 			*outError = "open_output_failed";
@@ -6107,7 +6107,7 @@ bool Restorer::RestoreBundleToFile(
 		return false;
 	}
 
-	std::ofstream out(outputPath, std::ios::binary);
+	std::ofstream out(Utf8PathToPath(outputPath), std::ios::binary);
 	if (!out.is_open()) {
 		if (outError != nullptr) {
 			*outError = "open_output_failed";

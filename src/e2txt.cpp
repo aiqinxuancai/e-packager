@@ -310,7 +310,7 @@ struct EComDependencyRecord {
 bool ReadFileBytes(const std::string& path, std::vector<std::uint8_t>& outBytes)
 {
 	outBytes.clear();
-	std::ifstream in(path, std::ios::binary);
+	std::ifstream in(Utf8PathToPath(path), std::ios::binary);
 	if (!in.is_open()) {
 		return false;
 	}
@@ -2345,7 +2345,7 @@ std::vector<std::filesystem::path> BuildSupportLibraryCandidatePaths(
 
 	std::error_code ec;
 	if (!sourcePath.empty()) {
-		addBaseCandidates(std::filesystem::path(sourcePath).parent_path());
+		addBaseCandidates(Utf8PathToPath(sourcePath).parent_path());
 	}
 	addBaseCandidates(std::filesystem::current_path(ec));
 	addBaseCandidates(std::filesystem::path(GetBasePath()));
@@ -3060,7 +3060,7 @@ std::vector<std::filesystem::path> BuildModuleCandidatePaths(
 
 	std::error_code ec;
 	if (!sourcePath.empty()) {
-		addBaseCandidates(std::filesystem::path(sourcePath).parent_path());
+		addBaseCandidates(Utf8PathToPath(sourcePath).parent_path());
 	}
 	addBaseCandidates(std::filesystem::current_path(ec));
 	addBaseCandidates(std::filesystem::path(GetBasePath()));
@@ -5336,7 +5336,7 @@ bool BuildDocumentFromSections(
 	document.sourcePath = sourcePath;
 	document.projectName = sections.hasUserInfo && !TrimAsciiCopy(sections.userInfo.programName).empty()
 		? TrimAsciiCopy(sections.userInfo.programName)
-		: (sourcePath.empty() ? std::string("memory_serialize_project") : std::filesystem::path(sourcePath).stem().string());
+		: (sourcePath.empty() ? std::string("memory_serialize_project") : Utf8PathToPath(sourcePath).stem().string());
 	document.versionText = BuildVersionText(sections);
 
 	BuildDependencies(sections, document);
@@ -6588,7 +6588,7 @@ bool Generator::GenerateToFile(
 		return false;
 	}
 
-	std::ofstream out(outputPath, std::ios::binary);
+	std::ofstream out(Utf8PathToPath(outputPath), std::ios::binary);
 	if (!out.is_open()) {
 		if (outError != nullptr) {
 			*outError = "open_output_file_failed";

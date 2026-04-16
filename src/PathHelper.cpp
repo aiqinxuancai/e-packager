@@ -33,6 +33,68 @@ std::wstring ExpandEnvironmentStringsCopy(const std::wstring& value) {
     return expanded;
 }
 
+std::wstring Utf8ToWideCopy(const std::string& value) {
+    if (value.empty()) {
+        return std::wstring();
+    }
+
+    const int required = MultiByteToWideChar(
+        CP_UTF8,
+        MB_ERR_INVALID_CHARS,
+        value.data(),
+        static_cast<int>(value.size()),
+        nullptr,
+        0);
+    if (required <= 0) {
+        return std::wstring();
+    }
+
+    std::wstring wide(static_cast<size_t>(required), L'\0');
+    if (MultiByteToWideChar(
+            CP_UTF8,
+            MB_ERR_INVALID_CHARS,
+            value.data(),
+            static_cast<int>(value.size()),
+            wide.data(),
+            required) <= 0) {
+        return std::wstring();
+    }
+    return wide;
+}
+
+std::string WideToUtf8Copy(const std::wstring& value) {
+    if (value.empty()) {
+        return std::string();
+    }
+
+    const int required = WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        value.data(),
+        static_cast<int>(value.size()),
+        nullptr,
+        0,
+        nullptr,
+        nullptr);
+    if (required <= 0) {
+        return std::string();
+    }
+
+    std::string utf8(static_cast<size_t>(required), '\0');
+    if (WideCharToMultiByte(
+            CP_UTF8,
+            0,
+            value.data(),
+            static_cast<int>(value.size()),
+            utf8.data(),
+            required,
+            nullptr,
+            nullptr) <= 0) {
+        return std::string();
+    }
+    return utf8;
+}
+
 std::optional<std::wstring> ReadRegistryDefaultString(const HKEY root, const wchar_t* subKey, const REGSAM wowFlags = 0) {
     HKEY key = nullptr;
     const LONG openResult = RegOpenKeyExW(root, subKey, 0, KEY_QUERY_VALUE | wowFlags, &key);
@@ -133,6 +195,26 @@ std::string GetBasePath() {
     return std::string(buffer).substr(0, pos);
 }
 
+std::filesystem::path Utf8PathToPath(const std::string& utf8Path) {
+#ifdef _WIN32
+    const std::wstring widePath = Utf8ToWideCopy(utf8Path);
+    if (!widePath.empty() || utf8Path.empty()) {
+        return std::filesystem::path(widePath);
+    }
+#endif
+    return std::filesystem::path(utf8Path);
+}
+
+std::string PathToUtf8(const std::filesystem::path& path) {
+#ifdef _WIN32
+    const std::string utf8 = WideToUtf8Copy(path.wstring());
+    if (!utf8.empty() || path.empty()) {
+        return utf8;
+    }
+#endif
+    return path.string();
+}
+
 std::vector<std::filesystem::path> GetRegisteredEplOpenCommandBaseDirs() {
     std::vector<std::filesystem::path> baseDirs;
     const std::pair<HKEY, const wchar_t*> registryLocations[] = {
@@ -200,7 +282,7 @@ std::string ExtractBetweenDashes(const std::string& text) {
 /// <returns></returns>
 std::optional<size_t> FindByteInFile(const std::string& filename, const std::vector<char>& search_bytes) {
     // 从文件中读取数据
-    std::ifstream file(filename, std::ios::binary);
+    std::ifstream file(Utf8PathToPath(filename), std::ios::binary);
     std::vector<char> file_contents((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
     // 查找字节序列

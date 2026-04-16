@@ -13,6 +13,7 @@
 
 #include "..\thirdparty\json.hpp"
 #include "BundlePathUtils.h"
+#include "PathHelper.h"
 
 namespace e2txt {
 
@@ -1194,7 +1195,7 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 		outError->clear();
 	}
 
-	const std::filesystem::path root = std::filesystem::path(outputDir);
+	const std::filesystem::path root = Utf8PathToPath(outputDir);
 	std::error_code ec;
 	std::filesystem::create_directories(root, ec);
 	if (ec) {
@@ -1422,7 +1423,7 @@ bool BundleDirectoryCodec::ReadBundle(const std::string& inputDir, ProjectBundle
 		outError->clear();
 	}
 
-	const std::filesystem::path root = std::filesystem::path(inputDir);
+	const std::filesystem::path root = Utf8PathToPath(inputDir);
 	json moduleJson;
 	if (!ReadProjectJsonWithLegacyFallback(
 			root,

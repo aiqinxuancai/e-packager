@@ -6,9 +6,12 @@
 #include <filesystem>
 #include <Windows.h>
 
+// 获取程序所在目录。
 std::string GetBasePath();
+// 获取注册表中易语言打开命令对应的安装目录。
 std::vector<std::filesystem::path> GetRegisteredEplOpenCommandBaseDirs();
 
+// 提取两个 " - " 之间的文本。
 std::string ExtractBetweenDashes(const std::string& text);
 
 /// <summary>
@@ -19,7 +22,6 @@ std::string ExtractBetweenDashes(const std::string& text);
 /// <returns></returns>
 std::optional<size_t> FindByteInFile(const std::string& filename, const std::vector<char>& search_bytes);
 
-
 /// <summary>
 /// 解析链接器命令中 /out: 参数的文件名
 /// </summary>
@@ -27,5 +29,9 @@ std::optional<size_t> FindByteInFile(const std::string& filename, const std::vec
 /// <returns></returns>
 std::string GetLinkerCommandOutFileName(const std::string& s);
 
-
+// 解析链接器命令中静态库路径。
 std::string GetLinkerCommandKrnlnFileName(const std::string& s);
+// 将 UTF-8 路径转换为当前平台原生路径对象。
+std::filesystem::path Utf8PathToPath(const std::string& utf8Path);
+// 将当前平台原生路径对象转换为 UTF-8 字符串。
+std::string PathToUtf8(const std::filesystem::path& path);
