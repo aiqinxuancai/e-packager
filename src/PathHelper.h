@@ -1,6 +1,7 @@
 ﻿#pragma once
 
 #include <string>
+#include <string_view>
 #include <vector>
 #include <optional>
 #include <filesystem>
@@ -33,5 +34,9 @@ std::string GetLinkerCommandOutFileName(const std::string& s);
 std::string GetLinkerCommandKrnlnFileName(const std::string& s);
 // 将 UTF-8 路径转换为当前平台原生路径对象。
 std::filesystem::path Utf8PathToPath(const std::string& utf8Path);
+// 将宽字符串转换为 UTF-8 字符串。
+std::string WideToUtf8Text(const std::wstring& text);
 // 将当前平台原生路径对象转换为 UTF-8 字符串。
 std::string PathToUtf8(const std::filesystem::path& path);
+// 将 UTF-8 字面量转换为 std::string。
+std::string Utf8Literal(std::u8string_view text);

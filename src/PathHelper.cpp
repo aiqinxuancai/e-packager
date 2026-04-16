@@ -215,6 +215,14 @@ std::string PathToUtf8(const std::filesystem::path& path) {
     return path.string();
 }
 
+std::string WideToUtf8Text(const std::wstring& text) {
+    return WideToUtf8Copy(text);
+}
+
+std::string Utf8Literal(const std::u8string_view text) {
+    return std::string(reinterpret_cast<const char*>(text.data()), text.size());
+}
+
 std::vector<std::filesystem::path> GetRegisteredEplOpenCommandBaseDirs() {
     std::vector<std::filesystem::path> baseDirs;
     const std::pair<HKEY, const wchar_t*> registryLocations[] = {

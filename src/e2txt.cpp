@@ -2391,34 +2391,34 @@ std::string BuildCoreSupportLibraryWarning(
 	std::ostringstream stream;
 	switch (issue) {
 	case CoreSupportLibraryIssue::NotFound:
-		stream << "未找到核心支持库 " << displayName
-			<< "。它是所有易语言源码都必须引用的核心支持库。当前仍会继续处理，但支持库命令名可能退化为 _Lib0CmdXXX，AI 解读和部分回包场景会受影响。"
-			<< "请检查易语言安装目录及其上级 lib，或注册表 E.Document\\Shell\\Open\\Command。";
+		stream << Utf8Literal(u8"未找到核心支持库 ") << displayName
+			<< Utf8Literal(u8"。它是所有易语言源码都必须引用的核心支持库。当前仍会继续处理，但支持库命令名可能退化为 _Lib0CmdXXX，AI 解读和部分回包场景会受影响。")
+			<< Utf8Literal(u8"请检查易语言安装目录及其上级 lib，或注册表 E.Document\\Shell\\Open\\Command。");
 		break;
 	case CoreSupportLibraryIssue::LoadFailed:
-		stream << "已找到核心支持库 " << displayName;
+		stream << Utf8Literal(u8"已找到核心支持库 ") << displayName;
 		if (!candidatePath.empty()) {
-			stream << "（" << candidatePath << "）";
+			stream << Utf8Literal(u8"（") << candidatePath << Utf8Literal(u8"）");
 		}
-		stream << "，但加载失败";
+		stream << Utf8Literal(u8"，但加载失败");
 		if (errorCode != ERROR_SUCCESS) {
-			stream << "，Win32 错误=" << errorCode;
+			stream << Utf8Literal(u8"，Win32 错误=") << errorCode;
 		}
-		stream << "。";
+		stream << Utf8Literal(u8"。");
 		if (errorCode == ERROR_BAD_EXE_FORMAT) {
-			stream << "这通常表示当前 e-packager 与支持库位数不匹配，例如 x64 的 e-packager 尝试加载 x86 的 krnln.fne。";
+			stream << Utf8Literal(u8"这通常表示当前 e-packager 与支持库位数不匹配，例如 x64 的 e-packager 尝试加载 x86 的 krnln.fne。");
 		}
 		else {
-			stream << "这通常表示文件损坏、依赖缺失，或当前进程无法直接加载该支持库。";
+			stream << Utf8Literal(u8"这通常表示文件损坏、依赖缺失，或当前进程无法直接加载该支持库。");
 		}
-		stream << "当前仍会继续处理，但支持库命令名可能退化为 _Lib0CmdXXX。";
+		stream << Utf8Literal(u8"当前仍会继续处理，但支持库命令名可能退化为 _Lib0CmdXXX。");
 		break;
 	case CoreSupportLibraryIssue::SymbolReadFailed:
-		stream << "已加载核心支持库 " << displayName;
+		stream << Utf8Literal(u8"已加载核心支持库 ") << displayName;
 		if (!candidatePath.empty()) {
-			stream << "（" << candidatePath << "）";
+			stream << Utf8Literal(u8"（") << candidatePath << Utf8Literal(u8"）");
 		}
-		stream << "，但无法读取 GetLibInfo 导出的命令/类型符号。当前仍会继续处理，但支持库命令名可能退化为 _Lib0CmdXXX。";
+		stream << Utf8Literal(u8"，但无法读取 GetLibInfo 导出的命令/类型符号。当前仍会继续处理，但支持库命令名可能退化为 _Lib0CmdXXX。");
 		break;
 	}
 	return stream.str();
@@ -2772,10 +2772,10 @@ private:
 				continue;
 			}
 			candidateExists = true;
-			lastCandidatePath = path.string();
+			lastCandidatePath = PathToUtf8(path);
 			module = LoadLibraryExA(path.string().c_str(), nullptr, 0);
 			if (module != nullptr) {
-				symbols.filePath = path.string();
+				symbols.filePath = PathToUtf8(path);
 				moduleLoaded = true;
 				break;
 			}

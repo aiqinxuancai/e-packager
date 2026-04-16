@@ -13,6 +13,7 @@
 
 #include "..\thirdparty\json.hpp"
 #include "EFolderCodec.h"
+#include "PathHelper.h"
 #include "UpdateCheck.h"
 #include "WorkspaceProjectSupport.h"
 #include "e2txt.h"
@@ -41,43 +42,9 @@ int PrintStringResult(const char* label, int result, const char* text)
 	return EXIT_FAILURE;
 }
 
-std::string WideToUtf8(const std::wstring& text)
-{
-	if (text.empty()) {
-		return std::string();
-	}
-
-	const int utf8Len = WideCharToMultiByte(
-		CP_UTF8,
-		0,
-		text.data(),
-		static_cast<int>(text.size()),
-		nullptr,
-		0,
-		nullptr,
-		nullptr);
-	if (utf8Len <= 0) {
-		return std::string();
-	}
-
-	std::string utf8(static_cast<size_t>(utf8Len), '\0');
-	if (WideCharToMultiByte(
-			CP_UTF8,
-			0,
-			text.data(),
-			static_cast<int>(text.size()),
-			utf8.data(),
-			utf8Len,
-			nullptr,
-			nullptr) <= 0) {
-		return std::string();
-	}
-	return utf8;
-}
-
 std::string PathToUtf8(const std::filesystem::path& path)
 {
-	return WideToUtf8(path.wstring());
+	return WideToUtf8Text(path.wstring());
 }
 
 std::filesystem::path ResolveAbsolutePath(const std::filesystem::path& path)
@@ -85,6 +52,18 @@ std::filesystem::path ResolveAbsolutePath(const std::filesystem::path& path)
 	std::error_code ec;
 	const std::filesystem::path absolutePath = std::filesystem::absolute(path, ec);
 	return ec ? path : absolutePath;
+}
+
+void ConfigureConsoleForUtf8()
+{
+	DWORD mode = 0;
+	const HANDLE stdoutHandle = GetStdHandle(STD_OUTPUT_HANDLE);
+	const HANDLE stderrHandle = GetStdHandle(STD_ERROR_HANDLE);
+	if ((stdoutHandle != nullptr && stdoutHandle != INVALID_HANDLE_VALUE && GetConsoleMode(stdoutHandle, &mode)) ||
+		(stderrHandle != nullptr && stderrHandle != INVALID_HANDLE_VALUE && GetConsoleMode(stderrHandle, &mode))) {
+		SetConsoleOutputCP(CP_UTF8);
+		SetConsoleCP(CP_UTF8);
+	}
 }
 
 bool DoUnpack(const std::string& inputPath, const std::string& outputDir, std::string& outSummary, std::string& outError)
@@ -799,14 +778,14 @@ int RunDragDropUnpack(const char* inputPath)
 
 void PrintUsage()
 {
-	std::cout << "e-packager 用法:" << std::endl;
-	std::cout << "  e-packager                           # 封包当前项目到 .\\pack\\<info.json sourceFileName>" << std::endl;
-	std::cout << "  e-packager <input.e>                 # 拆包 .e 文件到同目录下同名文件夹（拖放直接打开）" << std::endl;
-	std::cout << "  e-packager unpack <input.e> <output-dir>    # 拆包到指定目录" << std::endl;
-	std::cout << "  e-packager pack <input-dir> <output.e>      # 将目录封包为 .e 文件" << std::endl;
-	std::cout << "  e-packager compare-bundle <input.e> <input-dir>           # 比较 .e 与目录" << std::endl;
-	std::cout << "  e-packager roundtrip <input.e> <work-dir> <output.e>      # 拆包再封包" << std::endl;
-	std::cout << "  e-packager verify-roundtrip <input.e> <work-dir> <output.e>  # 验证往返一致性" << std::endl;
+	std::cout << Utf8Literal(u8"e-packager 用法:") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager                           # 封包当前项目到 .\\pack\\<info.json sourceFileName>") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager <input.e>                 # 拆包 .e 文件到同目录下同名文件夹（拖放直接打开）") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager unpack <input.e> <output-dir>    # 拆包到指定目录") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager pack <input-dir> <output.e>      # 将目录封包为 .e 文件") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager compare-bundle <input.e> <input-dir>           # 比较 .e 与目录") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager roundtrip <input.e> <work-dir> <output.e>      # 拆包再封包") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager verify-roundtrip <input.e> <work-dir> <output.e>  # 验证往返一致性") << std::endl;
 }
 
 }  // namespace
@@ -874,6 +853,7 @@ int RunCommand(int argc, char* argv[])
 
 int main(int argc, char* argv[])
 {
+	ConfigureConsoleForUtf8();
 	std::cerr << "e-packager " << APP_VERSION << std::endl;
 
 	// 后台异步检查更新（预发布版本跳过）。
@@ -885,7 +865,7 @@ int main(int argc, char* argv[])
 	e2txt::ClearRuntimeWarnings();
 	const int result = RunCommand(argc, argv);
 	for (const auto& warning : e2txt::ConsumeRuntimeWarnings()) {
-		std::cerr << "提示: " << warning << std::endl;
+		std::cerr << Utf8Literal(u8"提示: ") << warning << std::endl;
 	}
 
 	// 主命令执行完毕后，检查是否有可用的新版本。
@@ -893,7 +873,7 @@ int main(int argc, char* argv[])
 		if (updateFuture.wait_for(std::chrono::milliseconds(1500)) == std::future_status::ready) {
 			const std::string latest = updateFuture.get();
 			if (!latest.empty() && update_check::IsNewer(latest, APP_VERSION)) {
-				std::cerr << "提示: 新版本可用 " << latest
+				std::cerr << Utf8Literal(u8"提示: 新版本可用 ") << latest
 					<< " -> https://github.com/aiqinxuancai/e-packager/releases/latest"
 					<< std::endl;
 			}
