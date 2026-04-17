@@ -54,6 +54,18 @@ std::filesystem::path ResolveAbsolutePath(const std::filesystem::path& path)
 	return ec ? path : absolutePath;
 }
 
+void ClearNativeReuseState(e2txt::ProjectBundle& bundle)
+{
+	bundle.nativeBundleDigest.clear();
+	bundle.nativeSourceBytes.clear();
+	bundle.nativeSourceSnapshots.clear();
+	bundle.nativeProgramHeader.reset();
+	bundle.nativeGlobalSnapshots.clear();
+	bundle.nativeStructSnapshots.clear();
+	bundle.nativeDllSnapshots.clear();
+	bundle.nativeConstantSnapshots.clear();
+}
+
 void ConfigureConsoleForUtf8()
 {
 	DWORD mode = 0;
@@ -66,22 +78,58 @@ void ConfigureConsoleForUtf8()
 	}
 }
 
-bool DoUnpack(const std::string& inputPath, const std::string& outputDir, std::string& outSummary, std::string& outError)
+bool DoUnpack(
+	const std::filesystem::path& inputPath,
+	const std::filesystem::path& outputDir,
+	std::string& outSummary,
+	std::string& outError)
 {
-	const std::filesystem::path effectiveInputPath = ResolveAbsolutePath(std::filesystem::path(inputPath));
-	const std::filesystem::path effectiveOutputDir = ResolveAbsolutePath(std::filesystem::path(outputDir));
+	const std::filesystem::path effectiveInputPath = ResolveAbsolutePath(inputPath);
+	const std::filesystem::path effectiveOutputDir = ResolveAbsolutePath(outputDir);
 
 	e2txt::Generator generator;
 	e2txt::ProjectBundle bundle;
-	if (!generator.GenerateBundle(PathToUtf8(effectiveInputPath), bundle, &outError)) {
-		return false;
+	workspace_support::WorkspaceWriteOptions workspaceOptions;
+	std::string extension = effectiveInputPath.extension().string();
+	std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch) {
+		return static_cast<char>(std::tolower(ch));
+	});
+	if (extension == ".ec") {
+		e2txt::ProjectBundle ecBundle;
+		if (!generator.GenerateBundle(PathToUtf8(effectiveInputPath), ecBundle, &outError)) {
+			return false;
+		}
+
+		e2txt::ProjectBundle bridgeSourceBundle = ecBundle;
+		bridgeSourceBundle.nativeSourceBytes.clear();
+		bridgeSourceBundle.nativeBundleDigest.clear();
+
+		e2txt::Restorer restorer;
+		std::vector<std::uint8_t> eBytes;
+		if (!restorer.RestoreBundleToBytes(bridgeSourceBundle, eBytes, &outError)) {
+			return false;
+		}
+
+		std::filesystem::path bridgeSourcePath = effectiveInputPath;
+		bridgeSourcePath += L".e";
+		if (!generator.GenerateBundleFromBytes(eBytes, PathToUtf8(bridgeSourcePath), bundle, &outError)) {
+			return false;
+		}
+		ClearNativeReuseState(bundle);
+		bundle.publicHeaderText = ecBundle.publicHeaderText;
+		workspaceOptions.defaultPackOutputFileName = PathToUtf8(effectiveInputPath.filename()) + ".e";
+	}
+	else {
+		if (!generator.GenerateBundle(PathToUtf8(effectiveInputPath), bundle, &outError)) {
+			return false;
+		}
 	}
 
 	e2txt::BundleDirectoryCodec codec;
 	if (!codec.WriteBundle(bundle, PathToUtf8(effectiveOutputDir), &outError)) {
 		return false;
 	}
-	if (!workspace_support::WriteWorkspaceFiles(effectiveInputPath, effectiveOutputDir, outError)) {
+	if (!workspace_support::WriteWorkspaceFiles(effectiveInputPath, effectiveOutputDir, outError, workspaceOptions)) {
 		return false;
 	}
 
@@ -93,12 +141,26 @@ bool DoUnpack(const std::string& inputPath, const std::string& outputDir, std::s
 	return true;
 }
 
-bool DoPack(const std::string& inputDir, const std::string& outputPath, std::string& outSummary, std::string& outError)
+bool DoPack(
+	const std::filesystem::path& inputDir,
+	const std::filesystem::path& outputPath,
+	std::string& outSummary,
+	std::string& outError,
+	std::filesystem::path* outWrittenOutputPath = nullptr)
 {
-	const std::filesystem::path effectiveInputDir = ResolveAbsolutePath(std::filesystem::path(inputDir));
-	const std::filesystem::path effectiveOutputPath = ResolveAbsolutePath(std::filesystem::path(outputPath));
+	const std::filesystem::path effectiveInputDir = ResolveAbsolutePath(inputDir);
+	const std::filesystem::path requestedOutputPath = ResolveAbsolutePath(outputPath);
 
 	if (!workspace_support::ValidateInfoJsonVersion(effectiveInputDir, outError)) {
+		return false;
+	}
+
+	std::filesystem::path effectiveOutputPath;
+	if (!workspace_support::ResolvePackOutputPath(
+			effectiveInputDir,
+			requestedOutputPath,
+			effectiveOutputPath,
+			outError)) {
 		return false;
 	}
 
@@ -111,6 +173,9 @@ bool DoPack(const std::string& inputDir, const std::string& outputPath, std::str
 	e2txt::Restorer restorer;
 	if (!restorer.RestoreBundleToFile(bundle, PathToUtf8(effectiveOutputPath), &outSummary, &outError)) {
 		return false;
+	}
+	if (outWrittenOutputPath != nullptr) {
+		*outWrittenOutputPath = effectiveOutputPath;
 	}
 	return true;
 }
@@ -355,7 +420,7 @@ int RunUnpack(const char* inputPath, const char* outputDir)
 {
 	std::string summary;
 	std::string error;
-	if (!DoUnpack(inputPath, outputDir, summary, error)) {
+	if (!DoUnpack(std::filesystem::path(inputPath), std::filesystem::path(outputDir), summary, error)) {
 		return PrintStringResult("unpack", -1, error.c_str());
 	}
 	return PrintStringResult("unpack", 0, summary.c_str());
@@ -365,7 +430,7 @@ int RunPack(const char* inputDir, const char* outputPath)
 {
 	std::string summary;
 	std::string error;
-	if (!DoPack(inputDir, outputPath, summary, error)) {
+	if (!DoPack(std::filesystem::path(inputDir), std::filesystem::path(outputPath), summary, error)) {
 		return PrintStringResult("pack", -1, error.c_str());
 	}
 	return PrintStringResult("pack", 0, summary.c_str());
@@ -381,7 +446,7 @@ int RunDefaultPack()
 	}
 
 	std::string summary;
-	if (!DoPack(PathToUtf8(projectRoot), PathToUtf8(outputPath), summary, error)) {
+	if (!DoPack(projectRoot, outputPath, summary, error)) {
 		return PrintStringResult("pack", -1, error.c_str());
 	}
 	if (summary.find("output=") == std::string::npos) {
@@ -416,7 +481,7 @@ int RunRoundTrip(const char* inputPath, const char* workDir, const char* outputP
 {
 	const std::filesystem::path root = ResolveAbsolutePath(std::filesystem::path(workDir));
 	const std::filesystem::path effectiveInputPath = ResolveAbsolutePath(std::filesystem::path(inputPath));
-	const std::filesystem::path effectiveOutputPath = ResolveAbsolutePath(std::filesystem::path(outputPath));
+	const std::filesystem::path requestedOutputPath = ResolveAbsolutePath(std::filesystem::path(outputPath));
 	const std::filesystem::path unpackDir = root / "unpacked";
 	std::error_code ec;
 	std::filesystem::remove_all(unpackDir, ec);
@@ -424,10 +489,10 @@ int RunRoundTrip(const char* inputPath, const char* workDir, const char* outputP
 
 	std::string summary;
 	std::string error;
-	if (!DoUnpack(PathToUtf8(effectiveInputPath), PathToUtf8(unpackDir), summary, error)) {
+	if (!DoUnpack(effectiveInputPath, unpackDir, summary, error)) {
 		return PrintStringResult("roundtrip", -1, error.c_str());
 	}
-	if (!DoPack(PathToUtf8(unpackDir), PathToUtf8(effectiveOutputPath), summary, error)) {
+	if (!DoPack(unpackDir, requestedOutputPath, summary, error)) {
 		return PrintStringResult("roundtrip", -1, error.c_str());
 	}
 	return PrintStringResult("roundtrip", 0, summary.c_str());
@@ -744,13 +809,14 @@ int RunVerifyRoundTrip(const char* inputPath, const char* workDir, const char* o
 
 	std::string summary;
 	std::string error;
-	if (!DoUnpack(inputPath, originalDir.string(), summary, error)) {
+	if (!DoUnpack(std::filesystem::path(inputPath), originalDir, summary, error)) {
 		return PrintStringResult("verify-roundtrip", -1, error.c_str());
 	}
-	if (!DoPack(originalDir.string(), outputPath, summary, error)) {
+	std::filesystem::path writtenOutputPath;
+	if (!DoPack(originalDir, std::filesystem::path(outputPath), summary, error, &writtenOutputPath)) {
 		return PrintStringResult("verify-roundtrip", -1, error.c_str());
 	}
-	if (!DoUnpack(outputPath, roundtripDir.string(), summary, error)) {
+	if (!DoUnpack(writtenOutputPath, roundtripDir, summary, error)) {
 		return PrintStringResult("verify-roundtrip", -1, error.c_str());
 	}
 
@@ -766,11 +832,10 @@ int RunDragDropUnpack(const char* inputPath)
 {
 	const std::filesystem::path input(inputPath);
 	const std::filesystem::path outputDir = input.parent_path() / input.stem();
-	const std::string outputDirStr = outputDir.string();
 
 	std::string summary;
 	std::string error;
-	if (!DoUnpack(inputPath, outputDirStr, summary, error)) {
+	if (!DoUnpack(input, outputDir, summary, error)) {
 		return PrintStringResult("unpack", -1, error.c_str());
 	}
 	return PrintStringResult("unpack", 0, summary.c_str());
@@ -780,12 +845,12 @@ void PrintUsage()
 {
 	std::cout << Utf8Literal(u8"e-packager 用法:") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager                           # 封包当前项目到 .\\pack\\<info.json sourceFileName>") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager <input.e>                 # 拆包 .e 文件到同目录下同名文件夹（拖放直接打开）") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager unpack <input.e> <output-dir>    # 拆包到指定目录") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager pack <input-dir> <output.e>      # 将目录封包为 .e 文件") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager compare-bundle <input.e> <input-dir>           # 比较 .e 与目录") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager roundtrip <input.e> <work-dir> <output.e>      # 拆包再封包") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager verify-roundtrip <input.e> <work-dir> <output.e>  # 验证往返一致性") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager <input.e|input.ec>       # 拆包 .e/.ec 文件到同目录下同名文件夹（拖放直接打开）") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager unpack <input.e|input.ec> <output-dir>    # 拆包到指定目录") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager pack <input-dir> <output.e|output.ec>      # 将目录封包为 .e/.ec 文件") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager compare-bundle <input.e|input.ec> <input-dir>   # 比较原文件与目录") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager roundtrip <input.e|input.ec> <work-dir> <output.e|output.ec>      # 拆包再封包") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager verify-roundtrip <input.e|input.ec> <work-dir> <output.e|output.ec>  # 验证往返一致性") << std::endl;
 }
 
 }  // namespace
@@ -837,12 +902,12 @@ int RunCommand(int argc, char* argv[])
 		return RunVerifyRoundTrip(argv[2], argv[3], argv[4]);
 	}
 
-	// Drag-and-drop: a single .e file path passed directly
+	// Drag-and-drop: a single .e/.ec file path passed directly
 	if (argc == 2) {
 		std::filesystem::path inputPath(command);
 		std::string ext = inputPath.extension().string();
 		std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-		if (ext == ".e") {
+		if (ext == ".e" || ext == ".ec") {
 			return RunDragDropUnpack(argv[1]);
 		}
 	}

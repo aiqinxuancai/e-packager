@@ -7,6 +7,12 @@
 
 namespace e2txt {
 
+// 源工程文件类型。
+enum class SourceFileKind {
+	E,
+	EC,
+};
+
 // 依赖项类型。
 enum class DependencyKind {
 	ELib,
@@ -176,6 +182,7 @@ struct BundleNativeProgramHeaderSnapshot {
 // 目录化工程包。
 struct ProjectBundle {
 	std::string sourcePath;
+	SourceFileKind sourceFileKind = SourceFileKind::E;
 	std::string projectName;
 	bool projectNameStored = false;
 	std::string versionText;
@@ -200,6 +207,8 @@ struct ProjectBundle {
 	std::vector<BundleNativeConstantSnapshot> nativeConstantSnapshots;
 	std::string nativeBundleDigest;
 	std::vector<std::uint8_t> nativeSourceBytes;
+	// `.ec` 导出目录使用的公开接口头文本。
+	std::string publicHeaderText;
 };
 
 // 计算目录工程包可见内容的稳定摘要。

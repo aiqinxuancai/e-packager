@@ -132,6 +132,7 @@ void ReserveBundleRelativePaths(std::unordered_set<std::string>& usedRelativePat
 	ReserveRelativePath("src/.全局变量.txt", usedRelativePaths);
 	ReserveRelativePath("image/list.json", usedRelativePaths);
 	ReserveRelativePath("audio/list.json", usedRelativePaths);
+	ReserveRelativePath("header/header.txt", usedRelativePaths);
 }
 
 }  // namespace e2txt

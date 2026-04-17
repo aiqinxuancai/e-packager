@@ -19,7 +19,7 @@ namespace e2txt {
 
 namespace {
 
-constexpr std::int32_t kBundleDirectoryFormatVersion = 2;
+constexpr std::int32_t kBundleDirectoryFormatVersion = 3;
 
 using json = nlohmann::json;
 
@@ -27,6 +27,8 @@ constexpr unsigned char kUtf8Bom[3] = { 0xEF, 0xBB, 0xBF };
 
 std::string EncodeBase64(const std::vector<std::uint8_t>& bytes);
 std::vector<std::uint8_t> DecodeBase64(const std::string& text);
+std::string ToLowerAscii(std::string text);
+std::string TrimAsciiCopy(std::string text);
 
 std::string ConvertCodePage(const std::string& text, const UINT fromCodePage, const UINT toCodePage, const DWORD fromFlags)
 {
@@ -93,6 +95,28 @@ std::string LocalToUtf8Text(const std::string& text)
 std::string Utf8ToLocalText(const std::string& text)
 {
 	return ConvertCodePage(text, CP_UTF8, CP_ACP, MB_ERR_INVALID_CHARS);
+}
+
+std::string SourceFileKindToText(const SourceFileKind kind)
+{
+	return kind == SourceFileKind::EC ? "ec" : "e";
+}
+
+SourceFileKind ParseSourceFileKindText(const std::string& text)
+{
+	std::string normalized = ToLowerAscii(TrimAsciiCopy(text));
+	if (!normalized.empty() && normalized.front() == '.') {
+		normalized.erase(normalized.begin());
+	}
+	return normalized == "ec" ? SourceFileKind::EC : SourceFileKind::E;
+}
+
+SourceFileKind ResolveBundleSourceFileKind(const json& metaJson, const std::string& sourcePath)
+{
+	if (const auto it = metaJson.find("sourceFileKind"); it != metaJson.end() && it->is_string()) {
+		return ParseSourceFileKindText(it->get<std::string>());
+	}
+	return ParseSourceFileKindText(Utf8PathToPath(sourcePath).extension().string());
 }
 
 std::string NormalizeCrLf(const std::string& text)
@@ -480,6 +504,12 @@ BundleBinaryResource ResourceMetaFromJson(const json& item, BundleResourceKind k
 	resource.comment = Utf8ToLocalText(item.value("comment", ""));
 	resource.isPublic = item.value("isPublic", false);
 	return resource;
+}
+
+std::int64_t ReadResourceOrder(const json& item, const std::int64_t fallbackOrder)
+{
+	const auto it = item.find("order");
+	return it != item.end() && it->is_number_integer() ? it->get<std::int64_t>() : fallbackOrder;
 }
 
 BundleNativeMethodSnapshot NativeMethodSnapshotFromJson(const json& item)
@@ -1235,6 +1265,7 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 
 	json metaJson;
 	metaJson["formatVersion"] = kBundleDirectoryFormatVersion;
+	metaJson["sourceFileKind"] = SourceFileKindToText(bundle.sourceFileKind);
 	metaJson["projectNameStored"] = bundle.projectNameStored;
 	metaJson["sourceFiles"] = json::array();
 	metaJson["formFiles"] = json::array();
@@ -1248,6 +1279,7 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 
 	ProjectBundle persistedBundle;
 	persistedBundle.sourcePath = bundle.sourcePath;
+	persistedBundle.sourceFileKind = bundle.sourceFileKind;
 	persistedBundle.projectName = bundle.projectName;
 	persistedBundle.projectNameStored = bundle.projectNameStored;
 	persistedBundle.versionText = bundle.versionText;
@@ -1387,12 +1419,14 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 			}
 			return false;
 		}
+		json resourceJson = ResourceMetaToJson(resource);
+		resourceJson["order"] = static_cast<std::int64_t>(persistedBundle.resources.size());
 
 		if (resource.kind == BundleResourceKind::Image) {
-			imageList["items"].push_back(ResourceMetaToJson(resource));
+			imageList["items"].push_back(std::move(resourceJson));
 		}
 		else {
-			audioList["items"].push_back(ResourceMetaToJson(resource));
+			audioList["items"].push_back(std::move(resourceJson));
 		}
 		persistedBundle.resources.push_back(resource);
 	}
@@ -1412,6 +1446,20 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 			*outError = "write_resource_list_failed";
 		}
 		return false;
+	}
+
+	if (!TrimAsciiCopy(bundle.publicHeaderText).empty()) {
+		if (!WriteLocalTextFileUtf8Bom(root / "header" / "header.txt", bundle.publicHeaderText)) {
+			if (outError != nullptr) {
+				*outError = "write_header_file_failed";
+			}
+			return false;
+		}
+	}
+	else {
+		std::error_code removeEc;
+		std::filesystem::remove(root / "header" / "header.txt", removeEc);
+		std::filesystem::remove(root / "header", removeEc);
 	}
 
 	return true;
@@ -1452,6 +1500,7 @@ bool BundleDirectoryCodec::ReadBundle(const std::string& inputDir, ProjectBundle
 	bundle.projectName = Utf8ToLocalText(moduleJson.value("projectName", ""));
 	bundle.versionText = Utf8ToLocalText(moduleJson.value("versionText", ""));
 	bundle.sourcePath = Utf8ToLocalText(moduleJson.value("sourcePath", ""));
+	bundle.sourceFileKind = ResolveBundleSourceFileKind(metaJson, moduleJson.value("sourcePath", std::string()));
 	bundle.bundleFormatVersion = metaJson.value("formatVersion", 0);
 	bundle.projectNameStored = metaJson.value("projectNameStored", true);
 	if (const auto it = moduleJson.find("dependencies"); it != moduleJson.end() && it->is_array()) {
@@ -1549,6 +1598,13 @@ bool BundleDirectoryCodec::ReadBundle(const std::string& inputDir, ProjectBundle
 		}
 	}
 
+	struct OrderedResource {
+		std::int64_t order = 0;
+		BundleBinaryResource resource;
+	};
+	std::vector<OrderedResource> orderedResources;
+	std::int64_t nextFallbackResourceOrder = 0;
+
 	const auto readResourceList = [&](const std::filesystem::path& path, BundleResourceKind kind) -> bool {
 		json listJson;
 		if (!ReadJsonFile(path, listJson)) {
@@ -1563,7 +1619,9 @@ bool BundleDirectoryCodec::ReadBundle(const std::string& inputDir, ProjectBundle
 			if (!ReadFileBytes(root / resource.relativePath, resource.data)) {
 				return false;
 			}
-			bundle.resources.push_back(std::move(resource));
+			orderedResources.push_back(OrderedResource{
+				ReadResourceOrder(item, nextFallbackResourceOrder++),
+				std::move(resource) });
 		}
 		return true;
 	};
@@ -1579,6 +1637,15 @@ bool BundleDirectoryCodec::ReadBundle(const std::string& inputDir, ProjectBundle
 			*outError = "read_audio_list_failed";
 		}
 		return false;
+	}
+	std::stable_sort(
+		orderedResources.begin(),
+		orderedResources.end(),
+		[](const OrderedResource& left, const OrderedResource& right) {
+			return left.order < right.order;
+		});
+	for (auto& item : orderedResources) {
+		bundle.resources.push_back(std::move(item.resource));
 	}
 
 	if (!ReadAutoDiscoveredSourceFiles(root, bundle, outError)) {

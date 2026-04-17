@@ -3,7 +3,9 @@
 #include <Windows.h>
 #include <Wincrypt.h>
 
+#include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -25,6 +27,7 @@ using json = nlohmann::json;
 struct SourceFileInfo {
 	std::string fileName;
 	std::string fullPath;
+	std::string sourceFileKind;
 	std::string modifiedTimeUtc;
 	std::uint64_t fileSize = 0;
 	std::string md5;
@@ -97,6 +100,24 @@ std::wstring Utf8ToWide(const std::string& text)
 std::string PathToUtf8(const std::filesystem::path& path)
 {
 	return WideToUtf8(path.wstring());
+}
+
+std::string DetectSourceFileKind(const std::filesystem::path& path)
+{
+	std::string extension = path.extension().string();
+	std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch) {
+		return static_cast<char>(std::tolower(ch));
+	});
+	return extension == ".ec" ? "ec" : "e";
+}
+
+bool IsEcSourceFileKind(const std::string& sourceFileKind)
+{
+	std::string normalized = sourceFileKind;
+	std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char ch) {
+		return static_cast<char>(std::tolower(ch));
+	});
+	return normalized == "ec";
 }
 
 std::string NormalizeCrLf(const std::string& text)
@@ -256,6 +277,7 @@ bool QuerySourceFileInfo(const std::filesystem::path& inputFile, SourceFileInfo&
 
 		outInfo.fileName = PathToUtf8(absolutePath.filename());
 		outInfo.fullPath = PathToUtf8(absolutePath);
+		outInfo.sourceFileKind = DetectSourceFileKind(absolutePath);
 		outInfo.modifiedTimeUtc = FormatFileTimeUtc(writeTime);
 		outInfo.fileSize = static_cast<std::uint64_t>(sizeValue.QuadPart);
 		ok = true;
@@ -290,21 +312,39 @@ std::filesystem::path GetCurrentExecutablePath()
 	}
 }
 
-json BuildInfoJson(const SourceFileInfo& info)
+json BuildInfoJson(const SourceFileInfo& info, const WorkspaceWriteOptions& options)
 {
 	json infoJson;
 	infoJson["version"] = 1;
+	infoJson["sourceFileKind"] = info.sourceFileKind;
 	infoJson["sourceFileName"] = info.fileName;
 	infoJson["sourcePath"] = info.fullPath;
 	infoJson["sourceModifiedTimeUtc"] = info.modifiedTimeUtc;
 	infoJson["sourceSize"] = info.fileSize;
 	infoJson["sourceMd5"] = info.md5;
 	infoJson["toolUrl"] = "https://github.com/aiqinxuancai/e-packager";
+	if (!options.defaultPackOutputFileName.empty()) {
+		infoJson["defaultPackOutputFileName"] = options.defaultPackOutputFileName;
+	}
 	return infoJson;
 }
 
-std::string BuildAgentsMarkdown(const SourceFileInfo& info)
+std::string BuildAgentsMarkdown(const SourceFileInfo& info, const WorkspaceWriteOptions& options)
 {
+	const bool isEcProject = IsEcSourceFileKind(info.sourceFileKind);
+	const std::wstring headerDirectoryLine = isEcProject
+		? L"- `header/`：自动生成的公开接口头文件，仅供查阅与分发，不参与回包。\r\n"
+		: std::wstring();
+	const std::wstring infoJsonSourceType = isEcProject ? L".ec" : L".e";
+	std::wstring packOutputFileName = Utf8ToWide(options.defaultPackOutputFileName);
+	if (packOutputFileName.empty()) {
+		if (!info.fileName.empty()) {
+			packOutputFileName = Utf8ToWide(info.fileName);
+		}
+		else {
+			packOutputFileName = isEcProject ? L"project.ec" : L"project.e";
+		}
+	}
 	std::wostringstream stream;
 	stream
 		<< L"# AGENTS.md\r\n"
@@ -312,7 +352,7 @@ std::string BuildAgentsMarkdown(const SourceFileInfo& info)
 		<< L"## 项目说明\r\n"
 		<< L"\r\n"
 		<< L"当前目录是由 `" << Utf8ToWide(info.fileName) << L"` 解包得到的易语言目录工程。\r\n"
-		<< L"外部编辑器应直接修改本目录内容，再通过 `tool\\\\e-packager.exe` 回包生成 `.e` 文件。\r\n"
+		<< L"外部编辑器应直接修改本目录内容，再通过 `tool\\\\e-packager.exe` 回包生成 `" << packOutputFileName << L"` 文件。\r\n"
 		<< L"\r\n"
 		<< L"## 目录结构\r\n"
 		<< L"\r\n"
@@ -322,10 +362,11 @@ std::string BuildAgentsMarkdown(const SourceFileInfo& info)
 		<< L"- `src/.常量.txt`：常量定义。\r\n"
 		<< L"- `src/.全局变量.txt`：全局变量定义。\r\n"
 		<< L"- `project/`：封包所需元数据与原生快照，请勿随意删除。\r\n"
+		<< headerDirectoryLine
 		<< L"- `image/`：图片资源及 `list.json`。\r\n"
 		<< L"- `audio/`：音频资源及 `list.json`。\r\n"
 		<< L"- `tool/`：当前目录自带的 `e-packager.exe`。\r\n"
-		<< L"- `info.json`：记录本目录来源 `.e` 的文件名、路径、修改时间、尺寸、MD5。\r\n"
+		<< L"- `info.json`：记录本目录来源 `" << infoJsonSourceType << L"` 的文件名、路径、类型、修改时间、尺寸、MD5。\r\n"
 		<< L"\r\n"
 		<< L"## 易语言基础约定\r\n"
 		<< L"\r\n"
@@ -446,10 +487,10 @@ std::string BuildAgentsMarkdown(const SourceFileInfo& info)
 		<< L"在项目根目录执行以下任一方式：\r\n"
 		<< L"\r\n"
 		<< L"- 默认方式：`tool\\\\e-packager.exe`\r\n"
-		<< L"  默认输出到 `pack/` 目录，文件名优先使用 `info.json` 中记录的原始文件名。\r\n"
-		<< L"- 显式方式：`tool\\\\e-packager.exe pack . .\\\\pack\\\\" << Utf8ToWide(info.fileName) << L"`\r\n"
+		<< L"  默认输出到 `pack/` 目录，文件名优先使用 `info.json` 中记录的默认封包文件名。\r\n"
+		<< L"- 显式方式：`tool\\\\e-packager.exe pack . .\\\\pack\\\\" << packOutputFileName << L"`\r\n"
 		<< L"\r\n"
-		<< L"回包后的 `.e` 可直接在易语言 IDE 中打开并编译。\r\n"
+		<< L"回包后的 `" << packOutputFileName << L"` 可直接在易语言 IDE 中打开并编译。\r\n"
 		<< L"\r\n"
 		<< L"## 错误定位\r\n"
 		<< L"\r\n"
@@ -495,6 +536,34 @@ bool ReadInfoJson(const std::filesystem::path& root, json& outInfo, std::string&
 
 std::string ResolveDefaultOutputFileName(const json& infoJson, const std::filesystem::path& projectRoot)
 {
+	if (const auto it = infoJson.find("defaultPackOutputFileName");
+		it != infoJson.end() && it->is_string()) {
+		std::string fileName = it->get<std::string>();
+		if (!fileName.empty()) {
+			std::filesystem::path filePath = std::filesystem::path(Utf8ToWide(fileName)).filename();
+			const std::string resolved = PathToUtf8(filePath);
+			if (!resolved.empty()) {
+				return resolved;
+			}
+		}
+	}
+
+	std::string sourceFileKind = infoJson.value("sourceFileKind", std::string());
+	if (sourceFileKind.empty()) {
+		const std::string sourceFileName = infoJson.value("sourceFileName", std::string());
+		if (!sourceFileName.empty()) {
+			sourceFileKind = DetectSourceFileKind(std::filesystem::path(Utf8ToWide(sourceFileName)));
+		}
+		else {
+			const std::string sourcePath = infoJson.value("sourcePath", std::string());
+			if (!sourcePath.empty()) {
+				sourceFileKind = DetectSourceFileKind(std::filesystem::path(Utf8ToWide(sourcePath)));
+			}
+		}
+	}
+
+	const bool isEcProject = IsEcSourceFileKind(sourceFileKind);
+	const std::wstring defaultExtension = isEcProject ? L".ec" : L".e";
 	std::string fileName = infoJson.value("sourceFileName", std::string());
 	if (fileName.empty()) {
 		const std::string sourcePath = infoJson.value("sourcePath", std::string());
@@ -503,16 +572,16 @@ std::string ResolveDefaultOutputFileName(const json& infoJson, const std::filesy
 		}
 	}
 	if (fileName.empty()) {
-		fileName = PathToUtf8(projectRoot.filename()) + ".e";
+		fileName = PathToUtf8(projectRoot.filename()) + WideToUtf8(defaultExtension);
 	}
 
 	std::filesystem::path filePath = std::filesystem::path(Utf8ToWide(fileName)).filename();
 	if (filePath.extension().empty()) {
-		filePath += L".e";
+		filePath += defaultExtension;
 	}
 
 	const std::string resolved = PathToUtf8(filePath);
-	return resolved.empty() ? std::string("project.e") : resolved;
+	return resolved.empty() ? std::string("project") + WideToUtf8(defaultExtension) : resolved;
 }
 
 bool CopyExecutableToToolDirectory(const std::filesystem::path& outputDir, std::string& outError)
@@ -547,7 +616,8 @@ static constexpr int kSupportedInfoVersion = 1;
 bool WriteWorkspaceFiles(
 	const std::filesystem::path& inputFile,
 	const std::filesystem::path& outputDir,
-	std::string& outError)
+	std::string& outError,
+	const WorkspaceWriteOptions& options)
 {
 	outError.clear();
 
@@ -556,7 +626,7 @@ bool WriteWorkspaceFiles(
 		return false;
 	}
 
-	if (!WriteUtf8TextFileBom(outputDir / "info.json", BuildInfoJson(info).dump(2))) {
+	if (!WriteUtf8TextFileBom(outputDir / "info.json", BuildInfoJson(info, options).dump(2))) {
 		outError = "write_info_json_failed: " + PathToUtf8(outputDir / "info.json");
 		return false;
 	}
@@ -565,7 +635,7 @@ bool WriteWorkspaceFiles(
 		return false;
 	}
 
-	if (!WriteUtf8TextFileBom(outputDir / "AGENTS.md", BuildAgentsMarkdown(info))) {
+	if (!WriteUtf8TextFileBom(outputDir / "AGENTS.md", BuildAgentsMarkdown(info, options))) {
 		outError = "write_agents_md_failed: " + PathToUtf8(outputDir / "AGENTS.md");
 		return false;
 	}
@@ -627,6 +697,42 @@ bool ResolveDefaultPackOutput(
 	}
 
 	outOutputFile = outProjectRoot / "pack" / std::filesystem::path(Utf8ToWide(outputFileName));
+	return true;
+}
+
+bool ResolvePackOutputPath(
+	const std::filesystem::path& projectRoot,
+	const std::filesystem::path& requestedOutputPath,
+	std::filesystem::path& outOutputPath,
+	std::string& outError)
+{
+	outOutputPath = requestedOutputPath;
+	outError.clear();
+
+	json infoJson;
+	if (!ReadInfoJson(projectRoot, infoJson, outError)) {
+		return false;
+	}
+
+	std::string sourceFileKind = infoJson.value("sourceFileKind", std::string());
+	if (sourceFileKind.empty()) {
+		const std::string sourceFileName = infoJson.value("sourceFileName", std::string());
+		if (!sourceFileName.empty()) {
+			sourceFileKind = DetectSourceFileKind(std::filesystem::path(Utf8ToWide(sourceFileName)));
+		}
+	}
+
+	if (!IsEcSourceFileKind(sourceFileKind)) {
+		return true;
+	}
+
+	std::string extension = outOutputPath.extension().string();
+	std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch) {
+		return static_cast<char>(std::tolower(ch));
+	});
+	if (extension != ".e") {
+		outOutputPath += L".e";
+	}
 	return true;
 }
 

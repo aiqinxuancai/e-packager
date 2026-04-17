@@ -640,6 +640,28 @@ bool TryDecodeDumpTextLiteral(const std::string& valueText, std::string& outRawT
 	return true;
 }
 
+bool TryDecodeLegacyUnterminatedDumpTextLiteral(const std::string& valueText, std::string& outRawText, bool& outIsLongText)
+{
+	outRawText.clear();
+	outIsLongText = false;
+	if (!StartsWith(valueText, kTextLiteralLeftQuote) || EndsWith(valueText, kTextLiteralRightQuote)) {
+		return false;
+	}
+
+	// 兼容历史导出里少了结尾右引号的占位文本。
+	const std::string payload = valueText.substr(std::strlen(kTextLiteralLeftQuote));
+	if (StartsWith(payload, kEscapedLongTextLiteralPrefix)) {
+		outIsLongText = true;
+		outRawText = UnescapeTextLiteralPayload(payload.substr(std::strlen(kEscapedLongTextLiteralPrefix)));
+		return true;
+	}
+	if (StartsWith(payload, kEscapedTextLiteralPrefix)) {
+		outRawText = UnescapeTextLiteralPayload(payload.substr(std::strlen(kEscapedTextLiteralPrefix)));
+		return true;
+	}
+	return false;
+}
+
 bool TryDecodeEscapedBodyLine(const std::string& text, std::string& outBody)
 {
 	outBody.clear();
@@ -659,8 +681,10 @@ bool TryDecodeEscapedBodyLine(const std::string& text, std::string& outBody)
 
 	bool isLongText = false;
 	if (!TryDecodeDumpTextLiteral(encodedText, outBody, isLongText)) {
-		outBody.clear();
-		return false;
+		if (!TryDecodeLegacyUnterminatedDumpTextLiteral(encodedText, outBody, isLongText)) {
+			outBody.clear();
+			return false;
+		}
 	}
 	if (masked) {
 		outBody = "' " + outBody;
@@ -5788,8 +5812,7 @@ bool SerializeToModuleBytes(
 
 	if (originalSections != nullptr) {
 		for (const auto& snapshot : *originalSections) {
-			if (!IsStandardSerializedSectionKey(snapshot.key) &&
-				snapshot.key != kSectionEditorInfo) {
+			if (!IsStandardSerializedSectionKey(snapshot.key)) {
 				addRawSection(snapshot);
 			}
 		}
