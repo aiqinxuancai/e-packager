@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build-release:
-    name: Build And Publish Win32 And x64
+    name: Build Win32 And x64, Publish Win32
     runs-on: windows-2025-vs2026
 
     steps:
@@ -38,15 +38,13 @@ jobs:
           msbuild .\e-packager.sln /t:Build "/p:Configuration=Release;Platform=Win32" /m
           msbuild .\e-packager.sln /t:Build "/p:Configuration=Release;Platform=x64" /m
 
-      - name: Package Release Files
+      - name: Package Win32 Release Files
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
           $assetRoot = Join-Path $env:GITHUB_WORKSPACE "release-assets"
           $win32PackageRoot = Join-Path $assetRoot "e-packager-$tag-windows-win32"
-          $x64PackageRoot = Join-Path $assetRoot "e-packager-$tag-windows-x64"
           $win32ZipPath = Join-Path $assetRoot "e-packager-$tag-windows-win32.zip"
-          $x64ZipPath = Join-Path $assetRoot "e-packager-$tag-windows-x64.zip"
 
           if (Test-Path $assetRoot) {
             Remove-Item -LiteralPath $assetRoot -Recurse -Force
@@ -56,14 +54,9 @@ jobs:
           Copy-Item .\bin\Win32\Release\* $win32PackageRoot -Recurse -Force
           Compress-Archive -Path (Join-Path $win32PackageRoot '*') -DestinationPath $win32ZipPath -Force
 
-          New-Item -ItemType Directory -Path $x64PackageRoot | Out-Null
-          Copy-Item .\bin\x64\Release\* $x64PackageRoot -Recurse -Force
-          Compress-Archive -Path (Join-Path $x64PackageRoot '*') -DestinationPath $x64ZipPath -Force
-
           @(
             "ASSET_ZIPS<<EOF"
             ($win32ZipPath -replace '\\','/')
-            ($x64ZipPath -replace '\\','/')
             "EOF"
           ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
