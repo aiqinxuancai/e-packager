@@ -4269,6 +4269,7 @@ bool ParseExpression(ByteReader& reader, std::unique_ptr<Expr>& outExpr, std::st
 		}
 		if (nextType == 0x37) {
 			reader.ReadU8(nextType);
+			continue;
 		}
 		break;
 	}
