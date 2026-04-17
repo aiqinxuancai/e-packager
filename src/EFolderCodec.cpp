@@ -1241,7 +1241,7 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 	json moduleJson;
 	moduleJson["projectName"] = LocalToUtf8Text(bundle.projectName);
 	moduleJson["versionText"] = LocalToUtf8Text(bundle.versionText);
-	moduleJson["sourcePath"] = LocalToUtf8Text(bundle.sourcePath);
+	moduleJson["sourcePath"] = bundle.sourcePath;
 	moduleJson["dependencies"] = json::array();
 	for (const auto& dependency : bundle.dependencies) {
 		moduleJson["dependencies"].push_back(DependencyToJson(dependency));
@@ -1499,7 +1499,7 @@ bool BundleDirectoryCodec::ReadBundle(const std::string& inputDir, ProjectBundle
 	ProjectBundle bundle;
 	bundle.projectName = Utf8ToLocalText(moduleJson.value("projectName", ""));
 	bundle.versionText = Utf8ToLocalText(moduleJson.value("versionText", ""));
-	bundle.sourcePath = Utf8ToLocalText(moduleJson.value("sourcePath", ""));
+	bundle.sourcePath = moduleJson.value("sourcePath", std::string());
 	bundle.sourceFileKind = ResolveBundleSourceFileKind(metaJson, moduleJson.value("sourcePath", std::string()));
 	bundle.bundleFormatVersion = metaJson.value("formatVersion", 0);
 	bundle.projectNameStored = metaJson.value("projectNameStored", true);

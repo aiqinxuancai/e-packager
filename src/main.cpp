@@ -2,6 +2,7 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -9,6 +10,8 @@
 #include <iostream>
 #include <map>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "..\thirdparty\json.hpp"
@@ -78,11 +81,425 @@ void ConfigureConsoleForUtf8()
 	}
 }
 
-bool DoUnpack(
+struct UnpackOptions {
+	bool writeAgentsMarkdown = true;
+	bool unpackDependencyModules = true;
+};
+
+struct DependencyModuleAnnotation {
+	size_t dependencyIndex = 0;
+	std::string resolvedPath;
+	std::string localWorkspace;
+};
+
+struct DependencyModuleExportResult {
+	size_t exportedCount = 0;
+	std::vector<DependencyModuleAnnotation> annotations;
+};
+
+std::string TrimAsciiCopy(std::string text)
+{
+	const auto isSpace = [](unsigned char ch) {
+		return std::isspace(ch) != 0;
+	};
+	text.erase(
+		text.begin(),
+		std::find_if(text.begin(), text.end(), [&](const unsigned char ch) {
+			return !isSpace(ch);
+		}));
+	text.erase(
+		std::find_if(text.rbegin(), text.rend(), [&](const unsigned char ch) {
+			return !isSpace(ch);
+		}).base(),
+		text.end());
+	return text;
+}
+
+std::string ToLowerAsciiCopy(std::string text)
+{
+	std::transform(text.begin(), text.end(), text.begin(), [](unsigned char ch) {
+		return static_cast<char>(std::tolower(ch));
+	});
+	return text;
+}
+
+void PushUniquePathCandidate(std::vector<std::filesystem::path>& outPaths, const std::filesystem::path& path)
+{
+	if (path.empty()) {
+		return;
+	}
+	const std::filesystem::path normalized = path.lexically_normal();
+	if (std::find(outPaths.begin(), outPaths.end(), normalized) == outPaths.end()) {
+		outPaths.push_back(normalized);
+	}
+}
+
+std::vector<std::filesystem::path> BuildDependencyModuleCandidatePaths(
+	const std::filesystem::path& sourcePath,
+	const std::string& modulePathText)
+{
+	std::vector<std::filesystem::path> candidates;
+	std::string normalizedText = TrimAsciiCopy(modulePathText);
+	if (normalizedText.empty()) {
+		return candidates;
+	}
+
+	if (normalizedText.size() >= 2 &&
+		normalizedText.front() == '"' &&
+		normalizedText.back() == '"') {
+		normalizedText = normalizedText.substr(1, normalizedText.size() - 2);
+	}
+	if (!normalizedText.empty() && normalizedText.front() == '$') {
+		normalizedText.erase(normalizedText.begin());
+	}
+
+	std::filesystem::path filePath(normalizedText);
+	if (filePath.extension().empty()) {
+		filePath += ".ec";
+	}
+
+	if (filePath.is_absolute()) {
+		PushUniquePathCandidate(candidates, filePath);
+		return candidates;
+	}
+
+	const auto addBaseCandidates = [&](const std::filesystem::path& baseDir) {
+		if (baseDir.empty()) {
+			return;
+		}
+
+		PushUniquePathCandidate(candidates, baseDir / filePath);
+		PushUniquePathCandidate(candidates, baseDir / "ecom" / filePath);
+
+		std::filesystem::path current = baseDir;
+		while (!current.empty()) {
+			PushUniquePathCandidate(candidates, current / "ecom" / filePath);
+			if (current == current.root_path()) {
+				break;
+			}
+			current = current.parent_path();
+		}
+	};
+
+	std::error_code ec;
+	if (!sourcePath.empty()) {
+		addBaseCandidates(sourcePath.parent_path());
+	}
+	addBaseCandidates(std::filesystem::current_path(ec));
+	addBaseCandidates(std::filesystem::path(GetBasePath()));
+	for (const auto& registeredBaseDir : GetRegisteredEplOpenCommandBaseDirs()) {
+		addBaseCandidates(registeredBaseDir);
+	}
+
+	return candidates;
+}
+
+bool ResolveDependencyModulePath(
+	const std::filesystem::path& sourcePath,
+	const std::string& modulePathText,
+	std::filesystem::path& outResolvedPath)
+{
+	outResolvedPath.clear();
+	for (const auto& candidate : BuildDependencyModuleCandidatePaths(sourcePath, modulePathText)) {
+		std::error_code ec;
+		if (!std::filesystem::exists(candidate, ec)) {
+			continue;
+		}
+		outResolvedPath = candidate;
+		return true;
+	}
+	return false;
+}
+
+std::string SanitizeDirectoryName(std::string name)
+{
+	for (char& ch : name) {
+		const unsigned char byte = static_cast<unsigned char>(ch);
+		if (byte < 0x20 ||
+			ch == '<' || ch == '>' || ch == ':' || ch == '"' ||
+			ch == '/' || ch == '\\' || ch == '|' || ch == '?' || ch == '*') {
+			ch = '_';
+		}
+	}
+
+	while (!name.empty() && (name.back() == ' ' || name.back() == '.')) {
+		name.pop_back();
+	}
+	size_t first = 0;
+	while (first < name.size() && (name[first] == ' ' || name[first] == '.')) {
+		++first;
+	}
+	name.erase(0, first);
+	return name.empty() ? std::string("module") : name;
+}
+
+std::string BuildDependencyDirectoryName(
+	const e2txt::Dependency& dependency,
+	const std::filesystem::path& resolvedPath)
+{
+	std::string name = TrimAsciiCopy(dependency.name);
+	if (name.empty() && !resolvedPath.empty()) {
+		name = resolvedPath.stem().string();
+	}
+	if (name.empty()) {
+		std::string modulePathText = TrimAsciiCopy(dependency.path);
+		if (modulePathText.size() >= 2 &&
+			modulePathText.front() == '"' &&
+			modulePathText.back() == '"') {
+			modulePathText = modulePathText.substr(1, modulePathText.size() - 2);
+		}
+		if (!modulePathText.empty() && modulePathText.front() == '$') {
+			modulePathText.erase(modulePathText.begin());
+		}
+		name = std::filesystem::path(modulePathText).stem().string();
+	}
+	return SanitizeDirectoryName(name);
+}
+
+std::string PathToGenericUtf8(const std::filesystem::path& path)
+{
+	return WideToUtf8Text(path.generic_wstring());
+}
+
+std::string NormalizeCrLfForWrite(const std::string& text)
+{
+	std::string normalized;
+	normalized.reserve(text.size() + 16);
+	for (size_t index = 0; index < text.size(); ++index) {
+		const char ch = text[index];
+		if (ch == '\r') {
+			normalized.append("\r\n");
+			if (index + 1 < text.size() && text[index + 1] == '\n') {
+				++index;
+			}
+		}
+		else if (ch == '\n') {
+			normalized.append("\r\n");
+		}
+		else {
+			normalized.push_back(ch);
+		}
+	}
+	return normalized;
+}
+
+bool ReadUtf8JsonFile(const std::filesystem::path& path, json& outJson, std::string& outError)
+{
+	outJson = json();
+	outError.clear();
+
+	std::ifstream in(path, std::ios::binary);
+	if (!in.is_open()) {
+		outError = "open_json_failed: " + PathToUtf8(path);
+		return false;
+	}
+
+	in.seekg(0, std::ios::end);
+	const std::streamoff size = in.tellg();
+	if (size < 0) {
+		outError = "tellg_json_failed: " + PathToUtf8(path);
+		return false;
+	}
+	in.seekg(0, std::ios::beg);
+
+	std::string bytes(static_cast<size_t>(size), '\0');
+	if (size > 0) {
+		in.read(bytes.data(), size);
+		if (!in.good() && static_cast<size_t>(in.gcount()) != bytes.size()) {
+			outError = "read_json_failed: " + PathToUtf8(path);
+			return false;
+		}
+	}
+	if (bytes.size() >= 3 &&
+		static_cast<unsigned char>(bytes[0]) == 0xEF &&
+		static_cast<unsigned char>(bytes[1]) == 0xBB &&
+		static_cast<unsigned char>(bytes[2]) == 0xBF) {
+		bytes.erase(0, 3);
+	}
+
+	try {
+		outJson = json::parse(bytes);
+		return true;
+	}
+	catch (const std::exception& ex) {
+		outError = std::string("parse_json_failed: ") + ex.what();
+		return false;
+	}
+}
+
+bool WriteUtf8JsonFileBom(const std::filesystem::path& path, const json& value, std::string& outError)
+{
+	outError.clear();
+
+	std::error_code ec;
+	if (path.has_parent_path()) {
+		std::filesystem::create_directories(path.parent_path(), ec);
+		if (ec) {
+			outError = "create_json_dir_failed: " + PathToUtf8(path.parent_path());
+			return false;
+		}
+	}
+
+	std::ofstream out(path, std::ios::binary | std::ios::trunc);
+	if (!out.is_open()) {
+		outError = "write_json_open_failed: " + PathToUtf8(path);
+		return false;
+	}
+
+	static constexpr unsigned char kUtf8Bom[] = {0xEF, 0xBB, 0xBF};
+	out.write(reinterpret_cast<const char*>(kUtf8Bom), sizeof(kUtf8Bom));
+	const std::string text = NormalizeCrLfForWrite(value.dump(2, ' ', false, json::error_handler_t::replace));
+	out.write(text.data(), static_cast<std::streamsize>(text.size()));
+	if (!out.good()) {
+		outError = "write_json_failed: " + PathToUtf8(path);
+		return false;
+	}
+	return true;
+}
+
+bool WriteDependencyModuleAnnotations(
+	const std::filesystem::path& outputDir,
+	const std::vector<DependencyModuleAnnotation>& annotations,
+	std::string& outError)
+{
+	outError.clear();
+	if (annotations.empty()) {
+		return true;
+	}
+
+	const std::filesystem::path moduleJsonPath = outputDir / L"project" / L"模块.json";
+	json moduleJson;
+	if (!ReadUtf8JsonFile(moduleJsonPath, moduleJson, outError)) {
+		return false;
+	}
+
+	auto dependenciesIt = moduleJson.find("dependencies");
+	if (dependenciesIt == moduleJson.end() || !dependenciesIt->is_array()) {
+		outError = "dependencies_json_not_array: " + PathToUtf8(moduleJsonPath);
+		return false;
+	}
+
+	for (const auto& annotation : annotations) {
+		if (annotation.dependencyIndex >= dependenciesIt->size()) {
+			continue;
+		}
+
+		auto& dependencyJson = (*dependenciesIt)[annotation.dependencyIndex];
+		if (!dependencyJson.is_object()) {
+			continue;
+		}
+
+		if (!annotation.resolvedPath.empty()) {
+			dependencyJson["resolvedPath"] = annotation.resolvedPath;
+		}
+		if (!annotation.localWorkspace.empty()) {
+			dependencyJson["localWorkspace"] = annotation.localWorkspace;
+		}
+	}
+
+	return WriteUtf8JsonFileBom(moduleJsonPath, moduleJson, outError);
+}
+
+bool DoUnpackInternal(
 	const std::filesystem::path& inputPath,
 	const std::filesystem::path& outputDir,
 	std::string& outSummary,
-	std::string& outError)
+	std::string& outError,
+	const UnpackOptions& options);
+
+DependencyModuleExportResult ExportDependencyModules(
+	const std::filesystem::path& sourcePath,
+	const std::filesystem::path& outputDir,
+	const e2txt::ProjectBundle& bundle)
+{
+	DependencyModuleExportResult result;
+	std::filesystem::path ecomRoot = outputDir / "ecom";
+	std::unordered_set<std::string> exportedPaths;
+	std::unordered_map<std::string, std::string> localWorkspacesByResolvedPath;
+	std::unordered_map<std::string, int> exportedDirNames;
+
+	for (size_t dependencyIndex = 0; dependencyIndex < bundle.dependencies.size(); ++dependencyIndex) {
+		const auto& dependency = bundle.dependencies[dependencyIndex];
+		if (dependency.kind != e2txt::DependencyKind::ECom) {
+			continue;
+		}
+
+		std::filesystem::path resolvedPath;
+		if (!ResolveDependencyModulePath(sourcePath, dependency.path, resolvedPath)) {
+			e2txt::AddRuntimeWarning(
+				Utf8Literal(u8"未找到易模块依赖：") + dependency.name +
+				" path=" + dependency.path);
+			continue;
+		}
+
+		std::error_code ec;
+		std::filesystem::path resolvedAbsolutePath = std::filesystem::absolute(resolvedPath, ec);
+		if (ec) {
+			resolvedAbsolutePath = resolvedPath;
+		}
+		resolvedAbsolutePath = resolvedAbsolutePath.lexically_normal();
+		const std::string resolvedKey = PathToUtf8(resolvedAbsolutePath);
+		if (const auto localWorkspaceIt = localWorkspacesByResolvedPath.find(resolvedKey);
+			localWorkspaceIt != localWorkspacesByResolvedPath.end()) {
+			result.annotations.push_back(DependencyModuleAnnotation {
+				.dependencyIndex = dependencyIndex,
+				.resolvedPath = resolvedKey,
+				.localWorkspace = localWorkspaceIt->second,
+			});
+			continue;
+		}
+
+		const std::string baseDirName = BuildDependencyDirectoryName(dependency, resolvedPath);
+		const std::string normalizedBaseDirName = ToLowerAsciiCopy(baseDirName);
+		const int duplicateIndex = ++exportedDirNames[normalizedBaseDirName];
+		const std::string actualDirName =
+			duplicateIndex <= 1 ? baseDirName : (baseDirName + "_" + std::to_string(duplicateIndex));
+		const std::filesystem::path moduleOutputDir = ecomRoot / std::filesystem::path(actualDirName);
+		const std::string localWorkspace = PathToGenericUtf8(moduleOutputDir.lexically_relative(outputDir));
+
+		if (!exportedPaths.insert(resolvedKey).second) {
+			result.annotations.push_back(DependencyModuleAnnotation {
+				.dependencyIndex = dependencyIndex,
+				.resolvedPath = resolvedKey,
+			});
+			continue;
+		}
+
+		std::string childSummary;
+		std::string childError;
+		const UnpackOptions childOptions {
+			.writeAgentsMarkdown = false,
+			.unpackDependencyModules = false,
+		};
+		if (!DoUnpackInternal(resolvedPath, moduleOutputDir, childSummary, childError, childOptions)) {
+			e2txt::AddRuntimeWarning(
+				Utf8Literal(u8"易模块依赖解包失败：") + PathToUtf8(resolvedPath) +
+				" => " + childError);
+			result.annotations.push_back(DependencyModuleAnnotation {
+				.dependencyIndex = dependencyIndex,
+				.resolvedPath = resolvedKey,
+			});
+			continue;
+		}
+
+		localWorkspacesByResolvedPath[resolvedKey] = localWorkspace;
+		result.annotations.push_back(DependencyModuleAnnotation {
+			.dependencyIndex = dependencyIndex,
+			.resolvedPath = resolvedKey,
+			.localWorkspace = localWorkspace,
+		});
+		++result.exportedCount;
+	}
+
+	return result;
+}
+
+bool DoUnpackInternal(
+	const std::filesystem::path& inputPath,
+	const std::filesystem::path& outputDir,
+	std::string& outSummary,
+	std::string& outError,
+	const UnpackOptions& options)
 {
 	const std::filesystem::path effectiveInputPath = ResolveAbsolutePath(inputPath);
 	const std::filesystem::path effectiveOutputDir = ResolveAbsolutePath(outputDir);
@@ -115,6 +532,8 @@ bool DoUnpack(
 		if (!generator.GenerateBundleFromBytes(eBytes, PathToUtf8(bridgeSourcePath), bundle, &outError)) {
 			return false;
 		}
+		bundle.sourcePath = PathToUtf8(effectiveInputPath);
+		bundle.sourceFileKind = e2txt::SourceFileKind::EC;
 		ClearNativeReuseState(bundle);
 		bundle.publicHeaderText = ecBundle.publicHeaderText;
 		workspaceOptions.defaultPackOutputFileName = PathToUtf8(effectiveInputPath.filename()) + ".e";
@@ -129,16 +548,35 @@ bool DoUnpack(
 	if (!codec.WriteBundle(bundle, PathToUtf8(effectiveOutputDir), &outError)) {
 		return false;
 	}
+	workspaceOptions.writeAgentsMarkdown = options.writeAgentsMarkdown;
 	if (!workspace_support::WriteWorkspaceFiles(effectiveInputPath, effectiveOutputDir, outError, workspaceOptions)) {
 		return false;
+	}
+
+	DependencyModuleExportResult dependencyExportResult;
+	if (options.unpackDependencyModules && extension != ".ec") {
+		dependencyExportResult = ExportDependencyModules(effectiveInputPath, effectiveOutputDir, bundle);
+		if (!WriteDependencyModuleAnnotations(effectiveOutputDir, dependencyExportResult.annotations, outError)) {
+			return false;
+		}
 	}
 
 	outSummary =
 		"source_files=" + std::to_string(bundle.sourceFiles.size()) +
 		", form_files=" + std::to_string(bundle.formFiles.size()) +
 		", resources=" + std::to_string(bundle.resources.size()) +
+		", ecom_modules=" + std::to_string(dependencyExportResult.exportedCount) +
 		", output=" + PathToUtf8(effectiveOutputDir);
 	return true;
+}
+
+bool DoUnpack(
+	const std::filesystem::path& inputPath,
+	const std::filesystem::path& outputDir,
+	std::string& outSummary,
+	std::string& outError)
+{
+	return DoUnpackInternal(inputPath, outputDir, outSummary, outError, UnpackOptions {});
 }
 
 bool DoPack(

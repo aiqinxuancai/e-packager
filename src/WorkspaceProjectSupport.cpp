@@ -635,9 +635,11 @@ bool WriteWorkspaceFiles(
 		return false;
 	}
 
-	if (!WriteUtf8TextFileBom(outputDir / "AGENTS.md", BuildAgentsMarkdown(info, options))) {
-		outError = "write_agents_md_failed: " + PathToUtf8(outputDir / "AGENTS.md");
-		return false;
+	if (options.writeAgentsMarkdown) {
+		if (!WriteUtf8TextFileBom(outputDir / "AGENTS.md", BuildAgentsMarkdown(info, options))) {
+			outError = "write_agents_md_failed: " + PathToUtf8(outputDir / "AGENTS.md");
+			return false;
+		}
 	}
 
 	return true;
