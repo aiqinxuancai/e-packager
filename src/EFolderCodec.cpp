@@ -656,6 +656,11 @@ std::filesystem::path GetProjectMetadataDirPath(const std::filesystem::path& roo
 
 std::filesystem::path GetModuleJsonPath(const std::filesystem::path& root)
 {
+	return GetProjectMetadataDirPath(root) / ".module.json";
+}
+
+std::filesystem::path GetLegacyProjectModuleJsonPath(const std::filesystem::path& root)
+{
 	return GetProjectMetadataDirPath(root) / "模块.json";
 }
 
@@ -689,16 +694,16 @@ std::filesystem::path GetLegacyMetaJsonPath(const std::filesystem::path& root)
 	return root / "src" / "_meta.json";
 }
 
-bool ReadProjectJsonWithLegacyFallback(
-	const std::filesystem::path& root,
-	const std::filesystem::path& primaryPath,
-	const std::filesystem::path& legacyPath,
+bool ReadProjectJsonWithFallbacks(
+	const std::initializer_list<std::filesystem::path>& paths,
 	json& outJson)
 {
-	if (ReadJsonFile(primaryPath, outJson)) {
-		return true;
+	for (const auto& path : paths) {
+		if (ReadJsonFile(path, outJson)) {
+			return true;
+		}
 	}
-	return ReadJsonFile(legacyPath, outJson);
+	return false;
 }
 
 std::string EncodeBase64(const std::vector<std::uint8_t>& bytes)
@@ -1252,6 +1257,8 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 		}
 		return false;
 	}
+	std::error_code legacyRemoveEc;
+	std::filesystem::remove(GetLegacyProjectModuleJsonPath(root), legacyRemoveEc);
 
 	if (!WriteLocalTextFileUtf8Bom(root / "src" / ".数据类型.txt", bundle.dataTypeText) ||
 		!WriteLocalTextFileUtf8Bom(root / "src" / ".DLL声明.txt", bundle.dllDeclareText) ||
@@ -1473,10 +1480,12 @@ bool BundleDirectoryCodec::ReadBundle(const std::string& inputDir, ProjectBundle
 
 	const std::filesystem::path root = Utf8PathToPath(inputDir);
 	json moduleJson;
-	if (!ReadProjectJsonWithLegacyFallback(
-			root,
-			GetModuleJsonPath(root),
-			GetLegacyModuleJsonPath(root),
+	if (!ReadProjectJsonWithFallbacks(
+			{
+				GetModuleJsonPath(root),
+				GetLegacyProjectModuleJsonPath(root),
+				GetLegacyModuleJsonPath(root),
+			},
 			moduleJson)) {
 		if (outError != nullptr) {
 			*outError = "read_module_json_failed";
@@ -1485,10 +1494,11 @@ bool BundleDirectoryCodec::ReadBundle(const std::string& inputDir, ProjectBundle
 	}
 
 	json metaJson;
-	if (!ReadProjectJsonWithLegacyFallback(
-			root,
-			GetMetaJsonPath(root),
-			GetLegacyMetaJsonPath(root),
+	if (!ReadProjectJsonWithFallbacks(
+			{
+				GetMetaJsonPath(root),
+				GetLegacyMetaJsonPath(root),
+			},
 			metaJson)) {
 		if (outError != nullptr) {
 			*outError = "read_meta_json_failed";

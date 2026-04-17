@@ -335,6 +335,10 @@ std::string BuildAgentsMarkdown(const SourceFileInfo& info, const WorkspaceWrite
 	const std::wstring headerDirectoryLine = isEcProject
 		? L"- `header/`：自动生成的公开接口头文件，仅供查阅与分发，不参与回包。\r\n"
 		: std::wstring();
+	const std::wstring dependencyDirectoryLines = isEcProject
+		? L"- `elib/`：当前工程依赖支持库的公开接口导出文本，仅供查阅与 AI 理解，不参与回包。\r\n"
+		: L"- `ecom/`：当前工程引用的易模块工作区副本，仅供查阅、检索与辅助编辑。\r\n"
+		  L"- `elib/`：当前工程依赖支持库的公开接口导出文本，仅供查阅与 AI 理解，不参与回包。\r\n";
 	const std::wstring infoJsonSourceType = isEcProject ? L".ec" : L".e";
 	std::wstring packOutputFileName = Utf8ToWide(options.defaultPackOutputFileName);
 	if (packOutputFileName.empty()) {
@@ -363,6 +367,7 @@ std::string BuildAgentsMarkdown(const SourceFileInfo& info, const WorkspaceWrite
 		<< L"- `src/.全局变量.txt`：全局变量定义。\r\n"
 		<< L"- `project/`：封包所需元数据与原生快照，请勿随意删除。\r\n"
 		<< headerDirectoryLine
+		<< dependencyDirectoryLines
 		<< L"- `image/`：图片资源及 `list.json`。\r\n"
 		<< L"- `audio/`：音频资源及 `list.json`。\r\n"
 		<< L"- `tool/`：当前目录自带的 `e-packager.exe`。\r\n"
@@ -512,7 +517,11 @@ bool HasProjectMarkers(const std::filesystem::path& root)
 	std::error_code ec;
 	return std::filesystem::exists(root / "info.json", ec) &&
 		std::filesystem::exists(root / "src", ec) &&
-		std::filesystem::exists(root / "project" / "模块.json", ec);
+		(
+			std::filesystem::exists(root / "project" / ".module.json", ec) ||
+			std::filesystem::exists(root / "project" / "模块.json", ec) ||
+			std::filesystem::exists(root / "src" / "模块.json", ec)
+		);
 }
 
 bool ReadInfoJson(const std::filesystem::path& root, json& outInfo, std::string& outError)

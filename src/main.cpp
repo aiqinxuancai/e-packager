@@ -17,6 +17,7 @@
 #include "..\thirdparty\json.hpp"
 #include "EFolderCodec.h"
 #include "PathHelper.h"
+#include "SupportLibraryPublicInfo.h"
 #include "UpdateCheck.h"
 #include "WorkspaceProjectSupport.h"
 #include "e2txt.h"
@@ -367,7 +368,7 @@ bool WriteDependencyModuleAnnotations(
 		return true;
 	}
 
-	const std::filesystem::path moduleJsonPath = outputDir / L"project" / L"模块.json";
+	const std::filesystem::path moduleJsonPath = outputDir / L"project" / L".module.json";
 	json moduleJson;
 	if (!ReadUtf8JsonFile(moduleJsonPath, moduleJson, outError)) {
 		return false;
@@ -399,6 +400,12 @@ bool WriteDependencyModuleAnnotations(
 
 	return WriteUtf8JsonFileBom(moduleJsonPath, moduleJson, outError);
 }
+
+struct DependencyRefreshResult {
+	size_t exportedEComModules = 0;
+	size_t exportedELibFiles = 0;
+	std::vector<DependencyModuleAnnotation> annotations;
+};
 
 bool DoUnpackInternal(
 	const std::filesystem::path& inputPath,
@@ -494,6 +501,70 @@ DependencyModuleExportResult ExportDependencyModules(
 	return result;
 }
 
+void AppendSupportLibraryAnnotations(
+	const std::vector<support_library_public_info::DependencyAnnotation>& inputAnnotations,
+	std::vector<DependencyModuleAnnotation>& outAnnotations)
+{
+	for (const auto& item : inputAnnotations) {
+		outAnnotations.push_back(DependencyModuleAnnotation {
+			.dependencyIndex = item.dependencyIndex,
+			.resolvedPath = item.resolvedPath,
+			.localWorkspace = item.localWorkspace,
+		});
+	}
+}
+
+bool RemoveGeneratedDependencyArtifacts(const std::filesystem::path& outputDir, std::string& outError)
+{
+	outError.clear();
+
+	for (const auto& childDirName : { L"ecom", L"elib" }) {
+		std::error_code ec;
+		std::filesystem::remove_all(outputDir / childDirName, ec);
+		if (ec) {
+			outError = "remove_generated_dependency_artifacts_failed: " + PathToUtf8(outputDir / childDirName);
+			return false;
+		}
+	}
+
+	return true;
+}
+
+bool RefreshDependencyArtifacts(
+	const std::filesystem::path& sourcePath,
+	const std::filesystem::path& outputDir,
+	const e2txt::ProjectBundle& bundle,
+	const bool exportEComModules,
+	DependencyRefreshResult& outResult,
+	std::string& outError)
+{
+	outResult = {};
+	outError.clear();
+
+	if (!RemoveGeneratedDependencyArtifacts(outputDir, outError)) {
+		return false;
+	}
+
+	if (exportEComModules) {
+		const DependencyModuleExportResult ecomResult = ExportDependencyModules(sourcePath, outputDir, bundle);
+		outResult.exportedEComModules = ecomResult.exportedCount;
+		outResult.annotations.insert(
+			outResult.annotations.end(),
+			ecomResult.annotations.begin(),
+			ecomResult.annotations.end());
+	}
+
+	const auto elibResult = support_library_public_info::ExportDependencies(sourcePath, outputDir, bundle.dependencies);
+	outResult.exportedELibFiles = elibResult.exportedCount;
+	AppendSupportLibraryAnnotations(elibResult.annotations, outResult.annotations);
+
+	if (!WriteDependencyModuleAnnotations(outputDir, outResult.annotations, outError)) {
+		return false;
+	}
+
+	return true;
+}
+
 bool DoUnpackInternal(
 	const std::filesystem::path& inputPath,
 	const std::filesystem::path& outputDir,
@@ -553,19 +624,23 @@ bool DoUnpackInternal(
 		return false;
 	}
 
-	DependencyModuleExportResult dependencyExportResult;
-	if (options.unpackDependencyModules && extension != ".ec") {
-		dependencyExportResult = ExportDependencyModules(effectiveInputPath, effectiveOutputDir, bundle);
-		if (!WriteDependencyModuleAnnotations(effectiveOutputDir, dependencyExportResult.annotations, outError)) {
-			return false;
-		}
+	DependencyRefreshResult dependencyRefreshResult;
+	if (!RefreshDependencyArtifacts(
+			effectiveInputPath,
+			effectiveOutputDir,
+			bundle,
+			options.unpackDependencyModules && extension != ".ec",
+			dependencyRefreshResult,
+			outError)) {
+		return false;
 	}
 
 	outSummary =
 		"source_files=" + std::to_string(bundle.sourceFiles.size()) +
 		", form_files=" + std::to_string(bundle.formFiles.size()) +
 		", resources=" + std::to_string(bundle.resources.size()) +
-		", ecom_modules=" + std::to_string(dependencyExportResult.exportedCount) +
+		", ecom_modules=" + std::to_string(dependencyRefreshResult.exportedEComModules) +
+		", elib_files=" + std::to_string(dependencyRefreshResult.exportedELibFiles) +
 		", output=" + PathToUtf8(effectiveOutputDir);
 	return true;
 }
@@ -616,6 +691,165 @@ bool DoPack(
 		*outWrittenOutputPath = effectiveOutputPath;
 	}
 	return true;
+}
+
+bool IsEquivalentDependency(const e2txt::Dependency& left, const e2txt::Dependency& right)
+{
+	if (left.kind != right.kind) {
+		return false;
+	}
+
+	if (left.kind == e2txt::DependencyKind::ECom) {
+		return ToLowerAsciiCopy(TrimAsciiCopy(left.path)) == ToLowerAsciiCopy(TrimAsciiCopy(right.path));
+	}
+
+	const std::string leftFile = ToLowerAsciiCopy(TrimAsciiCopy(left.fileName));
+	const std::string rightFile = ToLowerAsciiCopy(TrimAsciiCopy(right.fileName));
+	const std::string leftGuid = ToLowerAsciiCopy(TrimAsciiCopy(left.guid));
+	const std::string rightGuid = ToLowerAsciiCopy(TrimAsciiCopy(right.guid));
+	if (!leftGuid.empty() || !rightGuid.empty()) {
+		return leftFile == rightFile && leftGuid == rightGuid;
+	}
+	return leftFile == rightFile;
+}
+
+bool HasEquivalentDependency(
+	const std::vector<e2txt::Dependency>& dependencies,
+	const e2txt::Dependency& candidate)
+{
+	return std::any_of(dependencies.begin(), dependencies.end(), [&](const e2txt::Dependency& item) {
+		return IsEquivalentDependency(item, candidate);
+	});
+}
+
+std::filesystem::path ResolveWorkspaceSourcePath(
+	const e2txt::ProjectBundle& bundle,
+	const std::filesystem::path& projectRoot)
+{
+	if (!bundle.sourcePath.empty()) {
+		return ResolveAbsolutePath(Utf8PathToPath(bundle.sourcePath));
+	}
+	return projectRoot;
+}
+
+bool BuildEComDependencyFromInput(
+	const std::filesystem::path& sourcePath,
+	const std::string& inputText,
+	e2txt::Dependency& outDependency,
+	std::string& outResolvedPath,
+	std::string& outError)
+{
+	outDependency = {};
+	outResolvedPath.clear();
+	outError.clear();
+
+	const std::string trimmedInput = TrimAsciiCopy(inputText);
+	if (trimmedInput.empty()) {
+		outError = "empty_ecom_input";
+		return false;
+	}
+
+	std::filesystem::path resolvedPath;
+	const std::filesystem::path directPath(trimmedInput);
+	std::error_code ec;
+	if ((directPath.is_absolute() || trimmedInput.find('\\') != std::string::npos || trimmedInput.find('/') != std::string::npos) &&
+		std::filesystem::exists(directPath, ec)) {
+		resolvedPath = std::filesystem::absolute(directPath, ec);
+		if (ec) {
+			resolvedPath = directPath;
+		}
+	}
+	else if (!ResolveDependencyModulePath(sourcePath, trimmedInput, resolvedPath)) {
+		outError = "ecom_not_found: " + trimmedInput;
+		return false;
+	}
+
+	e2txt::Generator generator;
+	e2txt::ProjectBundle moduleBundle;
+	if (!generator.GenerateBundle(PathToUtf8(resolvedPath), moduleBundle, &outError)) {
+		outError = "ecom_parse_failed: " + PathToUtf8(resolvedPath) + " => " + outError;
+		return false;
+	}
+
+	outDependency.kind = e2txt::DependencyKind::ECom;
+	outDependency.name = TrimAsciiCopy(moduleBundle.projectName);
+	if (outDependency.name.empty()) {
+		outDependency.name = resolvedPath.stem().string();
+	}
+	outDependency.path = "$" + resolvedPath.filename().string();
+	outDependency.reExport = false;
+	outResolvedPath = PathToUtf8(resolvedPath);
+	return true;
+}
+
+int RunUpdate(
+	const std::filesystem::path& inputDir,
+	const std::vector<std::string>& addEcomInputs,
+	const std::vector<std::string>& addElibInputs)
+{
+	const std::filesystem::path effectiveInputDir = ResolveAbsolutePath(inputDir);
+
+	std::string error;
+	if (!workspace_support::ValidateInfoJsonVersion(effectiveInputDir, error)) {
+		return PrintStringResult("update", -1, error.c_str());
+	}
+
+	e2txt::BundleDirectoryCodec codec;
+	e2txt::ProjectBundle bundle;
+	if (!codec.ReadBundle(PathToUtf8(effectiveInputDir), bundle, &error)) {
+		return PrintStringResult("update", -1, error.c_str());
+	}
+
+	const std::filesystem::path workspaceSourcePath = ResolveWorkspaceSourcePath(bundle, effectiveInputDir);
+	size_t addedEcomCount = 0;
+	size_t addedElibCount = 0;
+
+	for (const auto& input : addEcomInputs) {
+		e2txt::Dependency dependency;
+		std::string resolvedPath;
+		if (!BuildEComDependencyFromInput(workspaceSourcePath, input, dependency, resolvedPath, error)) {
+			return PrintStringResult("update", -1, error.c_str());
+		}
+		if (!HasEquivalentDependency(bundle.dependencies, dependency)) {
+			bundle.dependencies.push_back(std::move(dependency));
+			++addedEcomCount;
+		}
+	}
+
+	for (const auto& input : addElibInputs) {
+		support_library_public_info::BuildDependencyResult buildResult;
+		if (!support_library_public_info::TryBuildDependencyFromInput(workspaceSourcePath, input, buildResult, error)) {
+			return PrintStringResult("update", -1, error.c_str());
+		}
+		if (!HasEquivalentDependency(bundle.dependencies, buildResult.dependency)) {
+			bundle.dependencies.push_back(std::move(buildResult.dependency));
+			++addedElibCount;
+		}
+	}
+
+	if (!codec.WriteBundle(bundle, PathToUtf8(effectiveInputDir), &error)) {
+		return PrintStringResult("update", -1, error.c_str());
+	}
+
+	DependencyRefreshResult refreshResult;
+	if (!RefreshDependencyArtifacts(
+			workspaceSourcePath,
+			effectiveInputDir,
+			bundle,
+			bundle.sourceFileKind != e2txt::SourceFileKind::EC,
+			refreshResult,
+			error)) {
+		return PrintStringResult("update", -1, error.c_str());
+	}
+
+	const std::string summary =
+		"dependencies_added=" + std::to_string(addedEcomCount + addedElibCount) +
+		", add_ecom=" + std::to_string(addedEcomCount) +
+		", add_elib=" + std::to_string(addedElibCount) +
+		", ecom_modules=" + std::to_string(refreshResult.exportedEComModules) +
+		", elib_files=" + std::to_string(refreshResult.exportedELibFiles) +
+		", output=" + PathToUtf8(effectiveInputDir);
+	return PrintStringResult("update", 0, summary.c_str());
 }
 
 std::string ResourceDataDigest(const e2txt::BundleBinaryResource& resource)
@@ -1286,6 +1520,7 @@ void PrintUsage()
 	std::cout << Utf8Literal(u8"  e-packager <input.e|input.ec>       # 拆包 .e/.ec 文件到同目录下同名文件夹（拖放直接打开）") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager unpack <input.e|input.ec> <output-dir>    # 拆包到指定目录") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager pack <input-dir> <output.e|output.ec>      # 将目录封包为 .e/.ec 文件") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager update <input-dir> [--add-ecom <file.ec>]... [--add-elib <name|file.fne>]...   # 刷新 ecom/elib 派生内容") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager compare-bundle <input.e|input.ec> <input-dir>   # 比较原文件与目录") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager roundtrip <input.e|input.ec> <work-dir> <output.e|output.ec>      # 拆包再封包") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager verify-roundtrip <input.e|input.ec> <work-dir> <output.e|output.ec>  # 验证往返一致性") << std::endl;
@@ -1317,6 +1552,39 @@ int RunCommand(int argc, char* argv[])
 			return EXIT_FAILURE;
 		}
 		return RunPack(argv[2], argv[3]);
+	}
+	if (command == "update") {
+		if (argc < 3) {
+			PrintUsage();
+			return EXIT_FAILURE;
+		}
+
+		std::vector<std::string> addEcomInputs;
+		std::vector<std::string> addElibInputs;
+		for (int index = 3; index < argc; ++index) {
+			const std::string option = argv[index];
+			if (option == "--add-ecom") {
+				if (index + 1 >= argc) {
+					PrintUsage();
+					return EXIT_FAILURE;
+				}
+				addEcomInputs.emplace_back(argv[++index]);
+				continue;
+			}
+			if (option == "--add-elib") {
+				if (index + 1 >= argc) {
+					PrintUsage();
+					return EXIT_FAILURE;
+				}
+				addElibInputs.emplace_back(argv[++index]);
+				continue;
+			}
+
+			PrintUsage();
+			return EXIT_FAILURE;
+		}
+
+		return RunUpdate(argv[2], addEcomInputs, addElibInputs);
 	}
 	if (command == "compare-bundle") {
 		if (argc != 4) {

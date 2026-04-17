@@ -121,7 +121,9 @@ void ReserveRelativePath(
 
 void ReserveBundleRelativePaths(std::unordered_set<std::string>& usedRelativePaths)
 {
+	ReserveRelativePath("project/.module.json", usedRelativePaths);
 	ReserveRelativePath("project/模块.json", usedRelativePaths);
+	ReserveRelativePath("src/模块.json", usedRelativePaths);
 	ReserveRelativePath("project/_meta.json", usedRelativePaths);
 	ReserveRelativePath("project/.native_source.bin", usedRelativePaths);
 	ReserveRelativePath("project/.native_source_map.json", usedRelativePaths);
