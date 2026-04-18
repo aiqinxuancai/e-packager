@@ -1,6 +1,7 @@
 ﻿#include "e2txt.h"
 
 #include <Windows.h>
+#include <wincrypt.h>
 
 #include <algorithm>
 #include <array>
@@ -34,10 +35,14 @@ namespace e2txt {
 namespace {
 
 constexpr std::uint32_t kMagicEncryptedSource = 1162630231u;
+constexpr std::uint32_t kMagicEncryptedSourceTypeEStd = 0x00000001u;
+constexpr std::uint32_t kMagicEncryptedSourceTypeEC = 0x00020001u;
 constexpr std::uint32_t kMagicFileHeader1 = 1415007811u;
 constexpr std::uint32_t kMagicFileHeader2 = 1196576837u;
 constexpr std::uint32_t kMagicSection = 353465113u;
 constexpr std::array<std::uint8_t, 4> kSectionNameNoKey = { 25, 115, 0, 7 };
+constexpr size_t kEncryptedSecretIdLength = 32;
+constexpr size_t kCryptoBlockLength = 4096;
 
 constexpr std::int32_t kVarAttrByRef = 0x0002;
 constexpr std::int32_t kVarAttrNullable = 0x0004;
@@ -52,6 +57,8 @@ constexpr std::uint8_t kConstTypeBool = 24;
 constexpr std::uint8_t kConstTypeDate = 25;
 constexpr std::uint8_t kConstTypeText = 26;
 constexpr std::int16_t kConstAttrLongText = 0x0010;
+
+bool ReadFileBytes(const std::string& path, std::vector<std::uint8_t>& outBytes);
 
 SourceFileKind DetectSourceFileKindFromPath(const std::string& sourcePath)
 {
@@ -95,6 +102,475 @@ struct RawSectionInfo {
 	std::int32_t reserveItems[10] = {};
 };
 #pragma pack(pop)
+
+constexpr std::array<std::uint8_t, 256> kEcDefaultInitialStatus = {
+	0xF0, 0x5E, 0x99, 0xA1, 0x88, 0xE3, 0x1E, 0xEE, 0x11, 0x9E, 0xC9, 0x97, 0x1B, 0x90, 0x4F, 0x7C,
+	0x52, 0xCB, 0x82, 0xFA, 0x27, 0xDE, 0xF6, 0xA8, 0xDA, 0xD3, 0xB0, 0xCF, 0x56, 0xD6, 0x85, 0x42,
+	0x1A, 0x9C, 0xB5, 0x0E, 0xB8, 0xED, 0x10, 0x1C, 0x24, 0x6A, 0x69, 0xCE, 0x87, 0x55, 0x1F, 0x96,
+	0x6C, 0x7B, 0xBA, 0x65, 0x14, 0xAA, 0x2C, 0xDD, 0xA3, 0xB6, 0x7D, 0x63, 0xF5, 0xE9, 0x8E, 0x20,
+	0x41, 0x23, 0x78, 0x8C, 0xFC, 0x22, 0x9F, 0xA6, 0xB4, 0x6F, 0xA7, 0x77, 0x59, 0xC0, 0xBF, 0x3A,
+	0x30, 0xA2, 0x15, 0x2A, 0x53, 0x5D, 0x74, 0x4D, 0x93, 0xFB, 0xF7, 0x40, 0x73, 0x28, 0x6E, 0x76,
+	0xD5, 0xB1, 0x2D, 0x95, 0x70, 0xF4, 0x3C, 0x34, 0xE5, 0x4C, 0x5B, 0xBB, 0x5F, 0x50, 0x58, 0x8D,
+	0x6B, 0xB7, 0x61, 0x09, 0xF2, 0x48, 0xCA, 0x81, 0x37, 0x45, 0xEF, 0xD0, 0xBE, 0xD9, 0xD4, 0xE7,
+	0x9D, 0x33, 0x91, 0x71, 0x2F, 0x3B, 0xE6, 0x0D, 0xFE, 0x79, 0x49, 0x67, 0x19, 0xA5, 0x08, 0xAF,
+	0x80, 0xB2, 0xEB, 0x3E, 0xD2, 0xB9, 0xD1, 0x44, 0x57, 0x8F, 0x8A, 0x4B, 0x39, 0xF1, 0x66, 0xEA,
+	0xE2, 0xDF, 0xF3, 0x7A, 0x98, 0xCD, 0xAB, 0x8B, 0x04, 0x62, 0x54, 0x16, 0x12, 0x43, 0x02, 0xD8,
+	0x36, 0x72, 0x06, 0x7F, 0x25, 0xE0, 0x2E, 0x05, 0x0F, 0xFF, 0xAD, 0x03, 0x07, 0xE1, 0x94, 0x17,
+	0xC1, 0x32, 0xC3, 0x51, 0xD7, 0xDB, 0xE8, 0xE4, 0x75, 0x3F, 0x01, 0x26, 0x4A, 0x29, 0x64, 0x47,
+	0x86, 0x3D, 0xBD, 0xDC, 0x83, 0x2B, 0x68, 0x1D, 0x46, 0xEC, 0xC4, 0x9A, 0xC8, 0x31, 0x4E, 0xA9,
+	0xA4, 0x35, 0x9B, 0xAC, 0x5C, 0x0B, 0x92, 0xCC, 0x0A, 0x84, 0x13, 0x0C, 0x00, 0xA0, 0xB3, 0x60,
+	0x18, 0x5A, 0xC5, 0xC6, 0x89, 0x7E, 0x21, 0xF9, 0xC2, 0x6D, 0xBC, 0xC7, 0xAE, 0x38, 0xFD, 0xF8,
+};
+
+struct EncryptedSourceInfo {
+	bool encrypted = false;
+	bool cryptEc = false;
+	std::uint32_t type = 0;
+	size_t overtLength = 0;
+	std::string passwordHint;
+};
+
+class Rc4Crypto {
+public:
+	Rc4Crypto(const std::vector<std::uint8_t>& key, const std::vector<std::uint8_t>& initialState)
+		: m_state(initialState)
+	{
+		EmitKey(key);
+	}
+
+	Rc4Crypto(const std::vector<std::uint8_t>& key, const size_t stateLength)
+		: m_state(stateLength)
+	{
+		for (size_t index = 0; index < stateLength; ++index) {
+			m_state[index] = static_cast<std::uint8_t>(index);
+		}
+		EmitKey(key);
+	}
+
+	void Apply(std::uint8_t* data, const size_t length)
+	{
+		for (size_t offset = 0; offset < length; ++offset) {
+			m_i = (m_i + 1) % m_state.size();
+			m_j = (m_j + m_state[m_i]) % m_state.size();
+			std::swap(m_state[m_i], m_state[m_j]);
+			const auto keyByte = m_state[(m_state[m_i] + m_state[m_j]) % m_state.size()];
+			if (data != nullptr) {
+				data[offset] ^= keyByte;
+			}
+		}
+	}
+
+	void Skip(const size_t length)
+	{
+		Apply(nullptr, length);
+	}
+
+	void Fill(std::uint8_t* data, const size_t length)
+	{
+		std::fill_n(data, length, static_cast<std::uint8_t>(0));
+		Apply(data, length);
+	}
+
+	const std::vector<std::uint8_t>& State() const
+	{
+		return m_state;
+	}
+
+private:
+	void EmitKey(const std::vector<std::uint8_t>& key)
+	{
+		if (key.empty()) {
+			return;
+		}
+
+		size_t index2 = 0;
+		for (size_t index1 = 0; index1 < m_state.size(); ++index1) {
+			index2 = (index2 + m_state[index1] + key[index1 % key.size()]) % m_state.size();
+			std::swap(m_state[index1], m_state[index2]);
+		}
+	}
+
+	std::vector<std::uint8_t> m_state;
+	size_t m_i = 0;
+	size_t m_j = 0;
+};
+
+std::uint32_t ReadLeU32(const std::uint8_t* data)
+{
+	return
+		static_cast<std::uint32_t>(data[0]) |
+		(static_cast<std::uint32_t>(data[1]) << 8) |
+		(static_cast<std::uint32_t>(data[2]) << 16) |
+		(static_cast<std::uint32_t>(data[3]) << 24);
+}
+
+bool ComputeMd5Bytes(
+	const std::vector<std::uint8_t>& input,
+	std::array<std::uint8_t, 16>& outHash,
+	std::string* outError)
+{
+	HCRYPTPROV provider = 0;
+	HCRYPTHASH hash = 0;
+	auto releaseHandles = [&]() {
+		if (hash != 0) {
+			CryptDestroyHash(hash);
+			hash = 0;
+		}
+		if (provider != 0) {
+			CryptReleaseContext(provider, 0);
+			provider = 0;
+		}
+	};
+
+	if (!CryptAcquireContextW(&provider, nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+		if (outError != nullptr) {
+			*outError = "md5_provider_acquire_failed";
+		}
+		releaseHandles();
+		return false;
+	}
+	if (!CryptCreateHash(provider, CALG_MD5, 0, 0, &hash)) {
+		if (outError != nullptr) {
+			*outError = "md5_create_failed";
+		}
+		releaseHandles();
+		return false;
+	}
+	if (!input.empty() && !CryptHashData(hash, input.data(), static_cast<DWORD>(input.size()), 0)) {
+		if (outError != nullptr) {
+			*outError = "md5_hash_failed";
+		}
+		releaseHandles();
+		return false;
+	}
+	DWORD hashLength = static_cast<DWORD>(outHash.size());
+	if (!CryptGetHashParam(hash, HP_HASHVAL, outHash.data(), &hashLength, 0) || hashLength != outHash.size()) {
+		if (outError != nullptr) {
+			*outError = "md5_read_failed";
+		}
+		releaseHandles();
+		return false;
+	}
+	releaseHandles();
+	return true;
+}
+
+std::vector<std::uint8_t> BuildReversedMd5Text(const std::array<std::uint8_t, 16>& hash)
+{
+	static constexpr char kHexDigits[] = "0123456789abcdef";
+	std::vector<std::uint8_t> out;
+	out.reserve(kEncryptedSecretIdLength);
+	for (size_t index = hash.size(); index > 0; --index) {
+		const std::uint8_t byte = hash[index - 1];
+		out.push_back(static_cast<std::uint8_t>(kHexDigits[(byte >> 4) & 0x0F]));
+		out.push_back(static_cast<std::uint8_t>(kHexDigits[byte & 0x0F]));
+	}
+	return out;
+}
+
+bool BuildEncryptedSecretId(
+	const std::string& password,
+	const bool cryptEc,
+	std::vector<std::uint8_t>& outSecretId,
+	std::vector<std::uint8_t>& outIv,
+	std::string* outError)
+{
+	const std::vector<std::uint8_t> passwordBytes(password.begin(), password.end());
+	std::array<std::uint8_t, 16> hash = {};
+	if (!ComputeMd5Bytes(passwordBytes, hash, outError)) {
+		return false;
+	}
+
+	if (cryptEc) {
+		const std::uint8_t low4bit7 = static_cast<std::uint8_t>(hash[7] & 0x0F);
+		const std::uint8_t high4bit7 = static_cast<std::uint8_t>(hash[7] & 0xF0);
+		const std::uint8_t low4bit8 = static_cast<std::uint8_t>(hash[8] & 0x0F);
+		const std::uint8_t high4bit8 = static_cast<std::uint8_t>(hash[8] & 0xF0);
+		hash[7] = static_cast<std::uint8_t>(high4bit7 | (high4bit8 >> 4));
+		hash[8] = static_cast<std::uint8_t>((low4bit7 << 4) | low4bit8);
+
+		Rc4Crypto ivBuilder(
+			passwordBytes,
+			std::vector<std::uint8_t>(kEcDefaultInitialStatus.begin(), kEcDefaultInitialStatus.end()));
+		outIv = ivBuilder.State();
+	}
+	else {
+		Rc4Crypto ivBuilder(passwordBytes, static_cast<size_t>(256));
+		outIv = ivBuilder.State();
+	}
+
+	outSecretId = BuildReversedMd5Text(hash);
+	return true;
+}
+
+bool ParseEncryptedSourceInfo(
+	const std::vector<std::uint8_t>& inputBytes,
+	EncryptedSourceInfo& outInfo,
+	std::string* outError)
+{
+	outInfo = {};
+	if (inputBytes.size() < sizeof(std::uint32_t) * 2) {
+		return true;
+	}
+	if (ReadLeU32(inputBytes.data()) != kMagicEncryptedSource) {
+		return true;
+	}
+
+	outInfo.encrypted = true;
+	outInfo.type = ReadLeU32(inputBytes.data() + sizeof(std::uint32_t));
+	if (outInfo.type == kMagicEncryptedSourceTypeEStd) {
+		outInfo.overtLength = sizeof(std::uint32_t) * 2;
+		return true;
+	}
+	if (outInfo.type == kMagicEncryptedSourceTypeEC) {
+		if (inputBytes.size() < sizeof(std::uint32_t) * 3) {
+			if (outError != nullptr) {
+				*outError = "encrypted_source_header_truncated";
+			}
+			return false;
+		}
+
+		const auto hintLength = static_cast<std::int32_t>(ReadLeU32(inputBytes.data() + sizeof(std::uint32_t) * 2));
+		if (hintLength < 0) {
+			if (outError != nullptr) {
+				*outError = "encrypted_source_hint_length_invalid";
+			}
+			return false;
+		}
+
+		outInfo.cryptEc = true;
+		outInfo.overtLength = sizeof(std::uint32_t) * 3 + static_cast<size_t>(hintLength);
+		if (inputBytes.size() < outInfo.overtLength) {
+			if (outError != nullptr) {
+				*outError = "encrypted_source_hint_truncated";
+			}
+			return false;
+		}
+		outInfo.passwordHint.assign(
+			reinterpret_cast<const char*>(inputBytes.data() + sizeof(std::uint32_t) * 3),
+			static_cast<size_t>(hintLength));
+		return true;
+	}
+
+	if (outError != nullptr) {
+		std::ostringstream stream;
+		stream << "encrypted_source_type_unsupported: 0x"
+			<< std::hex << std::uppercase << outInfo.type;
+		*outError = stream.str();
+	}
+	return false;
+}
+
+void ApplyEStdTransform(
+	std::vector<std::uint8_t>& bytes,
+	const size_t overtLength,
+	const std::vector<std::uint8_t>& secretId,
+	const std::vector<std::uint8_t>& iv)
+{
+	Rc4Crypto keyTable({}, iv);
+	size_t remainedOvert = overtLength;
+	std::uint32_t blockIndex = 0;
+
+	for (size_t offset = 0; offset < bytes.size(); offset += kCryptoBlockLength) {
+		const size_t blockLength = (std::min)(kCryptoBlockLength, bytes.size() - offset);
+		std::array<std::uint8_t, 40> blockKey = {};
+		keyTable.Fill(blockKey.data(), 4);
+		const std::uint32_t prefix = ReadLeU32(blockKey.data());
+		const std::uint32_t suffix = prefix ^ blockIndex;
+		++blockIndex;
+
+		std::copy(secretId.begin(), secretId.end(), blockKey.begin() + 4);
+		blockKey[36] = static_cast<std::uint8_t>(suffix & 0xFF);
+		blockKey[37] = static_cast<std::uint8_t>((suffix >> 8) & 0xFF);
+		blockKey[38] = static_cast<std::uint8_t>((suffix >> 16) & 0xFF);
+		blockKey[39] = static_cast<std::uint8_t>((suffix >> 24) & 0xFF);
+
+		Rc4Crypto blockCrypto(std::vector<std::uint8_t>(blockKey.begin(), blockKey.end()), static_cast<size_t>(256));
+		blockCrypto.Skip(36);
+		if (blockLength > remainedOvert) {
+			blockCrypto.Skip(remainedOvert);
+			blockCrypto.Apply(bytes.data() + offset + remainedOvert, blockLength - remainedOvert);
+			remainedOvert = 0;
+		}
+		else {
+			remainedOvert -= blockLength;
+		}
+	}
+}
+
+void ApplyEcTransform(
+	std::vector<std::uint8_t>& bytes,
+	const size_t overtLength,
+	const std::vector<std::uint8_t>& secretId,
+	const std::vector<std::uint8_t>& iv)
+{
+	Rc4Crypto keyTable({}, iv);
+	size_t remainedOvert = overtLength;
+
+	for (size_t offset = 0; offset < bytes.size(); offset += kCryptoBlockLength) {
+		const size_t blockLength = (std::min)(kCryptoBlockLength, bytes.size() - offset);
+		std::array<std::uint8_t, 40> blockKey = {};
+		keyTable.Fill(blockKey.data(), 8);
+		std::copy(secretId.begin(), secretId.end(), blockKey.begin() + 8);
+
+		Rc4Crypto blockCrypto(
+			std::vector<std::uint8_t>(blockKey.begin(), blockKey.end()),
+			std::vector<std::uint8_t>(kEcDefaultInitialStatus.begin(), kEcDefaultInitialStatus.end()));
+		if (blockLength > remainedOvert) {
+			blockCrypto.Skip(remainedOvert);
+			blockCrypto.Apply(bytes.data() + offset + remainedOvert, blockLength - remainedOvert);
+			remainedOvert = 0;
+		}
+		else {
+			remainedOvert -= blockLength;
+		}
+	}
+}
+
+bool NormalizeEcDecryptedModuleBytes(std::vector<std::uint8_t>& bytes, std::string* outError)
+{
+	if (bytes.size() < sizeof(std::uint32_t) * 2) {
+		if (outError != nullptr) {
+			*outError = "encrypted_source_body_too_small";
+		}
+		return false;
+	}
+	if (ReadLeU32(bytes.data()) != kMagicFileHeader1 || ReadLeU32(bytes.data() + sizeof(std::uint32_t)) != kMagicFileHeader2) {
+		if (outError != nullptr) {
+			*outError = "encrypted_source_body_header_invalid";
+		}
+		return false;
+	}
+
+	size_t offset = sizeof(std::uint32_t) * 2;
+	while (offset < bytes.size()) {
+		if (bytes.size() - offset < sizeof(RawSectionHeader) + sizeof(RawSectionInfo)) {
+			if (outError != nullptr) {
+				*outError = "encrypted_source_section_truncated";
+			}
+			return false;
+		}
+
+		RawSectionHeader header = {};
+		std::memcpy(&header, bytes.data() + offset, sizeof(header));
+		if (header.magic != kMagicSection) {
+			if (outError != nullptr) {
+				*outError = "encrypted_source_section_header_invalid";
+			}
+			return false;
+		}
+
+		RawSectionInfo info = {};
+		std::memcpy(&info, bytes.data() + offset + sizeof(header), sizeof(info));
+		info.dataLength ^= 1;
+		if (info.dataLength < 0) {
+			if (outError != nullptr) {
+				*outError = "encrypted_source_section_length_invalid";
+			}
+			return false;
+		}
+		std::memcpy(bytes.data() + offset + sizeof(header), &info, sizeof(info));
+
+		const size_t sectionLength =
+			sizeof(RawSectionHeader) +
+			sizeof(RawSectionInfo) +
+			static_cast<size_t>(info.dataLength);
+		if (bytes.size() - offset < sectionLength) {
+			if (outError != nullptr) {
+				*outError = "encrypted_source_section_body_truncated";
+			}
+			return false;
+		}
+		offset += sectionLength;
+	}
+
+	return true;
+}
+
+bool DecodeEncryptedSourceBytes(
+	const std::vector<std::uint8_t>& inputBytes,
+	const ReadOptions& readOptions,
+	std::vector<std::uint8_t>& outBytes,
+	std::string* outError)
+{
+	EncryptedSourceInfo encryptedInfo;
+	if (!ParseEncryptedSourceInfo(inputBytes, encryptedInfo, outError)) {
+		return false;
+	}
+	if (!encryptedInfo.encrypted) {
+		outBytes = inputBytes;
+		return true;
+	}
+
+	if (readOptions.password.empty()) {
+		if (outError != nullptr) {
+			*outError = encryptedInfo.passwordHint.empty()
+				? "encrypted_source_password_required"
+				: ("encrypted_source_password_required: " + encryptedInfo.passwordHint);
+		}
+		return false;
+	}
+
+	std::vector<std::uint8_t> secretId;
+	std::vector<std::uint8_t> iv;
+	if (!BuildEncryptedSecretId(readOptions.password, encryptedInfo.cryptEc, secretId, iv, outError)) {
+		return false;
+	}
+
+	std::vector<std::uint8_t> decryptedBytes = inputBytes;
+	if (encryptedInfo.cryptEc) {
+		ApplyEcTransform(decryptedBytes, encryptedInfo.overtLength, secretId, iv);
+	}
+	else {
+		ApplyEStdTransform(decryptedBytes, encryptedInfo.overtLength, secretId, iv);
+	}
+
+	const size_t secretOffset = encryptedInfo.overtLength;
+	if (decryptedBytes.size() < secretOffset + kEncryptedSecretIdLength + sizeof(std::uint32_t) * 2) {
+		if (outError != nullptr) {
+			*outError = "encrypted_source_body_too_small";
+		}
+		return false;
+	}
+	if (!std::equal(secretId.begin(), secretId.end(), decryptedBytes.begin() + static_cast<std::ptrdiff_t>(secretOffset))) {
+		if (outError != nullptr) {
+			*outError = "encrypted_source_password_invalid";
+		}
+		return false;
+	}
+
+	outBytes.assign(
+		decryptedBytes.begin() + static_cast<std::ptrdiff_t>(secretOffset + kEncryptedSecretIdLength),
+		decryptedBytes.end());
+	if (encryptedInfo.cryptEc && !NormalizeEcDecryptedModuleBytes(outBytes, outError)) {
+		return false;
+	}
+	if (outBytes.size() < sizeof(std::uint32_t) * 2 ||
+		ReadLeU32(outBytes.data()) != kMagicFileHeader1 ||
+		ReadLeU32(outBytes.data() + sizeof(std::uint32_t)) != kMagicFileHeader2) {
+		if (outError != nullptr) {
+			*outError = "encrypted_source_body_header_invalid";
+		}
+		return false;
+	}
+	return true;
+}
+
+bool ReadModuleBytesWithReadOptions(
+	const std::string& modulePath,
+	const ReadOptions& readOptions,
+	std::vector<std::uint8_t>& outBytes,
+	std::string* outError)
+{
+	std::vector<std::uint8_t> inputBytes;
+	if (!ReadFileBytes(modulePath, inputBytes)) {
+		if (outError != nullptr) {
+			*outError = "read_module_file_failed";
+		}
+		return false;
+	}
+	return DecodeEncryptedSourceBytes(inputBytes, readOptions, outBytes, outError);
+}
 
 struct UserInfoSection {
 	std::string programName;
@@ -6829,19 +7305,32 @@ std::string ComputeBundleDigest(const ProjectBundle& bundle)
 	return writer.FinishHex();
 }
 
-bool Generator::GenerateDocument(const std::string& inputPath, Document& outDocument, std::string* outError) const
+bool Generator::GenerateDocument(
+	const std::string& inputPath,
+	Document& outDocument,
+	std::string* outError,
+	const ReadOptions& readOptions) const
 {
-	return GenerateDocumentInternal(inputPath, {}, outDocument, outError);
+	return GenerateDocumentInternal(inputPath, {}, readOptions, outDocument, outError);
 }
 
-bool Generator::GenerateBundle(const std::string& inputPath, ProjectBundle& outBundle, std::string* outError) const
+bool Generator::GenerateBundle(
+	const std::string& inputPath,
+	ProjectBundle& outBundle,
+	std::string* outError,
+	const ReadOptions& readOptions) const
 {
 	if (outError != nullptr) {
 		outError->clear();
 	}
 
+	std::vector<std::uint8_t> inputBytes;
+	if (!ReadModuleBytesWithReadOptions(inputPath, readOptions, inputBytes, outError)) {
+		return false;
+	}
+
 	ModuleSections sections;
-	if (!ParseModuleSections(inputPath, sections, outError)) {
+	if (!ParseModuleSectionsFromBytes(inputBytes, sections, outError)) {
 		return false;
 	}
 	if (!BuildBundleFromSections(sections, inputPath, outBundle)) {
@@ -6850,7 +7339,7 @@ bool Generator::GenerateBundle(const std::string& inputPath, ProjectBundle& outB
 		}
 		return false;
 	}
-	(void)ReadFileBytes(inputPath, outBundle.nativeSourceBytes);
+	outBundle.nativeSourceBytes = std::move(inputBytes);
 	outBundle.nativeBundleDigest = ComputeBundleDigest(outBundle);
 	return true;
 }
@@ -6922,6 +7411,7 @@ bool Generator::GenerateBundleFromBytes(
 bool Generator::GenerateDocumentInternal(
 	const std::string& inputPath,
 	const GenerateOptions& options,
+	const ReadOptions& readOptions,
 	Document& outDocument,
 	std::string* outError) const
 {
@@ -6930,8 +7420,14 @@ bool Generator::GenerateDocumentInternal(
 		outError->clear();
 	}
 
+	std::vector<std::uint8_t> inputBytes;
+	if (!ReadModuleBytesWithReadOptions(inputPath, readOptions, inputBytes, outError)) {
+		TraceLine("GenerateDocumentInternal read_or_decrypt_failed");
+		return false;
+	}
+
 	ModuleSections sections;
-	if (!ParseModuleSections(inputPath, sections, outError)) {
+	if (!ParseModuleSectionsFromBytes(inputBytes, sections, outError)) {
 		TraceLine("GenerateDocumentInternal parse_failed");
 		return false;
 	}
@@ -7033,7 +7529,7 @@ bool Generator::GenerateToFile(
 	}
 
 	Document document;
-	if (!GenerateDocumentInternal(inputPath, options, document, outError)) {
+	if (!GenerateDocumentInternal(inputPath, options, {}, document, outError)) {
 		TraceLine("GenerateToFile generate_document_failed");
 		return false;
 	}

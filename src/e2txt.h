@@ -241,12 +241,26 @@ struct GenerateOptions {
 	bool includeImportedPages = false;
 };
 
+// 读取源工程文件时的附加选项。
+struct ReadOptions {
+	// 加密 `.e` / `.ec` 文件的密码；留空表示按未加密文件读取。
+	std::string password;
+};
+
 // 原生 e2txt 生成器。
 class Generator {
 public:
-	bool GenerateDocument(const std::string& inputPath, Document& outDocument, std::string* outError) const;
+	bool GenerateDocument(
+		const std::string& inputPath,
+		Document& outDocument,
+		std::string* outError,
+		const ReadOptions& readOptions = {}) const;
 	// 直接生成目录化工程包。
-	bool GenerateBundle(const std::string& inputPath, ProjectBundle& outBundle, std::string* outError) const;
+	bool GenerateBundle(
+		const std::string& inputPath,
+		ProjectBundle& outBundle,
+		std::string* outError,
+		const ReadOptions& readOptions = {}) const;
 	// 按内存中的 .e 二进制直接生成文档。
 	bool GenerateDocumentFromBytes(
 		const std::vector<std::uint8_t>& inputBytes,
@@ -271,6 +285,7 @@ private:
 	bool GenerateDocumentInternal(
 		const std::string& inputPath,
 		const GenerateOptions& options,
+		const ReadOptions& readOptions,
 		Document& outDocument,
 		std::string* outError) const;
 };

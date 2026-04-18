@@ -85,6 +85,7 @@ void ConfigureConsoleForUtf8()
 struct UnpackOptions {
 	bool writeAgentsMarkdown = true;
 	bool unpackDependencyModules = true;
+	e2txt::ReadOptions readOptions;
 };
 
 struct DependencyModuleAnnotation {
@@ -417,7 +418,8 @@ bool DoUnpackInternal(
 DependencyModuleExportResult ExportDependencyModules(
 	const std::filesystem::path& sourcePath,
 	const std::filesystem::path& outputDir,
-	const e2txt::ProjectBundle& bundle)
+	const e2txt::ProjectBundle& bundle,
+	const e2txt::ReadOptions& readOptions)
 {
 	DependencyModuleExportResult result;
 	std::filesystem::path ecomRoot = outputDir / "ecom";
@@ -477,6 +479,7 @@ DependencyModuleExportResult ExportDependencyModules(
 		const UnpackOptions childOptions {
 			.writeAgentsMarkdown = false,
 			.unpackDependencyModules = false,
+			.readOptions = readOptions,
 		};
 		if (!DoUnpackInternal(resolvedPath, moduleOutputDir, childSummary, childError, childOptions)) {
 			e2txt::AddRuntimeWarning(
@@ -535,6 +538,7 @@ bool RefreshDependencyArtifacts(
 	const std::filesystem::path& outputDir,
 	const e2txt::ProjectBundle& bundle,
 	const bool exportEComModules,
+	const e2txt::ReadOptions& readOptions,
 	DependencyRefreshResult& outResult,
 	std::string& outError)
 {
@@ -546,7 +550,7 @@ bool RefreshDependencyArtifacts(
 	}
 
 	if (exportEComModules) {
-		const DependencyModuleExportResult ecomResult = ExportDependencyModules(sourcePath, outputDir, bundle);
+		const DependencyModuleExportResult ecomResult = ExportDependencyModules(sourcePath, outputDir, bundle, readOptions);
 		outResult.exportedEComModules = ecomResult.exportedCount;
 		outResult.annotations.insert(
 			outResult.annotations.end(),
@@ -584,7 +588,7 @@ bool DoUnpackInternal(
 	});
 	if (extension == ".ec") {
 		e2txt::ProjectBundle ecBundle;
-		if (!generator.GenerateBundle(PathToUtf8(effectiveInputPath), ecBundle, &outError)) {
+		if (!generator.GenerateBundle(PathToUtf8(effectiveInputPath), ecBundle, &outError, options.readOptions)) {
 			return false;
 		}
 
@@ -610,7 +614,7 @@ bool DoUnpackInternal(
 		workspaceOptions.defaultPackOutputFileName = PathToUtf8(effectiveInputPath.filename()) + ".e";
 	}
 	else {
-		if (!generator.GenerateBundle(PathToUtf8(effectiveInputPath), bundle, &outError)) {
+		if (!generator.GenerateBundle(PathToUtf8(effectiveInputPath), bundle, &outError, options.readOptions)) {
 			return false;
 		}
 	}
@@ -630,6 +634,7 @@ bool DoUnpackInternal(
 			effectiveOutputDir,
 			bundle,
 			options.unpackDependencyModules && extension != ".ec",
+			options.readOptions,
 			dependencyRefreshResult,
 			outError)) {
 		return false;
@@ -649,9 +654,12 @@ bool DoUnpack(
 	const std::filesystem::path& inputPath,
 	const std::filesystem::path& outputDir,
 	std::string& outSummary,
-	std::string& outError)
+	std::string& outError,
+	const e2txt::ReadOptions& readOptions = {})
 {
-	return DoUnpackInternal(inputPath, outputDir, outSummary, outError, UnpackOptions {});
+	UnpackOptions options;
+	options.readOptions = readOptions;
+	return DoUnpackInternal(inputPath, outputDir, outSummary, outError, options);
 }
 
 bool DoPack(
@@ -837,6 +845,7 @@ int RunUpdate(
 			effectiveInputDir,
 			bundle,
 			bundle.sourceFileKind != e2txt::SourceFileKind::EC,
+			e2txt::ReadOptions {},
 			refreshResult,
 			error)) {
 		return PrintStringResult("update", -1, error.c_str());
@@ -1088,11 +1097,36 @@ std::string BuildBundleDigestCompareText(const e2txt::ProjectBundle& fromE, cons
 	return stream.str();
 }
 
-int RunUnpack(const char* inputPath, const char* outputDir)
+bool ParseReadOptions(
+	const int argc,
+	char* argv[],
+	const int startIndex,
+	e2txt::ReadOptions& outReadOptions)
+{
+	outReadOptions = {};
+	for (int index = startIndex; index < argc; ++index) {
+		const std::string option = argv[index];
+		if (option == "--password") {
+			if (index + 1 >= argc) {
+				return false;
+			}
+			outReadOptions.password = argv[++index];
+			continue;
+		}
+		if (option.rfind("--password=", 0) == 0) {
+			outReadOptions.password = option.substr(std::string("--password=").size());
+			continue;
+		}
+		return false;
+	}
+	return true;
+}
+
+int RunUnpack(const char* inputPath, const char* outputDir, const e2txt::ReadOptions& readOptions = {})
 {
 	std::string summary;
 	std::string error;
-	if (!DoUnpack(std::filesystem::path(inputPath), std::filesystem::path(outputDir), summary, error)) {
+	if (!DoUnpack(std::filesystem::path(inputPath), std::filesystem::path(outputDir), summary, error, readOptions)) {
 		return PrintStringResult("unpack", -1, error.c_str());
 	}
 	return PrintStringResult("unpack", 0, summary.c_str());
@@ -1130,7 +1164,7 @@ int RunDefaultPack()
 	return PrintStringResult("pack", 0, summary.c_str());
 }
 
-int RunCompareBundle(const char* inputPath, const char* inputDir)
+int RunCompareBundle(const char* inputPath, const char* inputDir, const e2txt::ReadOptions& readOptions = {})
 {
 	e2txt::Generator generator;
 	e2txt::BundleDirectoryCodec codec;
@@ -1139,7 +1173,7 @@ int RunCompareBundle(const char* inputPath, const char* inputDir)
 	std::string error;
 	const std::filesystem::path effectiveInputPath = ResolveAbsolutePath(std::filesystem::path(inputPath));
 	const std::filesystem::path effectiveInputDir = ResolveAbsolutePath(std::filesystem::path(inputDir));
-	if (!generator.GenerateBundle(PathToUtf8(effectiveInputPath), bundleFromE, &error)) {
+	if (!generator.GenerateBundle(PathToUtf8(effectiveInputPath), bundleFromE, &error, readOptions)) {
 		return PrintStringResult("compare-bundle", -1, error.c_str());
 	}
 	if (!codec.ReadBundle(PathToUtf8(effectiveInputDir), bundleFromDir, &error)) {
@@ -1149,7 +1183,11 @@ int RunCompareBundle(const char* inputPath, const char* inputDir)
 	return PrintStringResult("compare-bundle", 0, summary.c_str());
 }
 
-int RunRoundTrip(const char* inputPath, const char* workDir, const char* outputPath)
+int RunRoundTrip(
+	const char* inputPath,
+	const char* workDir,
+	const char* outputPath,
+	const e2txt::ReadOptions& readOptions = {})
 {
 	const std::filesystem::path root = ResolveAbsolutePath(std::filesystem::path(workDir));
 	const std::filesystem::path effectiveInputPath = ResolveAbsolutePath(std::filesystem::path(inputPath));
@@ -1161,7 +1199,7 @@ int RunRoundTrip(const char* inputPath, const char* workDir, const char* outputP
 
 	std::string summary;
 	std::string error;
-	if (!DoUnpack(effectiveInputPath, unpackDir, summary, error)) {
+	if (!DoUnpack(effectiveInputPath, unpackDir, summary, error, readOptions)) {
 		return PrintStringResult("roundtrip", -1, error.c_str());
 	}
 	if (!DoPack(unpackDir, requestedOutputPath, summary, error)) {
@@ -1470,7 +1508,11 @@ bool CompareDirectoryTrees(
 	return true;
 }
 
-int RunVerifyRoundTrip(const char* inputPath, const char* workDir, const char* outputPath)
+int RunVerifyRoundTrip(
+	const char* inputPath,
+	const char* workDir,
+	const char* outputPath,
+	const e2txt::ReadOptions& readOptions = {})
 {
 	const std::filesystem::path root(workDir);
 	const std::filesystem::path originalDir = root / "original_unpacked";
@@ -1481,7 +1523,7 @@ int RunVerifyRoundTrip(const char* inputPath, const char* workDir, const char* o
 
 	std::string summary;
 	std::string error;
-	if (!DoUnpack(std::filesystem::path(inputPath), originalDir, summary, error)) {
+	if (!DoUnpack(std::filesystem::path(inputPath), originalDir, summary, error, readOptions)) {
 		return PrintStringResult("verify-roundtrip", -1, error.c_str());
 	}
 	std::filesystem::path writtenOutputPath;
@@ -1500,14 +1542,14 @@ int RunVerifyRoundTrip(const char* inputPath, const char* workDir, const char* o
 	return PrintStringResult("verify-roundtrip", 0, compareSummary.c_str());
 }
 
-int RunDragDropUnpack(const char* inputPath)
+int RunDragDropUnpack(const char* inputPath, const e2txt::ReadOptions& readOptions = {})
 {
 	const std::filesystem::path input(inputPath);
 	const std::filesystem::path outputDir = input.parent_path() / input.stem();
 
 	std::string summary;
 	std::string error;
-	if (!DoUnpack(input, outputDir, summary, error)) {
+	if (!DoUnpack(input, outputDir, summary, error, readOptions)) {
 		return PrintStringResult("unpack", -1, error.c_str());
 	}
 	return PrintStringResult("unpack", 0, summary.c_str());
@@ -1517,13 +1559,13 @@ void PrintUsage()
 {
 	std::cout << Utf8Literal(u8"e-packager 用法:") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager                           # 封包当前项目到 .\\pack\\<info.json sourceFileName>") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager <input.e|input.ec>       # 拆包 .e/.ec 文件到同目录下同名文件夹（拖放直接打开）") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager unpack <input.e|input.ec> <output-dir>    # 拆包到指定目录") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager <input.e|input.ec> [--password <text>]       # 拆包 .e/.ec 文件到同目录下同名文件夹（拖放直接打开）") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager unpack <input.e|input.ec> <output-dir> [--password <text>]    # 拆包到指定目录") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager pack <input-dir> <output.e|output.ec>      # 将目录封包为 .e/.ec 文件") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager update <input-dir> [--add-ecom <file.ec>]... [--add-elib <name|file.fne>]...   # 刷新 ecom/elib 派生内容") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager compare-bundle <input.e|input.ec> <input-dir>   # 比较原文件与目录") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager roundtrip <input.e|input.ec> <work-dir> <output.e|output.ec>      # 拆包再封包") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager verify-roundtrip <input.e|input.ec> <work-dir> <output.e|output.ec>  # 验证往返一致性") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager compare-bundle <input.e|input.ec> <input-dir> [--password <text>]   # 比较原文件与目录") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager roundtrip <input.e|input.ec> <work-dir> <output.e|output.ec> [--password <text>]      # 拆包再封包") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager verify-roundtrip <input.e|input.ec> <work-dir> <output.e|output.ec> [--password <text>]  # 验证往返一致性") << std::endl;
 }
 
 }  // namespace
@@ -1540,11 +1582,16 @@ int RunCommand(int argc, char* argv[])
 		return EXIT_SUCCESS;
 	}
 	if (command == "unpack") {
-		if (argc != 4) {
+		if (argc < 4) {
 			PrintUsage();
 			return EXIT_FAILURE;
 		}
-		return RunUnpack(argv[2], argv[3]);
+		e2txt::ReadOptions readOptions;
+		if (!ParseReadOptions(argc, argv, 4, readOptions)) {
+			PrintUsage();
+			return EXIT_FAILURE;
+		}
+		return RunUnpack(argv[2], argv[3], readOptions);
 	}
 	if (command == "pack") {
 		if (argc != 4) {
@@ -1587,34 +1634,54 @@ int RunCommand(int argc, char* argv[])
 		return RunUpdate(argv[2], addEcomInputs, addElibInputs);
 	}
 	if (command == "compare-bundle") {
-		if (argc != 4) {
+		if (argc < 4) {
 			PrintUsage();
 			return EXIT_FAILURE;
 		}
-		return RunCompareBundle(argv[2], argv[3]);
+		e2txt::ReadOptions readOptions;
+		if (!ParseReadOptions(argc, argv, 4, readOptions)) {
+			PrintUsage();
+			return EXIT_FAILURE;
+		}
+		return RunCompareBundle(argv[2], argv[3], readOptions);
 	}
 	if (command == "roundtrip") {
-		if (argc != 5) {
+		if (argc < 5) {
 			PrintUsage();
 			return EXIT_FAILURE;
 		}
-		return RunRoundTrip(argv[2], argv[3], argv[4]);
+		e2txt::ReadOptions readOptions;
+		if (!ParseReadOptions(argc, argv, 5, readOptions)) {
+			PrintUsage();
+			return EXIT_FAILURE;
+		}
+		return RunRoundTrip(argv[2], argv[3], argv[4], readOptions);
 	}
 	if (command == "verify-roundtrip") {
-		if (argc != 5) {
+		if (argc < 5) {
 			PrintUsage();
 			return EXIT_FAILURE;
 		}
-		return RunVerifyRoundTrip(argv[2], argv[3], argv[4]);
+		e2txt::ReadOptions readOptions;
+		if (!ParseReadOptions(argc, argv, 5, readOptions)) {
+			PrintUsage();
+			return EXIT_FAILURE;
+		}
+		return RunVerifyRoundTrip(argv[2], argv[3], argv[4], readOptions);
 	}
 
 	// Drag-and-drop: a single .e/.ec file path passed directly
-	if (argc == 2) {
+	if (argc == 2 || argc >= 4) {
 		std::filesystem::path inputPath(command);
 		std::string ext = inputPath.extension().string();
 		std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 		if (ext == ".e" || ext == ".ec") {
-			return RunDragDropUnpack(argv[1]);
+			e2txt::ReadOptions readOptions;
+			if (!ParseReadOptions(argc, argv, 2, readOptions)) {
+				PrintUsage();
+				return EXIT_FAILURE;
+			}
+			return RunDragDropUnpack(argv[1], readOptions);
 		}
 	}
 

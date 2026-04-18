@@ -12,6 +12,14 @@
 e-packager unpack <input.e|input.ec> <output-dir>
 ```
 
+如果源文件设置了打开密码，解包时传入 `--password`：
+
+```
+e-packager unpack MyApp.e MyApp\ --password 111222333
+```
+
+解包加密文件后，后续回包默认输出为未加密 `.e`，不需要再次提供密码。
+
 也可直接将 `.e` / `.ec` 文件拖放到 `e-packager.exe` 上，自动在源文件所在目录创建同名子目录并解包：
 
 ```
@@ -85,13 +93,13 @@ e-packager update MyApp\ --add-ecom D:\modules\Net.ec --add-elib 互联网支持
 
 ```
 # 比较原文件与目录内容是否一致
-e-packager compare-bundle <input.e|input.ec> <input-dir>
+e-packager compare-bundle <input.e|input.ec> <input-dir> [--password <text>]
 
 # 解包后立即回包（快速验证）
-e-packager roundtrip <input.e|input.ec> <work-dir> <output.e|output.ec>
+e-packager roundtrip <input.e|input.ec> <work-dir> <output.e|output.ec> [--password <text>]
 
 # 往返并校验字节一致性
-e-packager verify-roundtrip <input.e|input.ec> <work-dir> <output.e|output.ec>
+e-packager verify-roundtrip <input.e|input.ec> <work-dir> <output.e|output.ec> [--password <text>]
 ```
 
 ## 注意
