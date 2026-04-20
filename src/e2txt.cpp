@@ -759,6 +759,17 @@ struct FolderSectionInfo {
 	std::vector<FolderInfo> folders;
 };
 
+struct RemovedDefinedItemInfo {
+	std::int32_t id = 0;
+	std::string name;
+};
+
+struct LosableSectionInfo {
+	std::string outFile;
+	std::vector<RemovedDefinedItemInfo> removedDefinedItems;
+	std::vector<std::uint8_t> tailBytes;
+};
+
 
 struct ModuleSections {
 	bool hasSystemInfo = false;
@@ -768,6 +779,7 @@ struct ModuleSections {
 	bool hasEventIndices = false;
 	bool hasClassPublicity = false;
 	bool hasFolders = false;
+	bool hasLosable = false;
 	RawSystemInfoSection systemInfo = {};
 	UserInfoSection userInfo;
 	ProgramSection program;
@@ -775,6 +787,7 @@ struct ModuleSections {
 	std::vector<IndexedEventInfo> eventIndices;
 	std::vector<ClassPublicityInfo> classPublicities;
 	FolderSectionInfo folders;
+	LosableSectionInfo losable;
 	std::vector<std::uint8_t> ecomSectionBytes;
 };
 
@@ -2095,6 +2108,97 @@ bool ParseUserInfoSection(const std::vector<std::uint8_t>& bytes, UserInfoSectio
 		reader.ReadI32(outUser.version2);
 }
 
+std::string ReadCStyleTextAt(
+	const std::vector<std::uint8_t>& bytes,
+	const size_t offset)
+{
+	if (offset >= bytes.size()) {
+		return std::string();
+	}
+
+	size_t end = offset;
+	while (end < bytes.size() && bytes[end] != 0) {
+		++end;
+	}
+	return std::string(
+		reinterpret_cast<const char*>(bytes.data() + static_cast<std::ptrdiff_t>(offset)),
+		end - offset);
+}
+
+bool ParseRemovedDefinedItems(ByteReader& reader, std::vector<RemovedDefinedItemInfo>& outItems)
+{
+	outItems.clear();
+
+	std::int32_t count = 0;
+	std::int32_t size = 0;
+	if (!reader.ReadI32(count) || !reader.ReadI32(size) || count < 0 || size < 0) {
+		return false;
+	}
+
+	std::vector<std::uint8_t> payload;
+	if (!reader.ReadRaw(static_cast<size_t>(size), payload)) {
+		return false;
+	}
+
+	if (count == 0) {
+		return payload.empty();
+	}
+
+	ByteReader payloadReader(payload);
+	std::vector<std::int32_t> ids(static_cast<size_t>(count));
+	std::vector<std::int32_t> nameCodes(static_cast<size_t>(count));
+	std::vector<std::int32_t> offsets(static_cast<size_t>(count));
+	for (int index = 0; index < count; ++index) {
+		if (!payloadReader.ReadI32(ids[static_cast<size_t>(index)])) {
+			return false;
+		}
+	}
+	for (int index = 0; index < count; ++index) {
+		if (!payloadReader.ReadI32(nameCodes[static_cast<size_t>(index)])) {
+			return false;
+		}
+	}
+	for (int index = 0; index < count; ++index) {
+		if (!payloadReader.ReadI32(offsets[static_cast<size_t>(index)])) {
+			return false;
+		}
+	}
+
+	const size_t namesBase = payloadReader.position();
+	outItems.reserve(static_cast<size_t>(count));
+	for (int index = 0; index < count; ++index) {
+		const std::int32_t rawOffset = offsets[static_cast<size_t>(index)];
+		if (rawOffset < 0) {
+			return false;
+		}
+
+		const size_t nameOffset = namesBase + static_cast<size_t>(rawOffset);
+		if (nameOffset > payload.size()) {
+			return false;
+		}
+
+		RemovedDefinedItemInfo item;
+		item.id = ids[static_cast<size_t>(index)];
+		item.name = ReadCStyleTextAt(payload, nameOffset);
+		outItems.push_back(std::move(item));
+	}
+
+	return true;
+}
+
+bool ParseLosableSection(const std::vector<std::uint8_t>& bytes, LosableSectionInfo& outLosable)
+{
+	outLosable = {};
+
+	ByteReader reader(bytes);
+	if (!reader.ReadDynamicText(outLosable.outFile) ||
+		!ParseRemovedDefinedItems(reader, outLosable.removedDefinedItems)) {
+		return false;
+	}
+
+	return reader.ReadRaw(bytes.size() - reader.position(), outLosable.tailBytes);
+}
+
 bool ParseModuleSectionsFromBytes(
 	const std::vector<std::uint8_t>& bytes,
 	ModuleSections& outSections,
@@ -2237,6 +2341,15 @@ bool ParseModuleSectionsFromBytes(
 				return false;
 			}
 			outSections.hasFolders = true;
+		}
+		else if (sectionName == "可丢失程序段") {
+			if (!ParseLosableSection(sectionBytes, outSections.losable)) {
+				if (outError != nullptr) {
+					*outError = "losable_section_parse_failed";
+				}
+				return false;
+			}
+			outSections.hasLosable = true;
 		}
 		else if (sectionName == "易模块记录段") {
 			outSections.ecomSectionBytes = std::move(sectionBytes);
@@ -2966,11 +3079,16 @@ std::string BuildCoreSupportLibraryWarning(
 
 class SymbolResolver {
 public:
-	SymbolResolver(const ProgramSection& program, const ResourceSection& resources, const std::string& sourcePath)
+	SymbolResolver(
+		const ProgramSection& program,
+		const ResourceSection& resources,
+		const std::string& sourcePath,
+		const std::vector<RemovedDefinedItemInfo>* removedDefinedItems = nullptr)
 		: m_program(program)
 		, m_resources(resources)
 		, m_sourcePath(sourcePath)
 		, m_sourceFileKind(DetectSourceFileKindFromPath(sourcePath))
+		, m_removedDefinedItems(removedDefinedItems)
 	{
 		BuildUserNameCache();
 	}
@@ -3192,6 +3310,41 @@ public:
 	}
 
 private:
+	static bool IsDebugSymbolIdentifierStart(const unsigned char ch)
+	{
+		return ch == '_' || std::isalpha(ch) || ch >= 0x80;
+	}
+
+	static bool IsDebugSymbolIdentifierContinue(const unsigned char ch)
+	{
+		return ch == '_' || std::isalnum(ch) || ch >= 0x80;
+	}
+
+	static std::string ParseDebugSymbolName(const std::string& rawComment)
+	{
+		const std::string comment = TrimAsciiCopy(rawComment);
+		if (comment.size() < 7 ||
+			comment[0] != '_' ||
+			comment[1] != '-' ||
+			comment[2] != '@' ||
+			(comment[3] != 'M' && comment[3] != 'S') ||
+			comment[4] != '<' ||
+			comment.back() != '>') {
+			return std::string();
+		}
+
+		std::string name = comment.substr(5, comment.size() - 6);
+		if (name.empty() || !IsDebugSymbolIdentifierStart(static_cast<unsigned char>(name.front()))) {
+			return std::string();
+		}
+		for (size_t index = 1; index < name.size(); ++index) {
+			if (!IsDebugSymbolIdentifierContinue(static_cast<unsigned char>(name[index]))) {
+				return std::string();
+			}
+		}
+		return name;
+	}
+
 	static std::string ToHexSuffix(std::int32_t id)
 	{
 		std::ostringstream stream;
@@ -3210,12 +3363,16 @@ private:
 		return prefix + std::to_string(counter);
 	}
 
-	std::string NormalizeOrGenerateName(
+	std::string ResolveVisibleName(
 		const std::string& rawName,
+		const std::string& rawComment,
 		const std::string& prefix,
 		int& counter) const
 	{
 		std::string name = TrimAsciiCopy(rawName);
+		if (name.empty()) {
+			name = ParseDebugSymbolName(rawComment);
+		}
 		if (!name.empty() || !ShouldGenerateEcAnonymousNames()) {
 			return name;
 		}
@@ -3236,18 +3393,18 @@ private:
 		int anonymousMenuCount = 0;
 
 		for (const auto& page : m_program.codePages) {
-			std::string pageName = TrimAsciiCopy(page.name);
-			if (pageName.empty() && ShouldGenerateEcAnonymousNames()) {
-				pageName = BuildSequentialPlaceholderName(
-					page.baseClass == 0 ? "匿名程序集_" : "匿名类_",
-					page.baseClass == 0 ? anonymousAssemblyCount : anonymousClassCount);
-			}
+			std::string pageName = ResolveVisibleName(
+				page.name,
+				page.comment,
+				page.baseClass == 0 ? "匿名程序集_" : "匿名类_",
+				page.baseClass == 0 ? anonymousAssemblyCount : anonymousClassCount);
 			m_userNameCache[page.header.dwId] = pageName;
 
 			int anonymousPageVarCount = 0;
 			for (const auto& pageVar : page.pageVars) {
-				m_userNameCache[pageVar.marker] = NormalizeOrGenerateName(
+				m_userNameCache[pageVar.marker] = ResolveVisibleName(
 					pageVar.name,
+					pageVar.comment,
 					page.baseClass == 0 ? "匿名程序集变量_" : "匿名私有成员_",
 					anonymousPageVarCount);
 			}
@@ -3257,41 +3414,71 @@ private:
 		}
 
 		for (const auto& function : m_program.functions) {
-			std::string functionName = TrimAsciiCopy(function.name);
-			if (functionName.empty() && ShouldGenerateEcAnonymousNames()) {
-				functionName = function.header.dwId == m_program.header.flag2
-					? "_启动子程序"
-					: BuildSequentialPlaceholderName("匿名子程序_", anonymousMethodCount);
+			std::string functionName = ResolveVisibleName(
+				function.name,
+				function.comment,
+				"匿名子程序_",
+				anonymousMethodCount);
+			if (functionName.empty() && function.header.dwId == m_program.header.flag2) {
+				functionName = "_启动子程序";
 			}
 			m_userNameCache[function.header.dwId] = functionName;
 
 			int anonymousParamCount = 0;
 			for (const auto& item : function.params) {
-				m_userNameCache[item.marker] = NormalizeOrGenerateName(item.name, "匿名参数_", anonymousParamCount);
+				m_userNameCache[item.marker] = ResolveVisibleName(
+					item.name,
+					item.comment,
+					"匿名参数_",
+					anonymousParamCount);
 			}
 
 			int anonymousLocalCount = 0;
 			for (const auto& item : function.locals) {
-				m_userNameCache[item.marker] = NormalizeOrGenerateName(item.name, "匿名局部变量_", anonymousLocalCount);
+				m_userNameCache[item.marker] = ResolveVisibleName(
+					item.name,
+					item.comment,
+					"匿名局部变量_",
+					anonymousLocalCount);
 			}
 		}
 		for (const auto& item : m_program.globals) {
-			m_userNameCache[item.marker] = NormalizeOrGenerateName(item.name, "匿名全局变量_", anonymousGlobalCount);
+			m_userNameCache[item.marker] = ResolveVisibleName(
+				item.name,
+				item.comment,
+				"匿名全局变量_",
+				anonymousGlobalCount);
 		}
 		for (const auto& item : m_program.dataTypes) {
-			m_userNameCache[item.header.dwId] = NormalizeOrGenerateName(item.name, "匿名数据类型_", anonymousStructCount);
+			m_userNameCache[item.header.dwId] = ResolveVisibleName(
+				item.name,
+				item.comment,
+				"匿名数据类型_",
+				anonymousStructCount);
 
 			int anonymousMemberCount = 0;
 			for (const auto& member : item.members) {
-				m_userNameCache[member.marker] = NormalizeOrGenerateName(member.name, "匿名成员_", anonymousMemberCount);
+				m_userNameCache[member.marker] = ResolveVisibleName(
+					member.name,
+					member.comment,
+					"匿名成员_",
+					anonymousMemberCount);
 			}
 		}
 		for (const auto& item : m_program.dlls) {
-			m_userNameCache[item.header.dwId] = NormalizeOrGenerateName(item.name, "匿名API_", anonymousDllCount);
+			m_userNameCache[item.header.dwId] = ResolveVisibleName(
+				item.name,
+				item.comment,
+				"匿名API_",
+				anonymousDllCount);
 
 			int anonymousDllParamCount = 0;
 			for (const auto& param : item.params) {
-				m_userNameCache[param.marker] = NormalizeOrGenerateName(param.name, "匿名参数_", anonymousDllParamCount);
+				m_userNameCache[param.marker] = ResolveVisibleName(
+					param.name,
+					param.comment,
+					"匿名参数_",
+					anonymousDllParamCount);
 			}
 		}
 		for (const auto& item : m_resources.constants) {
@@ -3302,19 +3489,44 @@ private:
 			else if (item.pageType == kConstPageSound) {
 				prefix = "匿名声音_";
 			}
-			m_userNameCache[item.marker] = NormalizeOrGenerateName(item.name, prefix, anonymousConstantCount);
+			m_userNameCache[item.marker] = ResolveVisibleName(
+				item.name,
+				item.comment,
+				prefix,
+				anonymousConstantCount);
 		}
 		for (const auto& item : m_resources.forms) {
-			m_userNameCache[item.header.dwId] = NormalizeOrGenerateName(item.name, "匿名窗口_", anonymousFormCount);
+			m_userNameCache[item.header.dwId] = ResolveVisibleName(
+				item.name,
+				item.comment,
+				"匿名窗口_",
+				anonymousFormCount);
 			for (const auto& element : item.elements) {
 				std::int32_t elementId = element.id;
 				if (epl_system_id::GetType(elementId) == 0) {
 					elementId |= element.isMenu ? epl_system_id::kTypeFormMenu : epl_system_id::kTypeFormControl;
 				}
-				m_userNameCache[elementId] = NormalizeOrGenerateName(
+				m_userNameCache[elementId] = ResolveVisibleName(
 					element.name,
+					element.comment,
 					element.isMenu ? "匿名菜单_" : "匿名控件_",
 					element.isMenu ? anonymousMenuCount : anonymousControlCount);
+			}
+		}
+
+		if (m_removedDefinedItems != nullptr) {
+			for (const auto& item : *m_removedDefinedItems) {
+				const std::string name = TrimAsciiCopy(item.name);
+				if (name.empty()) {
+					continue;
+				}
+
+				if (const auto it = m_userNameCache.find(item.id); it != m_userNameCache.end()) {
+					if (!TrimAsciiCopy(it->second).empty()) {
+						continue;
+					}
+				}
+				m_userNameCache[item.id] = name;
 			}
 		}
 	}
@@ -3501,6 +3713,7 @@ private:
 	const ResourceSection& m_resources;
 	std::string m_sourcePath;
 	SourceFileKind m_sourceFileKind = SourceFileKind::E;
+	const std::vector<RemovedDefinedItemInfo>* m_removedDefinedItems = nullptr;
 	std::unordered_map<std::int32_t, std::string> m_userNameCache;
 	std::unordered_map<std::int32_t, std::string> m_methodOwnerNameCache;
 	std::unordered_map<std::uint16_t, SupportLibrarySymbols> m_supportCache;
@@ -3631,57 +3844,7 @@ std::vector<std::filesystem::path> BuildModuleCandidatePaths(
 	const std::string& sourcePath,
 	const std::string& modulePathText)
 {
-	std::vector<std::filesystem::path> candidates;
-	std::string normalizedText = TrimAsciiCopy(modulePathText);
-	if (normalizedText.empty()) {
-		return candidates;
-	}
-
-	if (normalizedText.front() == '"' && normalizedText.back() == '"' && normalizedText.size() >= 2) {
-		normalizedText = normalizedText.substr(1, normalizedText.size() - 2);
-	}
-	if (!normalizedText.empty() && normalizedText.front() == '$') {
-		normalizedText.erase(normalizedText.begin());
-	}
-
-	std::filesystem::path filePath(normalizedText);
-	if (filePath.extension().empty()) {
-		filePath += ".ec";
-	}
-
-	if (filePath.is_absolute()) {
-		PushUniqueCandidate(candidates, filePath);
-		return candidates;
-	}
-
-	auto addBaseCandidates = [&](const std::filesystem::path& baseDir) {
-		if (baseDir.empty()) {
-			return;
-		}
-		PushUniqueCandidate(candidates, baseDir / filePath);
-		PushUniqueCandidate(candidates, baseDir / "ecom" / filePath);
-
-		std::filesystem::path current = baseDir;
-		while (!current.empty()) {
-			PushUniqueCandidate(candidates, current / "ecom" / filePath);
-			if (current == current.root_path()) {
-				break;
-			}
-			current = current.parent_path();
-		}
-	};
-
-	std::error_code ec;
-	if (!sourcePath.empty()) {
-		addBaseCandidates(Utf8PathToPath(sourcePath).parent_path());
-	}
-	addBaseCandidates(std::filesystem::current_path(ec));
-	addBaseCandidates(std::filesystem::path(GetBasePath()));
-	for (const auto& registeredBaseDir : GetRegisteredEplOpenCommandBaseDirs()) {
-		addBaseCandidates(registeredBaseDir);
-	}
-
-	return candidates;
+	return BuildModuleFileLookupCandidates(Utf8PathToPath(sourcePath), modulePathText);
 }
 
 AnonymousTypeHints BuildAnonymousTypeHints(const ModuleSections& sections, const std::string& sourcePath)
@@ -5260,7 +5423,11 @@ bool IsProgramPagePublic(const ModuleSections& sections, std::int32_t pageId)
 
 void BuildProgramPages(const ModuleSections& sections, const GenerateOptions& options, Document& outDocument)
 {
-	SymbolResolver resolver(sections.program, sections.resources, outDocument.sourcePath);
+	SymbolResolver resolver(
+		sections.program,
+		sections.resources,
+		outDocument.sourcePath,
+		&sections.losable.removedDefinedItems);
 	std::vector<EComDependencyRecord> dependencyRecords;
 	(void)ParseEComDependencies(sections.ecomSectionBytes, dependencyRecords);
 	bool firstProgramPage = true;
@@ -5385,7 +5552,11 @@ void BuildGlobalPage(const ModuleSections& sections, Document& outDocument)
 
 	std::vector<EComDependencyRecord> dependencyRecords;
 	(void)ParseEComDependencies(sections.ecomSectionBytes, dependencyRecords);
-	SymbolResolver resolver(sections.program, sections.resources, outDocument.sourcePath);
+	SymbolResolver resolver(
+		sections.program,
+		sections.resources,
+		outDocument.sourcePath,
+		&sections.losable.removedDefinedItems);
 	Page page;
 	page.typeName = "全局变量";
 	page.name = "全局变量";
@@ -5410,7 +5581,11 @@ void BuildStructPage(const ModuleSections& sections, const AnonymousTypeHints& h
 
 	std::vector<EComDependencyRecord> dependencyRecords;
 	(void)ParseEComDependencies(sections.ecomSectionBytes, dependencyRecords);
-	SymbolResolver resolver(sections.program, sections.resources, outDocument.sourcePath);
+	SymbolResolver resolver(
+		sections.program,
+		sections.resources,
+		outDocument.sourcePath,
+		&sections.losable.removedDefinedItems);
 	Page page;
 	page.typeName = "自定义数据类型";
 	page.name = "自定义数据类型";
@@ -5457,7 +5632,11 @@ void BuildDllPage(const ModuleSections& sections, const AnonymousTypeHints& hint
 
 	std::vector<EComDependencyRecord> dependencyRecords;
 	(void)ParseEComDependencies(sections.ecomSectionBytes, dependencyRecords);
-	SymbolResolver resolver(sections.program, sections.resources, outDocument.sourcePath);
+	SymbolResolver resolver(
+		sections.program,
+		sections.resources,
+		outDocument.sourcePath,
+		&sections.losable.removedDefinedItems);
 	Page page;
 	page.typeName = "DLL命令";
 	page.name = "Dll命令";
@@ -5505,7 +5684,11 @@ void BuildConstantPage(const ModuleSections& sections, Document& outDocument)
 		return;
 	}
 
-	SymbolResolver resolver(sections.program, sections.resources, outDocument.sourcePath);
+	SymbolResolver resolver(
+		sections.program,
+		sections.resources,
+		outDocument.sourcePath,
+		&sections.losable.removedDefinedItems);
 	Page page;
 	page.typeName = "常量资源";
 	page.name = "常量表...";
@@ -5811,7 +5994,11 @@ void BuildFormXmlEntries(const ModuleSections& sections, Document& outDocument)
 		return;
 	}
 
-	SymbolResolver resolver(sections.program, sections.resources, outDocument.sourcePath);
+	SymbolResolver resolver(
+		sections.program,
+		sections.resources,
+		outDocument.sourcePath,
+		&sections.losable.removedDefinedItems);
 	for (const auto& form : sections.resources.forms) {
 		FormXml formXml;
 		formXml.name = TrimAsciiCopy(form.name);
@@ -6066,7 +6253,11 @@ std::string BuildPublicHeaderText(
 		sections.hasUserInfo ? sections.userInfo.programComment : std::string(),
 		projectName);
 
-	SymbolResolver resolver(sections.program, sections.resources, sourcePath);
+	SymbolResolver resolver(
+		sections.program,
+		sections.resources,
+		sourcePath,
+		&sections.losable.removedDefinedItems);
 	std::vector<std::string> lines;
 	lines.push_back("模块名称：" + projectName);
 	lines.push_back("作者：" + author);
@@ -6764,7 +6955,11 @@ bool BuildBundleFromSections(
 	(void)ParseEComDependencies(sections.ecomSectionBytes, dependencyRecords);
 	const AnonymousTypeHints anonymousTypeHints = BuildAnonymousTypeHints(sections, sourcePath);
 	bundle.publicHeaderText = BuildPublicHeaderText(sections, sourcePath, dependencyRecords, anonymousTypeHints);
-	SymbolResolver resolver(sections.program, sections.resources, sourcePath);
+	SymbolResolver resolver(
+		sections.program,
+		sections.resources,
+		sourcePath,
+		&sections.losable.removedDefinedItems);
 
 	std::unordered_map<std::int32_t, std::string> itemKeys;
 	std::unordered_map<std::string, int> keyCounters;

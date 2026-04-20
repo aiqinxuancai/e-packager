@@ -11,6 +11,10 @@
 std::string GetBasePath();
 // 获取注册表中易语言打开命令对应的安装目录。
 std::vector<std::filesystem::path> GetRegisteredEplOpenCommandBaseDirs();
+// 构建易模块依赖文件的候选查找路径列表。
+std::vector<std::filesystem::path> BuildModuleFileLookupCandidates(
+	const std::filesystem::path& sourcePath,
+	const std::string& modulePathText);
 
 // 提取两个 " - " 之间的文本。
 std::string ExtractBetweenDashes(const std::string& text);

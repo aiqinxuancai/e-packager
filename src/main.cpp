@@ -125,75 +125,11 @@ std::string ToLowerAsciiCopy(std::string text)
 	return text;
 }
 
-void PushUniquePathCandidate(std::vector<std::filesystem::path>& outPaths, const std::filesystem::path& path)
-{
-	if (path.empty()) {
-		return;
-	}
-	const std::filesystem::path normalized = path.lexically_normal();
-	if (std::find(outPaths.begin(), outPaths.end(), normalized) == outPaths.end()) {
-		outPaths.push_back(normalized);
-	}
-}
-
 std::vector<std::filesystem::path> BuildDependencyModuleCandidatePaths(
 	const std::filesystem::path& sourcePath,
 	const std::string& modulePathText)
 {
-	std::vector<std::filesystem::path> candidates;
-	std::string normalizedText = TrimAsciiCopy(modulePathText);
-	if (normalizedText.empty()) {
-		return candidates;
-	}
-
-	if (normalizedText.size() >= 2 &&
-		normalizedText.front() == '"' &&
-		normalizedText.back() == '"') {
-		normalizedText = normalizedText.substr(1, normalizedText.size() - 2);
-	}
-	if (!normalizedText.empty() && normalizedText.front() == '$') {
-		normalizedText.erase(normalizedText.begin());
-	}
-
-	std::filesystem::path filePath(normalizedText);
-	if (filePath.extension().empty()) {
-		filePath += ".ec";
-	}
-
-	if (filePath.is_absolute()) {
-		PushUniquePathCandidate(candidates, filePath);
-		return candidates;
-	}
-
-	const auto addBaseCandidates = [&](const std::filesystem::path& baseDir) {
-		if (baseDir.empty()) {
-			return;
-		}
-
-		PushUniquePathCandidate(candidates, baseDir / filePath);
-		PushUniquePathCandidate(candidates, baseDir / "ecom" / filePath);
-
-		std::filesystem::path current = baseDir;
-		while (!current.empty()) {
-			PushUniquePathCandidate(candidates, current / "ecom" / filePath);
-			if (current == current.root_path()) {
-				break;
-			}
-			current = current.parent_path();
-		}
-	};
-
-	std::error_code ec;
-	if (!sourcePath.empty()) {
-		addBaseCandidates(sourcePath.parent_path());
-	}
-	addBaseCandidates(std::filesystem::current_path(ec));
-	addBaseCandidates(std::filesystem::path(GetBasePath()));
-	for (const auto& registeredBaseDir : GetRegisteredEplOpenCommandBaseDirs()) {
-		addBaseCandidates(registeredBaseDir);
-	}
-
-	return candidates;
+	return BuildModuleFileLookupCandidates(sourcePath, modulePathText);
 }
 
 bool ResolveDependencyModulePath(

@@ -12,6 +12,82 @@
 
 namespace {
 
+void PushUniquePath(std::vector<std::filesystem::path>& paths, const std::filesystem::path& path);
+
+std::string TrimAsciiWhitespaceCopy(std::string value) {
+    auto isAsciiSpace = [](unsigned char ch) {
+        return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == '\f' || ch == '\v';
+    };
+
+    while (!value.empty() && isAsciiSpace(static_cast<unsigned char>(value.front()))) {
+        value.erase(value.begin());
+    }
+    while (!value.empty() && isAsciiSpace(static_cast<unsigned char>(value.back()))) {
+        value.pop_back();
+    }
+    return value;
+}
+
+std::filesystem::path NormalizeModuleLookupFilePath(const std::string& modulePathText) {
+    std::string normalizedText = TrimAsciiWhitespaceCopy(modulePathText);
+    if (normalizedText.size() >= 2 &&
+        normalizedText.front() == '"' &&
+        normalizedText.back() == '"') {
+        normalizedText = normalizedText.substr(1, normalizedText.size() - 2);
+    }
+    if (!normalizedText.empty() && normalizedText.front() == '$') {
+        normalizedText.erase(normalizedText.begin());
+    }
+
+    std::filesystem::path filePath = Utf8PathToPath(normalizedText);
+    if (filePath.extension().empty()) {
+        filePath += L".ec";
+    }
+    return filePath;
+}
+
+std::filesystem::path NormalizeLookupSourceDir(const std::filesystem::path& sourcePath) {
+    if (sourcePath.empty()) {
+        return {};
+    }
+    return sourcePath.has_extension() ? sourcePath.parent_path() : sourcePath;
+}
+
+void AppendModuleLookupCandidates(
+    std::vector<std::filesystem::path>& candidates,
+    const std::filesystem::path& baseDir,
+    const std::filesystem::path& relativePath,
+    const std::filesystem::path& fileNameOnly) {
+    if (baseDir.empty()) {
+        return;
+    }
+
+    const auto appendModuleDir = [&](const std::filesystem::path& moduleDir) {
+        PushUniquePath(candidates, moduleDir / relativePath);
+        if (fileNameOnly != relativePath) {
+            PushUniquePath(candidates, moduleDir / fileNameOnly);
+        }
+    };
+
+    PushUniquePath(candidates, baseDir / relativePath);
+    if (fileNameOnly != relativePath) {
+        PushUniquePath(candidates, baseDir / fileNameOnly);
+    }
+
+    appendModuleDir(baseDir / L"ecom");
+    appendModuleDir(baseDir / L"模块");
+
+    std::filesystem::path current = baseDir;
+    while (!current.empty()) {
+        appendModuleDir(current / L"ecom");
+        appendModuleDir(current / L"模块");
+        if (current == current.root_path()) {
+            break;
+        }
+        current = current.parent_path();
+    }
+}
+
 std::wstring ExpandEnvironmentStringsCopy(const std::wstring& value) {
     if (value.empty()) {
         return value;
@@ -258,6 +334,49 @@ std::vector<std::filesystem::path> GetRegisteredEplOpenCommandBaseDirs() {
     }
 
     return baseDirs;
+}
+
+std::vector<std::filesystem::path> BuildModuleFileLookupCandidates(
+    const std::filesystem::path& sourcePath,
+    const std::string& modulePathText) {
+    std::vector<std::filesystem::path> candidates;
+    const std::filesystem::path filePath = NormalizeModuleLookupFilePath(modulePathText);
+    if (filePath.empty()) {
+        return candidates;
+    }
+
+    if (filePath.is_absolute()) {
+        PushUniquePath(candidates, filePath);
+    }
+
+    const std::filesystem::path relativePath = filePath.is_absolute() ? filePath.filename() : filePath;
+    const std::filesystem::path fileNameOnly = filePath.filename().empty() ? relativePath : filePath.filename();
+    if (relativePath.empty()) {
+        return candidates;
+    }
+
+    AppendModuleLookupCandidates(
+        candidates,
+        NormalizeLookupSourceDir(sourcePath),
+        relativePath,
+        fileNameOnly);
+
+    std::error_code ec;
+    AppendModuleLookupCandidates(
+        candidates,
+        std::filesystem::current_path(ec),
+        relativePath,
+        fileNameOnly);
+    AppendModuleLookupCandidates(
+        candidates,
+        Utf8PathToPath(GetBasePath()),
+        relativePath,
+        fileNameOnly);
+    for (const auto& registeredBaseDir : GetRegisteredEplOpenCommandBaseDirs()) {
+        AppendModuleLookupCandidates(candidates, registeredBaseDir, relativePath, fileNameOnly);
+    }
+
+    return candidates;
 }
 
 std::string ExtractBetweenDashes(const std::string& text) {
