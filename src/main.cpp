@@ -535,7 +535,7 @@ bool DoUnpackInternal(
 
 		e2txt::Restorer restorer;
 		std::vector<std::uint8_t> eBytes;
-		if (!restorer.RestoreBundleToBytes(bridgeSourceBundle, eBytes, &outError)) {
+		if (!restorer.RestoreBundleToBytesForEcBridge(bridgeSourceBundle, eBytes, &outError)) {
 			return false;
 		}
 

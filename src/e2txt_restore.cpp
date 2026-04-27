@@ -5973,7 +5973,8 @@ bool BuildRestoreModel(
 	const ProjectBundle* bundle,
 	RestoreDocumentModel& outModel,
 	std::string* outError,
-	const ProjectBundle* originalBundle = nullptr)
+	const ProjectBundle* originalBundle = nullptr,
+	const bool preferNativeMethodSnapshots = false)
 {
 	RestoreDocumentModel model;
 	model.sourcePath = document.sourcePath;
@@ -7204,13 +7205,16 @@ bool BuildRestoreModel(
 						TypeResolver::NormalizeTypeName(existingMethod.name),
 						NativeFunctionSymbol{ -2, existingMethod.id });
 			}
-			if (reusableNativeMethodSnapshot != nullptr) {
-				method.lineOffset = reusableNativeMethodSnapshot->lineOffset;
-				method.blockOffset = reusableNativeMethodSnapshot->blockOffset;
-				method.methodReference = reusableNativeMethodSnapshot->methodReference;
-				method.variableReference = reusableNativeMethodSnapshot->variableReference;
-				method.constantReference = reusableNativeMethodSnapshot->constantReference;
-				method.expressionData = reusableNativeMethodSnapshot->expressionData;
+			if (reusableNativeMethodSnapshot != nullptr ||
+				(preferNativeMethodSnapshots && identityNativeMethodSnapshot != nullptr)) {
+				const BundleNativeMethodSnapshot* nativeMethodSnapshot =
+					reusableNativeMethodSnapshot != nullptr ? reusableNativeMethodSnapshot : identityNativeMethodSnapshot;
+				method.lineOffset = nativeMethodSnapshot->lineOffset;
+				method.blockOffset = nativeMethodSnapshot->blockOffset;
+				method.methodReference = nativeMethodSnapshot->methodReference;
+				method.variableReference = nativeMethodSnapshot->variableReference;
+				method.constantReference = nativeMethodSnapshot->constantReference;
+				method.expressionData = nativeMethodSnapshot->expressionData;
 			}
 			else if (identityNativeMethodSnapshot != nullptr) {
 				std::string semanticError;
@@ -8880,7 +8884,11 @@ bool Restorer::RestoreToFile(
 	return true;
 }
 
-bool Restorer::RestoreBundleToBytes(const ProjectBundle& bundle, std::vector<std::uint8_t>& outBytes, std::string* outError) const
+bool RestoreBundleToBytesInternal(
+	const ProjectBundle& bundle,
+	std::vector<std::uint8_t>& outBytes,
+	std::string* outError,
+	const bool preferNativeMethodSnapshots)
 {
 	if (outError != nullptr) {
 		outError->clear();
@@ -8918,7 +8926,7 @@ bool Restorer::RestoreBundleToBytes(const ProjectBundle& bundle, std::vector<std
 
 	RestoreDocumentModel model;
 	try {
-		if (!BuildRestoreModel(document, &bundle, model, outError, originalBundlePtr)) {
+		if (!BuildRestoreModel(document, &bundle, model, outError, originalBundlePtr, preferNativeMethodSnapshots)) {
 			return false;
 		}
 	}
@@ -8947,6 +8955,16 @@ bool Restorer::RestoreBundleToBytes(const ProjectBundle& bundle, std::vector<std
 		}
 		return false;
 	}
+}
+
+bool Restorer::RestoreBundleToBytes(const ProjectBundle& bundle, std::vector<std::uint8_t>& outBytes, std::string* outError) const
+{
+	return RestoreBundleToBytesInternal(bundle, outBytes, outError, false);
+}
+
+bool Restorer::RestoreBundleToBytesForEcBridge(const ProjectBundle& bundle, std::vector<std::uint8_t>& outBytes, std::string* outError) const
+{
+	return RestoreBundleToBytesInternal(bundle, outBytes, outError, true);
 }
 
 bool Restorer::RestoreBundleToFile(

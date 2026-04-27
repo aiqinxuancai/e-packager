@@ -352,6 +352,8 @@ public:
 	bool RestoreToBytes(const Document& document, std::vector<std::uint8_t>& outBytes, std::string* outError) const;
 	// 从目录化工程包恢复为 .e 二进制。
 	bool RestoreBundleToBytes(const ProjectBundle& bundle, std::vector<std::uint8_t>& outBytes, std::string* outError) const;
+	// `.ec` 解包桥接为临时 `.e` 时使用：优先复用原生方法快照，避免生成源码再次语义重建。
+	bool RestoreBundleToBytesForEcBridge(const ProjectBundle& bundle, std::vector<std::uint8_t>& outBytes, std::string* outError) const;
 	bool RestoreToFile(
 		const std::string& inputPath,
 		const std::string& outputPath,
