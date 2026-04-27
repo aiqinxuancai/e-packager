@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -1266,7 +1267,10 @@ void NormalizeJsonForCompare(json& value)
 	}
 
 	value.erase("sourcePath");
+	value.erase("sourceFileName");
+	value.erase("sourceModifiedTimeUtc");
 	value.erase("nativeBundleDigest");
+	value.erase("projectName");
 	value.erase("projectNameStored");
 
 	auto it = value.find("rootChildKeys");
@@ -1287,7 +1291,8 @@ void NormalizeJsonForCompare(json& value)
 
 bool ShouldIgnorePathForRoundTripCompare(const std::string& relativePath)
 {
-	return relativePath.starts_with("src/.native_");
+	return relativePath == "AGENTS.md" ||
+		relativePath.starts_with("src/.native_");
 }
 
 bool CompareJsonFile(
@@ -1625,7 +1630,7 @@ int RunCommand(int argc, char* argv[])
 	return EXIT_FAILURE;
 }
 
-int main(int argc, char* argv[])
+int MainImpl(int argc, char* argv[])
 {
 	ConfigureConsoleForUtf8();
 	std::cerr << "e-packager " << APP_VERSION << std::endl;
@@ -1655,4 +1660,19 @@ int main(int argc, char* argv[])
 	}
 
 	return result;
+}
+
+int main(int argc, char* argv[])
+{
+	try {
+		return MainImpl(argc, argv);
+	}
+	catch (const std::exception& ex) {
+		std::cerr << "fatal: " << ex.what() << std::endl;
+		return EXIT_FAILURE;
+	}
+	catch (...) {
+		std::cerr << "fatal: unknown exception" << std::endl;
+		return EXIT_FAILURE;
+	}
 }

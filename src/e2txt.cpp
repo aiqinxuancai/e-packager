@@ -4257,6 +4257,13 @@ void BuildDependencies(const ModuleSections& sections, Document& outDocument)
 			item.name = record.name;
 			item.path = record.path;
 			item.reExport = record.reExport;
+			item.definedIds.reserve(record.definedIds.size());
+			for (const auto& range : record.definedIds) {
+				item.definedIds.push_back(DependencyDefinedIdRange{
+					range.start,
+					range.count,
+				});
+			}
 			outDocument.dependencies.push_back(std::move(item));
 		}
 	}
@@ -7416,6 +7423,174 @@ bool CaptureNativeSectionSnapshots(
 	std::string* outError)
 {
 	return CaptureNativeSectionSnapshotsInternal(inputBytes, outSnapshots, outError);
+}
+
+bool ExtractNativeDependencySymbols(
+	const std::vector<std::uint8_t>& inputBytes,
+	std::vector<NativeDependencySymbolRecord>& outRecords,
+	std::string* outError)
+{
+	outRecords.clear();
+	if (outError != nullptr) {
+		outError->clear();
+	}
+
+	ModuleSections sections;
+	if (!ParseModuleSectionsFromBytes(inputBytes, sections, outError)) {
+		return false;
+	}
+
+	std::vector<EComDependencyRecord> dependencyRecords;
+	if (!ParseEComDependencies(sections.ecomSectionBytes, dependencyRecords)) {
+		if (outError != nullptr) {
+			*outError = "parse_ecom_dependencies_failed";
+		}
+		return false;
+	}
+	if (dependencyRecords.empty()) {
+		return true;
+	}
+
+	outRecords.reserve(dependencyRecords.size());
+	for (const auto& record : dependencyRecords) {
+		NativeDependencySymbolRecord item;
+		item.name = record.name;
+		item.path = record.path;
+		item.reExport = record.reExport;
+		item.definedIds.reserve(record.definedIds.size());
+		for (const auto& range : record.definedIds) {
+			if (range.count > 0) {
+				item.definedIds.push_back(DependencyDefinedIdRange{
+					range.start,
+					range.count,
+				});
+			}
+		}
+		outRecords.push_back(std::move(item));
+	}
+
+	const auto findRecordIndexById = [&](const std::int32_t id) -> size_t {
+		if ((id & epl_system_id::kMaskType) == 0) {
+			return dependencyRecords.size();
+		}
+		const auto isClassLikeType = [](const std::int32_t type) {
+			return type == epl_system_id::kTypeClass ||
+				type == epl_system_id::kTypeStaticClass ||
+				type == epl_system_id::kTypeFormClass;
+		};
+		const std::int32_t idNum = id & epl_system_id::kMaskNum;
+		const std::int32_t idType = epl_system_id::GetType(id);
+		for (size_t recordIndex = 0; recordIndex < dependencyRecords.size(); ++recordIndex) {
+			for (const auto& range : dependencyRecords[recordIndex].definedIds) {
+				if (range.count <= 0) {
+					continue;
+				}
+				const std::int32_t rangeType = epl_system_id::GetType(range.start);
+				if (rangeType != idType &&
+					!(rangeType == epl_system_id::kTypeClass && isClassLikeType(idType))) {
+					continue;
+				}
+				const std::int32_t startNum = range.start & epl_system_id::kMaskNum;
+				if (idNum >= startNum && idNum < startNum + range.count) {
+					return recordIndex;
+				}
+			}
+		}
+		return dependencyRecords.size();
+	};
+
+	SymbolResolver resolver(
+		sections.program,
+		sections.resources,
+		std::string(),
+		&sections.losable.removedDefinedItems);
+	std::unordered_map<std::int32_t, std::string> classNamesById;
+	for (const auto& page : sections.program.codePages) {
+		classNamesById.insert_or_assign(page.header.dwId, TrimAsciiCopy(resolver.ResolveUserName(page.header.dwId)));
+		const size_t recordIndex = findRecordIndexById(page.header.dwId);
+		if (recordIndex >= outRecords.size()) {
+			continue;
+		}
+
+		NativeDependencyClassSymbol classSymbol;
+		classSymbol.id = page.header.dwId;
+		classSymbol.memoryAddress = page.header.dwUnk;
+		classSymbol.baseClass = page.baseClass;
+		classSymbol.name = classNamesById[page.header.dwId];
+		outRecords[recordIndex].classes.push_back(std::move(classSymbol));
+	}
+
+	for (const auto& function : sections.program.functions) {
+		const size_t recordIndex = findRecordIndexById(function.header.dwId);
+		if (recordIndex >= outRecords.size()) {
+			continue;
+		}
+
+		NativeDependencyMethodSymbol methodSymbol;
+		methodSymbol.id = function.header.dwId;
+		methodSymbol.ownerClassId = function.ownerClass;
+		methodSymbol.memoryAddress = function.header.dwUnk;
+		methodSymbol.attr = function.attr;
+		methodSymbol.returnType = function.returnType;
+		if (const auto ownerIt = classNamesById.find(function.ownerClass); ownerIt != classNamesById.end()) {
+			methodSymbol.ownerClassName = ownerIt->second;
+		}
+		methodSymbol.name = TrimAsciiCopy(resolver.ResolveUserName(function.header.dwId));
+		methodSymbol.paramIds.reserve(function.params.size());
+		methodSymbol.params.reserve(function.params.size());
+		for (const auto& param : function.params) {
+			methodSymbol.paramIds.push_back(param.marker);
+			NativeDependencyMethodParamSymbol paramSymbol;
+			paramSymbol.id = param.marker;
+			paramSymbol.dataType = param.dataType;
+			paramSymbol.attr = param.attr;
+			paramSymbol.arrayBounds = param.arrayBounds;
+			methodSymbol.params.push_back(std::move(paramSymbol));
+		}
+		outRecords[recordIndex].methods.push_back(std::move(methodSymbol));
+	}
+
+	for (const auto& removedItem : sections.losable.removedDefinedItems) {
+		const size_t recordIndex = findRecordIndexById(removedItem.id);
+		if (recordIndex >= outRecords.size()) {
+			continue;
+		}
+
+		const std::string name = TrimAsciiCopy(removedItem.name);
+		if (name.empty()) {
+			continue;
+		}
+
+		const std::int32_t idType = epl_system_id::GetType(removedItem.id);
+		if (idType == epl_system_id::kTypeClass ||
+			idType == epl_system_id::kTypeStaticClass ||
+			idType == epl_system_id::kTypeFormClass) {
+			const bool exists = std::any_of(
+				outRecords[recordIndex].classes.begin(),
+				outRecords[recordIndex].classes.end(),
+				[&](const NativeDependencyClassSymbol& item) { return item.id == removedItem.id; });
+			if (!exists) {
+				NativeDependencyClassSymbol classSymbol;
+				classSymbol.id = removedItem.id;
+				classSymbol.name = name;
+				outRecords[recordIndex].classes.push_back(std::move(classSymbol));
+			}
+		}
+		else if (idType == epl_system_id::kTypeMethod) {
+			const bool exists = std::any_of(
+				outRecords[recordIndex].methods.begin(),
+				outRecords[recordIndex].methods.end(),
+				[&](const NativeDependencyMethodSymbol& item) { return item.id == removedItem.id; });
+			if (!exists) {
+				NativeDependencyMethodSymbol methodSymbol;
+				methodSymbol.id = removedItem.id;
+				methodSymbol.name = name;
+				outRecords[recordIndex].methods.push_back(std::move(methodSymbol));
+			}
+		}
+	}
+
+	return true;
 }
 
 std::string ComputeTextDigest(const std::string& text)

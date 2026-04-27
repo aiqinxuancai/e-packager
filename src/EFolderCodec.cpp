@@ -281,7 +281,23 @@ json DependencyToJson(const Dependency& dependency)
 	item["guid"] = LocalToUtf8Text(dependency.guid);
 	item["versionText"] = LocalToUtf8Text(dependency.versionText);
 	item["path"] = LocalToUtf8Text(dependency.path);
+	if (!dependency.resolvedPath.empty()) {
+		item["resolvedPath"] = dependency.resolvedPath;
+	}
+	if (!dependency.localWorkspace.empty()) {
+		item["localWorkspace"] = dependency.localWorkspace;
+	}
 	item["reExport"] = dependency.reExport;
+	if (!dependency.definedIds.empty()) {
+		json ranges = json::array();
+		for (const auto& range : dependency.definedIds) {
+			ranges.push_back(json{
+				{ "start", range.start },
+				{ "count", range.count },
+			});
+		}
+		item["definedIds"] = std::move(ranges);
+	}
 	return item;
 }
 
@@ -295,7 +311,19 @@ Dependency DependencyFromJson(const json& item)
 	dependency.guid = Utf8ToLocalText(item.value("guid", ""));
 	dependency.versionText = Utf8ToLocalText(item.value("versionText", ""));
 	dependency.path = Utf8ToLocalText(item.value("path", ""));
+	dependency.resolvedPath = item.value("resolvedPath", std::string());
+	dependency.localWorkspace = item.value("localWorkspace", std::string());
 	dependency.reExport = item.value("reExport", false);
+	if (const auto it = item.find("definedIds"); it != item.end() && it->is_array()) {
+		for (const auto& rangeItem : *it) {
+			DependencyDefinedIdRange range;
+			range.start = rangeItem.value("start", 0);
+			range.count = rangeItem.value("count", 0);
+			if (range.count > 0) {
+				dependency.definedIds.push_back(range);
+			}
+		}
+	}
 	return dependency;
 }
 
@@ -1515,7 +1543,22 @@ bool BundleDirectoryCodec::ReadBundle(const std::string& inputDir, ProjectBundle
 	bundle.projectNameStored = metaJson.value("projectNameStored", true);
 	if (const auto it = moduleJson.find("dependencies"); it != moduleJson.end() && it->is_array()) {
 		for (const auto& dependencyItem : *it) {
-			bundle.dependencies.push_back(DependencyFromJson(dependencyItem));
+			Dependency dependency = DependencyFromJson(dependencyItem);
+			if (!dependency.resolvedPath.empty()) {
+				std::filesystem::path resolvedPath = Utf8PathToPath(dependency.resolvedPath);
+				if (resolvedPath.is_relative()) {
+					resolvedPath = (root / resolvedPath).lexically_normal();
+					dependency.resolvedPath = PathToUtf8(resolvedPath);
+				}
+			}
+			if (!dependency.localWorkspace.empty()) {
+				std::filesystem::path localWorkspace = Utf8PathToPath(dependency.localWorkspace);
+				if (localWorkspace.is_relative()) {
+					localWorkspace = (root / localWorkspace).lexically_normal();
+					dependency.localWorkspace = PathToUtf8(localWorkspace);
+				}
+			}
+			bundle.dependencies.push_back(std::move(dependency));
 		}
 	}
 

@@ -19,6 +19,51 @@ enum class DependencyKind {
 	ECom,
 };
 
+// 易模块依赖导入符号 ID 范围。
+struct DependencyDefinedIdRange {
+	std::int32_t start = 0;
+	std::int32_t count = 0;
+};
+
+// 原生工程里易模块导入的公开类符号。
+struct NativeDependencyClassSymbol {
+	std::int32_t id = 0;
+	std::int32_t memoryAddress = 0;
+	std::int32_t baseClass = 0;
+	std::string name;
+};
+
+// 原生工程里易模块导入方法的参数符号。
+struct NativeDependencyMethodParamSymbol {
+	std::int32_t id = 0;
+	std::int32_t dataType = 0;
+	std::int16_t attr = 0;
+	std::vector<std::int32_t> arrayBounds;
+};
+
+// 原生工程里易模块导入的公开方法符号。
+struct NativeDependencyMethodSymbol {
+	std::int32_t id = 0;
+	std::int32_t ownerClassId = 0;
+	std::int32_t memoryAddress = 0;
+	std::int32_t attr = 0;
+	std::int32_t returnType = 0;
+	std::string ownerClassName;
+	std::string name;
+	std::vector<std::int32_t> paramIds;
+	std::vector<NativeDependencyMethodParamSymbol> params;
+};
+
+// 原生工程里单个易模块依赖的导入符号表。
+struct NativeDependencySymbolRecord {
+	std::string name;
+	std::string path;
+	bool reExport = false;
+	std::vector<DependencyDefinedIdRange> definedIds;
+	std::vector<NativeDependencyClassSymbol> classes;
+	std::vector<NativeDependencyMethodSymbol> methods;
+};
+
 // 目录化资源类型。
 enum class BundleResourceKind {
 	Image,
@@ -33,7 +78,12 @@ struct Dependency {
 	std::string guid;
 	std::string versionText;
 	std::string path;
+	// 解包时解析到的本机完整路径，仅供回包和刷新派生内容辅助使用。
+	std::string resolvedPath;
+	// 解包时导出的本地工作区目录，仅供回包缺少原始模块时读取公开符号。
+	std::string localWorkspace;
 	bool reExport = false;
+	std::vector<DependencyDefinedIdRange> definedIds;
 };
 
 // 导出页面信息。
@@ -223,6 +273,11 @@ std::vector<std::string> ConsumeRuntimeWarnings();
 bool CaptureNativeSectionSnapshots(
 	const std::vector<std::uint8_t>& inputBytes,
 	std::vector<NativeSectionSnapshot>& outSnapshots,
+	std::string* outError);
+// 从原生 `.e` 文件数据提取易模块依赖的导入符号表。
+bool ExtractNativeDependencySymbols(
+	const std::vector<std::uint8_t>& inputBytes,
+	std::vector<NativeDependencySymbolRecord>& outRecords,
 	std::string* outError);
 
 // e2txt 文档对象。
