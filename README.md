@@ -2,7 +2,7 @@
 
 将易语言 `.e` / `.ec` 文件解包为可读目录，或将目录回包为 `.e`，让易语言项目享有 Git 版本管理、代码 Diff、AI 辅助编辑等现代开发体验。
 
-> 📖 [《易语言 × AI Agent 实践白皮书》](https://github.com/aiqinxuancai/Awesome-E-Agent)
+> 📖 参考应用：[易语言 × AI Agent 实践白皮书](https://github.com/aiqinxuancai/Awesome-E-Agent)
 
 ## 使用
 
