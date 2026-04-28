@@ -54,6 +54,12 @@ struct NativeDependencyMethodSymbol {
 	std::vector<NativeDependencyMethodParamSymbol> params;
 };
 
+// 原生工程里易模块导入的公开常量符号。
+struct NativeDependencyConstantSymbol {
+	std::int32_t id = 0;
+	std::string name;
+};
+
 // 原生工程里单个易模块依赖的导入符号表。
 struct NativeDependencySymbolRecord {
 	std::string name;
@@ -62,6 +68,7 @@ struct NativeDependencySymbolRecord {
 	std::vector<DependencyDefinedIdRange> definedIds;
 	std::vector<NativeDependencyClassSymbol> classes;
 	std::vector<NativeDependencyMethodSymbol> methods;
+	std::vector<NativeDependencyConstantSymbol> constants;
 };
 
 // 目录化资源类型。

@@ -91,6 +91,7 @@ struct RestoreDependencyInfo {
 	std::vector<DefinedIdRange> definedIds;
 	std::vector<NativeDependencyClassSymbol> nativeClasses;
 	std::vector<NativeDependencyMethodSymbol> nativeMethods;
+	std::vector<NativeDependencyConstantSymbol> nativeConstants;
 	std::int32_t childIdStart = 0;
 	std::int32_t childIdEnd = 0;
 };
@@ -644,6 +645,34 @@ bool TryDecodeDumpTextLiteral(const std::string& valueText, std::string& outRawT
 	}
 
 	outRawText = payload;
+	return true;
+}
+
+bool TryDecodeExpressionTextLiteral(const std::string& valueText, std::string& outRawText, bool& outIsLongText)
+{
+	if (TryDecodeDumpTextLiteral(valueText, outRawText, outIsLongText)) {
+		return true;
+	}
+	outRawText.clear();
+	outIsLongText = false;
+	if (valueText.size() < 2 || valueText.front() != '"' || valueText.back() != '"') {
+		return false;
+	}
+
+	const std::string payload = valueText.substr(1, valueText.size() - 2);
+	outRawText.reserve(payload.size());
+	for (size_t index = 0; index < payload.size(); ++index) {
+		if (payload[index] == '"' && index + 1 < payload.size() && payload[index + 1] == '"') {
+			outRawText.push_back('"');
+			++index;
+			continue;
+		}
+		if (payload[index] == '"') {
+			outRawText.clear();
+			return false;
+		}
+		outRawText.push_back(payload[index]);
+	}
 	return true;
 }
 
@@ -1449,6 +1478,7 @@ void ApplyNativeDependencyDefinedIds(
 			}
 			dependency.nativeClasses = nativeRecords[matchedIndex].classes;
 			dependency.nativeMethods = nativeRecords[matchedIndex].methods;
+			dependency.nativeConstants = nativeRecords[matchedIndex].constants;
 		}
 		return;
 	}
@@ -1724,6 +1754,11 @@ struct SupportLibraryCommandInfo {
 	std::int32_t commandId = 0;
 };
 
+struct SupportLibraryConstantInfo {
+	std::int16_t libraryId = 0;
+	std::int32_t constantId = 0;
+};
+
 struct SupportLibraryTypeInfo {
 	std::int32_t typeId = 0;
 	bool isTabControl = false;
@@ -1812,6 +1847,18 @@ public:
 		return true;
 	}
 
+	bool TryResolveSupportConstant(const std::string& rawConstantName, SupportLibraryConstantInfo& outInfo) const
+	{
+		const std::string constantName = NormalizeTypeName(rawConstantName);
+		const auto it = m_supportConstants.find(constantName);
+		if (it == m_supportConstants.end()) {
+			outInfo = {};
+			return false;
+		}
+		outInfo = it->second;
+		return true;
+	}
+
 	bool TryResolveSupportTypeMethod(
 		const std::int32_t typeId,
 		const std::string& rawMethodName,
@@ -1856,9 +1903,16 @@ private:
 		const auto addCoreCommand = [this](const char* name, const std::int32_t commandId) {
 			m_supportCommands.emplace(NormalizeTypeName(name), SupportLibraryCommandInfo{ 0, commandId });
 		};
+		const auto addCoreConstant = [this](const char* name, const std::int32_t constantId) {
+			m_supportConstants.emplace(NormalizeTypeName(name), SupportLibraryConstantInfo{ 0, constantId });
+		};
 
 		// 核心支持库的基础命令在 x64 进程无法加载 x86 krnln.fne 时仍需要可回包。
 		addCoreCommand("取运行目录", 65);
+		addCoreConstant("引号", 0);
+		addCoreConstant("左引号", 1);
+		addCoreConstant("右引号", 2);
+		addCoreConstant("换行符", 3);
 	}
 
 	void LoadSupportLibrary(const RestoreDependencyInfo& dependency, const int supportIndex)
@@ -1974,6 +2028,20 @@ private:
 				}
 			}
 		}
+		if (libInfo->m_nLibConstCount > 0 &&
+			libInfo->m_nLibConstCount <= kMaxSupportLibraryArrayCount &&
+			libInfo->m_pLibConst != nullptr &&
+			IsReadableMemoryRange(
+				libInfo->m_pLibConst,
+				sizeof(LIB_CONST_INFO) * static_cast<size_t>(libInfo->m_nLibConstCount))) {
+			const auto libraryId = static_cast<std::int16_t>(supportIndex - 1);
+			for (int i = 0; i < libInfo->m_nLibConstCount; ++i) {
+				const std::string name = NormalizeTypeName(ReadSupportLibraryName(libInfo->m_pLibConst[i].m_szName));
+				if (!name.empty()) {
+					m_supportConstants.insert_or_assign(name, SupportLibraryConstantInfo{ libraryId, i });
+				}
+			}
+		}
 		// Intentionally keep support-library modules loaded for the rest of the process
 		// lifetime. Some third-party .fne libraries corrupt the process heap during
 		// DLL detach.
@@ -1984,6 +2052,7 @@ private:
 	std::unordered_map<std::string, std::int32_t> m_userTypes;
 	std::unordered_map<std::string, SupportLibraryTypeInfo> m_supportTypes;
 	std::unordered_map<std::string, SupportLibraryCommandInfo> m_supportCommands;
+	std::unordered_map<std::string, SupportLibraryConstantInfo> m_supportConstants;
 	std::unordered_set<std::string> m_placeholderTypeNames;
 	std::vector<const RestoreDependencyInfo*> m_supportLibraryOrder;
 };
@@ -3181,13 +3250,26 @@ struct NativeObjectVariableSymbol {
 	std::int32_t typeId = 0;
 };
 
+struct NativeObjectMemberSymbol {
+	std::int32_t id = 0;
+	std::int32_t ownerTypeId = 0;
+	std::int32_t typeId = 0;
+};
+
 struct NativeFunctionSymbol {
 	std::int16_t libraryId = 0;
 	std::int32_t methodId = 0;
 };
 
+struct NativeConstantSymbol {
+	std::int16_t libraryId = -2;
+	std::int32_t id = 0;
+};
+
 struct NativeObjectMethodEncodeContext {
 	std::unordered_map<std::string, NativeObjectVariableSymbol> variablesByName;
+	std::unordered_map<std::int32_t, std::unordered_map<std::string, NativeObjectMemberSymbol>> membersByOwnerType;
+	std::unordered_map<std::string, NativeConstantSymbol> constantsByName;
 	std::unordered_map<std::string, NativeFunctionSymbol> functionsByName;
 	std::unordered_map<std::int32_t, std::unordered_map<std::string, NativeFunctionSymbol>> methodsByOwnerType;
 	const TypeResolver* typeResolver = nullptr;
@@ -3414,6 +3496,190 @@ bool ParseNativeFunctionCallExpression(
 	return SplitNativeObjectCallArguments(argText, outCall.args);
 }
 
+struct ParsedNativeVariableAccessStep {
+	enum class Kind {
+		ArrayIndex,
+		Member,
+	};
+
+	Kind kind = Kind::ArrayIndex;
+	std::string indexExpression;
+	NativeObjectMemberSymbol member;
+};
+
+struct ParsedNativeVariableAccessExpression {
+	NativeObjectVariableSymbol base;
+	std::string baseName;
+	std::int32_t typeId = 0;
+	std::vector<ParsedNativeVariableAccessStep> steps;
+};
+
+std::string StripOuterParentheses(std::string expression);
+
+bool FindNativeAccessClosingBracket(const std::string& text, const size_t openPos, size_t& outClosePos)
+{
+	if (openPos >= text.size() || text[openPos] != '[') {
+		return false;
+	}
+	int bracketDepth = 1;
+	int parenDepth = 0;
+	bool inChineseQuote = false;
+	bool inAsciiQuote = false;
+	for (size_t index = openPos + 1; index < text.size(); ++index) {
+		size_t quoteLength = 0;
+		if (!inAsciiQuote && TryGetNativeTextQuoteLength(text, index, quoteLength)) {
+			inChineseQuote = !inChineseQuote;
+			index += quoteLength - 1;
+			continue;
+		}
+		if (!inChineseQuote && text[index] == '"') {
+			inAsciiQuote = !inAsciiQuote;
+			continue;
+		}
+		if (inChineseQuote || inAsciiQuote) {
+			continue;
+		}
+		if (text[index] == '(') {
+			++parenDepth;
+			continue;
+		}
+		if (text[index] == ')' && parenDepth > 0) {
+			--parenDepth;
+			continue;
+		}
+		if (text[index] == '[') {
+			++bracketDepth;
+			continue;
+		}
+		if (text[index] == ']') {
+			--bracketDepth;
+			if (bracketDepth == 0) {
+				outClosePos = index;
+				return parenDepth == 0;
+			}
+		}
+	}
+	return false;
+}
+
+bool TryResolveNativeMember(
+	const std::int32_t ownerTypeId,
+	const std::string& rawMemberName,
+	const NativeObjectMethodEncodeContext& context,
+	NativeObjectMemberSymbol& outMember)
+{
+	const auto ownerIt = context.membersByOwnerType.find(ownerTypeId);
+	if (ownerIt == context.membersByOwnerType.end()) {
+		outMember = {};
+		return false;
+	}
+	const auto memberIt = ownerIt->second.find(TypeResolver::NormalizeTypeName(rawMemberName));
+	if (memberIt == ownerIt->second.end()) {
+		outMember = {};
+		return false;
+	}
+	outMember = memberIt->second;
+	return outMember.id != 0;
+}
+
+bool ParseNativeVariableAccessExpression(
+	const std::string& rawExpression,
+	const NativeObjectMethodEncodeContext& context,
+	ParsedNativeVariableAccessExpression& outAccess,
+	std::string* outError = nullptr)
+{
+	outAccess = {};
+	const std::string expression = StripOuterParentheses(rawExpression);
+	if (expression.empty()) {
+		if (outError != nullptr) {
+			*outError = "access_expression_empty";
+		}
+		return false;
+	}
+
+	size_t pos = 0;
+	while (pos < expression.size() && std::isspace(static_cast<unsigned char>(expression[pos]))) {
+		++pos;
+	}
+	const size_t baseBegin = pos;
+	while (pos < expression.size() && expression[pos] != '[' && expression[pos] != '.') {
+		++pos;
+	}
+	const std::string baseName = TrimAsciiCopy(expression.substr(baseBegin, pos - baseBegin));
+	const auto variableIt = context.variablesByName.find(TypeResolver::NormalizeTypeName(baseName));
+	if (variableIt == context.variablesByName.end() || variableIt->second.id == 0) {
+		if (outError != nullptr) {
+			*outError = "access_base_variable_not_found: " + baseName;
+		}
+		return false;
+	}
+
+	outAccess.base = variableIt->second;
+	outAccess.baseName = baseName;
+	outAccess.typeId = variableIt->second.typeId;
+	while (pos < expression.size()) {
+		while (pos < expression.size() && std::isspace(static_cast<unsigned char>(expression[pos]))) {
+			++pos;
+		}
+		if (pos >= expression.size()) {
+			break;
+		}
+		if (expression[pos] == '[') {
+			size_t closePos = std::string::npos;
+			if (!FindNativeAccessClosingBracket(expression, pos, closePos)) {
+				if (outError != nullptr) {
+					*outError = "access_array_index_unclosed: " + expression;
+				}
+				return false;
+			}
+			ParsedNativeVariableAccessStep step;
+			step.kind = ParsedNativeVariableAccessStep::Kind::ArrayIndex;
+			step.indexExpression = TrimAsciiCopy(expression.substr(pos + 1, closePos - pos - 1));
+			if (step.indexExpression.empty()) {
+				if (outError != nullptr) {
+					*outError = "access_array_index_empty: " + expression;
+				}
+				return false;
+			}
+			outAccess.steps.push_back(std::move(step));
+			pos = closePos + 1;
+			continue;
+		}
+		if (expression[pos] == '.') {
+			++pos;
+			const size_t memberBegin = pos;
+			while (pos < expression.size() && expression[pos] != '[' && expression[pos] != '.') {
+				++pos;
+			}
+			const std::string memberName = TrimAsciiCopy(expression.substr(memberBegin, pos - memberBegin));
+			if (memberName.empty()) {
+				if (outError != nullptr) {
+					*outError = "access_member_empty: " + expression;
+				}
+				return false;
+			}
+			NativeObjectMemberSymbol member;
+			if (!TryResolveNativeMember(outAccess.typeId, memberName, context, member)) {
+				if (outError != nullptr) {
+					*outError = "access_member_not_found: " + memberName + " ownerType=" + std::to_string(outAccess.typeId);
+				}
+				return false;
+			}
+			ParsedNativeVariableAccessStep step;
+			step.kind = ParsedNativeVariableAccessStep::Kind::Member;
+			step.member = member;
+			outAccess.typeId = member.typeId;
+			outAccess.steps.push_back(std::move(step));
+			continue;
+		}
+		if (outError != nullptr) {
+			*outError = "access_expression_invalid: " + expression;
+		}
+		return false;
+	}
+	return true;
+}
+
 bool FindTopLevelNativeAssignmentOperator(const std::string& text, size_t& outOffset, size_t& outLength)
 {
 	constexpr const char* kFullWidthAssign = "＝";
@@ -3574,42 +3840,72 @@ bool TryResolveNativeExpressionType(
 	const NativeObjectMethodEncodeContext& context,
 	std::int32_t& outTypeId)
 {
-	const std::string expression = StripOuterParentheses(rawExpression);
-	const auto variableIt = context.variablesByName.find(TypeResolver::NormalizeTypeName(expression));
-	if (variableIt != context.variablesByName.end()) {
-		outTypeId = variableIt->second.typeId;
+	ParsedNativeVariableAccessExpression access;
+	if (ParseNativeVariableAccessExpression(rawExpression, context, access)) {
+		outTypeId = access.typeId;
 		return outTypeId != 0;
 	}
 	outTypeId = 0;
 	return false;
 }
 
+bool TryEncodeNativeExpression(
+	const std::string& rawExpression,
+	const NativeObjectMethodEncodeContext& context,
+	ByteWriter& writer,
+	std::vector<std::int32_t>& methodReferences,
+	std::vector<std::int32_t>& variableReferences,
+	std::vector<std::int32_t>& constantReferences,
+	std::string* outError);
+
 bool TryEncodeNativeIn38Expression(
 	const std::string& rawExpression,
 	const NativeObjectMethodEncodeContext& context,
 	ByteWriter& writer,
+	std::vector<std::int32_t>& methodReferences,
 	std::vector<std::int32_t>& variableReferences,
+	std::vector<std::int32_t>& constantReferences,
 	const bool includeExpressionWrapper,
 	std::string* outError = nullptr)
 {
-	const std::string expression = StripOuterParentheses(rawExpression);
-	const auto variableIt = context.variablesByName.find(TypeResolver::NormalizeTypeName(expression));
-	if (variableIt != context.variablesByName.end() && variableIt->second.id != 0) {
-		if (includeExpressionWrapper) {
-			variableReferences.push_back(static_cast<std::int32_t>(writer.position()));
-			writer.WriteU8(0x1D);
-			writer.WriteU8(0x38);
+	ParsedNativeVariableAccessExpression access;
+	std::string parseError;
+	if (!ParseNativeVariableAccessExpression(rawExpression, context, access, &parseError)) {
+		if (outError != nullptr) {
+			*outError = parseError.empty() ? "in38_expression_not_found: " + StripOuterParentheses(rawExpression) : parseError;
 		}
-		writer.WriteI32(variableIt->second.id);
-		if (includeExpressionWrapper) {
-			writer.WriteU8(0x37);
+		return false;
+	}
+
+	if (includeExpressionWrapper) {
+		variableReferences.push_back(static_cast<std::int32_t>(writer.position()));
+		writer.WriteU8(0x1D);
+		writer.WriteU8(0x38);
+	}
+	writer.WriteI32(access.base.id);
+	for (const auto& step : access.steps) {
+		if (step.kind == ParsedNativeVariableAccessStep::Kind::ArrayIndex) {
+			writer.WriteU8(0x3A);
+			if (!TryEncodeNativeExpression(
+					step.indexExpression,
+					context,
+					writer,
+					methodReferences,
+					variableReferences,
+					constantReferences,
+					outError)) {
+				return false;
+			}
+			continue;
 		}
-		return true;
+		writer.WriteU8(0x39);
+		writer.WriteI32(step.member.id);
+		writer.WriteI32(step.member.ownerTypeId);
 	}
-	if (outError != nullptr) {
-		*outError = "in38_expression_not_found: " + expression;
+	if (includeExpressionWrapper) {
+		writer.WriteU8(0x37);
 	}
-	return false;
+	return true;
 }
 
 bool TryEncodeNativeCallExpression(
@@ -3620,6 +3916,7 @@ bool TryEncodeNativeCallExpression(
 	ByteWriter& writer,
 	std::vector<std::int32_t>& methodReferences,
 	std::vector<std::int32_t>& variableReferences,
+	std::vector<std::int32_t>& constantReferences,
 	std::string* outError = nullptr);
 
 bool TryEncodeNativeExpression(
@@ -3628,6 +3925,7 @@ bool TryEncodeNativeExpression(
 	ByteWriter& writer,
 	std::vector<std::int32_t>& methodReferences,
 	std::vector<std::int32_t>& variableReferences,
+	std::vector<std::int32_t>& constantReferences,
 	std::string* outError = nullptr)
 {
 	const std::string expression = StripOuterParentheses(rawExpression);
@@ -3652,15 +3950,54 @@ bool TryEncodeNativeExpression(
 		return true;
 	}
 
-	const std::string variableKey = TypeResolver::NormalizeTypeName(expression);
-	const auto variableIt = context.variablesByName.find(variableKey);
-	if (variableIt != context.variablesByName.end() && variableIt->second.id != 0) {
-		return TryEncodeNativeIn38Expression(expression, context, writer, variableReferences, true, outError);
+	if (expression.front() == '#') {
+		const std::string constantName = TrimAsciiCopy(expression.substr(1));
+		const auto constantIt = context.constantsByName.find(TypeResolver::NormalizeTypeName(constantName));
+		if (constantIt != context.constantsByName.end() && constantIt->second.id != 0) {
+			constantReferences.push_back(static_cast<std::int32_t>(writer.position()));
+			if (constantIt->second.libraryId == -2) {
+				writer.WriteU8(0x1B);
+				writer.WriteI32(constantIt->second.id);
+			}
+			else {
+				writer.WriteU8(0x1C);
+				writer.WriteI16(static_cast<std::int16_t>(constantIt->second.libraryId + 1));
+				writer.WriteI16(static_cast<std::int16_t>(constantIt->second.id + 1));
+			}
+			return true;
+		}
+		if (context.typeResolver != nullptr) {
+			SupportLibraryConstantInfo constantInfo;
+			if (context.typeResolver->TryResolveSupportConstant(constantName, constantInfo)) {
+				constantReferences.push_back(static_cast<std::int32_t>(writer.position()));
+				writer.WriteU8(0x1C);
+				writer.WriteI16(static_cast<std::int16_t>(constantInfo.libraryId + 1));
+				writer.WriteI16(static_cast<std::int16_t>(constantInfo.constantId + 1));
+				return true;
+			}
+		}
+		if (outError != nullptr) {
+			*outError = "constant_not_found: " + constantName;
+		}
+		return false;
+	}
+
+	ParsedNativeVariableAccessExpression accessExpression;
+	if (ParseNativeVariableAccessExpression(expression, context, accessExpression)) {
+		return TryEncodeNativeIn38Expression(
+			expression,
+			context,
+			writer,
+			methodReferences,
+			variableReferences,
+			constantReferences,
+			true,
+			outError);
 	}
 
 	std::string textValue;
 	bool isLongText = false;
-	if (TryDecodeDumpTextLiteral(expression, textValue, isLongText) && !isLongText) {
+	if (TryDecodeExpressionTextLiteral(expression, textValue, isLongText) && !isLongText) {
 		writer.WriteU8(0x1A);
 		writer.WriteBStr(std::make_optional(textValue));
 		return true;
@@ -3693,7 +4030,7 @@ bool TryEncodeNativeExpression(
 		WriteNativeCallHeader(writer, 19, 0, 0);
 		writer.WriteU8(0x36);
 		for (const auto& part : plusParts) {
-			if (!TryEncodeNativeExpression(part, context, writer, methodReferences, variableReferences, outError)) {
+			if (!TryEncodeNativeExpression(part, context, writer, methodReferences, variableReferences, constantReferences, outError)) {
 				if (outError != nullptr && outError->empty()) {
 					*outError = "plus_argument_encode_failed: " + part;
 				}
@@ -3731,6 +4068,7 @@ bool TryEncodeNativeExpression(
 				writer,
 				methodReferences,
 				variableReferences,
+				constantReferences,
 				outError);
 		}
 
@@ -3749,6 +4087,7 @@ bool TryEncodeNativeExpression(
 			writer,
 			methodReferences,
 			variableReferences,
+			constantReferences,
 			outError);
 	}
 
@@ -3766,6 +4105,7 @@ bool TryEncodeNativeCallExpression(
 	ByteWriter& writer,
 	std::vector<std::int32_t>& methodReferences,
 	std::vector<std::int32_t>& variableReferences,
+	std::vector<std::int32_t>& constantReferences,
 	std::string* outError)
 {
 	const auto callOffset = static_cast<std::int32_t>(writer.position());
@@ -3780,7 +4120,15 @@ bool TryEncodeNativeCallExpression(
 	WriteNativeCallHeader(writer, functionSymbol.methodId, functionSymbol.libraryId, 0);
 	if (targetExpression.has_value()) {
 		writer.WriteU8(0x38);
-		if (!TryEncodeNativeIn38Expression(*targetExpression, context, writer, variableReferences, false, outError)) {
+		if (!TryEncodeNativeIn38Expression(
+				*targetExpression,
+				context,
+				writer,
+				methodReferences,
+				variableReferences,
+				constantReferences,
+				false,
+				outError)) {
 			return false;
 		}
 		writer.WriteU8(0x37);
@@ -3789,7 +4137,7 @@ bool TryEncodeNativeCallExpression(
 		writer.WriteU8(0x36);
 	}
 	for (const auto& arg : args) {
-		if (!TryEncodeNativeExpression(arg, context, writer, methodReferences, variableReferences, outError)) {
+		if (!TryEncodeNativeExpression(arg, context, writer, methodReferences, variableReferences, constantReferences, outError)) {
 			if (outError != nullptr && outError->empty()) {
 				*outError = "call_argument_encode_failed: " + arg;
 			}
@@ -3822,26 +4170,18 @@ bool TryEncodeNativeObjectMethodCallLine(
 		return false;
 	}
 
-	const std::string objectKey = TypeResolver::NormalizeTypeName(call.objectName);
-	const auto variableIt = context.variablesByName.find(objectKey);
-	if (variableIt == context.variablesByName.end() ||
-		variableIt->second.id == 0) {
+	std::int32_t targetTypeId = 0;
+	if (!TryResolveNativeExpressionType(call.objectName, context, targetTypeId)) {
 		if (outError != nullptr) {
-			*outError = "object_variable_not_found: " + call.objectName;
-		}
-		return false;
-	}
-	if (variableIt->second.typeId == 0) {
-		if (outError != nullptr) {
-			*outError = "object_variable_type_missing: " + call.objectName;
+			*outError = "object_target_type_not_found: " + call.objectName;
 		}
 		return false;
 	}
 
-	const auto ownerIt = context.methodsByOwnerType.find(variableIt->second.typeId);
+	const auto ownerIt = context.methodsByOwnerType.find(targetTypeId);
 	if (ownerIt == context.methodsByOwnerType.end()) {
 		if (outError != nullptr) {
-			*outError = "owner_type_methods_missing: " + call.objectName + " type=" + std::to_string(variableIt->second.typeId);
+			*outError = "owner_type_methods_missing: " + call.objectName + " type=" + std::to_string(targetTypeId);
 		}
 		return false;
 	}
@@ -3855,7 +4195,7 @@ bool TryEncodeNativeObjectMethodCallLine(
 	}
 	else if (context.typeResolver != nullptr) {
 		SupportLibraryCommandInfo supportMethod;
-		if (context.typeResolver->TryResolveSupportTypeMethod(variableIt->second.typeId, call.methodName, supportMethod)) {
+		if (context.typeResolver->TryResolveSupportTypeMethod(targetTypeId, call.methodName, supportMethod)) {
 			methodSymbol = NativeFunctionSymbol{ supportMethod.libraryId, supportMethod.commandId };
 			hasMethodSymbol = true;
 		}
@@ -3863,7 +4203,7 @@ bool TryEncodeNativeObjectMethodCallLine(
 	if (!hasMethodSymbol) {
 		if (outError != nullptr) {
 			*outError = "object_method_not_found: " + call.objectName + "." + call.methodName +
-				" type=" + std::to_string(variableIt->second.typeId);
+				" type=" + std::to_string(targetTypeId);
 		}
 		return false;
 	}
@@ -3877,11 +4217,21 @@ bool TryEncodeNativeObjectMethodCallLine(
 	outExpression.variableReferences.push_back(0);
 
 	writer.WriteU8(0x38);
-	writer.WriteI32(variableIt->second.id);
+	if (!TryEncodeNativeIn38Expression(
+			call.objectName,
+			context,
+			writer,
+			outExpression.methodReferences,
+			outExpression.variableReferences,
+			outExpression.constantReferences,
+			false,
+			outError)) {
+		return false;
+	}
 	writer.WriteU8(0x37);
 	for (const auto& arg : call.args) {
 		std::string expressionError;
-		if (!TryEncodeNativeExpression(arg, context, writer, outExpression.methodReferences, outExpression.variableReferences, &expressionError)) {
+		if (!TryEncodeNativeExpression(arg, context, writer, outExpression.methodReferences, outExpression.variableReferences, outExpression.constantReferences, &expressionError)) {
 			if (outError != nullptr) {
 				*outError = "argument_encode_failed: " + call.objectName + "." + call.methodName +
 					" arg=\"" + arg + "\" " + expressionError;
@@ -3935,7 +4285,7 @@ bool TryEncodeNativeFunctionCallStatementLine(
 	writer.WriteU8(0x36);
 	for (const auto& arg : call.args) {
 		std::string expressionError;
-		if (!TryEncodeNativeExpression(arg, context, writer, outExpression.methodReferences, outExpression.variableReferences, &expressionError)) {
+		if (!TryEncodeNativeExpression(arg, context, writer, outExpression.methodReferences, outExpression.variableReferences, outExpression.constantReferences, &expressionError)) {
 			if (outError != nullptr) {
 				*outError = "function_argument_encode_failed: " + call.name +
 					" arg=\"" + arg + "\" " + expressionError;
@@ -3984,14 +4334,14 @@ bool TryEncodeNativeAssignmentLine(
 	WriteNativeCallHeader(writer, 52, 0, static_cast<std::int16_t>(statement.mask ? 0x20 : 0));
 	writer.WriteU8(0x36);
 	std::string expressionError;
-	if (!TryEncodeNativeExpression(leftExpression, context, writer, outExpression.methodReferences, outExpression.variableReferences, &expressionError)) {
+	if (!TryEncodeNativeExpression(leftExpression, context, writer, outExpression.methodReferences, outExpression.variableReferences, outExpression.constantReferences, &expressionError)) {
 		if (outError != nullptr) {
 			*outError = "assignment_left_encode_failed: " + leftExpression + " " + expressionError;
 		}
 		return false;
 	}
 	expressionError.clear();
-	if (!TryEncodeNativeExpression(rightExpression, context, writer, outExpression.methodReferences, outExpression.variableReferences, &expressionError)) {
+	if (!TryEncodeNativeExpression(rightExpression, context, writer, outExpression.methodReferences, outExpression.variableReferences, outExpression.constantReferences, &expressionError)) {
 		if (outError != nullptr) {
 			*outError = "assignment_right_encode_failed: " + rightExpression + " " + expressionError;
 		}
@@ -4009,9 +4359,12 @@ bool TryEncodeNativeRawStatementLine(
 	std::string* outError = nullptr)
 {
 	std::string lastError;
+	std::string objectCallError;
+	const bool objectCallLike = LooksLikeReusableObjectMethodLine(statement.code);
 	if (TryEncodeNativeObjectMethodCallLine(statement, context, outExpression, &lastError)) {
 		return true;
 	}
+	objectCallError = lastError;
 	if (TryEncodeNativeAssignmentLine(statement, context, outExpression, &lastError)) {
 		return true;
 	}
@@ -4019,7 +4372,7 @@ bool TryEncodeNativeRawStatementLine(
 		return true;
 	}
 	if (outError != nullptr) {
-		*outError = lastError;
+		*outError = objectCallLike && !objectCallError.empty() ? objectCallError : lastError;
 	}
 	return false;
 }
@@ -5098,11 +5451,12 @@ bool ParseProgramPage(const Page& page, const std::unordered_set<std::string>& f
 	outClass.baseClassName = GetFieldOrEmpty(fields, 1);
 	outClass.isPublic = GetFieldOrEmpty(fields, 2) == "公开";
 	outClass.comment = ExtractRemainingDefinitionFieldText(TrimAsciiCopy(page.lines[index]), "程序集", 3);
-	outClass.isUserClass = TypeResolver::NormalizeTypeName(outClass.baseClassName) == "对象";
+	const std::string normalizedBaseClassName = TypeResolver::NormalizeTypeName(outClass.baseClassName);
 	outClass.isFormClass =
 		formNames.contains(outClass.name) ||
-		TypeResolver::NormalizeTypeName(outClass.baseClassName) == "窗口" ||
+		normalizedBaseClassName == "窗口" ||
 		IsLikelyFormClassName(outClass.name);
+	outClass.isUserClass = !outClass.isFormClass && !normalizedBaseClassName.empty();
 	++index;
 
 	while (index < page.lines.size()) {
@@ -6357,12 +6711,14 @@ bool BuildRestoreModel(
 	std::vector<size_t> localStructModelIndices;
 	localStructModelIndices.reserve(parsedStructs.size());
 	std::vector<const BundleNativeStructSnapshot*> nativeStructSnapshotsByIndex(parsedStructs.size(), nullptr);
+	std::vector<std::vector<std::int32_t>> localStructMemberIds(parsedStructs.size());
 	std::vector<size_t> localGlobalModelIndices;
 	localGlobalModelIndices.reserve(parsedGlobals.size());
 	std::vector<size_t> localDllModelIndices;
 	localDllModelIndices.reserve(parsedDlls.size());
 	std::vector<size_t> localConstantModelIndices;
 	localConstantModelIndices.reserve(parsedConstants.size());
+	std::vector<std::int32_t> localConstantIds(parsedConstants.size(), 0);
 	std::vector<std::string> localConstantKeys;
 	localConstantKeys.reserve(parsedConstants.size());
 	std::unordered_map<std::string, int> localConstantKeyCounters;
@@ -6395,6 +6751,139 @@ bool BuildRestoreModel(
 			}
 		}
 		if (!dependencyLoaded) {
+			if (!dependency.nativeClasses.empty() || !dependency.nativeMethods.empty() || !dependency.nativeConstants.empty()) {
+				DependencyImportIdCursor dependencyIds(dependency);
+				if (dependencyIds.HasOriginalRanges()) {
+					dependencyIds.ObserveAll(allocator);
+				}
+
+				std::unordered_map<std::int32_t, size_t> classIndexById;
+				std::unordered_map<std::string, size_t> classIndexByName;
+				const auto addNativeOnlyClass = [&](const std::int32_t preferredId, const std::string& rawName, const std::int32_t memoryAddress, const std::int32_t baseClass) -> size_t {
+					if (preferredId != 0) {
+						if (const auto it = classIndexById.find(preferredId); it != classIndexById.end()) {
+							return it->second;
+						}
+					}
+					const std::string normalizedName = TypeResolver::NormalizeTypeName(rawName);
+					if (!normalizedName.empty()) {
+						if (const auto it = classIndexByName.find(normalizedName); it != classIndexByName.end()) {
+							if (preferredId != 0) {
+								classIndexById.insert_or_assign(preferredId, it->second);
+							}
+							return it->second;
+						}
+					}
+
+					RestoreClass item;
+					const std::int32_t preferredType = epl_system_id::GetType(preferredId);
+					const bool preferredIsClass =
+						preferredType == epl_system_id::kTypeClass ||
+						preferredType == epl_system_id::kTypeStaticClass ||
+						preferredType == epl_system_id::kTypeFormClass;
+					item.id = preferredIsClass
+						? preferredId
+						: dependencyIds.AllocTopLevel(allocator, epl_system_id::kTypeStaticClass);
+					allocator.Observe(item.id);
+					item.memoryAddress = memoryAddress;
+					item.baseClass = baseClass;
+					item.name = rawName.empty()
+						? std::string("__HIDDEN_DEP_") + std::to_string(model.classes.size())
+						: rawName;
+					item.isHidden = true;
+					const size_t modelIndex = model.classes.size();
+					model.classes.push_back(std::move(item));
+					resolver.RegisterUserType(model.classes.back().name, model.classes.back().id);
+					classIndexById.insert_or_assign(model.classes.back().id, modelIndex);
+					if (preferredId != 0) {
+						classIndexById.insert_or_assign(preferredId, modelIndex);
+					}
+					if (!normalizedName.empty()) {
+						classIndexByName.insert_or_assign(normalizedName, modelIndex);
+					}
+					return modelIndex;
+				};
+
+				for (const auto& classSymbol : dependency.nativeClasses) {
+					addNativeOnlyClass(classSymbol.id, classSymbol.name, classSymbol.memoryAddress, classSymbol.baseClass);
+				}
+
+				size_t hiddenTempClassIndex = (std::numeric_limits<size_t>::max)();
+				const auto ensureNativeOnlyOwnerClass = [&](const NativeDependencyMethodSymbol& methodSymbol) -> size_t {
+					if (methodSymbol.ownerClassId != 0) {
+						if (const auto it = classIndexById.find(methodSymbol.ownerClassId); it != classIndexById.end()) {
+							return it->second;
+						}
+					}
+					const std::string ownerName = TypeResolver::NormalizeTypeName(methodSymbol.ownerClassName);
+					if (!ownerName.empty()) {
+						if (const auto it = classIndexByName.find(ownerName); it != classIndexByName.end()) {
+							if (methodSymbol.ownerClassId != 0) {
+								classIndexById.insert_or_assign(methodSymbol.ownerClassId, it->second);
+							}
+							return it->second;
+						}
+						return addNativeOnlyClass(methodSymbol.ownerClassId, methodSymbol.ownerClassName, 0, -1);
+					}
+					if (hiddenTempClassIndex == (std::numeric_limits<size_t>::max)()) {
+						hiddenTempClassIndex = addNativeOnlyClass(0, "__HIDDEN_TEMP_MOD__", 0, -1);
+					}
+					return hiddenTempClassIndex;
+				};
+
+				for (const auto& methodSymbol : dependency.nativeMethods) {
+					if (methodSymbol.id == 0 || methodSymbol.name.empty()) {
+						continue;
+					}
+					const size_t ownerIndex = ensureNativeOnlyOwnerClass(methodSymbol);
+					RestoreMethod method;
+					method.id = methodSymbol.id;
+					allocator.Observe(method.id);
+					method.memoryAddress = methodSymbol.memoryAddress;
+					method.ownerClass = model.classes[ownerIndex].id;
+					method.attr = (methodSymbol.attr != 0 ? methodSymbol.attr : 0x80) | 0x80;
+					method.returnType = methodSymbol.returnType;
+					method.name = methodSymbol.name;
+					const size_t paramCount = (std::max)(methodSymbol.params.size(), methodSymbol.paramIds.size());
+					for (size_t paramIndex = 0; paramIndex < paramCount; ++paramIndex) {
+						RestoreVariable param;
+						const NativeDependencyMethodParamSymbol* nativeParam =
+							paramIndex < methodSymbol.params.size() ? &methodSymbol.params[paramIndex] : nullptr;
+						const std::int32_t nativeParamId =
+							nativeParam != nullptr && nativeParam->id != 0
+								? nativeParam->id
+								: (paramIndex < methodSymbol.paramIds.size() ? methodSymbol.paramIds[paramIndex] : 0);
+						param.id = dependencyIds.AllocChild(allocator, epl_system_id::kTypeLocal, nativeParamId);
+						param.dataType = nativeParam != nullptr ? nativeParam->dataType : 0;
+						param.attr = nativeParam != nullptr ? nativeParam->attr : 0;
+						if (nativeParam != nullptr) {
+							param.arrayBounds = nativeParam->arrayBounds;
+						}
+						method.params.push_back(std::move(param));
+					}
+					model.classes[ownerIndex].functionIds.push_back(method.id);
+					model.methods.push_back(std::move(method));
+				}
+				for (const auto& constantSymbol : dependency.nativeConstants) {
+					if (constantSymbol.id == 0 || constantSymbol.name.empty()) {
+						continue;
+					}
+					RestoreConstant constant;
+					const std::int32_t idType = epl_system_id::GetType(constantSymbol.id);
+					if (idType == epl_system_id::kTypeImageResource) {
+						constant.pageType = kConstPageImage;
+					}
+					else if (idType == epl_system_id::kTypeSoundResource) {
+						constant.pageType = kConstPageSound;
+					}
+					constant.id = constantSymbol.id;
+					allocator.Observe(constant.id);
+					constant.attr = kConstAttrHidden;
+					constant.name = constantSymbol.name;
+					model.constants.push_back(std::move(constant));
+				}
+				return true;
+			}
 			if (outError != nullptr) {
 				*outError = "dependency_module_not_found: " + dependency.path;
 				if (!dependency.resolvedPath.empty()) {
@@ -7003,6 +7492,35 @@ bool BuildRestoreModel(
 		resolver.RegisterUserType(parsedStruct.name, model.structs.back().id);
 	}
 
+	for (size_t structIndex = 0; structIndex < parsedStructs.size(); ++structIndex) {
+		const auto& parsedStruct = parsedStructs[structIndex];
+		const BundleNativeStructSnapshot* reusableStructSnapshot =
+			structIndex < nativeStructSnapshotsByIndex.size() ? nativeStructSnapshotsByIndex[structIndex] : nullptr;
+		auto& memberIds = localStructMemberIds[structIndex];
+		memberIds.reserve(parsedStruct.members.size());
+		for (size_t memberIndex = 0; memberIndex < parsedStruct.members.size(); ++memberIndex) {
+			std::int32_t memberId = 0;
+			if (reusableStructSnapshot != nullptr &&
+				memberIndex < reusableStructSnapshot->memberIds.size() &&
+				reusableStructSnapshot->memberIds[memberIndex] != 0) {
+				memberId = reusableStructSnapshot->memberIds[memberIndex];
+			}
+			else {
+				memberId = allocator.Alloc(epl_system_id::kTypeStructMember);
+			}
+			memberIds.push_back(memberId);
+		}
+	}
+
+	for (size_t constantIndex = 0; constantIndex < parsedConstants.size(); ++constantIndex) {
+		const BundleNativeConstantSnapshot* reusableConstantSnapshot =
+			findReusableValueConstantSnapshot(parsedConstants[constantIndex]);
+		localConstantIds[constantIndex] =
+			reusableConstantSnapshot != nullptr && reusableConstantSnapshot->id != 0
+				? reusableConstantSnapshot->id
+				: allocator.Alloc(epl_system_id::kTypeConstant);
+	}
+
 	for (size_t classIndex = 0; classIndex < parsedClasses.size(); ++classIndex) {
 		const auto& parsedClass = parsedClasses[classIndex];
 		const BundleNativeSourceFileSnapshot* nativeSourceSnapshot =
@@ -7133,6 +7651,60 @@ bool BuildRestoreModel(
 					key,
 					NativeObjectVariableSymbol{ id, typeId });
 			};
+			const auto addNativeObjectMember = [&nativeObjectEncodeContext](
+				const std::int32_t ownerTypeId,
+				const std::string& name,
+				const std::int32_t id,
+				const std::int32_t typeId) {
+				const std::string key = TypeResolver::NormalizeTypeName(name);
+				if (ownerTypeId == 0 || key.empty() || id == 0) {
+					return;
+				}
+				nativeObjectEncodeContext
+					.membersByOwnerType[ownerTypeId]
+					.insert_or_assign(
+						key,
+						NativeObjectMemberSymbol{ id, ownerTypeId, typeId });
+			};
+			const auto addNativeConstant = [&nativeObjectEncodeContext](const std::string& name, const std::int32_t id) {
+				const std::string key = TypeResolver::NormalizeTypeName(name);
+				if (key.empty() || id == 0) {
+					return;
+				}
+				nativeObjectEncodeContext.constantsByName.insert_or_assign(key, NativeConstantSymbol{ -2, id });
+			};
+			for (const auto& item : model.structs) {
+				for (const auto& member : item.members) {
+					addNativeObjectMember(item.id, member.name, member.id, member.dataType);
+				}
+			}
+			for (size_t structIndex = 0; structIndex < parsedStructs.size() && structIndex < localStructModelIndices.size(); ++structIndex) {
+				const auto& parsedStruct = parsedStructs[structIndex];
+				const std::int32_t ownerTypeId = model.structs[localStructModelIndices[structIndex]].id;
+				for (size_t memberIndex = 0; memberIndex < parsedStruct.members.size(); ++memberIndex) {
+					const std::int32_t memberId =
+						structIndex < localStructMemberIds.size() &&
+						memberIndex < localStructMemberIds[structIndex].size()
+							? localStructMemberIds[structIndex][memberIndex]
+							: 0;
+					addNativeObjectMember(
+						ownerTypeId,
+						parsedStruct.members[memberIndex].name,
+						memberId,
+						ensureTypeId(parsedStruct.members[memberIndex].typeName));
+				}
+			}
+			for (const auto& item : model.classes) {
+				for (const auto& member : item.vars) {
+					addNativeObjectMember(item.id, member.name, member.id, member.dataType);
+				}
+			}
+			for (const auto& constant : model.constants) {
+				addNativeConstant(constant.name, constant.id);
+			}
+			for (size_t constantIndex = 0; constantIndex < parsedConstants.size() && constantIndex < localConstantIds.size(); ++constantIndex) {
+				addNativeConstant(parsedConstants[constantIndex].name, localConstantIds[constantIndex]);
+			}
 			for (size_t paramIndex = 0; paramIndex < parsedMethod.params.size() && paramIndex < method.params.size(); ++paramIndex) {
 				addNativeObjectVariable(parsedMethod.params[paramIndex].name, method.params[paramIndex].id, method.params[paramIndex].dataType);
 			}
@@ -7256,15 +7828,13 @@ bool BuildRestoreModel(
 
 	for (size_t structIndex = 0; structIndex < parsedStructs.size(); ++structIndex) {
 		const auto& parsedStruct = parsedStructs[structIndex];
-		const BundleNativeStructSnapshot* reusableStructSnapshot =
-			structIndex < nativeStructSnapshotsByIndex.size() ? nativeStructSnapshotsByIndex[structIndex] : nullptr;
 		for (size_t memberIndex = 0; memberIndex < parsedStruct.members.size(); ++memberIndex) {
 			RestoreVariable convertedMember =
 				convertVariable(parsedStruct.members[memberIndex], epl_system_id::kTypeStructMember, false, false);
-			if (reusableStructSnapshot != nullptr &&
-				memberIndex < reusableStructSnapshot->memberIds.size() &&
-				reusableStructSnapshot->memberIds[memberIndex] != 0) {
-				convertedMember.id = reusableStructSnapshot->memberIds[memberIndex];
+			if (structIndex < localStructMemberIds.size() &&
+				memberIndex < localStructMemberIds[structIndex].size() &&
+				localStructMemberIds[structIndex][memberIndex] != 0) {
+				convertedMember.id = localStructMemberIds[structIndex][memberIndex];
 			}
 			model.structs[localStructModelIndices[structIndex]].members.push_back(std::move(convertedMember));
 		}
@@ -7298,14 +7868,13 @@ bool BuildRestoreModel(
 		model.dlls.push_back(std::move(dll));
 	}
 
-	for (const auto& parsedConstant : parsedConstants) {
-		const BundleNativeConstantSnapshot* reusableConstantSnapshot =
-			findReusableValueConstantSnapshot(parsedConstant);
+	for (size_t constantIndex = 0; constantIndex < parsedConstants.size(); ++constantIndex) {
+		const auto& parsedConstant = parsedConstants[constantIndex];
 		RestoreConstant constant;
 		constant.id =
-			reusableConstantSnapshot != nullptr && reusableConstantSnapshot->id != 0
-			? reusableConstantSnapshot->id
-			: allocator.Alloc(epl_system_id::kTypeConstant);
+			constantIndex < localConstantIds.size() && localConstantIds[constantIndex] != 0
+				? localConstantIds[constantIndex]
+				: allocator.Alloc(epl_system_id::kTypeConstant);
 		constant.attr = parsedConstant.isPublic ? kConstAttrPublic : 0;
 		if (parsedConstant.isLongText) {
 			constant.attr |= kConstAttrLongText;

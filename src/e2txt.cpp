@@ -7550,6 +7550,21 @@ bool ExtractNativeDependencySymbols(
 		outRecords[recordIndex].methods.push_back(std::move(methodSymbol));
 	}
 
+	for (const auto& constant : sections.resources.constants) {
+		const size_t recordIndex = findRecordIndexById(constant.marker);
+		if (recordIndex >= outRecords.size()) {
+			continue;
+		}
+		const std::string name = TrimAsciiCopy(resolver.ResolveUserName(constant.marker));
+		if (name.empty()) {
+			continue;
+		}
+		NativeDependencyConstantSymbol constantSymbol;
+		constantSymbol.id = constant.marker;
+		constantSymbol.name = name;
+		outRecords[recordIndex].constants.push_back(std::move(constantSymbol));
+	}
+
 	for (const auto& removedItem : sections.losable.removedDefinedItems) {
 		const size_t recordIndex = findRecordIndexById(removedItem.id);
 		if (recordIndex >= outRecords.size()) {
@@ -7586,6 +7601,20 @@ bool ExtractNativeDependencySymbols(
 				methodSymbol.id = removedItem.id;
 				methodSymbol.name = name;
 				outRecords[recordIndex].methods.push_back(std::move(methodSymbol));
+			}
+		}
+		else if (idType == epl_system_id::kTypeConstant ||
+			idType == epl_system_id::kTypeImageResource ||
+			idType == epl_system_id::kTypeSoundResource) {
+			const bool exists = std::any_of(
+				outRecords[recordIndex].constants.begin(),
+				outRecords[recordIndex].constants.end(),
+				[&](const NativeDependencyConstantSymbol& item) { return item.id == removedItem.id; });
+			if (!exists) {
+				NativeDependencyConstantSymbol constantSymbol;
+				constantSymbol.id = removedItem.id;
+				constantSymbol.name = name;
+				outRecords[recordIndex].constants.push_back(std::move(constantSymbol));
 			}
 		}
 	}
