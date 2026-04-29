@@ -23,12 +23,16 @@
 
 #include <lib2.h>
 
+#include "..\thirdparty\json.hpp"
+
 #include "EFolderCodec.h"
 #include "PathHelper.h"
 
 namespace e2txt {
 
 namespace {
+
+using json = nlohmann::json;
 
 constexpr std::uint32_t kMagicFileHeader1 = 1415007811u;
 constexpr std::uint32_t kMagicFileHeader2 = 1196576837u;
@@ -545,6 +549,79 @@ std::string ConvertCodePage(
 std::string Utf8ToLocalText(const std::string& text)
 {
 	return ConvertCodePage(text, CP_UTF8, CP_ACP, MB_ERR_INVALID_CHARS);
+}
+
+std::string NormalizeUtf8OrLocalTextToLocal(const std::string& text)
+{
+	return Utf8ToLocalText(text);
+}
+
+struct DependencyModulePathSelection {
+	std::string pathText;
+	bool pathIsUtf8 = false;
+};
+
+bool TryReadDependencyWorkspaceSourcePath(
+	const std::string& localWorkspace,
+	std::string& outSourcePath)
+{
+	outSourcePath.clear();
+	if (localWorkspace.empty()) {
+		return false;
+	}
+
+	const std::filesystem::path workspacePath = Utf8PathToPath(localWorkspace);
+	const std::array<std::filesystem::path, 2> candidates = {
+		workspacePath / "project" / ".module.json",
+		workspacePath / ".module.json",
+	};
+	for (const auto& candidate : candidates) {
+		std::error_code ec;
+		if (!std::filesystem::exists(candidate, ec) || ec) {
+			continue;
+		}
+
+		std::vector<std::uint8_t> bytes;
+		if (!ReadFileBytes(PathToUtf8(candidate), bytes)) {
+			continue;
+		}
+
+		try {
+			std::string utf8Text(bytes.begin(), bytes.end());
+			utf8Text = RemoveUtf8Bom(std::move(utf8Text));
+			const json moduleJson = json::parse(utf8Text);
+			std::string sourcePath = moduleJson.value("sourcePath", std::string());
+			if (sourcePath.empty()) {
+				continue;
+			}
+
+			std::filesystem::path resolvedPath = Utf8PathToPath(sourcePath);
+			if (resolvedPath.is_relative()) {
+				resolvedPath = (workspacePath / resolvedPath).lexically_normal();
+				sourcePath = PathToUtf8(resolvedPath);
+			}
+			outSourcePath = sourcePath;
+			return true;
+		}
+		catch (...) {
+		}
+	}
+
+	return false;
+}
+
+DependencyModulePathSelection SelectPersistedDependencyModulePath(const RestoreDependencyInfo& dependency)
+{
+	if (!dependency.resolvedPath.empty()) {
+		return DependencyModulePathSelection{ dependency.resolvedPath, true };
+	}
+
+	std::string workspaceSourcePath;
+	if (TryReadDependencyWorkspaceSourcePath(dependency.localWorkspace, workspaceSourcePath)) {
+		return DependencyModulePathSelection{ std::move(workspaceSourcePath), true };
+	}
+
+	return DependencyModulePathSelection{ dependency.path, false };
 }
 
 std::string ExtractSupportLibraryTextName(
@@ -2169,6 +2246,10 @@ private:
 		};
 
 		// 核心支持库的基础命令在 x64 进程无法加载 x86 krnln.fne 时仍需要可回包。
+		addCoreCommand("到循环尾", 11);
+		addCoreCommand("跳出循环", 12);
+		addCoreCommand("返回", 13);
+		addCoreCommand("结束", 14);
 		addCoreCommand("取运行目录", 65);
 		addCoreConstant("引号", 0);
 		addCoreConstant("左引号", 1);
@@ -4409,6 +4490,72 @@ bool TryResolveNativeFunction(
 	return false;
 }
 
+bool IsSemanticOnlyCoreSupportCommandName(const std::string& rawName)
+{
+	const std::string normalized = TypeResolver::NormalizeTypeName(rawName);
+	return normalized == TypeResolver::NormalizeTypeName("到循环尾") ||
+		normalized == TypeResolver::NormalizeTypeName("跳出循环") ||
+		normalized == TypeResolver::NormalizeTypeName("返回") ||
+		normalized == TypeResolver::NormalizeTypeName("结束");
+}
+
+bool IsSemanticOnlyCoreSupportCommandLine(
+	const BodyStatement& statement,
+	const NativeObjectMethodEncodeContext& context,
+	std::string* outCommandName = nullptr)
+{
+	if (outCommandName != nullptr) {
+		outCommandName->clear();
+	}
+	if (statement.kind != BodyStatementKind::Raw) {
+		return false;
+	}
+
+	auto matchCommandName = [&](const std::string& rawName) -> bool {
+		if (!IsSemanticOnlyCoreSupportCommandName(rawName)) {
+			return false;
+		}
+
+		if (context.typeResolver != nullptr) {
+			SupportLibraryCommandInfo commandInfo;
+			if (context.typeResolver->TryResolveSupportCommand(rawName, commandInfo) &&
+				commandInfo.libraryId == 0) {
+				if (outCommandName != nullptr) {
+					*outCommandName = TypeResolver::NormalizeTypeName(rawName);
+				}
+				return true;
+			}
+		}
+
+		if (outCommandName != nullptr) {
+			*outCommandName = TypeResolver::NormalizeTypeName(rawName);
+		}
+		return true;
+	};
+
+	ParsedNativeFunctionCallExpression call;
+	if (ParseNativeFunctionCallExpression(statement.code, call) &&
+		call.name.find('.') == std::string::npos &&
+		matchCommandName(call.name)) {
+		return true;
+	}
+
+	const std::string trimmedCode = TrimAsciiCopy(statement.code);
+	static const std::array<const char*, 4> kSemanticOnlyCoreCommands = {
+		"到循环尾",
+		"跳出循环",
+		"返回",
+		"结束",
+	};
+	for (const char* commandName : kSemanticOnlyCoreCommands) {
+		if (MatchesBodyTokenBoundary(trimmedCode, commandName) &&
+			matchCommandName(commandName)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool TryResolveNativeOwnerMethod(
 	const std::int32_t ownerType,
 	const std::string& rawName,
@@ -5623,6 +5770,21 @@ bool TryBuildMethodCodeDataWithNativeObjectCallReuse(
 				switch (statement.kind) {
 				case BodyStatementKind::Raw:
 					if (!tryWriteReusableLine(ReusableObjectMethodLineKind::Raw, statement.mask, statement.code, &statement)) {
+						std::string semanticOnlyCommandName;
+						if (encodeContext != nullptr &&
+							IsSemanticOnlyCoreSupportCommandLine(statement, *encodeContext, &semanticOnlyCommandName)) {
+							EncodedNativeExpression encodedExpression;
+							if (!TryEncodeNativeRawStatementLine(statement, *encodeContext, encodedExpression)) {
+								unsupportedChangedObjectCall = true;
+								return;
+							}
+							writer.WriteNativeExpressionStatement(
+								encodedExpression.data,
+								encodedExpression.methodReferences,
+								encodedExpression.variableReferences,
+								encodedExpression.constantReferences);
+							break;
+						}
 						writer.WriteRawStatement(statement.mask, statement.code);
 					}
 					break;
@@ -5820,11 +5982,20 @@ bool TryBuildMethodCodeDataWithRawStatementReuse(
 				encodedExpression.constantReferences);
 			return;
 		}
-		if (LooksLikeReusableObjectMethodLine(statement.code)) {
+		std::string semanticOnlyCommandName;
+		if (LooksLikeReusableObjectMethodLine(statement.code) ||
+			IsSemanticOnlyCoreSupportCommandLine(statement, encodeContext, &semanticOnlyCommandName)) {
 			ok = false;
-			semanticError = encodeError.empty()
-				? "native_object_method_encode_failed: " + statement.code
-				: encodeError;
+			if (!semanticOnlyCommandName.empty()) {
+				semanticError = encodeError.empty()
+					? "core_support_command_encode_failed: " + semanticOnlyCommandName + " => " + statement.code
+					: encodeError;
+			}
+			else {
+				semanticError = encodeError.empty()
+					? "native_object_method_encode_failed: " + statement.code
+					: encodeError;
+			}
 			return;
 		}
 		writer.WriteRawStatement(statement.mask, statement.code);
@@ -5883,11 +6054,20 @@ bool BuildMethodCodeDataWithSemanticNativeObjectCalls(
 				encodedExpression.constantReferences);
 			return;
 		}
-		if (LooksLikeReusableObjectMethodLine(statement.code)) {
+		std::string semanticOnlyCommandName;
+		if (LooksLikeReusableObjectMethodLine(statement.code) ||
+			IsSemanticOnlyCoreSupportCommandLine(statement, encodeContext, &semanticOnlyCommandName)) {
 			ok = false;
-			semanticError = encodeError.empty()
-				? "native_object_method_encode_failed: " + statement.code
-				: encodeError;
+			if (!semanticOnlyCommandName.empty()) {
+				semanticError = encodeError.empty()
+					? "core_support_command_encode_failed: " + semanticOnlyCommandName + " => " + statement.code
+					: encodeError;
+			}
+			else {
+				semanticError = encodeError.empty()
+					? "native_object_method_encode_failed: " + statement.code
+					: encodeError;
+			}
 			return;
 		}
 		writer.WriteRawStatement(statement.mask, statement.code);
@@ -9285,14 +9465,7 @@ bool BuildRestoreModel(
 			else if (identityNativeMethodSnapshot != nullptr) {
 				std::string semanticError;
 				std::string rawReuseError;
-				const bool rebuiltWithNativeReuse =
-					originalParsedMethod != nullptr &&
-					TryBuildMethodCodeDataWithNativeObjectCallReuse(
-						parsedMethod.bodyLines,
-						originalParsedMethod->bodyLines,
-						*identityNativeMethodSnapshot,
-						method,
-						&nativeObjectEncodeContext);
+				const bool rebuiltWithNativeReuse = false;
 				const bool rebuiltWithRawStatementReuse = false;
 				const bool rebuiltWithSemantic =
 					!rebuiltWithNativeReuse &&
@@ -10219,11 +10392,11 @@ std::vector<std::string> BuildSupportLibraryInfoText(const std::vector<RestoreDe
 		}
 		auto [major, minor] = ParseVersionPair(dependency.versionText);
 		values.push_back(
-			dependency.fileName + "\r" +
-			dependency.guid + "\r" +
+			NormalizeUtf8OrLocalTextToLocal(dependency.fileName) + "\r" +
+			NormalizeUtf8OrLocalTextToLocal(dependency.guid) + "\r" +
 			std::to_string(major) + "\r" +
 			std::to_string(minor) + "\r" +
-			dependency.name);
+			NormalizeUtf8OrLocalTextToLocal(dependency.name));
 	}
 	return values;
 }
@@ -10525,13 +10698,12 @@ std::vector<std::uint8_t> BuildEcDependenciesSection(const RestoreDocumentModel&
 
 		std::int64_t fileTime = 0;
 		std::int32_t fileSize = 0;
-		const std::string persistedModulePath =
-			!dependency->resolvedPath.empty() ? dependency->resolvedPath : dependency->path;
-		const std::string statsPath = persistedModulePath;
+		const DependencyModulePathSelection persistedModulePath = SelectPersistedDependencyModulePath(*dependency);
+		const std::string statsPath = persistedModulePath.pathText;
 		if (!statsPath.empty()) {
 			std::error_code ec;
 			const std::filesystem::path path =
-				!dependency->resolvedPath.empty()
+				persistedModulePath.pathIsUtf8
 					? Utf8PathToPath(statsPath)
 					: std::filesystem::path(statsPath);
 			if (std::filesystem::exists(path, ec)) {
@@ -10550,8 +10722,10 @@ std::vector<std::uint8_t> BuildEcDependenciesSection(const RestoreDocumentModel&
 		writer.WriteI32(fileSize);
 		writer.WriteI64(fileTime);
 		writer.WriteI32(dependency->reExport ? 1 : 0);
-		writer.WriteDynamicText(dependency->name);
-		writer.WriteDynamicText(Utf8ToLocalText(persistedModulePath));
+		writer.WriteDynamicText(NormalizeUtf8OrLocalTextToLocal(dependency->name));
+		writer.WriteDynamicText(persistedModulePath.pathIsUtf8
+			? Utf8ToLocalText(persistedModulePath.pathText)
+			: NormalizeUtf8OrLocalTextToLocal(persistedModulePath.pathText));
 		std::vector<std::int32_t> starts;
 		std::vector<std::int32_t> counts;
 		starts.reserve(dependency->definedIds.size());
@@ -10569,6 +10743,297 @@ std::vector<std::uint8_t> BuildEcDependenciesSection(const RestoreDocumentModel&
 	return writer.TakeBytes();
 }
 
+std::vector<std::uint8_t> BuildInitEcSection()
+{
+	// 存在易模块依赖时，原生工程通常会携带一个极小的初始模块段。
+	// 即使易模块记录段发生重建，也不能把该段直接省掉，否则 IDE/编译期
+	// 可能出现模块关联异常。
+	return std::vector<std::uint8_t>(6, 0);
+}
+
+std::vector<std::uint8_t> BuildMinimalEditorInfoSection(
+	const RestoreDocumentModel& model,
+	const ProjectBundle* currentBundle)
+{
+	struct EditorClassTab {
+		std::int32_t classId = 0;
+		std::int16_t elemId = 0;
+		std::int32_t offset = 0;
+		std::uint8_t column = 0;
+		std::int32_t selectionStart = 0;
+		std::int32_t selectionCurrent = 0;
+	};
+
+	struct EditorPureTableTab {
+		std::uint8_t typeId = 0;
+		std::int32_t offset = 0;
+		std::uint8_t column = 0;
+		std::int32_t selectionStart = 0;
+		std::int32_t selectionCurrent = 0;
+	};
+
+	std::vector<std::vector<std::uint8_t>> tabs;
+	std::unordered_set<std::int32_t> usedClassIds;
+
+	const auto addClassTab = [&](const RestoreClass& item) {
+		EditorClassTab tab;
+		tab.classId = item.id;
+		tab.elemId = item.functionIds.empty() ? static_cast<std::int16_t>(-1) : 0;
+		ByteWriter tabWriter;
+		tabWriter.WriteU8(1);
+		tabWriter.WriteI32(tab.classId);
+		tabWriter.WriteI16(tab.elemId);
+		tabWriter.WriteI32(tab.offset | static_cast<std::int32_t>(0x80000000u));
+		tabWriter.WriteU8(tab.column);
+		tabWriter.WriteI32(tab.selectionStart);
+		tabWriter.WriteI32(tab.selectionCurrent);
+		tabs.push_back(tabWriter.TakeBytes());
+		usedClassIds.insert(item.id);
+	};
+
+	const auto addPureTableTab = [&](const std::uint8_t typeId, const bool enabled) {
+		if (!enabled) {
+			return;
+		}
+		ByteWriter tabWriter;
+		tabWriter.WriteU8(typeId);
+		tabWriter.WriteI32(static_cast<std::int32_t>(0x80000000u));
+		tabWriter.WriteU8(0);
+		tabWriter.WriteI32(0);
+		tabWriter.WriteI32(0);
+		tabs.push_back(tabWriter.TakeBytes());
+	};
+
+	if (currentBundle != nullptr && !currentBundle->sourceFiles.empty()) {
+		for (const auto& sourceFile : currentBundle->sourceFiles) {
+			const std::string normalizedSourceName = TypeResolver::NormalizeTypeName(sourceFile.logicalName);
+			if (normalizedSourceName.empty()) {
+				continue;
+			}
+			for (const auto& item : model.classes) {
+				if (usedClassIds.contains(item.id) ||
+					TypeResolver::NormalizeTypeName(item.name) != normalizedSourceName) {
+					continue;
+				}
+				addClassTab(item);
+				break;
+			}
+		}
+	}
+
+	if (tabs.empty()) {
+		for (const auto& item : model.classes) {
+			if (item.id == 0 || usedClassIds.contains(item.id)) {
+				continue;
+			}
+			addClassTab(item);
+			break;
+		}
+	}
+
+	addPureTableTab(2, !model.structs.empty());
+	addPureTableTab(3, !model.globals.empty());
+	addPureTableTab(4, !model.dlls.empty());
+	addPureTableTab(6, !model.constants.empty());
+
+	ByteWriter writer;
+	if (tabs.empty()) {
+		writer.WriteI32(-1);
+		return writer.TakeBytes();
+	}
+
+	writer.WriteI32(static_cast<std::int32_t>(tabs.size() - 1));
+	for (const auto& tab : tabs) {
+		writer.WriteDynamicBytes(tab);
+	}
+	return writer.TakeBytes();
+}
+
+const RestoreDependencyInfo* FindOwningDependencyForTopLevelId(
+	const std::vector<RestoreDependencyInfo>& dependencies,
+	const std::int32_t itemId)
+{
+	const auto normalizeRangeType = [](const std::int32_t typeMask) {
+		if (typeMask == epl_system_id::kTypeClass ||
+			typeMask == epl_system_id::kTypeStaticClass ||
+			typeMask == epl_system_id::kTypeFormClass) {
+			return epl_system_id::kTypeClass;
+		}
+		return typeMask;
+	};
+
+	const std::int32_t itemType = normalizeRangeType(epl_system_id::GetType(itemId));
+	const std::int32_t itemNum = itemId & epl_system_id::kMaskNum;
+	for (const auto& dependency : dependencies) {
+		if (dependency.isSupportLibrary) {
+			continue;
+		}
+		for (const auto& range : dependency.definedIds) {
+			if (range.count <= 0 ||
+				normalizeRangeType(epl_system_id::GetType(range.start)) != itemType) {
+				continue;
+			}
+			const std::int32_t startNum = range.start & epl_system_id::kMaskNum;
+			const std::int32_t endNum = startNum + range.count - 1;
+			if (itemNum >= startNum && itemNum <= endNum) {
+				return &dependency;
+			}
+		}
+	}
+	return nullptr;
+}
+
+std::vector<RestoreClass> ReorderClassesForEmit(
+	std::vector<RestoreClass> items,
+	const std::vector<RestoreDependencyInfo>& dependencies,
+	const ProjectBundle* currentBundle)
+{
+	(void)dependencies;
+	std::vector<RestoreClass> ordered;
+	ordered.reserve(items.size());
+	std::vector<bool> used(items.size(), false);
+	std::unordered_set<std::int32_t> localClassIds;
+	std::vector<std::pair<std::int32_t, std::string>> localClassTargets;
+
+	const auto appendIndex = [&](const size_t index) {
+		if (index >= items.size() || used[index]) {
+			return;
+		}
+		used[index] = true;
+		ordered.push_back(std::move(items[index]));
+	};
+
+	const auto isLocalClass = [&](const RestoreClass& item) {
+		if (item.name == "__HIDDEN_TEMP_MOD__") {
+			return false;
+		}
+		return localClassIds.contains(item.id);
+	};
+
+	if (currentBundle != nullptr) {
+		for (size_t index = 0; index < currentBundle->sourceFiles.size(); ++index) {
+			const auto& sourceFile = currentBundle->sourceFiles[index];
+			const std::int32_t classId =
+				index < currentBundle->nativeSourceSnapshots.size()
+					? currentBundle->nativeSourceSnapshots[index].classId
+					: 0;
+			if (classId != 0) {
+				localClassIds.insert(classId);
+			}
+			localClassTargets.emplace_back(classId, TypeResolver::NormalizeTypeName(sourceFile.logicalName));
+		}
+	}
+
+	for (const auto& [targetId, normalizedName] : localClassTargets) {
+		for (size_t index = 0; index < items.size(); ++index) {
+			if (used[index]) {
+				continue;
+			}
+			if (targetId != 0) {
+				if (items[index].id == targetId) {
+					appendIndex(index);
+					break;
+				}
+				continue;
+			}
+			if (normalizedName.empty()) {
+				continue;
+			}
+			if (TypeResolver::NormalizeTypeName(items[index].name) == normalizedName) {
+				appendIndex(index);
+				break;
+			}
+		}
+	}
+
+	for (size_t index = 0; index < items.size(); ++index) {
+		if (!used[index] && isLocalClass(items[index])) {
+			appendIndex(index);
+		}
+	}
+
+	for (size_t index = 0; index < items.size();) {
+		if (used[index] || isLocalClass(items[index])) {
+			++index;
+			continue;
+		}
+
+		const bool startsWithHiddenTemp = items[index].name == "__HIDDEN_TEMP_MOD__";
+		const size_t hiddenTempIndex = startsWithHiddenTemp ? index : static_cast<size_t>(-1);
+		if (startsWithHiddenTemp) {
+			++index;
+		}
+
+		std::vector<size_t> dependencyClassIndices;
+		while (index < items.size() &&
+			!used[index] &&
+			!isLocalClass(items[index]) &&
+			items[index].name != "__HIDDEN_TEMP_MOD__") {
+			dependencyClassIndices.push_back(index);
+			++index;
+		}
+
+		for (const auto classIndex : dependencyClassIndices) {
+			appendIndex(classIndex);
+		}
+		if (hiddenTempIndex != static_cast<size_t>(-1)) {
+			appendIndex(hiddenTempIndex);
+		}
+		if (dependencyClassIndices.empty() && hiddenTempIndex == static_cast<size_t>(-1)) {
+			++index;
+		}
+	}
+
+	for (size_t index = 0; index < items.size(); ++index) {
+		if (!used[index]) {
+			appendIndex(index);
+		}
+	}
+
+	return ordered;
+}
+
+template <typename TItem>
+std::vector<TItem> ReorderTopLevelItemsLocalFirst(
+	std::vector<TItem> items,
+	const std::vector<RestoreDependencyInfo>& dependencies)
+{
+	std::vector<TItem> ordered;
+	ordered.reserve(items.size());
+	std::vector<bool> used(items.size(), false);
+
+	const auto appendIndex = [&](const size_t index) {
+		if (index >= items.size() || used[index]) {
+			return;
+		}
+		used[index] = true;
+		ordered.push_back(std::move(items[index]));
+	};
+
+	for (size_t index = 0; index < items.size(); ++index) {
+		if (FindOwningDependencyForTopLevelId(dependencies, items[index].id) == nullptr) {
+			appendIndex(index);
+		}
+	}
+
+	for (const auto& dependency : dependencies) {
+		if (dependency.isSupportLibrary) {
+			continue;
+		}
+		for (size_t index = 0; index < items.size(); ++index) {
+			if (FindOwningDependencyForTopLevelId(dependencies, items[index].id) == &dependency) {
+				appendIndex(index);
+			}
+		}
+	}
+
+	for (size_t index = 0; index < items.size(); ++index) {
+		appendIndex(index);
+	}
+
+	return ordered;
+}
+
 bool SerializeToModuleBytes(
 	const RestoreDocumentModel& model,
 	std::vector<std::uint8_t>& outBytes,
@@ -10582,45 +11047,10 @@ bool SerializeToModuleBytes(
 	}
 
 	RestoreDocumentModel emitModel = model;
-	std::sort(
-		emitModel.classes.begin(),
-		emitModel.classes.end(),
-		[](const RestoreClass& left, const RestoreClass& right) {
-			return left.id < right.id;
-		});
-	std::sort(
-		emitModel.methods.begin(),
-		emitModel.methods.end(),
-		[](const RestoreMethod& left, const RestoreMethod& right) {
-			return left.id < right.id;
-		});
-	std::sort(
-		emitModel.globals.begin(),
-		emitModel.globals.end(),
-		[](const RestoreVariable& left, const RestoreVariable& right) {
-			return left.id < right.id;
-		});
-	std::sort(
-		emitModel.structs.begin(),
-		emitModel.structs.end(),
-		[](const RestoreStruct& left, const RestoreStruct& right) {
-			return left.id < right.id;
-		});
-	std::sort(
-		emitModel.dlls.begin(),
-		emitModel.dlls.end(),
-		[](const RestoreDll& left, const RestoreDll& right) {
-			return left.id < right.id;
-		});
-	std::sort(
-		emitModel.constants.begin(),
-		emitModel.constants.end(),
-		[](const RestoreConstant& left, const RestoreConstant& right) {
-			return left.id < right.id;
-		});
-	for (auto& item : emitModel.classes) {
-		std::sort(item.functionIds.begin(), item.functionIds.end());
-	}
+	emitModel.classes = ReorderClassesForEmit(std::move(emitModel.classes), emitModel.dependencies, currentBundle);
+	emitModel.globals = ReorderTopLevelItemsLocalFirst(std::move(emitModel.globals), emitModel.dependencies);
+	emitModel.structs = ReorderTopLevelItemsLocalFirst(std::move(emitModel.structs), emitModel.dependencies);
+	emitModel.dlls = ReorderTopLevelItemsLocalFirst(std::move(emitModel.dlls), emitModel.dependencies);
 
 	std::string resourceError;
 	const std::vector<std::uint8_t> resourceBytes = BuildResourceSection(emitModel, &resourceError);
@@ -10642,11 +11072,15 @@ bool SerializeToModuleBytes(
 		originalSections != nullptr ? FindNativeSectionSnapshot(*originalSections, kSectionEventIndices) : nullptr;
 	const std::vector<std::uint8_t> eventIndicesBytes =
 		BuildEventIndicesSection(emitModel, currentBundle, originalEventIndicesSection);
+	const auto* originalEditorInfoSection =
+		originalSections != nullptr ? FindNativeSectionSnapshot(*originalSections, kSectionEditorInfo) : nullptr;
+	const std::vector<std::uint8_t> editorInfoBytes = BuildMinimalEditorInfoSection(emitModel, currentBundle);
 	const auto* originalEPackageInfoSection =
 		originalSections != nullptr ? FindNativeSectionSnapshot(*originalSections, kSectionEPackageInfo) : nullptr;
 	const std::vector<std::uint8_t> epackageInfoBytes =
 		BuildEPackageInfoSection(emitModel, originalBundle, originalEPackageInfoSection);
 	const std::vector<std::uint8_t> ecomBytes = BuildEcDependenciesSection(emitModel);
+	const std::vector<std::uint8_t> initEcBytes = BuildInitEcSection();
 	const std::vector<std::uint8_t> publicityBytes = BuildClassPublicitySection(emitModel);
 	const std::vector<std::uint8_t> folderBytes = BuildFolderSection(emitModel);
 	const std::vector<std::uint8_t> losableBytes = BuildLosableSection();
@@ -10659,6 +11093,8 @@ bool SerializeToModuleBytes(
 		originalSections != nullptr ? FindNativeSectionSnapshot(*originalSections, kSectionResource) : nullptr;
 	const auto* originalCodeSection =
 		originalSections != nullptr ? FindNativeSectionSnapshot(*originalSections, kSectionCode) : nullptr;
+	const auto* originalInitEcSection =
+		originalSections != nullptr ? FindNativeSectionSnapshot(*originalSections, kSectionInitEc) : nullptr;
 	const auto* originalEComSection =
 		originalSections != nullptr ? FindNativeSectionSnapshot(*originalSections, kSectionEcDependencies) : nullptr;
 	const auto* originalClassPublicitySection =
@@ -10734,6 +11170,17 @@ bool SerializeToModuleBytes(
 
 	addBuiltSection(kSectionCode, "程序段", 0, originalCodeSection, codeBytes);
 
+	if (originalInitEcSection != nullptr) {
+		addRawSection(*originalInitEcSection);
+	}
+	else if (!ecomBytes.empty()) {
+		addBuiltSection(kSectionInitEc, "初始模块段", 0, nullptr, initEcBytes);
+	}
+
+	if (!editorInfoBytes.empty()) {
+		addBuiltSection(kSectionEditorInfo, "编辑信息段2", 1, originalEditorInfoSection, editorInfoBytes);
+	}
+
 	if (reuseResourceSection && originalEventIndicesSection != nullptr) {
 		addRawSection(*originalEventIndicesSection);
 	}
@@ -10775,11 +11222,7 @@ bool SerializeToModuleBytes(
 			if (snapshot.key == kSectionEndOfFile || sectionsToEmit.contains(snapshot.key)) {
 				continue;
 			}
-			if (snapshot.key == kSectionInitEc && !reuseEComSection) {
-				continue;
-			}
 			if (snapshot.key == kSectionInitEc ||
-				snapshot.key == kSectionEditorInfo ||
 				snapshot.key == kSectionProjectConfigEx ||
 				snapshot.key == kSectionConditionalCompilation ||
 				!IsStandardSerializedSectionKey(snapshot.key)) {
