@@ -52,6 +52,12 @@ struct NativeDependencyMethodSymbol {
 	std::string name;
 	std::vector<std::int32_t> paramIds;
 	std::vector<NativeDependencyMethodParamSymbol> params;
+	std::vector<std::uint8_t> lineOffset;
+	std::vector<std::uint8_t> blockOffset;
+	std::vector<std::uint8_t> methodReference;
+	std::vector<std::uint8_t> variableReference;
+	std::vector<std::uint8_t> constantReference;
+	std::vector<std::uint8_t> expressionData;
 };
 
 // 原生工程里易模块导入的公开常量符号。

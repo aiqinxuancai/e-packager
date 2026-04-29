@@ -565,7 +565,7 @@ bool ReadModuleBytesWithReadOptions(
 	std::vector<std::uint8_t> inputBytes;
 	if (!ReadFileBytes(modulePath, inputBytes)) {
 		if (outError != nullptr) {
-			*outError = "read_module_file_failed";
+			*outError = "read_module_file_failed: " + modulePath;
 		}
 		return false;
 	}
@@ -2372,7 +2372,7 @@ bool ParseModuleSections(const std::string& modulePath, ModuleSections& outSecti
 	std::vector<std::uint8_t> bytes;
 	if (!ReadFileBytes(modulePath, bytes)) {
 		if (outError != nullptr) {
-			*outError = "read_module_file_failed";
+			*outError = "read_module_file_failed: " + modulePath;
 		}
 		return false;
 	}
@@ -4929,7 +4929,18 @@ bool ReadExpectedMarker(ByteReader& reader, std::uint8_t expected, const char* e
 	std::uint8_t marker = 0;
 	if (!reader.ReadU8(marker) || marker != expected) {
 		if (outError != nullptr) {
-			*outError = errorCode;
+			std::ostringstream stream;
+			stream << errorCode << "@0x" << std::hex << std::uppercase
+				<< (reader.position() == 0 ? 0 : reader.position() - 1)
+				<< ":expected=0x" << static_cast<int>(expected)
+				<< ",actual=";
+			if (reader.position() == 0 && marker == 0) {
+				stream << "eof";
+			}
+			else {
+				stream << "0x" << static_cast<int>(marker);
+			}
+			*outError = stream.str();
 		}
 		return false;
 	}
@@ -5410,6 +5421,20 @@ bool TryRenderFunctionBody(const FunctionInfo& functionInfo, SymbolResolver& res
 	if (!ParseStatementBlock(reader, block, &parseError) || block == nullptr) {
 		if (outError != nullptr) {
 			*outError = parseError.empty() ? "function_body_parse_failed" : parseError;
+		}
+		return false;
+	}
+	if (reader.position() != functionInfo.expressionData.size()) {
+		if (outError != nullptr) {
+			std::ostringstream stream;
+			stream << "function_body_trailing_bytes@0x" << std::hex << std::uppercase
+				<< reader.position();
+			if (reader.position() < functionInfo.expressionData.size()) {
+				stream << ":next=0x"
+					<< std::setw(2) << std::setfill('0')
+					<< static_cast<int>(functionInfo.expressionData[reader.position()]);
+			}
+			*outError = stream.str();
 		}
 		return false;
 	}
@@ -7547,6 +7572,12 @@ bool ExtractNativeDependencySymbols(
 			paramSymbol.arrayBounds = param.arrayBounds;
 			methodSymbol.params.push_back(std::move(paramSymbol));
 		}
+		methodSymbol.lineOffset = function.lineOffset;
+		methodSymbol.blockOffset = function.blockOffset;
+		methodSymbol.methodReference = function.methodReference;
+		methodSymbol.variableReference = function.variableReference;
+		methodSymbol.constantReference = function.constantReference;
+		methodSymbol.expressionData = function.expressionData;
 		outRecords[recordIndex].methods.push_back(std::move(methodSymbol));
 	}
 
