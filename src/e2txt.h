@@ -173,7 +173,9 @@ struct BundleNativeMethodSnapshot {
 	std::int32_t memoryAddress = 0;
 	std::int32_t attr = 0;
 	std::vector<std::int32_t> paramIds;
+	std::vector<std::int32_t> paramTypes;
 	std::vector<std::int32_t> localIds;
+	std::vector<std::int32_t> localTypes;
 	std::vector<std::uint8_t> lineOffset;
 	std::vector<std::uint8_t> blockOffset;
 	std::vector<std::uint8_t> methodReference;
@@ -191,6 +193,7 @@ struct BundleNativeSourceFileSnapshot {
 	std::int32_t formId = 0;
 	std::int32_t baseClass = 0;
 	std::vector<std::int32_t> classVarIds;
+	std::vector<std::int32_t> classVarTypes;
 	std::vector<BundleNativeMethodSnapshot> methods;
 };
 
@@ -199,6 +202,7 @@ struct BundleNativeGlobalSnapshot {
 	std::string name;
 	std::string textDigest;
 	std::int32_t id = 0;
+	std::int32_t dataType = 0;
 };
 
 // 原生 DLL 命令快照。
@@ -207,7 +211,9 @@ struct BundleNativeDllSnapshot {
 	std::string textDigest;
 	std::int32_t id = 0;
 	std::int32_t memoryAddress = 0;
+	std::int32_t returnType = 0;
 	std::vector<std::int32_t> paramIds;
+	std::vector<std::int32_t> paramTypes;
 };
 
 // 原生自定义数据类型快照。
@@ -217,6 +223,7 @@ struct BundleNativeStructSnapshot {
 	std::int32_t id = 0;
 	std::int32_t memoryAddress = 0;
 	std::vector<std::int32_t> memberIds;
+	std::vector<std::int32_t> memberTypes;
 };
 
 // 原生常量快照。
@@ -304,6 +311,12 @@ bool ExtractNativeDependencySymbols(
 // 校验单个原生方法体字节码是否可被读侧解析器完整解析。
 bool ValidateNativeMethodBodyBytes(
 	const std::vector<std::uint8_t>& expressionData,
+	std::string* outError);
+// 计算原生方法体中一条语句调用自身的自然结束偏移，不包含其后的块标记。
+bool TryMeasureNativeStatementEndOffset(
+	const std::vector<std::uint8_t>& expressionData,
+	size_t beginOffset,
+	size_t& outEndOffset,
 	std::string* outError);
 
 // e2txt 文档对象。

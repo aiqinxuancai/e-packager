@@ -388,7 +388,9 @@ json NativeMethodSnapshotToJson(const BundleNativeMethodSnapshot& snapshot)
 		{ "memoryAddress", snapshot.memoryAddress },
 		{ "attr", snapshot.attr },
 		{ "paramIds", snapshot.paramIds },
+		{ "paramTypes", snapshot.paramTypes },
 		{ "localIds", snapshot.localIds },
+		{ "localTypes", snapshot.localTypes },
 		{ "lineOffset", EncodeBase64(snapshot.lineOffset) },
 		{ "blockOffset", EncodeBase64(snapshot.blockOffset) },
 		{ "methodReference", EncodeBase64(snapshot.methodReference) },
@@ -425,6 +427,7 @@ json NativeGlobalSnapshotToJson(const BundleNativeGlobalSnapshot& snapshot)
 		{ "name", LocalToUtf8Text(snapshot.name) },
 		{ "textDigest", snapshot.textDigest },
 		{ "id", snapshot.id },
+		{ "dataType", snapshot.dataType },
 	};
 }
 
@@ -435,7 +438,9 @@ json NativeDllSnapshotToJson(const BundleNativeDllSnapshot& snapshot)
 		{ "textDigest", snapshot.textDigest },
 		{ "id", snapshot.id },
 		{ "memoryAddress", snapshot.memoryAddress },
+		{ "returnType", snapshot.returnType },
 		{ "paramIds", snapshot.paramIds },
+		{ "paramTypes", snapshot.paramTypes },
 	};
 }
 
@@ -447,6 +452,7 @@ json NativeStructSnapshotToJson(const BundleNativeStructSnapshot& snapshot)
 		{ "id", snapshot.id },
 		{ "memoryAddress", snapshot.memoryAddress },
 		{ "memberIds", snapshot.memberIds },
+		{ "memberTypes", snapshot.memberTypes },
 	};
 }
 
@@ -475,6 +481,7 @@ json NativeSourceSnapshotToJson(const BundleNativeSourceFileSnapshot& snapshot)
 		{ "formId", snapshot.formId },
 		{ "baseClass", snapshot.baseClass },
 		{ "classVarIds", snapshot.classVarIds },
+		{ "classVarTypes", snapshot.classVarTypes },
 		{ "methods", std::move(methods) },
 	};
 }
@@ -555,10 +562,24 @@ BundleNativeMethodSnapshot NativeMethodSnapshotFromJson(const json& item)
 			}
 		}
 	}
+	if (const auto it = item.find("paramTypes"); it != item.end() && it->is_array()) {
+		for (const auto& value : *it) {
+			if (value.is_number_integer()) {
+				snapshot.paramTypes.push_back(value.get<std::int32_t>());
+			}
+		}
+	}
 	if (const auto it = item.find("localIds"); it != item.end() && it->is_array()) {
 		for (const auto& value : *it) {
 			if (value.is_number_integer()) {
 				snapshot.localIds.push_back(value.get<std::int32_t>());
+			}
+		}
+	}
+	if (const auto it = item.find("localTypes"); it != item.end() && it->is_array()) {
+		for (const auto& value : *it) {
+			if (value.is_number_integer()) {
+				snapshot.localTypes.push_back(value.get<std::int32_t>());
 			}
 		}
 	}
@@ -600,6 +621,7 @@ BundleNativeGlobalSnapshot NativeGlobalSnapshotFromJson(const json& item)
 	snapshot.name = Utf8ToLocalText(item.value("name", ""));
 	snapshot.textDigest = item.value("textDigest", "");
 	snapshot.id = item.value("id", 0);
+	snapshot.dataType = item.value("dataType", 0);
 	return snapshot;
 }
 
@@ -610,10 +632,18 @@ BundleNativeDllSnapshot NativeDllSnapshotFromJson(const json& item)
 	snapshot.textDigest = item.value("textDigest", "");
 	snapshot.id = item.value("id", 0);
 	snapshot.memoryAddress = item.value("memoryAddress", 0);
+	snapshot.returnType = item.value("returnType", 0);
 	if (const auto it = item.find("paramIds"); it != item.end() && it->is_array()) {
 		for (const auto& value : *it) {
 			if (value.is_number_integer()) {
 				snapshot.paramIds.push_back(value.get<std::int32_t>());
+			}
+		}
+	}
+	if (const auto it = item.find("paramTypes"); it != item.end() && it->is_array()) {
+		for (const auto& value : *it) {
+			if (value.is_number_integer()) {
+				snapshot.paramTypes.push_back(value.get<std::int32_t>());
 			}
 		}
 	}
@@ -631,6 +661,13 @@ BundleNativeStructSnapshot NativeStructSnapshotFromJson(const json& item)
 		for (const auto& value : *it) {
 			if (value.is_number_integer()) {
 				snapshot.memberIds.push_back(value.get<std::int32_t>());
+			}
+		}
+	}
+	if (const auto it = item.find("memberTypes"); it != item.end() && it->is_array()) {
+		for (const auto& value : *it) {
+			if (value.is_number_integer()) {
+				snapshot.memberTypes.push_back(value.get<std::int32_t>());
 			}
 		}
 	}
@@ -661,6 +698,13 @@ BundleNativeSourceFileSnapshot NativeSourceSnapshotFromJson(const json& item)
 		for (const auto& value : *it) {
 			if (value.is_number_integer()) {
 				snapshot.classVarIds.push_back(value.get<std::int32_t>());
+			}
+		}
+	}
+	if (const auto it = item.find("classVarTypes"); it != item.end() && it->is_array()) {
+		for (const auto& value : *it) {
+			if (value.is_number_integer()) {
+				snapshot.classVarTypes.push_back(value.get<std::int32_t>());
 			}
 		}
 	}

@@ -628,8 +628,29 @@ bool DoPack(
 	}
 
 	e2txt::Restorer restorer;
-	if (!restorer.RestoreBundleToFile(bundle, PathToUtf8(effectiveOutputPath), &outSummary, &outError)) {
-		return false;
+	if (bundle.sourceFileKind == e2txt::SourceFileKind::EC) {
+		std::vector<std::uint8_t> bytes;
+		if (!restorer.RestoreBundleToBytesForEcBridge(bundle, bytes, &outError)) {
+			return false;
+		}
+
+		std::ofstream out(effectiveOutputPath, std::ios::binary);
+		if (!out.is_open()) {
+			outError = "open_output_failed";
+			return false;
+		}
+		out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+		if (!out.good()) {
+			outError = "write_output_failed";
+			return false;
+		}
+
+		outSummary = "bytes=" + std::to_string(bytes.size()) + ", output=" + PathToUtf8(effectiveOutputPath);
+	}
+	else {
+		if (!restorer.RestoreBundleToFile(bundle, PathToUtf8(effectiveOutputPath), &outSummary, &outError)) {
+			return false;
+		}
 	}
 	if (outWrittenOutputPath != nullptr) {
 		*outWrittenOutputPath = effectiveOutputPath;

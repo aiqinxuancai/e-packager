@@ -4426,7 +4426,11 @@ struct OperatorInfo {
 
 std::string RenderExpr(const Expr& expr, SymbolResolver& resolver, int expectedLowestPrecedence = (std::numeric_limits<int>::max)());
 bool ParseExpression(ByteReader& reader, std::unique_ptr<Expr>& outExpr, std::string* outError, bool parseMember = true);
-bool ParseStatementBlock(ByteReader& reader, std::unique_ptr<StatementBlock>& outBlock, std::string* outError);
+bool ParseStatementBlock(
+	ByteReader& reader,
+	std::unique_ptr<StatementBlock>& outBlock,
+	std::string* outError,
+	bool stopOnLoopTailCall);
 void AppendStatementLines(const StatementBlock& block, SymbolResolver& resolver, int indent, std::vector<std::string>& outLines);
 
 bool TryGetOperatorInfo(std::int32_t methodId, OperatorInfo& outInfo)
@@ -4675,7 +4679,15 @@ bool ParseCallExpressionWithoutType(
 		}
 		else {
 			if (outError != nullptr) {
-				*outError = "call_expression_marker_invalid";
+				std::ostringstream stream;
+				stream << "call_expression_marker_invalid@0x"
+					<< std::hex << std::uppercase
+					<< (reader.position() == 0 ? 0 : reader.position() - 1)
+					<< ":marker=0x"
+					<< std::setw(2) << std::setfill('0')
+					<< static_cast<unsigned int>(marker)
+					<< "|ctx=" << BuildReaderHexContext(reader, reader.position() == 0 ? 0 : reader.position() - 1);
+				*outError = stream.str();
 			}
 			return false;
 		}
@@ -4952,7 +4964,11 @@ std::int32_t GetCallMethodId(const std::unique_ptr<Expr>& expr)
 	return expr != nullptr && expr->kind == ExprKind::Call ? expr->intValue1 : -1;
 }
 
-bool ParseStatementBlock(ByteReader& reader, std::unique_ptr<StatementBlock>& outBlock, std::string* outError)
+bool ParseStatementBlock(
+	ByteReader& reader,
+	std::unique_ptr<StatementBlock>& outBlock,
+	std::string* outError,
+	const bool stopOnLoopTailCall)
 {
 	outBlock = std::make_unique<StatementBlock>();
 
@@ -4974,8 +4990,43 @@ bool ParseStatementBlock(ByteReader& reader, std::unique_ptr<StatementBlock>& ou
 			}
 		} while (std::find(kKnownTypes.begin(), kKnownTypes.end(), type) == kKnownTypes.end());
 
-		if (type == 0x50 || type == 0x51 || type == 0x52 || type == 0x53 || type == 0x54 || type == 0x6F || type == 0x71) {
+		if (type == 0x50 || type == 0x51 || type == 0x52 || type == 0x53 || type == 0x54 || type == 0x6F) {
 			return reader.SetPosition(reader.position() - 1);
+		}
+		if (type == 0x71 && stopOnLoopTailCall) {
+			const size_t rewindPos = reader.position() - 1;
+			const size_t afterTypePos = reader.position();
+			std::unique_ptr<Expr> probeExpr;
+			std::string ignoredCode;
+			std::string ignoredComment;
+			bool ignoredMask = false;
+			std::string probeError;
+			if (ParseCallExpressionWithoutType(reader, probeExpr, &ignoredCode, &ignoredComment, &ignoredMask, &probeError)) {
+				const std::int32_t methodId = GetCallMethodId(probeExpr);
+				if (methodId == 4 || methodId == 6 || methodId == 8 || methodId == 10) {
+					if (!reader.SetPosition(rewindPos)) {
+						if (outError != nullptr) {
+							*outError = "statement_rewind_failed_after_tail_probe";
+						}
+						return false;
+					}
+					return true;
+				}
+				if (!reader.SetPosition(afterTypePos)) {
+					if (outError != nullptr) {
+						*outError = "statement_restore_failed_after_tail_probe";
+					}
+					return false;
+				}
+			}
+			else {
+				if (!reader.SetPosition(afterTypePos)) {
+					if (outError != nullptr) {
+						*outError = "statement_restore_failed_after_tail_probe_error";
+					}
+					return false;
+				}
+			}
 		}
 		if (type == 0x55) {
 			continue;
@@ -4998,7 +5049,7 @@ bool ParseStatementBlock(ByteReader& reader, std::unique_ptr<StatementBlock>& ou
 				if (callExpr != nullptr && !callExpr->items.empty()) {
 					caseInfo.condition = std::move(callExpr->items.front());
 				}
-				if (!ParseStatementBlock(reader, caseInfo.block, outError)) {
+				if (!ParseStatementBlock(reader, caseInfo.block, outError, false)) {
 					return false;
 				}
 				statement.switchCases.push_back(std::move(caseInfo));
@@ -5021,7 +5072,7 @@ bool ParseStatementBlock(ByteReader& reader, std::unique_ptr<StatementBlock>& ou
 				}
 				return false;
 			}
-			if (!ParseStatementBlock(reader, statement.defaultBlock, outError) ||
+			if (!ParseStatementBlock(reader, statement.defaultBlock, outError, false) ||
 				!ReadExpectedMarker(reader, 0x54, "switch_end_missing", outError) ||
 				!ReadExpectedMarker(reader, 0x74, "switch_tail_marker_missing", outError)) {
 				return false;
@@ -5040,7 +5091,7 @@ bool ParseStatementBlock(ByteReader& reader, std::unique_ptr<StatementBlock>& ou
 
 		if (type == 0x70) {
 			std::unique_ptr<StatementBlock> loopBody;
-			if (!ParseStatementBlock(reader, loopBody, outError) ||
+			if (!ParseStatementBlock(reader, loopBody, outError, true) ||
 				!ReadExpectedMarker(reader, 0x71, "loop_end_call_missing", outError)) {
 				return false;
 			}
@@ -5120,7 +5171,7 @@ bool ParseStatementBlock(ByteReader& reader, std::unique_ptr<StatementBlock>& ou
 			if (callExpr != nullptr && !callExpr->items.empty()) {
 				statement.condition = std::move(callExpr->items.front());
 			}
-			if (!ParseStatementBlock(reader, statement.block, outError) ||
+			if (!ParseStatementBlock(reader, statement.block, outError, false) ||
 				!ReadExpectedMarker(reader, 0x52, "if_true_end_missing", outError) ||
 				!ReadExpectedMarker(reader, 0x73, "if_true_tail_marker_missing", outError)) {
 				return false;
@@ -5138,9 +5189,9 @@ bool ParseStatementBlock(ByteReader& reader, std::unique_ptr<StatementBlock>& ou
 			if (callExpr != nullptr && !callExpr->items.empty()) {
 				statement.condition = std::move(callExpr->items.front());
 			}
-			if (!ParseStatementBlock(reader, statement.block, outError) ||
+			if (!ParseStatementBlock(reader, statement.block, outError, false) ||
 				!ReadExpectedMarker(reader, 0x50, "if_else_marker_missing", outError) ||
-				!ParseStatementBlock(reader, statement.elseBlock, outError) ||
+				!ParseStatementBlock(reader, statement.elseBlock, outError, false) ||
 				!ReadExpectedMarker(reader, 0x51, "if_end_missing", outError) ||
 				!ReadExpectedMarker(reader, 0x72, "if_tail_marker_missing", outError)) {
 				return false;
@@ -5168,7 +5219,12 @@ bool ParseStatementBlock(ByteReader& reader, std::unique_ptr<StatementBlock>& ou
 		}
 
 		if (outError != nullptr) {
-			*outError = "statement_type_not_supported";
+			std::ostringstream stream;
+			stream << "statement_type_not_supported@0x"
+				<< std::hex << std::uppercase
+				<< (reader.position() == 0 ? 0 : reader.position() - 1)
+				<< ":type=0x" << static_cast<int>(type);
+			*outError = stream.str();
 		}
 		return false;
 	}
@@ -5418,7 +5474,7 @@ bool TryRenderFunctionBody(const FunctionInfo& functionInfo, SymbolResolver& res
 	ByteReader reader(functionInfo.expressionData);
 	std::unique_ptr<StatementBlock> block;
 	std::string parseError;
-	if (!ParseStatementBlock(reader, block, &parseError) || block == nullptr) {
+	if (!ParseStatementBlock(reader, block, &parseError, false) || block == nullptr) {
 		if (outError != nullptr) {
 			*outError = parseError.empty() ? "function_body_parse_failed" : parseError;
 		}
@@ -6740,17 +6796,11 @@ std::string ComputeSnapshotMethodDigest(const SnapshotMethodDef& method)
 		stream << ComputeSnapshotVariableDigest(item) << "\n";
 	}
 	stream << "body=";
-	bool firstBodyLine = true;
-	for (const auto& line : method.bodyLines) {
-		const std::string trimmed = TrimAsciiCopy(line);
-		if (trimmed.empty() || (!trimmed.empty() && trimmed.front() == '\'')) {
-			continue;
-		}
-		if (!firstBodyLine) {
+	for (size_t lineIndex = 0; lineIndex < method.bodyLines.size(); ++lineIndex) {
+		if (lineIndex != 0) {
 			stream << "\r\n";
 		}
-		firstBodyLine = false;
-		stream << line;
+		stream << method.bodyLines[lineIndex];
 	}
 	return ComputeTextDigest(stream.str());
 }
@@ -7106,6 +7156,7 @@ bool BuildBundleFromSections(
 			snapshot.baseClass = pageInfo.baseClass;
 			for (const auto& pageVar : pageInfo.pageVars) {
 				snapshot.classVarIds.push_back(pageVar.marker);
+				snapshot.classVarTypes.push_back(pageVar.dataType);
 			}
 			for (const auto* functionInfo : functions) {
 				if (functionInfo == nullptr || IsImportedFunction(*functionInfo)) {
@@ -7122,9 +7173,11 @@ bool BuildBundleFromSections(
 				methodSnapshot.attr = functionInfo->attr;
 				for (const auto& param : functionInfo->params) {
 					methodSnapshot.paramIds.push_back(param.marker);
+					methodSnapshot.paramTypes.push_back(param.dataType);
 				}
 				for (const auto& local : functionInfo->locals) {
 					methodSnapshot.localIds.push_back(local.marker);
+					methodSnapshot.localTypes.push_back(local.dataType);
 				}
 				methodSnapshot.lineOffset = functionInfo->lineOffset;
 				methodSnapshot.blockOffset = functionInfo->blockOffset;
@@ -7146,6 +7199,7 @@ bool BuildBundleFromSections(
 				snapshot.name = TrimAsciiCopy(resolver.ResolveUserName(item.marker));
 				snapshot.textDigest = ComputeGlobalSnapshotDigest(item, resolver);
 				snapshot.id = item.marker;
+				snapshot.dataType = item.dataType;
 				bundle.nativeGlobalSnapshots.push_back(std::move(snapshot));
 			}
 		}
@@ -7164,6 +7218,7 @@ bool BuildBundleFromSections(
 				snapshot.memoryAddress = item.header.dwUnk;
 				for (const auto& member : item.members) {
 					snapshot.memberIds.push_back(member.marker);
+					snapshot.memberTypes.push_back(member.dataType);
 				}
 				bundle.nativeStructSnapshots.push_back(std::move(snapshot));
 			}
@@ -7179,8 +7234,10 @@ bool BuildBundleFromSections(
 				snapshot.textDigest = ComputeDllSnapshotDigest(item, resolver, anonymousTypeHints);
 				snapshot.id = item.header.dwId;
 				snapshot.memoryAddress = item.header.dwUnk;
+				snapshot.returnType = item.returnType;
 				for (const auto& param : item.params) {
 					snapshot.paramIds.push_back(param.marker);
+					snapshot.paramTypes.push_back(param.dataType);
 				}
 				bundle.nativeDllSnapshots.push_back(std::move(snapshot));
 			}
@@ -7817,7 +7874,7 @@ bool ValidateNativeMethodBodyBytes(
 	ByteReader reader(expressionData);
 	std::unique_ptr<StatementBlock> block;
 	std::string parseError;
-	if (!ParseStatementBlock(reader, block, &parseError) || block == nullptr) {
+	if (!ParseStatementBlock(reader, block, &parseError, false) || block == nullptr) {
 		if (outError != nullptr) {
 			*outError = parseError.empty() ? "function_body_parse_failed" : parseError;
 		}
@@ -7837,6 +7894,89 @@ bool ValidateNativeMethodBodyBytes(
 		}
 		return false;
 	}
+	return true;
+}
+
+bool TryMeasureNativeStatementEndOffset(
+	const std::vector<std::uint8_t>& expressionData,
+	size_t beginOffset,
+	size_t& outEndOffset,
+	std::string* outError)
+{
+	outEndOffset = beginOffset;
+	if (outError != nullptr) {
+		outError->clear();
+	}
+	if (beginOffset >= expressionData.size()) {
+		if (outError != nullptr) {
+			*outError = "statement_begin_offset_out_of_range";
+		}
+		return false;
+	}
+
+	ByteReader reader(expressionData);
+	if (!reader.SetPosition(beginOffset)) {
+		if (outError != nullptr) {
+			*outError = "statement_begin_seek_failed";
+		}
+		return false;
+	}
+
+	std::uint8_t type = 0;
+	if (!reader.ReadU8(type)) {
+		if (outError != nullptr) {
+			*outError = "statement_type_read_failed";
+		}
+		return false;
+	}
+
+	switch (type) {
+	case 0x6A:
+	case 0x6B:
+	case 0x6C:
+	case 0x6E:
+	case 0x70:
+	case 0x71:
+		break;
+	default:
+		if (outError != nullptr) {
+			std::ostringstream stream;
+			stream << "statement_type_not_supported@0x" << std::hex << std::uppercase
+				<< beginOffset << ":type=0x" << static_cast<int>(type);
+			*outError = stream.str();
+		}
+		return false;
+	}
+
+	std::unique_ptr<Expr> callExpr;
+	std::string ignoredCode;
+	std::string ignoredComment;
+	bool ignoredMask = false;
+	std::string parseError;
+	if (!ParseCallExpressionWithoutType(
+			reader,
+			callExpr,
+			&ignoredCode,
+			&ignoredComment,
+			&ignoredMask,
+			&parseError)) {
+		if (outError != nullptr) {
+			*outError = parseError.empty() ? "statement_call_parse_failed" : parseError;
+		}
+		return false;
+	}
+
+	if (type == 0x71) {
+		const std::int32_t methodId = GetCallMethodId(callExpr);
+		if (methodId != 4 && methodId != 6 && methodId != 8 && methodId != 10) {
+			if (outError != nullptr) {
+				*outError = "loop_tail_call_method_invalid";
+			}
+			return false;
+		}
+	}
+
+	outEndOffset = reader.position();
 	return true;
 }
 
