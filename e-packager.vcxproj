@@ -170,6 +170,7 @@
     <ClCompile Include="src\EFolderCodec.cpp">
       <ObjectFileName>$(IntDir)EFolderCodecCore.obj</ObjectFileName>
     </ClCompile>
+    <ClCompile Include="src\SelfUpdater.cpp" />
     <ClCompile Include="src\UpdateCheck.cpp" />
     <ClCompile Include="src\WorkspaceProjectSupport.cpp" />
     <ClCompile Include="src\e2txt.cpp" />
@@ -180,6 +181,7 @@
   <ItemGroup>
     <ClInclude Include="src\BundlePathUtils.h" />
     <ClInclude Include="src\EFolderCodec.h" />
+    <ClInclude Include="src\SelfUpdater.h" />
     <ClInclude Include="src\UpdateCheck.h" />
     <ClInclude Include="src\version.h" />
     <ClInclude Include="src\WorkspaceProjectSupport.h" />

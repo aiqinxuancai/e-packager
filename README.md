@@ -105,6 +105,9 @@ e-packager update MyApp\ --add-image 启动画面=D:\res\splash.bin
 ### 其他命令
 
 ```
+# 从 GitHub Release 下载最新 e-packager 并替换当前 exe
+e-packager /update
+
 # 比较原文件与目录内容是否一致
 e-packager compare-bundle <input.e|input.ec> <input-dir> [--password <text>]
 
@@ -114,6 +117,8 @@ e-packager roundtrip <input.e|input.ec> <work-dir> <output.e|output.ec> [--passw
 # 往返并校验字节一致性
 e-packager verify-roundtrip <input.e|input.ec> <work-dir> <output.e|output.ec> [--password <text>]
 ```
+
+`/update` 会启动后台替换脚本：先查询 `aiqinxuancai/e-packager` 的最新 GitHub Release，下载匹配的 Win32 二进制压缩包，等待当前进程退出后替换当前 `e-packager.exe`。当前 GitHub Actions 不上传 x64 包，因此 x64 构建会跳过自更新。若需要在本地开发版或同版本上强制覆盖，可使用 `e-packager /update --force`。
 
 ## 注意
 

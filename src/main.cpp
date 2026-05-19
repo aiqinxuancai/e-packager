@@ -4,12 +4,14 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cwctype>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <future>
 #include <iostream>
 #include <map>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -18,6 +20,7 @@
 #include "..\thirdparty\json.hpp"
 #include "EFolderCodec.h"
 #include "PathHelper.h"
+#include "SelfUpdater.h"
 #include "SupportLibraryPublicInfo.h"
 #include "UpdateCheck.h"
 #include "WorkspaceProjectSupport.h"
@@ -1736,6 +1739,12 @@ int RunDragDropUnpack(const char* inputPath, const e2txt::ReadOptions& readOptio
 	return PrintStringResult("unpack", 0, summary.c_str());
 }
 
+int RunSelfUpdate(const bool force)
+{
+	const self_update::UpdateResult result = self_update::ScheduleSelfUpdate(APP_VERSION, force);
+	return PrintStringResult("self-update", result.ok ? 0 : -1, result.message.c_str());
+}
+
 void PrintUsage()
 {
 	std::cout << Utf8Literal(u8"e-packager 用法:") << std::endl;
@@ -1744,6 +1753,11 @@ void PrintUsage()
 	std::cout << Utf8Literal(u8"  e-packager unpack <input.e|input.ec> <output-dir> [--password <text>]    # 拆包到指定目录") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager pack <input-dir> <output.e|output.ec>      # 将目录封包为 .e/.ec 文件") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager update <input-dir> [--add-ecom <file.ec>]... [--add-elib <name|file.fne>]... [--add-image <file|name=file>]... [--add-audio <file|name=file>]...   # 刷新派生内容并新增资源") << std::endl;
+#if defined(_M_X64)
+	std::cout << Utf8Literal(u8"  e-packager /update [--force]         # x64 构建不启用自更新") << std::endl;
+#else
+	std::cout << Utf8Literal(u8"  e-packager /update [--force]         # 从 GitHub Release 下载最新版本并替换当前 e-packager.exe") << std::endl;
+#endif
 	std::cout << Utf8Literal(u8"  e-packager compare-bundle <input.e|input.ec> <input-dir> [--password <text>]   # 比较原文件与目录") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager roundtrip <input.e|input.ec> <work-dir> <output.e|output.ec> [--password <text>]      # 拆包再封包") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager verify-roundtrip <input.e|input.ec> <work-dir> <output.e|output.ec> [--password <text>]  # 验证往返一致性") << std::endl;
@@ -1761,6 +1775,19 @@ int RunCommand(int argc, char* argv[])
 	if (command == "help" || command == "--help" || command == "/?") {
 		PrintUsage();
 		return EXIT_SUCCESS;
+	}
+	if (command == "/update" || command == "self-update" || command == "--update") {
+		bool force = false;
+		for (int index = 2; index < argc; ++index) {
+			const std::string option = argv[index];
+			if (option == "--force") {
+				force = true;
+				continue;
+			}
+			PrintUsage();
+			return EXIT_FAILURE;
+		}
+		return RunSelfUpdate(force);
 	}
 	if (command == "unpack") {
 		if (argc < 4) {
@@ -1895,9 +1922,11 @@ int MainImpl(int argc, char* argv[])
 
 	// 后台异步检查更新（预发布版本跳过）。
 	std::future<std::string> updateFuture;
+#if !defined(_M_X64)
 	if (!update_check::IsPreRelease(APP_VERSION)) {
 		updateFuture = std::async(std::launch::async, update_check::FetchLatestTag);
 	}
+#endif
 
 	e2txt::ClearRuntimeWarnings();
 	const int result = RunCommand(argc, argv);
