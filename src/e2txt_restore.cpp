@@ -5118,16 +5118,9 @@ bool TryEncodeNativeExpression(
 		return true;
 	}
 
-	std::int32_t integerValue = 0;
-	const auto [ptr, ec] = std::from_chars(expression.data(), expression.data() + expression.size(), integerValue);
-	if (ec == std::errc() && ptr == expression.data() + expression.size()) {
-		writer.WriteU8(0x3B);
-		writer.WriteI32(integerValue);
-		return true;
-	}
-
 	double doubleValue = 0.0;
 	if (TryParseDouble(expression, doubleValue)) {
+		// IDE 生成的数值字面量使用 0x17 + double；0x3B int32 在部分支持库命令实参中会被 IDE 当成空参数。
 		writer.WriteU8(0x17);
 		writer.WriteDouble(doubleValue);
 		return true;
