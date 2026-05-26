@@ -9148,10 +9148,11 @@ bool BuildRestoreModel(
 	};
 
 	auto resolveTypeIdWithNativeFallback = [&](const std::string& rawTypeName, const std::int32_t nativeTypeId) -> std::int32_t {
-		if (nativeTypeId != 0) {
-			return nativeTypeId;
+		// 源码里已经明确写出类型时，以源码为准；native 只用于旧工程缺失类型文本的兜底。
+		if (!TypeResolver::NormalizeTypeName(rawTypeName).empty()) {
+			return ensureTypeId(rawTypeName);
 		}
-		return ensureTypeId(rawTypeName);
+		return nativeTypeId;
 	};
 
 	auto convertVariableWithId = [&](
