@@ -2713,6 +2713,10 @@ public:
 				break;
 			case BodyStatementKind::IfTrue:
 				WriteIfTrue(statement);
+				// 若 IfTrue 是块中最后一条语句，注入空行，避免 IDE 将流程线延伸到父块尾标记
+				if (!statements.empty() && &statement == &statements.back()) {
+					WriteBlankLine();
+				}
 				break;
 			case BodyStatementKind::IfElse:
 				WriteIfElse(statement);
@@ -2746,6 +2750,9 @@ public:
 				break;
 			case BodyStatementKind::IfTrue:
 				WriteIfTrueWithRawHandler(statement, writeRaw);
+				if (!statements.empty() && &statement == &statements.back()) {
+					WriteBlankLine();
+				}
 				break;
 			case BodyStatementKind::IfElse:
 				WriteIfElseWithRawHandler(statement, writeRaw);
@@ -2795,6 +2802,8 @@ public:
 	{
 		WriteUnexaminedCall(type, libraryId, methodId, mask, code);
 	}
+	// 在 .如果真结束 后注入空行，使 IDE 能正确定位流程线终点
+	void WriteBlankLinePublic() { WriteBlankLine(); }
 
 private:
 	void WriteBlankLine()
@@ -5632,6 +5641,9 @@ void WriteBlockWithStructuredControlEncoding(
 			writer.WriteMarker(0x52);
 			writer.EndBlock();
 			writer.WriteMarker(0x73);
+			if (!statements.empty() && &statement == &statements.back()) {
+				writer.WriteBlankLinePublic();
+			}
 			break;
 		}
 		case BodyStatementKind::IfElse: {
@@ -6178,6 +6190,9 @@ bool TryBuildMethodCodeDataWithNativeObjectCallReuse(
 					writer.WriteMarker(0x52);
 					writer.EndBlock();
 					writer.WriteMarker(0x73);
+					if (!blockStatements.empty() && &statement == &blockStatements.back()) {
+						writer.WriteBlankLinePublic();
+					}
 					break;
 				case BodyStatementKind::IfElse:
 					writer.BeginBlock(1);
@@ -6530,6 +6545,9 @@ bool TryBuildMethodCodeDataWithReusableNativeLineSegments(
 					writer.WriteMarker(0x52);
 					writer.EndBlock();
 					writer.WriteMarker(0x73);
+					if (!statements.empty() && &statement == &statements.back()) {
+						writer.WriteBlankLinePublic();
+					}
 					break;
 				case BodyStatementKind::IfElse:
 					writer.BeginBlock(1);
