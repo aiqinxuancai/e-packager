@@ -108,6 +108,9 @@ e-packager update MyApp\ --add-image 启动画面=D:\res\splash.bin
 # 从 GitHub Release 下载最新 e-packager 并替换当前 exe
 e-packager /update
 
+# 查看当前程序版本
+e-packager version
+
 # 比较原文件与目录内容是否一致
 e-packager compare-bundle <input.e|input.ec> <input-dir> [--password <text>]
 

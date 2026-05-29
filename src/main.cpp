@@ -31,6 +31,24 @@ namespace {
 
 using json = nlohmann::json;
 
+bool IsVersionCommand(const std::string& command)
+{
+	return command == "version" ||
+		command == "--version" ||
+		command == "-v" ||
+		command == "/version";
+}
+
+bool IsVersionInvocation(int argc, char* argv[])
+{
+	return argc >= 2 && argv[1] != nullptr && IsVersionCommand(argv[1]);
+}
+
+void PrintVersion()
+{
+	std::cout << "e-packager " << APP_VERSION << std::endl;
+}
+
 int PrintStringResult(const char* label, int result, const char* text)
 {
 	if (result >= 0) {
@@ -1761,6 +1779,7 @@ void PrintUsage()
 	std::cout << Utf8Literal(u8"  e-packager compare-bundle <input.e|input.ec> <input-dir> [--password <text>]   # 比较原文件与目录") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager roundtrip <input.e|input.ec> <work-dir> <output.e|output.ec> [--password <text>]      # 拆包再封包") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager verify-roundtrip <input.e|input.ec> <work-dir> <output.e|output.ec> [--password <text>]  # 验证往返一致性") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager version|--version|-v   # 查看当前程序版本") << std::endl;
 }
 
 }  // namespace
@@ -1772,6 +1791,10 @@ int RunCommand(int argc, char* argv[])
 	}
 
 	const std::string command = argv[1];
+	if (IsVersionCommand(command)) {
+		PrintVersion();
+		return EXIT_SUCCESS;
+	}
 	if (command == "help" || command == "--help" || command == "/?") {
 		PrintUsage();
 		return EXIT_SUCCESS;
@@ -1918,12 +1941,15 @@ int RunCommand(int argc, char* argv[])
 int MainImpl(int argc, char* argv[])
 {
 	ConfigureConsoleForUtf8();
-	std::cerr << "e-packager " << APP_VERSION << std::endl;
+	const bool versionInvocation = IsVersionInvocation(argc, argv);
+	if (!versionInvocation) {
+		std::cerr << "e-packager " << APP_VERSION << std::endl;
+	}
 
 	// 后台异步检查更新（预发布版本跳过）。
 	std::future<std::string> updateFuture;
 #if !defined(_M_X64)
-	if (!update_check::IsPreRelease(APP_VERSION)) {
+	if (!versionInvocation && !update_check::IsPreRelease(APP_VERSION)) {
 		updateFuture = std::async(std::launch::async, update_check::FetchLatestTag);
 	}
 #endif
