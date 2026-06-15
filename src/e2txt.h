@@ -1,11 +1,80 @@
 ﻿#pragma once
 
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <cstddef>
+#include <exception>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace e2txt {
+
+// 依赖派生内容导出默认使用的线程数。
+inline constexpr size_t kDefaultDependencyExportThreadCount = 4;
+
+// 将任务数与用户配置归一化为实际工作线程数。
+inline size_t NormalizeWorkerCount(const size_t requestedWorkerCount, const size_t taskCount)
+{
+	if (taskCount == 0) {
+		return 0;
+	}
+	const size_t workerCount = requestedWorkerCount == 0 ? 1 : requestedWorkerCount;
+	return (std::min)(workerCount, taskCount);
+}
+
+// 使用固定数量线程执行一批互相独立的任务。
+template <typename TaskFunction>
+void RunFixedThreadTasks(
+	const size_t taskCount,
+	const size_t requestedWorkerCount,
+	TaskFunction&& taskFunction)
+{
+	const size_t workerCount = NormalizeWorkerCount(requestedWorkerCount, taskCount);
+	if (workerCount <= 1) {
+		for (size_t index = 0; index < taskCount; ++index) {
+			taskFunction(index);
+		}
+		return;
+	}
+
+	std::atomic_size_t nextIndex { 0 };
+	std::exception_ptr firstException;
+	std::mutex exceptionMutex;
+	std::vector<std::thread> workers;
+	workers.reserve(workerCount);
+
+	const auto runWorker = [&]() {
+		for (;;) {
+			const size_t index = nextIndex.fetch_add(1, std::memory_order_relaxed);
+			if (index >= taskCount) {
+				break;
+			}
+			try {
+				taskFunction(index);
+			}
+			catch (...) {
+				std::lock_guard<std::mutex> lock(exceptionMutex);
+				if (firstException == nullptr) {
+					firstException = std::current_exception();
+				}
+			}
+		}
+	};
+
+	for (size_t workerIndex = 0; workerIndex < workerCount; ++workerIndex) {
+		workers.emplace_back(runWorker);
+	}
+	for (auto& worker : workers) {
+		worker.join();
+	}
+	if (firstException != nullptr) {
+		std::rethrow_exception(firstException);
+	}
+}
 
 // 源工程文件类型。
 enum class SourceFileKind {

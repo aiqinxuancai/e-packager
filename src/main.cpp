@@ -114,6 +114,7 @@ void ConfigureConsoleForUtf8()
 struct UnpackOptions {
 	bool writeAgentsMarkdown = true;
 	bool unpackDependencyModules = true;
+	size_t dependencyExportThreadCount = e2txt::kDefaultDependencyExportThreadCount;
 	e2txt::ReadOptions readOptions;
 };
 
@@ -126,6 +127,26 @@ struct DependencyModuleAnnotation {
 struct DependencyModuleExportResult {
 	size_t exportedCount = 0;
 	std::vector<DependencyModuleAnnotation> annotations;
+};
+
+struct PendingDependencyModuleExport {
+	size_t dependencyIndex = 0;
+	std::filesystem::path resolvedPath;
+	std::string resolvedKey;
+	std::filesystem::path outputDir;
+	std::string localWorkspace;
+};
+
+struct DependencyModuleTaskResult {
+	bool exported = false;
+	DependencyModuleAnnotation annotation;
+	std::string warning;
+};
+
+struct DependencyModuleAnnotationEntry {
+	size_t dependencyIndex = 0;
+	std::string resolvedKey;
+	size_t pendingExportIndex = static_cast<size_t>(-1);
 };
 
 std::string TrimAsciiCopy(std::string text)
@@ -386,13 +407,16 @@ DependencyModuleExportResult ExportDependencyModules(
 	const std::filesystem::path& sourcePath,
 	const std::filesystem::path& outputDir,
 	const e2txt::ProjectBundle& bundle,
-	const e2txt::ReadOptions& readOptions)
+	const e2txt::ReadOptions& readOptions,
+	const size_t workerCount)
 {
 	DependencyModuleExportResult result;
 	std::filesystem::path ecomRoot = outputDir / "ecom";
 	std::unordered_set<std::string> exportedPaths;
-	std::unordered_map<std::string, std::string> localWorkspacesByResolvedPath;
+	std::unordered_map<std::string, size_t> pendingExportIndexByResolvedPath;
 	std::unordered_map<std::string, int> exportedDirNames;
+	std::vector<PendingDependencyModuleExport> pendingExports;
+	std::vector<DependencyModuleAnnotationEntry> annotationEntries;
 
 	for (size_t dependencyIndex = 0; dependencyIndex < bundle.dependencies.size(); ++dependencyIndex) {
 		const auto& dependency = bundle.dependencies[dependencyIndex];
@@ -415,12 +439,20 @@ DependencyModuleExportResult ExportDependencyModules(
 		}
 		resolvedAbsolutePath = resolvedAbsolutePath.lexically_normal();
 		const std::string resolvedKey = PathToUtf8(resolvedAbsolutePath);
-		if (const auto localWorkspaceIt = localWorkspacesByResolvedPath.find(resolvedKey);
-			localWorkspaceIt != localWorkspacesByResolvedPath.end()) {
+		if (const auto pendingExportIt = pendingExportIndexByResolvedPath.find(resolvedKey);
+			pendingExportIt != pendingExportIndexByResolvedPath.end()) {
+			annotationEntries.push_back(DependencyModuleAnnotationEntry {
+				.dependencyIndex = dependencyIndex,
+				.resolvedKey = resolvedKey,
+				.pendingExportIndex = pendingExportIt->second,
+			});
+			continue;
+		}
+
+		if (!exportedPaths.insert(resolvedKey).second) {
 			result.annotations.push_back(DependencyModuleAnnotation {
 				.dependencyIndex = dependencyIndex,
 				.resolvedPath = resolvedKey,
-				.localWorkspace = localWorkspaceIt->second,
 			});
 			continue;
 		}
@@ -433,39 +465,71 @@ DependencyModuleExportResult ExportDependencyModules(
 		const std::filesystem::path moduleOutputDir = ecomRoot / std::filesystem::path(actualDirName);
 		const std::string localWorkspace = PathToGenericUtf8(moduleOutputDir.lexically_relative(outputDir));
 
-		if (!exportedPaths.insert(resolvedKey).second) {
-			result.annotations.push_back(DependencyModuleAnnotation {
-				.dependencyIndex = dependencyIndex,
-				.resolvedPath = resolvedKey,
-			});
-			continue;
-		}
+		const size_t pendingExportIndex = pendingExports.size();
+		pendingExportIndexByResolvedPath[resolvedKey] = pendingExportIndex;
+		annotationEntries.push_back(DependencyModuleAnnotationEntry {
+			.dependencyIndex = dependencyIndex,
+			.resolvedKey = resolvedKey,
+			.pendingExportIndex = pendingExportIndex,
+		});
+		pendingExports.push_back(PendingDependencyModuleExport {
+			.dependencyIndex = dependencyIndex,
+			.resolvedPath = resolvedPath,
+			.resolvedKey = resolvedKey,
+			.outputDir = moduleOutputDir,
+			.localWorkspace = localWorkspace,
+		});
+	}
 
+	std::vector<DependencyModuleTaskResult> taskResults(pendingExports.size());
+	e2txt::RunFixedThreadTasks(
+		pendingExports.size(),
+		workerCount,
+		[&](const size_t taskIndex) {
+		const auto& task = pendingExports[taskIndex];
 		std::string childSummary;
 		std::string childError;
 		const UnpackOptions childOptions {
 			.writeAgentsMarkdown = false,
 			.unpackDependencyModules = false,
+			.dependencyExportThreadCount = 1,
 			.readOptions = readOptions,
 		};
-		if (!DoUnpackInternal(resolvedPath, moduleOutputDir, childSummary, childError, childOptions)) {
-			e2txt::AddRuntimeWarning(
-				Utf8Literal(u8"易模块依赖解包失败：") + PathToUtf8(resolvedPath) +
-				" => " + childError);
-			result.annotations.push_back(DependencyModuleAnnotation {
-				.dependencyIndex = dependencyIndex,
-				.resolvedPath = resolvedKey,
-			});
-			continue;
+		DependencyModuleTaskResult taskResult;
+		taskResult.annotation = DependencyModuleAnnotation {
+			.dependencyIndex = task.dependencyIndex,
+			.resolvedPath = task.resolvedKey,
+		};
+		if (!DoUnpackInternal(task.resolvedPath, task.outputDir, childSummary, childError, childOptions)) {
+			taskResult.warning =
+				Utf8Literal(u8"易模块依赖解包失败：") + PathToUtf8(task.resolvedPath) +
+				" => " + childError;
+			taskResults[taskIndex] = std::move(taskResult);
+			return;
 		}
 
-		localWorkspacesByResolvedPath[resolvedKey] = localWorkspace;
-		result.annotations.push_back(DependencyModuleAnnotation {
-			.dependencyIndex = dependencyIndex,
-			.resolvedPath = resolvedKey,
-			.localWorkspace = localWorkspace,
-		});
-		++result.exportedCount;
+		taskResult.exported = true;
+		taskResult.annotation.localWorkspace = task.localWorkspace;
+		taskResults[taskIndex] = std::move(taskResult);
+	});
+
+	for (const auto& taskResult : taskResults) {
+		if (!taskResult.warning.empty()) {
+			e2txt::AddRuntimeWarning(taskResult.warning);
+		}
+		if (taskResult.exported) {
+			++result.exportedCount;
+		}
+	}
+	for (const auto& entry : annotationEntries) {
+		DependencyModuleAnnotation annotation {
+			.dependencyIndex = entry.dependencyIndex,
+			.resolvedPath = entry.resolvedKey,
+		};
+		if (entry.pendingExportIndex < taskResults.size() && taskResults[entry.pendingExportIndex].exported) {
+			annotation.localWorkspace = pendingExports[entry.pendingExportIndex].localWorkspace;
+		}
+		result.annotations.push_back(std::move(annotation));
 	}
 
 	return result;
@@ -506,6 +570,7 @@ bool RefreshDependencyArtifacts(
 	const e2txt::ProjectBundle& bundle,
 	const bool exportEComModules,
 	const e2txt::ReadOptions& readOptions,
+	const size_t workerCount,
 	DependencyRefreshResult& outResult,
 	std::string& outError)
 {
@@ -517,7 +582,12 @@ bool RefreshDependencyArtifacts(
 	}
 
 	if (exportEComModules) {
-		const DependencyModuleExportResult ecomResult = ExportDependencyModules(sourcePath, outputDir, bundle, readOptions);
+		const DependencyModuleExportResult ecomResult = ExportDependencyModules(
+			sourcePath,
+			outputDir,
+			bundle,
+			readOptions,
+			workerCount);
 		outResult.exportedEComModules = ecomResult.exportedCount;
 		outResult.annotations.insert(
 			outResult.annotations.end(),
@@ -525,7 +595,11 @@ bool RefreshDependencyArtifacts(
 			ecomResult.annotations.end());
 	}
 
-	const auto elibResult = support_library_public_info::ExportDependencies(sourcePath, outputDir, bundle.dependencies);
+	const auto elibResult = support_library_public_info::ExportDependencies(
+		sourcePath,
+		outputDir,
+		bundle.dependencies,
+		workerCount);
 	outResult.exportedELibFiles = elibResult.exportedCount;
 	AppendSupportLibraryAnnotations(elibResult.annotations, outResult.annotations);
 
@@ -601,6 +675,7 @@ bool DoUnpackInternal(
 			bundle,
 			options.unpackDependencyModules && extension != ".ec",
 			options.readOptions,
+			options.dependencyExportThreadCount,
 			dependencyRefreshResult,
 			outError)) {
 		return false;
@@ -1041,6 +1116,7 @@ int RunUpdate(
 			bundle,
 			bundle.sourceFileKind != e2txt::SourceFileKind::EC,
 			e2txt::ReadOptions {},
+			e2txt::kDefaultDependencyExportThreadCount,
 			refreshResult,
 			error)) {
 		return PrintStringResult("update", -1, error.c_str());

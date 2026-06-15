@@ -33,7 +33,8 @@ struct BuildDependencyResult {
 ExportResult ExportDependencies(
 	const std::filesystem::path& sourcePath,
 	const std::filesystem::path& outputDir,
-	const std::vector<e2txt::Dependency>& dependencies);
+	const std::vector<e2txt::Dependency>& dependencies,
+	size_t workerCount = e2txt::kDefaultDependencyExportThreadCount);
 
 // 根据输入的名称或路径解析支持库依赖。
 bool TryBuildDependencyFromInput(

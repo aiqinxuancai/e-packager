@@ -536,6 +536,25 @@ struct LoadedSupportLibraryDump {
 	std::vector<std::string> lines;
 };
 
+struct PendingSupportLibraryExport {
+	size_t dependencyIndex = 0;
+	std::filesystem::path resolvedPath;
+	std::string resolvedKey;
+	std::string fallbackName;
+};
+
+struct SupportLibraryTaskResult {
+	bool loaded = false;
+	LoadedSupportLibraryDump dump;
+	std::string warning;
+};
+
+struct SupportLibraryAnnotationEntry {
+	size_t dependencyIndex = 0;
+	std::string resolvedKey;
+	size_t pendingExportIndex = static_cast<size_t>(-1);
+};
+
 bool TryLoadSupportLibraryDump(
 	const std::filesystem::path& filePath,
 	LoadedSupportLibraryDump& outDump,
@@ -797,11 +816,13 @@ bool IsEquivalentDependency(const e2txt::Dependency& left, const e2txt::Dependen
 ExportResult ExportDependencies(
 	const std::filesystem::path& sourcePath,
 	const std::filesystem::path& outputDir,
-	const std::vector<e2txt::Dependency>& dependencies)
+	const std::vector<e2txt::Dependency>& dependencies,
+	const size_t workerCount)
 {
 	ExportResult result;
-	std::unordered_map<std::string, std::string> localWorkspacesByResolvedPath;
-	std::unordered_map<std::string, int> exportedFileNames;
+	std::unordered_map<std::string, size_t> pendingExportIndexByResolvedPath;
+	std::vector<PendingSupportLibraryExport> pendingExports;
+	std::vector<SupportLibraryAnnotationEntry> annotationEntries;
 
 	bool warnedAboutX64 = false;
 	for (size_t dependencyIndex = 0; dependencyIndex < dependencies.size(); ++dependencyIndex) {
@@ -829,12 +850,12 @@ ExportResult ExportDependencies(
 			resolvedAbsolutePath = resolvedPath;
 		}
 		const std::string resolvedKey = PathToUtf8(resolvedAbsolutePath.lexically_normal());
-		if (const auto it = localWorkspacesByResolvedPath.find(resolvedKey);
-			it != localWorkspacesByResolvedPath.end()) {
-			result.annotations.push_back(DependencyAnnotation {
+		if (const auto pendingExportIt = pendingExportIndexByResolvedPath.find(resolvedKey);
+			pendingExportIt != pendingExportIndexByResolvedPath.end()) {
+			annotationEntries.push_back(SupportLibraryAnnotationEntry {
 				.dependencyIndex = dependencyIndex,
-				.resolvedPath = resolvedKey,
-				.localWorkspace = it->second,
+				.resolvedKey = resolvedKey,
+				.pendingExportIndex = pendingExportIt->second,
 			});
 			continue;
 		}
@@ -850,22 +871,62 @@ ExportResult ExportDependencies(
 			warnedAboutX64 = true;
 		}
 #else
+		const size_t pendingExportIndex = pendingExports.size();
+		pendingExportIndexByResolvedPath[resolvedKey] = pendingExportIndex;
+		annotationEntries.push_back(SupportLibraryAnnotationEntry {
+			.dependencyIndex = dependencyIndex,
+			.resolvedKey = resolvedKey,
+			.pendingExportIndex = pendingExportIndex,
+		});
+		pendingExports.push_back(PendingSupportLibraryExport {
+			.dependencyIndex = dependencyIndex,
+			.resolvedPath = resolvedPath,
+			.resolvedKey = resolvedKey,
+			.fallbackName = dependency.name,
+		});
+#endif
+	}
+
+#if defined(_M_IX86)
+	std::vector<SupportLibraryTaskResult> taskResults(pendingExports.size());
+	e2txt::RunFixedThreadTasks(
+		pendingExports.size(),
+		workerCount,
+		[&](const size_t taskIndex) {
+		const auto& task = pendingExports[taskIndex];
 		LoadedSupportLibraryDump dump;
 		std::string loadError;
-		if (!TryLoadSupportLibraryDump(resolvedPath, dump, loadError)) {
-			e2txt::AddRuntimeWarning(
-				Utf8Literal(u8"支持库公开信息导出失败：") + PathToUtf8(resolvedPath) +
-				" => " + loadError);
-			result.annotations.push_back(DependencyAnnotation {
-				.dependencyIndex = dependencyIndex,
-				.resolvedPath = resolvedKey,
-			});
+		SupportLibraryTaskResult taskResult;
+		if (!TryLoadSupportLibraryDump(task.resolvedPath, dump, loadError)) {
+			taskResult.warning =
+				Utf8Literal(u8"支持库公开信息导出失败：") + PathToUtf8(task.resolvedPath) +
+				" => " + loadError;
+			taskResults[taskIndex] = std::move(taskResult);
+			return;
+		}
+
+		taskResult.loaded = true;
+		taskResult.dump = std::move(dump);
+		taskResults[taskIndex] = std::move(taskResult);
+	});
+
+	std::unordered_map<std::string, int> exportedFileNames;
+	std::vector<std::filesystem::path> outputFilePaths(pendingExports.size());
+	std::vector<std::string> localWorkspaces(pendingExports.size());
+	for (size_t taskIndex = 0; taskIndex < pendingExports.size(); ++taskIndex) {
+		const auto& task = pendingExports[taskIndex];
+		const auto& taskResult = taskResults[taskIndex];
+		if (!taskResult.warning.empty()) {
+			e2txt::AddRuntimeWarning(taskResult.warning);
+		}
+		if (!taskResult.loaded) {
 			continue;
 		}
 
-		std::string baseFileName = dump.name.empty() ? dependency.name : dump.name;
+		const auto& dump = taskResult.dump;
+		std::string baseFileName = dump.name.empty() ? task.fallbackName : dump.name;
 		if (TrimAsciiCopy(baseFileName).empty()) {
-			baseFileName = resolvedPath.stem().string();
+			baseFileName = task.resolvedPath.stem().string();
 		}
 		baseFileName = SanitizeFileName(baseFileName);
 		const std::string normalizedBaseFileName = ToLowerAsciiCopy(baseFileName);
@@ -873,27 +934,51 @@ ExportResult ExportDependencies(
 		const std::string actualFileName =
 			duplicateIndex <= 1 ? baseFileName + ".txt" : baseFileName + "_" + std::to_string(duplicateIndex) + ".txt";
 
-		const std::filesystem::path outputFilePath = outputDir / "elib" / std::filesystem::path(actualFileName);
-		if (!WriteUtf8TextFileBom(outputFilePath, JoinLines(dump.lines))) {
-			e2txt::AddRuntimeWarning(
-				Utf8Literal(u8"写入支持库公开信息失败：") + PathToUtf8(outputFilePath));
-			result.annotations.push_back(DependencyAnnotation {
-				.dependencyIndex = dependencyIndex,
-				.resolvedPath = resolvedKey,
-			});
-			continue;
-		}
-
-		const std::string localWorkspace = PathToGenericUtf8(outputFilePath.lexically_relative(outputDir));
-		localWorkspacesByResolvedPath[resolvedKey] = localWorkspace;
-		result.annotations.push_back(DependencyAnnotation {
-			.dependencyIndex = dependencyIndex,
-			.resolvedPath = resolvedKey,
-			.localWorkspace = localWorkspace,
-		});
-		++result.exportedCount;
-#endif
+		outputFilePaths[taskIndex] = outputDir / "elib" / std::filesystem::path(actualFileName);
+		localWorkspaces[taskIndex] = PathToGenericUtf8(outputFilePaths[taskIndex].lexically_relative(outputDir));
 	}
+
+	std::vector<std::string> writeWarnings(pendingExports.size());
+	std::vector<char> writeSucceeded(pendingExports.size(), 0);
+	e2txt::RunFixedThreadTasks(
+		pendingExports.size(),
+		workerCount,
+		[&](const size_t taskIndex) {
+		if (!taskResults[taskIndex].loaded || outputFilePaths[taskIndex].empty()) {
+			return;
+		}
+		if (!WriteUtf8TextFileBom(outputFilePaths[taskIndex], JoinLines(taskResults[taskIndex].dump.lines))) {
+			writeWarnings[taskIndex] =
+				Utf8Literal(u8"写入支持库公开信息失败：") + PathToUtf8(outputFilePaths[taskIndex]);
+			return;
+		}
+		writeSucceeded[taskIndex] = 1;
+	});
+
+	for (size_t taskIndex = 0; taskIndex < pendingExports.size(); ++taskIndex) {
+		if (!writeWarnings[taskIndex].empty()) {
+			e2txt::AddRuntimeWarning(writeWarnings[taskIndex]);
+		}
+		if (writeSucceeded[taskIndex] != 0) {
+			++result.exportedCount;
+		}
+	}
+
+	for (const auto& entry : annotationEntries) {
+		DependencyAnnotation annotation {
+			.dependencyIndex = entry.dependencyIndex,
+			.resolvedPath = entry.resolvedKey,
+		};
+		if (entry.pendingExportIndex < writeSucceeded.size() && writeSucceeded[entry.pendingExportIndex] != 0) {
+			annotation.localWorkspace = localWorkspaces[entry.pendingExportIndex];
+		}
+		result.annotations.push_back(DependencyAnnotation {
+			.dependencyIndex = annotation.dependencyIndex,
+			.resolvedPath = annotation.resolvedPath,
+			.localWorkspace = annotation.localWorkspace,
+		});
+	}
+#endif
 
 	return result;
 }
