@@ -1101,6 +1101,39 @@ std::string BuildDefinitionLine(
 	return stream.str();
 }
 
+std::string BuildDefinitionLineWithMinimumFieldCount(
+	const std::string& type,
+	const std::vector<std::string>& rawItems,
+	const size_t minimumFieldCount,
+	int indent = 0)
+{
+	std::ostringstream stream;
+	for (int i = 0; i < indent; ++i) {
+		stream << "    ";
+	}
+	stream << "." << type;
+
+	size_t count = rawItems.size();
+	while (count > minimumFieldCount && rawItems[count - 1].empty()) {
+		--count;
+	}
+	if (count == 0) {
+		return stream.str();
+	}
+
+	stream << " ";
+	for (size_t i = 0; i < count; ++i) {
+		if (i != 0) {
+			stream << ",";
+			if (!rawItems[i].empty() || i + 1 < count) {
+				stream << " ";
+			}
+		}
+		stream << rawItems[i];
+	}
+	return stream.str();
+}
+
 bool IsTxt2EPlaceholderStruct(const DataTypeInfo& item)
 {
 	return TrimAsciiCopy(item.comment) == "txt2e placeholder" && item.members.empty();
@@ -5546,23 +5579,23 @@ void BuildProgramPages(const ModuleSections& sections, const GenerateOptions& op
 		}
 
 		std::string baseClassName;
-		if (pageInfo.baseClass == -1) {
-			baseClassName = "<对象>";
-		}
-		else if (pageInfo.baseClass != 0) {
+		if (pageInfo.baseClass != 0 && pageInfo.baseClass != -1) {
 			baseClassName = TrimAsciiCopy(resolver.ResolveType(pageInfo.baseClass));
 		}
 		if (baseClassName == "窗口") {
 			baseClassName.clear();
 		}
-		AppendLine(page, BuildDefinitionLine(
+		const std::vector<std::string> headerFields{
+			page.name,
+			baseClassName,
+			IsProgramPagePublic(sections, pageInfo.header.dwId) ? "公开" : std::string(),
+			TrimAsciiCopy(pageInfo.comment),
+		};
+		AppendLine(page, pageInfo.baseClass == -1
+			? BuildDefinitionLineWithMinimumFieldCount("程序集", headerFields, 2)
+			: BuildDefinitionLine(
 			"程序集",
-			{
-				page.name,
-				baseClassName,
-				IsProgramPagePublic(sections, pageInfo.header.dwId) ? "公开" : std::string(),
-				TrimAsciiCopy(pageInfo.comment),
-			}));
+			headerFields));
 		AppendLine(page, "");
 
 		for (const auto& pageVar : pageInfo.pageVars) {
@@ -6565,6 +6598,7 @@ struct SnapshotMethodDef {
 struct SnapshotClassDef {
 	std::string name;
 	std::string baseClassName;
+	bool hasBaseClassField = false;
 	bool isPublic = false;
 	std::string comment;
 	std::vector<SnapshotVariableDef> vars;
@@ -6809,7 +6843,9 @@ std::string ComputeSnapshotClassShapeDigest(const SnapshotClassDef& snapshot)
 {
 	std::ostringstream stream;
 	stream << "name=" << snapshot.name << "\n";
-	stream << "base=" << snapshot.baseClassName << "\n";
+	stream << "base=" << (snapshot.hasBaseClassField && snapshot.baseClassName.empty()
+		? std::string("<对象>")
+		: snapshot.baseClassName) << "\n";
 	stream << "public=" << (snapshot.isPublic ? 1 : 0) << "\n";
 	stream << "comment=" << snapshot.comment << "\n";
 	stream << "vars=" << snapshot.vars.size() << "\n";
@@ -6845,6 +6881,7 @@ bool TryBuildProgramPageSnapshot(const Page& page, SnapshotClassDef& outSnapshot
 	}
 	outSnapshot.name = GetSnapshotFieldOrEmpty(fields, 0);
 	outSnapshot.baseClassName = GetSnapshotFieldOrEmpty(fields, 1);
+	outSnapshot.hasBaseClassField = fields.size() > 1;
 	outSnapshot.isPublic = GetSnapshotFieldOrEmpty(fields, 2) == "公开";
 	if (fields.size() > 3) {
 		std::vector<std::string> remain(fields.begin() + 3, fields.end());

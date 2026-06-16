@@ -7199,6 +7199,7 @@ struct ParsedClassDef {
 	std::string name;
 	std::string sourcePath;
 	std::string baseClassName;
+	bool hasBaseClassField = false;
 	bool isPublic = false;
 	bool isFormClass = false;
 	bool isUserClass = false;
@@ -7847,7 +7848,9 @@ std::string ComputeParsedClassShapeDigest(const ParsedClassDef& parsedClass)
 {
 	std::ostringstream stream;
 	stream << "name=" << parsedClass.name << "\n";
-	stream << "base=" << parsedClass.baseClassName << "\n";
+	stream << "base=" << (parsedClass.hasBaseClassField && parsedClass.baseClassName.empty()
+		? std::string("<对象>")
+		: parsedClass.baseClassName) << "\n";
 	stream << "public=" << (parsedClass.isPublic ? 1 : 0) << "\n";
 	stream << "comment=" << parsedClass.comment << "\n";
 	stream << "vars=" << parsedClass.vars.size() << "\n";
@@ -8062,6 +8065,7 @@ bool ParseProgramPage(const Page& page, const std::unordered_set<std::string>& f
 	outClass.sourcePath = page.sourcePath;
 	outClass.name = fields.size() > 0 ? fields[0] : page.name;
 	outClass.baseClassName = GetFieldOrEmpty(fields, 1);
+	outClass.hasBaseClassField = fields.size() > 1;
 	outClass.isPublic = GetFieldOrEmpty(fields, 2) == "公开";
 	outClass.comment = ExtractRemainingDefinitionFieldText(TrimAsciiCopy(page.lines[index]), "程序集", 3);
 	const std::string normalizedBaseClassName = TypeResolver::NormalizeTypeName(outClass.baseClassName);
@@ -8069,7 +8073,7 @@ bool ParseProgramPage(const Page& page, const std::unordered_set<std::string>& f
 		formNames.contains(outClass.name) ||
 		normalizedBaseClassName == "窗口" ||
 		IsLikelyFormClassName(outClass.name);
-	outClass.isUserClass = !outClass.isFormClass && !normalizedBaseClassName.empty();
+	outClass.isUserClass = !outClass.isFormClass && (outClass.hasBaseClassField || !normalizedBaseClassName.empty());
 	++index;
 
 	while (index < page.lines.size()) {
@@ -10309,7 +10313,7 @@ bool BuildRestoreModel(
 					}
 
 					const std::string baseClassName = TypeResolver::NormalizeTypeName(currentClass->baseClassName);
-					if (baseClassName.empty() || baseClassName == "对象") {
+					if (baseClassName.empty() || baseClassName == "对象" || baseClassName == "<对象>") {
 						break;
 					}
 					const auto baseIt = dependencyClassByName.find(baseClassName);
@@ -10431,9 +10435,14 @@ bool BuildRestoreModel(
 			targetClass.baseClass = nativeSourceSnapshot->baseClass;
 		}
 		else {
-			targetClass.baseClass = parsedClass.isFormClass && TypeResolver::NormalizeTypeName(parsedClass.baseClassName).empty()
+			const std::string normalizedBaseClassName = TypeResolver::NormalizeTypeName(parsedClass.baseClassName);
+			targetClass.baseClass = parsedClass.isFormClass && normalizedBaseClassName.empty()
 				? 65537
-				: (TypeResolver::NormalizeTypeName(parsedClass.baseClassName) == "对象" ? -1 : ensureTypeId(parsedClass.baseClassName));
+				: ((parsedClass.isUserClass && normalizedBaseClassName.empty()) ||
+					normalizedBaseClassName == "对象" ||
+					normalizedBaseClassName == "<对象>"
+					? -1
+					: ensureTypeId(parsedClass.baseClassName));
 		}
 		for (size_t variableIndex = 0; variableIndex < parsedClass.vars.size(); ++variableIndex) {
 			RestoreVariable variable =
