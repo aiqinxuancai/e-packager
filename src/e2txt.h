@@ -410,6 +410,23 @@ struct ReadOptions {
 	std::string password;
 };
 
+// 写出源工程文件时的附加选项。
+struct WriteOptions {
+	// 输出加密 `.e` / `.ec` 文件的密码；留空表示按未加密文件写出。
+	std::string password;
+	// 使用 `.ec` 加密包裹格式；否则使用标准 `.e` 加密包裹格式。
+	bool encryptAsEc = false;
+	// `.ec` 加密包裹里保存的密码提示文本；留空表示不写提示。
+	std::string passwordHint;
+};
+
+// 按写出选项将普通源工程字节封装为最终文件字节。
+bool EncodeSourceBytesForWrite(
+	const std::vector<std::uint8_t>& inputBytes,
+	const WriteOptions& writeOptions,
+	std::vector<std::uint8_t>& outBytes,
+	std::string* outError);
+
 // 原生 e2txt 生成器。
 class Generator {
 public:

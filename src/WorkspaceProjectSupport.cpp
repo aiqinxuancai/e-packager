@@ -590,6 +590,7 @@ std::string BuildAgentsMarkdown(
 		<< L"- 默认方式：`tool\\\\e-packager.exe`\r\n"
 		<< L"  默认输出到 `pack/` 目录，文件名优先使用 `info.json` 中记录的默认封包文件名。\r\n"
 		<< L"- 显式方式：`tool\\\\e-packager.exe pack . .\\\\pack\\\\" << packOutputFileName << L"`\r\n"
+		<< L"- 设置打开密码：`tool\\\\e-packager.exe pack . .\\\\pack\\\\" << packOutputFileName << L" --password 密码文本`\r\n"
 		<< L"\r\n"
 		<< L"回包后的 `" << packOutputFileName << L"` 可直接在易语言 IDE 中打开并编译。\r\n"
 		<< L"\r\n"

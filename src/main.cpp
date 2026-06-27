@@ -708,7 +708,8 @@ bool DoPack(
 	const std::filesystem::path& outputPath,
 	std::string& outSummary,
 	std::string& outError,
-	std::filesystem::path* outWrittenOutputPath = nullptr)
+	std::filesystem::path* outWrittenOutputPath = nullptr,
+	const e2txt::WriteOptions& writeOptions = {})
 {
 	const std::filesystem::path effectiveInputDir = ResolveAbsolutePath(inputDir);
 	const std::filesystem::path requestedOutputPath = ResolveAbsolutePath(outputPath);
@@ -733,30 +734,39 @@ bool DoPack(
 	}
 
 	e2txt::Restorer restorer;
+	std::vector<std::uint8_t> plainBytes;
 	if (bundle.sourceFileKind == e2txt::SourceFileKind::EC) {
-		std::vector<std::uint8_t> bytes;
-		if (!restorer.RestoreBundleToBytesForEcBridge(bundle, bytes, &outError)) {
+		if (!restorer.RestoreBundleToBytesForEcBridge(bundle, plainBytes, &outError)) {
 			return false;
 		}
-
-		std::ofstream out(effectiveOutputPath, std::ios::binary);
-		if (!out.is_open()) {
-			outError = "open_output_failed";
-			return false;
-		}
-		out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-		if (!out.good()) {
-			outError = "write_output_failed";
-			return false;
-		}
-
-		outSummary = "bytes=" + std::to_string(bytes.size()) + ", output=" + PathToUtf8(effectiveOutputPath);
 	}
 	else {
-		if (!restorer.RestoreBundleToFile(bundle, PathToUtf8(effectiveOutputPath), &outSummary, &outError)) {
+		if (!restorer.RestoreBundleToBytes(bundle, plainBytes, &outError)) {
 			return false;
 		}
 	}
+
+	std::vector<std::uint8_t> outputBytes;
+	if (!e2txt::EncodeSourceBytesForWrite(plainBytes, writeOptions, outputBytes, &outError)) {
+		return false;
+	}
+
+	std::ofstream out(effectiveOutputPath, std::ios::binary);
+	if (!out.is_open()) {
+		outError = "open_output_failed";
+		return false;
+	}
+	out.write(reinterpret_cast<const char*>(outputBytes.data()), static_cast<std::streamsize>(outputBytes.size()));
+	if (!out.good()) {
+		outError = "write_output_failed";
+		return false;
+	}
+
+	outSummary = "bytes=" + std::to_string(outputBytes.size());
+	if (!writeOptions.password.empty()) {
+		outSummary += ", encrypted=true";
+	}
+	outSummary += ", output=" + PathToUtf8(effectiveOutputPath);
 	if (outWrittenOutputPath != nullptr) {
 		*outWrittenOutputPath = effectiveOutputPath;
 	}
@@ -1396,6 +1406,31 @@ bool ParseReadOptions(
 	return true;
 }
 
+bool ParseWriteOptions(
+	const int argc,
+	char* argv[],
+	const int startIndex,
+	e2txt::WriteOptions& outWriteOptions)
+{
+	outWriteOptions = {};
+	for (int index = startIndex; index < argc; ++index) {
+		const std::string option = argv[index];
+		if (option == "--password") {
+			if (index + 1 >= argc) {
+				return false;
+			}
+			outWriteOptions.password = argv[++index];
+			continue;
+		}
+		if (option.rfind("--password=", 0) == 0) {
+			outWriteOptions.password = option.substr(std::string("--password=").size());
+			continue;
+		}
+		return false;
+	}
+	return true;
+}
+
 int RunUnpack(const char* inputPath, const char* outputDir, const e2txt::ReadOptions& readOptions = {})
 {
 	std::string summary;
@@ -1406,11 +1441,11 @@ int RunUnpack(const char* inputPath, const char* outputDir, const e2txt::ReadOpt
 	return PrintStringResult("unpack", 0, summary.c_str());
 }
 
-int RunPack(const char* inputDir, const char* outputPath)
+int RunPack(const char* inputDir, const char* outputPath, const e2txt::WriteOptions& writeOptions = {})
 {
 	std::string summary;
 	std::string error;
-	if (!DoPack(std::filesystem::path(inputDir), std::filesystem::path(outputPath), summary, error)) {
+	if (!DoPack(std::filesystem::path(inputDir), std::filesystem::path(outputPath), summary, error, nullptr, writeOptions)) {
 		return PrintStringResult("pack", -1, error.c_str());
 	}
 	return PrintStringResult("pack", 0, summary.c_str());
@@ -1845,7 +1880,7 @@ void PrintUsage()
 	std::cout << Utf8Literal(u8"  e-packager                           # 封包当前项目到 .\\pack\\<info.json sourceFileName>") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager <input.e|input.ec> [--password <text>]       # 拆包 .e/.ec 文件到同目录下同名文件夹（拖放直接打开）") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager unpack <input.e|input.ec> <output-dir> [--password <text>]    # 拆包到指定目录") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager pack <input-dir> <output.e|output.ec>      # 将目录封包为 .e/.ec 文件") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager pack <input-dir> <output.e|output.ec> [--password <text>]      # 将目录封包为 .e/.ec 文件") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager update <input-dir> [--add-ecom <file.ec>]... [--add-elib <name|file.fne>]... [--add-image <file|name=file>]... [--add-audio <file|name=file>]...   # 刷新派生内容并新增资源") << std::endl;
 #if defined(_M_X64)
 	std::cout << Utf8Literal(u8"  e-packager /update [--force]         # x64 构建不启用自更新") << std::endl;
@@ -1901,11 +1936,16 @@ int RunCommand(int argc, char* argv[])
 		return RunUnpack(argv[2], argv[3], readOptions);
 	}
 	if (command == "pack") {
-		if (argc != 4) {
+		if (argc < 4) {
 			PrintUsage();
 			return EXIT_FAILURE;
 		}
-		return RunPack(argv[2], argv[3]);
+		e2txt::WriteOptions writeOptions;
+		if (!ParseWriteOptions(argc, argv, 4, writeOptions)) {
+			PrintUsage();
+			return EXIT_FAILURE;
+		}
+		return RunPack(argv[2], argv[3], writeOptions);
 	}
 	if (command == "update") {
 		if (argc < 3) {

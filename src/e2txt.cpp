@@ -204,6 +204,14 @@ std::uint32_t ReadLeU32(const std::uint8_t* data)
 		(static_cast<std::uint32_t>(data[3]) << 24);
 }
 
+void WriteLeU32(std::vector<std::uint8_t>& outBytes, const std::uint32_t value)
+{
+	outBytes.push_back(static_cast<std::uint8_t>(value & 0xFF));
+	outBytes.push_back(static_cast<std::uint8_t>((value >> 8) & 0xFF));
+	outBytes.push_back(static_cast<std::uint8_t>((value >> 16) & 0xFF));
+	outBytes.push_back(static_cast<std::uint8_t>((value >> 24) & 0xFF));
+}
+
 bool ComputeMd5Bytes(
 	const std::vector<std::uint8_t>& input,
 	std::array<std::uint8_t, 16>& outHash,
@@ -481,6 +489,68 @@ bool NormalizeEcDecryptedModuleBytes(std::vector<std::uint8_t>& bytes, std::stri
 			}
 			return false;
 		}
+		offset += sectionLength;
+	}
+
+	return true;
+}
+
+bool DenormalizeEcModuleBytesForEncryption(std::vector<std::uint8_t>& bytes, std::string* outError)
+{
+	if (bytes.size() < sizeof(std::uint32_t) * 2) {
+		if (outError != nullptr) {
+			*outError = "encrypt_source_body_too_small";
+		}
+		return false;
+	}
+	if (ReadLeU32(bytes.data()) != kMagicFileHeader1 || ReadLeU32(bytes.data() + sizeof(std::uint32_t)) != kMagicFileHeader2) {
+		if (outError != nullptr) {
+			*outError = "encrypt_source_body_header_invalid";
+		}
+		return false;
+	}
+
+	size_t offset = sizeof(std::uint32_t) * 2;
+	while (offset < bytes.size()) {
+		if (bytes.size() - offset < sizeof(RawSectionHeader) + sizeof(RawSectionInfo)) {
+			if (outError != nullptr) {
+				*outError = "encrypt_source_section_truncated";
+			}
+			return false;
+		}
+
+		RawSectionHeader header = {};
+		std::memcpy(&header, bytes.data() + offset, sizeof(header));
+		if (header.magic != kMagicSection) {
+			if (outError != nullptr) {
+				*outError = "encrypt_source_section_header_invalid";
+			}
+			return false;
+		}
+
+		RawSectionInfo info = {};
+		const size_t infoOffset = offset + sizeof(header);
+		std::memcpy(&info, bytes.data() + infoOffset, sizeof(info));
+		if (info.dataLength < 0) {
+			if (outError != nullptr) {
+				*outError = "encrypt_source_section_length_invalid";
+			}
+			return false;
+		}
+
+		const size_t sectionLength =
+			sizeof(RawSectionHeader) +
+			sizeof(RawSectionInfo) +
+			static_cast<size_t>(info.dataLength);
+		if (bytes.size() - offset < sectionLength) {
+			if (outError != nullptr) {
+				*outError = "encrypt_source_section_body_truncated";
+			}
+			return false;
+		}
+
+		info.dataLength ^= 1;
+		std::memcpy(bytes.data() + infoOffset, &info, sizeof(info));
 		offset += sectionLength;
 	}
 
@@ -7507,6 +7577,92 @@ std::vector<std::string> g_runtimeWarnings;
 std::unordered_set<std::string> g_runtimeWarningSet;
 
 }  // namespace
+
+bool EncodeSourceBytesForWrite(
+	const std::vector<std::uint8_t>& inputBytes,
+	const WriteOptions& writeOptions,
+	std::vector<std::uint8_t>& outBytes,
+	std::string* outError)
+{
+	if (outError != nullptr) {
+		outError->clear();
+	}
+
+	if (writeOptions.password.empty()) {
+		outBytes = inputBytes;
+		return true;
+	}
+
+	if (inputBytes.size() < sizeof(std::uint32_t) * 2) {
+		if (outError != nullptr) {
+			*outError = "encrypt_source_body_too_small";
+		}
+		return false;
+	}
+	if (ReadLeU32(inputBytes.data()) == kMagicEncryptedSource) {
+		if (outError != nullptr) {
+			*outError = "encrypt_source_input_already_encrypted";
+		}
+		return false;
+	}
+	if (ReadLeU32(inputBytes.data()) != kMagicFileHeader1 ||
+		ReadLeU32(inputBytes.data() + sizeof(std::uint32_t)) != kMagicFileHeader2) {
+		if (outError != nullptr) {
+			*outError = "encrypt_source_body_header_invalid";
+		}
+		return false;
+	}
+
+	std::vector<std::uint8_t> secretId;
+	std::vector<std::uint8_t> iv;
+	if (!BuildEncryptedSecretId(writeOptions.password, writeOptions.encryptAsEc, secretId, iv, outError)) {
+		return false;
+	}
+
+	std::vector<std::uint8_t> bodyBytes = inputBytes;
+	if (writeOptions.encryptAsEc && !DenormalizeEcModuleBytesForEncryption(bodyBytes, outError)) {
+		return false;
+	}
+
+	const std::vector<std::uint8_t> hintBytes(
+		writeOptions.passwordHint.begin(),
+		writeOptions.passwordHint.end());
+	const std::uint32_t type = writeOptions.encryptAsEc
+		? kMagicEncryptedSourceTypeEC
+		: kMagicEncryptedSourceTypeEStd;
+
+	outBytes.clear();
+	outBytes.reserve(
+		sizeof(std::uint32_t) * (writeOptions.encryptAsEc ? 3 : 2) +
+		hintBytes.size() +
+		secretId.size() +
+		bodyBytes.size());
+	WriteLeU32(outBytes, kMagicEncryptedSource);
+	WriteLeU32(outBytes, type);
+	if (writeOptions.encryptAsEc) {
+		if (hintBytes.size() > static_cast<size_t>((std::numeric_limits<std::int32_t>::max)())) {
+			if (outError != nullptr) {
+				*outError = "encrypt_source_hint_too_large";
+			}
+			return false;
+		}
+		WriteLeU32(outBytes, static_cast<std::uint32_t>(hintBytes.size()));
+		outBytes.insert(outBytes.end(), hintBytes.begin(), hintBytes.end());
+	}
+	outBytes.insert(outBytes.end(), secretId.begin(), secretId.end());
+	outBytes.insert(outBytes.end(), bodyBytes.begin(), bodyBytes.end());
+
+	const size_t overtLength =
+		sizeof(std::uint32_t) * (writeOptions.encryptAsEc ? 3 : 2) +
+		(writeOptions.encryptAsEc ? hintBytes.size() : 0);
+	if (writeOptions.encryptAsEc) {
+		ApplyEcTransform(outBytes, overtLength, secretId, iv);
+	}
+	else {
+		ApplyEStdTransform(outBytes, overtLength, secretId, iv);
+	}
+	return true;
+}
 
 void ClearRuntimeWarnings()
 {

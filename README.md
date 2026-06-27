@@ -20,7 +20,7 @@ e-packager unpack <input.e|input.ec> <output-dir>
 e-packager unpack MyApp.e MyApp\ --password 111222333
 ```
 
-解包加密文件后，后续回包默认输出为未加密 `.e`，不需要再次提供密码。
+解包加密文件后，后续回包默认输出为未加密 `.e`，不需要再次提供密码；如果希望回包结果继续带打开密码，可在 `pack` 时传入 `--password`。
 
 也可直接将 `.e` / `.ec` 文件拖放到 `e-packager.exe` 上，自动在源文件所在目录创建同名子目录并解包：
 
@@ -49,7 +49,7 @@ e-packager MyMod.ec   # 解包到 MyMod\
 ### 回包
 
 ```
-e-packager pack <input-dir> <output.e|output.ec>
+e-packager pack <input-dir> <output.e|output.ec> [--password <text>]
 ```
 
 或在项目根目录（或 `tool/` 子目录）内直接运行，自动输出到 `pack/` 目录：
@@ -59,6 +59,12 @@ e-packager
 ```
 
 > `.ec` 工作区回包的实际输出始终为 `.e` 格式；无参默认回包时输出至 `pack/<原文件名>.ec.e`。
+
+需要为回包结果设置打开密码时：
+
+```
+e-packager pack MyApp\ MyApp-protected.e --password 111222333
+```
 
 ### 刷新派生内容
 
