@@ -113,6 +113,7 @@ void ConfigureConsoleForUtf8()
 
 struct UnpackOptions {
 	bool writeAgentsMarkdown = true;
+	bool writeDependencyArtifacts = true;
 	bool unpackDependencyModules = true;
 	size_t dependencyExportThreadCount = e2txt::kDefaultDependencyExportThreadCount;
 	e2txt::ReadOptions readOptions;
@@ -491,6 +492,7 @@ DependencyModuleExportResult ExportDependencyModules(
 		std::string childError;
 		const UnpackOptions childOptions {
 			.writeAgentsMarkdown = false,
+			.writeDependencyArtifacts = true,
 			.unpackDependencyModules = false,
 			.dependencyExportThreadCount = 1,
 			.readOptions = readOptions,
@@ -669,15 +671,20 @@ bool DoUnpackInternal(
 	}
 
 	DependencyRefreshResult dependencyRefreshResult;
-	if (!RefreshDependencyArtifacts(
-			effectiveInputPath,
-			effectiveOutputDir,
-			bundle,
-			options.unpackDependencyModules && extension != ".ec",
-			options.readOptions,
-			options.dependencyExportThreadCount,
-			dependencyRefreshResult,
-			outError)) {
+	if (options.writeDependencyArtifacts) {
+		if (!RefreshDependencyArtifacts(
+				effectiveInputPath,
+				effectiveOutputDir,
+				bundle,
+				options.unpackDependencyModules && extension != ".ec",
+				options.readOptions,
+				options.dependencyExportThreadCount,
+				dependencyRefreshResult,
+				outError)) {
+			return false;
+		}
+	}
+	else if (!RemoveGeneratedDependencyArtifacts(effectiveOutputDir, outError)) {
 		return false;
 	}
 
@@ -1406,6 +1413,36 @@ bool ParseReadOptions(
 	return true;
 }
 
+bool ParseUnpackOptions(
+	const int argc,
+	char* argv[],
+	const int startIndex,
+	UnpackOptions& outOptions)
+{
+	outOptions = {};
+	for (int index = startIndex; index < argc; ++index) {
+		const std::string option = argv[index];
+		if (option == "--password") {
+			if (index + 1 >= argc) {
+				return false;
+			}
+			outOptions.readOptions.password = argv[++index];
+			continue;
+		}
+		if (option.rfind("--password=", 0) == 0) {
+			outOptions.readOptions.password = option.substr(std::string("--password=").size());
+			continue;
+		}
+		if (option == "--main-only") {
+			outOptions.writeDependencyArtifacts = false;
+			outOptions.unpackDependencyModules = false;
+			continue;
+		}
+		return false;
+	}
+	return true;
+}
+
 bool ParseWriteOptions(
 	const int argc,
 	char* argv[],
@@ -1431,11 +1468,16 @@ bool ParseWriteOptions(
 	return true;
 }
 
-int RunUnpack(const char* inputPath, const char* outputDir, const e2txt::ReadOptions& readOptions = {})
+int RunUnpack(const char* inputPath, const char* outputDir, const UnpackOptions& unpackOptions = {})
 {
 	std::string summary;
 	std::string error;
-	if (!DoUnpack(std::filesystem::path(inputPath), std::filesystem::path(outputDir), summary, error, readOptions)) {
+	if (!DoUnpackInternal(
+			std::filesystem::path(inputPath),
+			std::filesystem::path(outputDir),
+			summary,
+			error,
+			unpackOptions)) {
 		return PrintStringResult("unpack", -1, error.c_str());
 	}
 	return PrintStringResult("unpack", 0, summary.c_str());
@@ -1855,14 +1897,14 @@ int RunVerifyRoundTrip(
 	return PrintStringResult("verify-roundtrip", 0, compareSummary.c_str());
 }
 
-int RunDragDropUnpack(const char* inputPath, const e2txt::ReadOptions& readOptions = {})
+int RunDragDropUnpack(const char* inputPath, const UnpackOptions& unpackOptions = {})
 {
 	const std::filesystem::path input(inputPath);
 	const std::filesystem::path outputDir = input.parent_path() / input.stem();
 
 	std::string summary;
 	std::string error;
-	if (!DoUnpack(input, outputDir, summary, error, readOptions)) {
+	if (!DoUnpackInternal(input, outputDir, summary, error, unpackOptions)) {
 		return PrintStringResult("unpack", -1, error.c_str());
 	}
 	return PrintStringResult("unpack", 0, summary.c_str());
@@ -1878,8 +1920,8 @@ void PrintUsage()
 {
 	std::cout << Utf8Literal(u8"e-packager 用法:") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager                           # 封包当前项目到 .\\pack\\<info.json sourceFileName>") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager <input.e|input.ec> [--password <text>]       # 拆包 .e/.ec 文件到同目录下同名文件夹（拖放直接打开）") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager unpack <input.e|input.ec> <output-dir> [--password <text>]    # 拆包到指定目录") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager <input.e|input.ec> [--password <text>] [--main-only]       # 拆包 .e/.ec 文件到同目录下同名文件夹（拖放直接打开）") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager unpack <input.e|input.ec> <output-dir> [--password <text>] [--main-only]    # 拆包到指定目录") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager pack <input-dir> <output.e|output.ec> [--password <text>]      # 将目录封包为 .e/.ec 文件") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager update <input-dir> [--add-ecom <file.ec>]... [--add-elib <name|file.fne>]... [--add-image <file|name=file>]... [--add-audio <file|name=file>]...   # 刷新派生内容并新增资源") << std::endl;
 #if defined(_M_X64)
@@ -1928,12 +1970,12 @@ int RunCommand(int argc, char* argv[])
 			PrintUsage();
 			return EXIT_FAILURE;
 		}
-		e2txt::ReadOptions readOptions;
-		if (!ParseReadOptions(argc, argv, 4, readOptions)) {
+		UnpackOptions unpackOptions;
+		if (!ParseUnpackOptions(argc, argv, 4, unpackOptions)) {
 			PrintUsage();
 			return EXIT_FAILURE;
 		}
-		return RunUnpack(argv[2], argv[3], readOptions);
+		return RunUnpack(argv[2], argv[3], unpackOptions);
 	}
 	if (command == "pack") {
 		if (argc < 4) {
@@ -2041,12 +2083,12 @@ int RunCommand(int argc, char* argv[])
 		std::string ext = inputPath.extension().string();
 		std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 		if (ext == ".e" || ext == ".ec") {
-			e2txt::ReadOptions readOptions;
-			if (!ParseReadOptions(argc, argv, 2, readOptions)) {
+			UnpackOptions unpackOptions;
+			if (!ParseUnpackOptions(argc, argv, 2, unpackOptions)) {
 				PrintUsage();
 				return EXIT_FAILURE;
 			}
-			return RunDragDropUnpack(argv[1], readOptions);
+			return RunDragDropUnpack(argv[1], unpackOptions);
 		}
 	}
 
