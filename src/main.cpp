@@ -684,9 +684,6 @@ bool DoUnpackInternal(
 			return false;
 		}
 	}
-	else if (!RemoveGeneratedDependencyArtifacts(effectiveOutputDir, outError)) {
-		return false;
-	}
 
 	outSummary =
 		"source_files=" + std::to_string(bundle.sourceFiles.size()) +

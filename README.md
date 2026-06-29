@@ -14,7 +14,7 @@
 e-packager unpack <input.e|input.ec> <output-dir>
 ```
 
-只需要解包主 `.e` / `.ec` 文件，不写出依赖易模块工作区和支持库公开接口时，可传入 `--main-only`：
+只需要解包主 `.e` / `.ec` 文件，不刷新依赖易模块工作区和支持库公开接口时，可传入 `--main-only`：
 
 ```
 e-packager unpack MyApp.e MyApp\ --main-only
@@ -50,7 +50,7 @@ e-packager MyMod.ec   # 解包到 MyMod\
 | `info.json` | 来源文件的类型、路径、修改时间、MD5 |
 | `AGENTS.md` | 供 AI Agent 阅读的项目结构说明 |
 
-若 `.e` 工程引用了易模块（`.ec`），默认解包时会自动将这些模块同步导出到 `ecom/<模块名>/`，并导出支持库公开接口到 `elib/`。`project/.module.json` 中对应依赖项会额外写入 `resolvedPath`（本机模块完整路径）与 `localWorkspace`（本地工作区目录）两个只读辅助字段，不参与回包。使用 `--main-only` 时不会生成 `ecom/` 与 `elib/`，也不会写入这些派生辅助字段。
+若 `.e` 工程引用了易模块（`.ec`），默认解包时会自动将这些模块同步导出到 `ecom/<模块名>/`，并导出支持库公开接口到 `elib/`。`project/.module.json` 中对应依赖项会额外写入 `resolvedPath`（本机模块完整路径）与 `localWorkspace`（本地工作区目录）两个只读辅助字段，不参与回包。使用 `--main-only` 时不会生成、更新或删除 `ecom/` 与 `elib/`，也不会写入这些派生辅助字段。
 
 ### 回包
 
