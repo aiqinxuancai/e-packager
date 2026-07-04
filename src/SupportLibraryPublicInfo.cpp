@@ -533,6 +533,9 @@ struct LoadedSupportLibraryDump {
 	int majorVersion = 0;
 	int minorVersion = 0;
 	int buildNumber = 0;
+	int commandCount = 0;
+	int dataTypeCount = 0;
+	int constantCount = 0;
 	std::vector<std::string> lines;
 };
 
@@ -642,6 +645,7 @@ bool TryLoadSupportLibraryDump(
 		IsReadableMemoryRange(
 			libInfo->m_pBeginCmdInfo,
 			sizeof(CMD_INFO) * static_cast<size_t>(libInfo->m_nCmdCount))) {
+		outDump.commandCount = libInfo->m_nCmdCount;
 		lines.push_back("");
 		lines.push_back("[命令]");
 		for (int i = 0; i < libInfo->m_nCmdCount; ++i) {
@@ -688,6 +692,7 @@ bool TryLoadSupportLibraryDump(
 		IsReadableMemoryRange(
 			libInfo->m_pDataType,
 			sizeof(LIB_DATA_TYPE_INFO) * static_cast<size_t>(libInfo->m_nDataTypeCount))) {
+		outDump.dataTypeCount = libInfo->m_nDataTypeCount;
 		lines.push_back("");
 		lines.push_back("[数据类型]");
 		for (int i = 0; i < libInfo->m_nDataTypeCount; ++i) {
@@ -734,6 +739,7 @@ bool TryLoadSupportLibraryDump(
 		IsReadableMemoryRange(
 			libInfo->m_pLibConst,
 			sizeof(LIB_CONST_INFO) * static_cast<size_t>(libInfo->m_nLibConstCount))) {
+		outDump.constantCount = libInfo->m_nLibConstCount;
 		lines.push_back("");
 		lines.push_back("[常量]");
 		for (int i = 0; i < libInfo->m_nLibConstCount; ++i) {
@@ -812,6 +818,53 @@ bool IsEquivalentDependency(const e2txt::Dependency& left, const e2txt::Dependen
 }
 
 }  // namespace
+
+bool DumpSupportLibraryPublicInfoToFile(
+	const std::filesystem::path& inputPath,
+	const std::filesystem::path& outputPath,
+	std::string& outSummary,
+	std::string& outError)
+{
+	outSummary.clear();
+	outError.clear();
+
+	if (inputPath.empty()) {
+		outError = "empty_support_library_input";
+		return false;
+	}
+	if (outputPath.empty()) {
+		outError = "empty_support_library_output";
+		return false;
+	}
+
+	std::error_code ec;
+	std::filesystem::path effectiveInputPath = std::filesystem::absolute(inputPath, ec);
+	if (ec) {
+		effectiveInputPath = inputPath;
+	}
+
+	LoadedSupportLibraryDump dump;
+	if (!TryLoadSupportLibraryDump(effectiveInputPath, dump, outError)) {
+		outError = "support_library_load_failed: " + PathToUtf8(effectiveInputPath) + " => " + outError;
+		return false;
+	}
+
+	if (!WriteUtf8TextFileBom(outputPath, JoinLines(dump.lines))) {
+		outError = "write_support_library_dump_failed: " + PathToUtf8(outputPath);
+		return false;
+	}
+
+	const std::string summaryName = dump.name.empty()
+		? PathToUtf8(effectiveInputPath.filename())
+		: LocalToUtf8Text(dump.name);
+	outSummary =
+		"name=" + summaryName +
+		", commands=" + std::to_string(dump.commandCount) +
+		", data_types=" + std::to_string(dump.dataTypeCount) +
+		", constants=" + std::to_string(dump.constantCount) +
+		", output=" + PathToUtf8(outputPath);
+	return true;
+}
 
 ExportResult ExportDependencies(
 	const std::filesystem::path& sourcePath,

@@ -36,6 +36,13 @@ ExportResult ExportDependencies(
 	const std::vector<e2txt::Dependency>& dependencies,
 	size_t workerCount = e2txt::kDefaultDependencyExportThreadCount);
 
+// 将单个支持库的公开接口导出为文本文件，仅 Win32 版可实际加载 x86 支持库。
+bool DumpSupportLibraryPublicInfoToFile(
+	const std::filesystem::path& inputPath,
+	const std::filesystem::path& outputPath,
+	std::string& outSummary,
+	std::string& outError);
+
 // 根据输入的名称或路径解析支持库依赖。
 bool TryBuildDependencyFromInput(
 	const std::filesystem::path& sourcePath,

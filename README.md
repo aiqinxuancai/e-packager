@@ -35,6 +35,16 @@ e-packager MyApp.e    # 解包到 MyApp\
 e-packager MyMod.ec   # 解包到 MyMod\
 ```
 
+### 支持库公开接口导出
+
+Win32 版可直接读取 x86 `.fne` 支持库，并导出与解包 `.e` 时 `elib/*.txt` 一致的公开接口文本：
+
+```
+e-packager decrypt-fne MyLib.fne MyLib.txt
+```
+
+也可直接将 `.fne` 文件拖放到 `e-packager.exe` 上，默认在同目录生成同名 `.txt`。x64 版不会加载 x86 支持库，此命令会提示需要 Win32 版。
+
 **解包目录结构：**
 
 | 路径 | 内容 |
@@ -122,6 +132,9 @@ e-packager /update
 
 # 查看当前程序版本
 e-packager version
+
+# 导出单个 .fne 支持库公开接口（仅 Win32 版）
+e-packager decrypt-fne <input.fne> [output.txt]
 
 # 比较原文件与目录内容是否一致
 e-packager compare-bundle <input.e|input.ec> <input-dir> [--password <text>]

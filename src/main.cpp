@@ -80,6 +80,37 @@ std::filesystem::path ResolveAbsolutePath(const std::filesystem::path& path)
 	return ec ? path : absolutePath;
 }
 
+bool IsSupportLibraryFileExtension(const std::filesystem::path& path)
+{
+	std::string extension = path.extension().string();
+	std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch) {
+		return static_cast<char>(std::tolower(ch));
+	});
+	return extension == ".fne" || extension == ".fnr" || extension == ".dll";
+}
+
+std::filesystem::path BuildDefaultSupportLibraryDumpOutputPath(const std::filesystem::path& inputPath)
+{
+	std::filesystem::path outputPath = inputPath;
+	outputPath.replace_extension(L".txt");
+	return outputPath;
+}
+
+std::filesystem::path ResolveSupportLibraryDumpOutputPath(
+	const std::filesystem::path& inputPath,
+	const std::filesystem::path& requestedOutputPath)
+{
+	if (requestedOutputPath.empty()) {
+		return BuildDefaultSupportLibraryDumpOutputPath(inputPath);
+	}
+
+	std::error_code ec;
+	if (std::filesystem::exists(requestedOutputPath, ec) && std::filesystem::is_directory(requestedOutputPath, ec)) {
+		return requestedOutputPath / (inputPath.stem().wstring() + L".txt");
+	}
+	return requestedOutputPath;
+}
+
 void ClearNativeReuseState(e2txt::ProjectBundle& bundle)
 {
 	bundle.nativeBundleDigest.clear();
@@ -1894,6 +1925,30 @@ int RunVerifyRoundTrip(
 	return PrintStringResult("verify-roundtrip", 0, compareSummary.c_str());
 }
 
+int RunSupportLibraryDump(const char* inputPath, const char* outputPath = nullptr)
+{
+	const std::filesystem::path effectiveInputPath = ResolveAbsolutePath(std::filesystem::path(inputPath));
+	if (!IsSupportLibraryFileExtension(effectiveInputPath)) {
+		return PrintStringResult("decrypt-fne", -1, "support_library_file_type_unsupported");
+	}
+
+	const std::filesystem::path requestedOutputPath =
+		outputPath == nullptr ? std::filesystem::path() : ResolveAbsolutePath(std::filesystem::path(outputPath));
+	const std::filesystem::path effectiveOutputPath =
+		ResolveSupportLibraryDumpOutputPath(effectiveInputPath, requestedOutputPath);
+
+	std::string summary;
+	std::string error;
+	if (!support_library_public_info::DumpSupportLibraryPublicInfoToFile(
+			effectiveInputPath,
+			effectiveOutputPath,
+			summary,
+			error)) {
+		return PrintStringResult("decrypt-fne", -1, error.c_str());
+	}
+	return PrintStringResult("decrypt-fne", 0, summary.c_str());
+}
+
 int RunDragDropUnpack(const char* inputPath, const UnpackOptions& unpackOptions = {})
 {
 	const std::filesystem::path input(inputPath);
@@ -1918,7 +1973,9 @@ void PrintUsage()
 	std::cout << Utf8Literal(u8"e-packager 用法:") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager                           # 封包当前项目到 .\\pack\\<info.json sourceFileName>") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager <input.e|input.ec> [--password <text>] [--main-only]       # 拆包 .e/.ec 文件到同目录下同名文件夹（拖放直接打开）") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager <input.fne>               # 导出支持库公开接口到同目录 .txt（仅 Win32 版可用）") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager unpack <input.e|input.ec> <output-dir> [--password <text>] [--main-only]    # 拆包到指定目录") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager decrypt-fne <input.fne> [output.txt]      # 导出支持库公开接口单文件（仅 Win32 版可用）") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager pack <input-dir> <output.e|output.ec> [--password <text>]      # 将目录封包为 .e/.ec 文件") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager update <input-dir> [--add-ecom <file.ec>]... [--add-elib <name|file.fne>]... [--add-image <file|name=file>]... [--add-audio <file|name=file>]...   # 刷新派生内容并新增资源") << std::endl;
 #if defined(_M_X64)
@@ -1973,6 +2030,13 @@ int RunCommand(int argc, char* argv[])
 			return EXIT_FAILURE;
 		}
 		return RunUnpack(argv[2], argv[3], unpackOptions);
+	}
+	if (command == "decrypt-fne" || command == "dump-fne") {
+		if (argc < 3 || argc > 4) {
+			PrintUsage();
+			return EXIT_FAILURE;
+		}
+		return RunSupportLibraryDump(argv[2], argc >= 4 ? argv[3] : nullptr);
 	}
 	if (command == "pack") {
 		if (argc < 4) {
@@ -2074,7 +2138,7 @@ int RunCommand(int argc, char* argv[])
 		return RunVerifyRoundTrip(argv[2], argv[3], argv[4], readOptions);
 	}
 
-	// Drag-and-drop: a single .e/.ec file path passed directly
+	// Drag-and-drop: a single .e/.ec/.fne file path passed directly
 	if (argc == 2 || argc >= 4) {
 		std::filesystem::path inputPath(command);
 		std::string ext = inputPath.extension().string();
@@ -2086,6 +2150,9 @@ int RunCommand(int argc, char* argv[])
 				return EXIT_FAILURE;
 			}
 			return RunDragDropUnpack(argv[1], unpackOptions);
+		}
+		if (argc == 2 && IsSupportLibraryFileExtension(inputPath)) {
+			return RunSupportLibraryDump(argv[1]);
 		}
 	}
 
