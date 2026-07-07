@@ -6,7 +6,10 @@
 #include <array>
 #include <cctype>
 #include <cstdint>
+#include <cmath>
 #include <fstream>
+#include <iomanip>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <unordered_map>
@@ -400,81 +403,173 @@ const LIB_INFO* CallGetLibInfoSafely(const PFN_GET_LIB_INFO getInfoProc)
 #endif
 }
 
-std::vector<std::string> BuildSupportTypeMemberNames(const LIB_DATA_TYPE_INFO& dataType)
+std::string DisplayNameOrPlaceholder(const std::string& name)
 {
-	std::vector<std::string> memberNames;
-	const bool isWinUnit =
-		(dataType.m_dwState & LDT_WIN_UNIT) != 0 &&
-		(dataType.m_dwState & LDT_ENUM) == 0;
-	if (isWinUnit) {
-		if (dataType.m_nPropertyCount > 0 &&
-			dataType.m_nPropertyCount <= kMaxSupportLibraryArrayCount &&
-			dataType.m_pPropertyBegin != nullptr &&
-			IsReadableMemoryRange(
-				dataType.m_pPropertyBegin,
-				sizeof(UNIT_PROPERTY) * static_cast<size_t>(dataType.m_nPropertyCount))) {
-			memberNames.reserve(static_cast<size_t>(dataType.m_nPropertyCount));
-			for (int propertyIndex = 0; propertyIndex < dataType.m_nPropertyCount; ++propertyIndex) {
-				memberNames.emplace_back(ReadAnsiText(dataType.m_pPropertyBegin[propertyIndex].m_szName));
+	return name.empty() ? std::string("<未命名>") : name;
+}
+
+std::string FormatNumberLiteral(double value)
+{
+	if (std::isfinite(value)) {
+		const double rounded = std::round(value);
+		if (std::fabs(value - rounded) < 1e-12 &&
+			rounded >= static_cast<double>((std::numeric_limits<long long>::min)()) &&
+			rounded <= static_cast<double>((std::numeric_limits<long long>::max)())) {
+			return std::to_string(static_cast<long long>(rounded));
+		}
+	}
+
+	std::ostringstream stream;
+	stream << std::fixed << std::setprecision(15) << value;
+	std::string text = stream.str();
+	while (!text.empty() && text.back() == '0') {
+		text.pop_back();
+	}
+	if (!text.empty() && text.back() == '.') {
+		text.pop_back();
+	}
+	if (text == "-0") {
+		text = "0";
+	}
+	return text.empty() ? "0" : text;
+}
+
+std::string FormatHexValue(const std::uint32_t value)
+{
+	std::ostringstream stream;
+	stream << "0x" << std::hex << std::uppercase << value;
+	return stream.str();
+}
+
+void AppendHexByte(std::string& out, const unsigned char value)
+{
+	static constexpr char kHexDigits[] = "0123456789ABCDEF";
+	out += "\\x";
+	out.push_back(kHexDigits[(value >> 4) & 0x0F]);
+	out.push_back(kHexDigits[value & 0x0F]);
+}
+
+std::string BuildReadableTextLiteral(const std::string& text)
+{
+	std::string out;
+	out.reserve(text.size() + 2);
+	out.push_back('"');
+	for (const unsigned char ch : text) {
+		switch (ch) {
+		case '\\': out += "\\\\"; break;
+		case '"': out += "\\\""; break;
+		case '\r': out += "\\r"; break;
+		case '\n': out += "\\n"; break;
+		case '\t': out += "\\t"; break;
+		default:
+			if (ch < 0x20) {
+				AppendHexByte(out, ch);
 			}
-			return memberNames;
-		}
-
-		static constexpr std::array<const char*, FIXED_WIN_UNIT_PROPERTY_COUNT> kFixedWinUnitPropertyNames = {
-			"左边",
-			"顶边",
-			"宽度",
-			"高度",
-			"标记",
-			"可视",
-			"禁止",
-			"鼠标指针",
-		};
-		memberNames.reserve(kFixedWinUnitPropertyNames.size());
-		for (const char* name : kFixedWinUnitPropertyNames) {
-			memberNames.emplace_back(name == nullptr ? "" : name);
-		}
-		return memberNames;
-	}
-
-	if (dataType.m_nElementCount > 0 &&
-		dataType.m_nElementCount <= kMaxSupportLibraryArrayCount &&
-		dataType.m_pElementBegin != nullptr &&
-		IsReadableMemoryRange(
-			dataType.m_pElementBegin,
-			sizeof(LIB_DATA_TYPE_ELEMENT) * static_cast<size_t>(dataType.m_nElementCount))) {
-		memberNames.reserve(static_cast<size_t>(dataType.m_nElementCount));
-		for (int memberIndex = 0; memberIndex < dataType.m_nElementCount; ++memberIndex) {
-			memberNames.emplace_back(ReadAnsiText(dataType.m_pElementBegin[memberIndex].m_szName));
+			else {
+				out.push_back(static_cast<char>(ch));
+			}
+			break;
 		}
 	}
-	return memberNames;
+	out.push_back('"');
+	return out;
 }
 
-std::vector<std::string> BuildSupportTypeEventNames(const LIB_DATA_TYPE_INFO& dataType)
+std::string JoinTextParts(const std::vector<std::string>& parts, const std::string& separator)
 {
-	std::vector<std::string> eventNames;
-	if (dataType.m_nEventCount <= 0 ||
-		dataType.m_nEventCount > kMaxSupportLibraryArrayCount ||
-		dataType.m_pEventBegin == nullptr ||
-		!IsReadableMemoryRange(
-			dataType.m_pEventBegin,
-			sizeof(EVENT_INFO2) * static_cast<size_t>(dataType.m_nEventCount))) {
-		return eventNames;
+	std::ostringstream stream;
+	for (size_t i = 0; i < parts.size(); ++i) {
+		if (i != 0) {
+			stream << separator;
+		}
+		stream << parts[i];
 	}
-
-	eventNames.reserve(static_cast<size_t>(dataType.m_nEventCount));
-	for (int eventIndex = 0; eventIndex < dataType.m_nEventCount; ++eventIndex) {
-		eventNames.emplace_back(ReadAnsiText(dataType.m_pEventBegin[eventIndex].m_szName));
-	}
-	return eventNames;
+	return stream.str();
 }
 
-std::string DecodeSupportLibraryDataType(const int typeValue)
+void AppendFlagLabel(std::vector<std::string>& labels, const bool condition, const char* label)
+{
+	if (condition) {
+		labels.emplace_back(label);
+	}
+}
+
+void AppendNamedField(std::vector<std::string>& fields, const char* name, const std::string& value)
+{
+	if (!value.empty()) {
+		fields.emplace_back(std::string(name) + "=" + value);
+	}
+}
+
+std::string JoinCommaFields(const std::vector<std::string>& fields)
+{
+	return JoinTextParts(fields, ", ");
+}
+
+bool HasReadableDataTypes(const LIB_INFO* libInfo)
+{
+	return libInfo != nullptr &&
+		libInfo->m_nDataTypeCount > 0 &&
+		libInfo->m_nDataTypeCount <= kMaxSupportLibraryArrayCount &&
+		libInfo->m_pDataType != nullptr &&
+		IsReadableMemoryRange(
+			libInfo->m_pDataType,
+			sizeof(LIB_DATA_TYPE_INFO) * static_cast<size_t>(libInfo->m_nDataTypeCount));
+}
+
+int CountNamedDataTypes(const LIB_INFO* libInfo)
+{
+	if (!HasReadableDataTypes(libInfo)) {
+		return 0;
+	}
+
+	int namedCount = 0;
+	for (int i = 0; i < libInfo->m_nDataTypeCount; ++i) {
+		if (!ReadAnsiText(libInfo->m_pDataType[i].m_szName).empty()) {
+			++namedCount;
+		}
+	}
+	return namedCount;
+}
+
+bool ShouldRetrySupportLibraryWithDllInitialization(const LIB_INFO* libInfo)
+{
+	if (libInfo == nullptr || libInfo->m_nDataTypeCount <= 1) {
+		return false;
+	}
+	if (!HasReadableDataTypes(libInfo)) {
+		return true;
+	}
+
+	const int namedCount = CountNamedDataTypes(libInfo);
+	return namedCount <= 1 ||
+		namedCount * 4 < libInfo->m_nDataTypeCount;
+}
+
+std::optional<std::string> ResolveLocalLibraryTypeName(const DATA_TYPE baseType, const LIB_INFO* libInfo)
+{
+	if (!HasReadableDataTypes(libInfo)) {
+		return std::nullopt;
+	}
+
+	const int oneBasedTypeIndex = LOWORD(baseType);
+	if (oneBasedTypeIndex <= 0 || oneBasedTypeIndex > libInfo->m_nDataTypeCount) {
+		return std::nullopt;
+	}
+
+	const std::string typeName = ReadAnsiText(libInfo->m_pDataType[oneBasedTypeIndex - 1].m_szName);
+	if (typeName.empty()) {
+		return std::nullopt;
+	}
+	return typeName;
+}
+
+std::string DecodeSupportLibraryDataType(
+	const int typeValue,
+	const LIB_INFO* libInfo,
+	const bool appendArrayFlag = true)
 {
 	const DATA_TYPE type = static_cast<DATA_TYPE>(typeValue);
-	const bool isArray = (type & DT_IS_ARY) != 0;
-	const bool isVar = (type & DT_IS_VAR) != 0;
 	const DATA_TYPE baseType = static_cast<DATA_TYPE>(type & ~DT_IS_ARY);
 
 	std::string text;
@@ -495,18 +590,21 @@ std::string DecodeSupportLibraryDataType(const int typeValue)
 	case SDT_STATMENT: text = "子语句"; break;
 	default:
 	{
-		std::ostringstream stream;
-		stream << "库类型(0x" << std::hex << std::uppercase << static_cast<unsigned int>(baseType) << ")";
-		text = stream.str();
+		if ((baseType & DTM_USER_DATA_TYPE_MASK) != 0) {
+			text = "用户类型(" + FormatHexValue(static_cast<std::uint32_t>(baseType)) + ")";
+		}
+		else if (const auto localTypeName = ResolveLocalLibraryTypeName(baseType, libInfo)) {
+			text = *localTypeName;
+		}
+		else {
+			text = "库类型(" + FormatHexValue(static_cast<std::uint32_t>(baseType)) + ")";
+		}
 		break;
 	}
 	}
 
-	if (isArray) {
+	if (appendArrayFlag && (type & DT_IS_ARY) != 0) {
 		text += "[]";
-	}
-	if (isVar) {
-		text += "&";
 	}
 	return text;
 }
@@ -520,6 +618,634 @@ std::string DecodeSupportLibraryConstType(const int typeValue)
 	case CT_TEXT: return "文本";
 	default:
 		return "未知(" + std::to_string(typeValue) + ")";
+	}
+}
+
+std::string DecodeSupportLibraryConstValue(const LIB_CONST_INFO& item)
+{
+	switch (item.m_shtType) {
+	case CT_NULL:
+		return "空";
+	case CT_NUM:
+		return FormatNumberLiteral(item.m_dbValue);
+	case CT_BOOL:
+		return item.m_dbValue != 0 ? "真" : "假";
+	case CT_TEXT:
+		return BuildReadableTextLiteral(ReadAnsiText(item.m_szText));
+	default:
+		return !ReadAnsiText(item.m_szText).empty()
+			? BuildReadableTextLiteral(ReadAnsiText(item.m_szText))
+			: FormatNumberLiteral(item.m_dbValue);
+	}
+}
+
+bool IsNullDataType(const DATA_TYPE dataType)
+{
+	return static_cast<DATA_TYPE>(dataType & ~DT_IS_ARY) == _SDT_NULL;
+}
+
+std::optional<std::string> ReadMultiStringItem(const char* text, const int oneBasedIndex)
+{
+	if (text == nullptr || oneBasedIndex <= 0) {
+		return std::nullopt;
+	}
+
+	const char* current = text;
+	for (int index = 1; index <= oneBasedIndex; ++index) {
+		if (!IsReadableMemoryRange(current, 1)) {
+			return std::nullopt;
+		}
+		const size_t length = GetSafeCStringLength(current, kMaxSupportLibraryStringLength);
+		if (length == static_cast<size_t>(-1) || length == 0) {
+			return std::nullopt;
+		}
+		if (index == oneBasedIndex) {
+			return std::string(current, length);
+		}
+		current += length + 1;
+	}
+
+	return std::nullopt;
+}
+
+std::string NormalizeSupportLibraryCategoryName(std::string name)
+{
+	name = TrimAsciiCopy(std::move(name));
+	if (name.size() > 4 &&
+		std::all_of(name.begin(), name.begin() + 4, [](const unsigned char ch) { return std::isdigit(ch) != 0; })) {
+		name.erase(0, 4);
+	}
+	return name;
+}
+
+std::string DecodeCommandCategory(const CMD_INFO& cmd, const LIB_INFO* libInfo)
+{
+	if (cmd.m_shtCategory < 0) {
+		return "成员命令";
+	}
+	if (const auto categoryName = ReadMultiStringItem(
+			libInfo == nullptr ? nullptr : libInfo->m_szzCategory,
+			cmd.m_shtCategory)) {
+		const std::string normalizedName = NormalizeSupportLibraryCategoryName(*categoryName);
+		if (!normalizedName.empty()) {
+			return normalizedName + "(" + std::to_string(cmd.m_shtCategory) + ")";
+		}
+	}
+	return std::to_string(cmd.m_shtCategory);
+}
+
+std::vector<std::string> BuildCommandStateLabels(const WORD state)
+{
+	std::vector<std::string> labels;
+	AppendFlagLabel(labels, (state & CT_IS_HIDED) != 0, "隐藏");
+	AppendFlagLabel(labels, (state & CT_IS_ERROR) != 0, "不可用");
+	AppendFlagLabel(labels, (state & CT_DISABLED_IN_RELEASE) != 0, "发布版禁用");
+	AppendFlagLabel(labels, (state & CT_ALLOW_APPEND_NEW_ARG) != 0, "允许追加参数");
+	AppendFlagLabel(labels, (state & CT_RETRUN_ARY_TYPE_DATA) != 0, "返回数组");
+	AppendFlagLabel(labels, (state & CT_IS_OBJ_COPY_CMD) != 0, "对象复制");
+	AppendFlagLabel(labels, (state & CT_IS_OBJ_FREE_CMD) != 0, "对象释放");
+	AppendFlagLabel(labels, (state & CT_IS_OBJ_CONSTURCT_CMD) != 0, "对象构造");
+	return labels;
+}
+
+std::vector<std::string> BuildArgumentStateLabels(const DWORD state)
+{
+	std::vector<std::string> labels;
+	AppendFlagLabel(labels, (state & AS_DEFAULT_VALUE_IS_EMPTY) != 0, "默认空");
+	AppendFlagLabel(labels, (state & AS_RECEIVE_VAR) != 0, "只接收变量");
+	AppendFlagLabel(labels, (state & AS_RECEIVE_VAR_ARRAY) != 0, "只接收变量数组");
+	AppendFlagLabel(labels, (state & AS_RECEIVE_VAR_OR_ARRAY) != 0, "接收变量或数组");
+	AppendFlagLabel(labels, (state & AS_RECEIVE_ARRAY_DATA) != 0, "接收数组数据");
+	AppendFlagLabel(labels, (state & AS_RECEIVE_ALL_TYPE_DATA) != 0, "接收任意类型");
+	AppendFlagLabel(labels, (state & AS_RECEIVE_VAR_OR_OTHER) != 0, "接收变量或表达式");
+	return labels;
+}
+
+std::vector<std::string> BuildDataTypeStateLabels(const DWORD state)
+{
+	std::vector<std::string> labels;
+	AppendFlagLabel(labels, (state & LDT_IS_HIDED) != 0, "隐藏");
+	AppendFlagLabel(labels, (state & LDT_IS_ERROR) != 0, "不可用");
+	AppendFlagLabel(labels, (state & LDT_WIN_UNIT) != 0, "窗口组件");
+	AppendFlagLabel(labels, (state & LDT_IS_CONTAINER) != 0, "容器");
+	AppendFlagLabel(labels, (state & LDT_IS_TAB_UNIT) != 0, "Tab组件");
+	AppendFlagLabel(labels, (state & LDT_IS_FUNCTION_PROVIDER) != 0, "功能提供者");
+	AppendFlagLabel(labels, (state & LDT_CANNOT_GET_FOCUS) != 0, "不可获焦");
+	AppendFlagLabel(labels, (state & LDT_DEFAULT_NO_TABSTOP) != 0, "默认跳过Tab停留");
+	AppendFlagLabel(labels, (state & LDT_ENUM) != 0, "枚举");
+	AppendFlagLabel(labels, (state & LDT_MSG_FILTER_CONTROL) != 0, "消息过滤组件");
+	return labels;
+}
+
+std::vector<std::string> BuildPropertyStateLabels(const WORD state)
+{
+	std::vector<std::string> labels;
+	AppendFlagLabel(labels, (state & UW_HAS_INDENT) != 0, "缩进");
+	AppendFlagLabel(labels, (state & UW_GROUP_LINE) != 0, "分组线");
+	AppendFlagLabel(labels, (state & UW_ONLY_READ) != 0, "只读");
+	AppendFlagLabel(labels, (state & UW_CANNOT_INIT) != 0, "不可初始化");
+	AppendFlagLabel(labels, (state & UW_IS_HIDED) != 0, "隐藏");
+	return labels;
+}
+
+std::vector<std::string> BuildElementStateLabels(const DWORD state)
+{
+	std::vector<std::string> labels;
+	AppendFlagLabel(labels, (state & LES_HIDED) != 0, "隐藏");
+	return labels;
+}
+
+std::vector<std::string> BuildEventStateLabels(const DWORD state)
+{
+	std::vector<std::string> labels;
+	AppendFlagLabel(labels, (state & EV_IS_HIDED) != 0, "隐藏");
+	AppendFlagLabel(labels, (state & EV_IS_KEY_EVENT) != 0, "键盘事件");
+	AppendFlagLabel(labels, (state & EV_IS_VER2) != 0, "新版事件");
+	return labels;
+}
+
+std::vector<std::string> BuildEventArgumentStateLabels(const DWORD state)
+{
+	std::vector<std::string> labels;
+	AppendFlagLabel(labels, (state & EAS_BY_REF) != 0, "传址");
+	return labels;
+}
+
+std::string DecodeUnitPropertyType(const SHORT type)
+{
+	switch (type) {
+	case UD_PICK_SPEC_INT: return "整数型(限定选择)";
+	case UD_INT: return "整数型";
+	case UD_DOUBLE: return "双精度小数型";
+	case UD_BOOL: return "逻辑型";
+	case UD_DATE_TIME: return "日期时间型";
+	case UD_TEXT: return "文本型";
+	case UD_PICK_INT: return "整数型(选择)";
+	case UD_PICK_TEXT: return "文本型(选择)";
+	case UD_EDIT_PICK_TEXT: return "文本型(可编辑选择)";
+	case UD_PIC: return "图片文件";
+	case UD_ICON: return "图标文件";
+	case UD_CURSOR: return "光标";
+	case UD_MUSIC: return "音乐文件";
+	case UD_FONT: return "字体";
+	case UD_COLOR: return "颜色";
+	case UD_COLOR_TRANS: return "透明颜色";
+	case UD_FILE_NAME: return "文件名";
+	case UD_COLOR_BACK: return "背景颜色";
+	case UD_IMAGE_LIST: return "图片组";
+	case UD_CUSTOMIZE: return "自定义";
+	default: return "属性类型(" + std::to_string(type) + ")";
+	}
+}
+
+std::string DecodeUnitPropertyDataType(const SHORT type)
+{
+	switch (type) {
+	case UD_PICK_SPEC_INT:
+	case UD_INT:
+	case UD_PICK_INT:
+	case UD_COLOR:
+	case UD_COLOR_TRANS:
+	case UD_COLOR_BACK:
+		return "整数型";
+	case UD_DOUBLE:
+		return "双精度小数型";
+	case UD_BOOL:
+		return "逻辑型";
+	case UD_DATE_TIME:
+		return "日期时间型";
+	case UD_TEXT:
+	case UD_PICK_TEXT:
+	case UD_EDIT_PICK_TEXT:
+	case UD_FILE_NAME:
+		return "文本型";
+	case UD_PIC:
+	case UD_ICON:
+	case UD_CURSOR:
+	case UD_MUSIC:
+	case UD_IMAGE_LIST:
+		return "字节集";
+	case UD_FONT:
+		return "字体";
+	case UD_CUSTOMIZE:
+		return "自定义";
+	default:
+		return "属性类型(" + std::to_string(type) + ")";
+	}
+}
+
+std::vector<std::string> ReadNullSeparatedStringList(const char* text, const int maxItems)
+{
+	std::vector<std::string> items;
+	if (text == nullptr || maxItems <= 0) {
+		return items;
+	}
+
+	const char* current = text;
+	for (int index = 0; index < maxItems; ++index) {
+		const size_t length = GetSafeCStringLength(current, kMaxSupportLibraryStringLength);
+		if (length == static_cast<size_t>(-1) || length == 0) {
+			break;
+		}
+		items.emplace_back(current, length);
+		current += length + 1;
+	}
+	return items;
+}
+
+std::string DecodeUnitPropertyPickValues(const UNIT_PROPERTY& property)
+{
+	const auto items = ReadNullSeparatedStringList(property.m_szzPickStr, 128);
+	if (items.empty()) {
+		return std::string();
+	}
+
+	std::vector<std::string> values;
+	if (property.m_shtType == UD_PICK_SPEC_INT) {
+		for (size_t index = 0; index + 1 < items.size(); index += 2) {
+			values.push_back(items[index] + ":" + items[index + 1]);
+		}
+	}
+	else if (property.m_shtType == UD_PICK_INT) {
+		for (size_t index = 0; index < items.size(); ++index) {
+			values.push_back(std::to_string(index) + ":" + items[index]);
+		}
+	}
+	else {
+		values = items;
+	}
+	return JoinTextParts(values, "|");
+}
+
+std::string DecodeDataTypeKind(const LIB_DATA_TYPE_INFO& dataType)
+{
+	if ((dataType.m_dwState & LDT_ENUM) != 0) {
+		return "枚举";
+	}
+	if ((dataType.m_dwState & LDT_WIN_UNIT) != 0) {
+		return "窗口组件";
+	}
+	return "复合数据";
+}
+
+std::string DecodeDefaultValue(const DATA_TYPE dataType, const INT defaultValue)
+{
+	const DATA_TYPE baseType = static_cast<DATA_TYPE>(dataType & ~DT_IS_ARY);
+	switch (baseType) {
+	case SDT_BOOL:
+		return defaultValue != 0 ? "真" : "假";
+	case SDT_TEXT:
+	{
+		if (defaultValue == 0) {
+			return BuildReadableTextLiteral(std::string());
+		}
+		const auto address = static_cast<std::uintptr_t>(static_cast<std::uint32_t>(defaultValue));
+		const auto* text = reinterpret_cast<const char*>(address);
+		return BuildReadableTextLiteral(ReadAnsiText(text));
+	}
+	case SDT_BYTE:
+	case SDT_SHORT:
+	case SDT_INT:
+	case SDT_INT64:
+	case SDT_FLOAT:
+	case SDT_DOUBLE:
+	case SDT_DATE_TIME:
+		return std::to_string(defaultValue);
+	default:
+		return std::to_string(defaultValue);
+	}
+}
+
+std::optional<std::string> DecodeArgumentDefaultValue(const ARG_INFO& arg)
+{
+	if ((arg.m_dwState & AS_HAS_DEFAULT_VALUE) == 0) {
+		return std::nullopt;
+	}
+	if ((arg.m_dwState & AS_DEFAULT_VALUE_IS_EMPTY) != 0) {
+		return std::string("<空>");
+	}
+	return DecodeDefaultValue(arg.m_dtType, arg.m_nDefault);
+}
+
+std::string DecodeCommandReturnType(const CMD_INFO& cmd, const LIB_INFO* libInfo)
+{
+	if (IsNullDataType(cmd.m_dtRetValType)) {
+		return "无返回值";
+	}
+	std::string typeName = DecodeSupportLibraryDataType(cmd.m_dtRetValType, libInfo);
+	if ((cmd.m_wState & CT_RETRUN_ARY_TYPE_DATA) != 0 &&
+		typeName.find("[]") == std::string::npos) {
+		typeName += "[]";
+	}
+	return typeName;
+}
+
+std::string DecodeEventReturnType(const EVENT_INFO2& eventInfo, const LIB_INFO* libInfo)
+{
+	if ((eventInfo.m_dwState & EV_IS_VER2) != 0) {
+		if (IsNullDataType(eventInfo.m_dtRetDataType)) {
+			return "无返回值";
+		}
+		return DecodeSupportLibraryDataType(eventInfo.m_dtRetDataType, libInfo);
+	}
+	if ((eventInfo.m_dwState & EV_RETURN_BOOL) != 0) {
+		return "逻辑型";
+	}
+	if ((eventInfo.m_dwState & EV_RETURN_INT) != 0) {
+		return "整数型";
+	}
+	return "无返回值";
+}
+
+void AppendCommandDetails(
+	std::vector<std::string>& lines,
+	const CMD_INFO& cmd,
+	const LIB_INFO* libInfo,
+	const std::string& indent,
+	const char* directive)
+{
+	const std::string cmdName = ReadAnsiText(cmd.m_szName);
+	const std::string cmdExplain = ReadAnsiText(cmd.m_szExplain);
+	const std::string cmdEnglishName = ReadAnsiText(cmd.m_szEgName);
+	const auto stateLabels = BuildCommandStateLabels(cmd.m_wState);
+
+	std::vector<std::string> headerFields;
+	headerFields.emplace_back(indent + directive + " " + DisplayNameOrPlaceholder(cmdName));
+	AppendNamedField(headerFields, "返回值", DecodeCommandReturnType(cmd, libInfo));
+	headerFields.emplace_back("分类=" + DecodeCommandCategory(cmd, libInfo));
+	headerFields.emplace_back("参数数=" + std::to_string(cmd.m_nArgCount));
+	AppendNamedField(headerFields, "英文名", cmdEnglishName);
+	if (!stateLabels.empty()) {
+		AppendNamedField(headerFields, "属性", JoinTextParts(stateLabels, "|"));
+	}
+	lines.push_back(JoinCommaFields(headerFields));
+
+	if (!cmdExplain.empty()) {
+		lines.push_back(indent + "  说明：" + cmdExplain);
+	}
+
+	if (cmd.m_nArgCount <= 0) {
+		return;
+	}
+	if (cmd.m_nArgCount > kMaxSupportLibraryArrayCount ||
+		cmd.m_pBeginArgInfo == nullptr ||
+		!IsReadableMemoryRange(
+			cmd.m_pBeginArgInfo,
+			sizeof(ARG_INFO) * static_cast<size_t>(cmd.m_nArgCount))) {
+		lines.push_back(indent + "  参数：<无法读取>");
+		return;
+	}
+
+	for (int argIndex = 0; argIndex < cmd.m_nArgCount; ++argIndex) {
+		const ARG_INFO& arg = cmd.m_pBeginArgInfo[argIndex];
+		const std::string argName = ReadAnsiText(arg.m_szName);
+		const std::string argExplain = ReadAnsiText(arg.m_szExplain);
+		const auto argStateLabels = BuildArgumentStateLabels(arg.m_dwState);
+
+		std::vector<std::string> argFields;
+		argFields.emplace_back(indent + "  .参数 " + DisplayNameOrPlaceholder(argName));
+		argFields.emplace_back(DecodeSupportLibraryDataType(arg.m_dtType, libInfo));
+		if (const auto defaultValue = DecodeArgumentDefaultValue(arg)) {
+			AppendNamedField(argFields, "默认值", *defaultValue);
+		}
+		if (!argStateLabels.empty()) {
+			AppendNamedField(argFields, "属性", JoinTextParts(argStateLabels, "|"));
+		}
+		AppendNamedField(argFields, "说明", argExplain);
+		lines.push_back(JoinCommaFields(argFields));
+	}
+}
+
+void AppendPropertyMemberLine(
+	std::vector<std::string>& lines,
+	const UNIT_PROPERTY& property,
+	const std::string& indent)
+{
+	const std::string propertyName = ReadAnsiText(property.m_szName);
+	const std::string propertyExplain = ReadAnsiText(property.m_szExplain);
+	const std::string propertyEnglishName = ReadAnsiText(property.m_szEgName);
+	const auto stateLabels = BuildPropertyStateLabels(property.m_wState);
+
+	std::vector<std::string> fields;
+	fields.emplace_back(indent + ".成员 " + DisplayNameOrPlaceholder(propertyName));
+	const std::string dataTypeText = DecodeUnitPropertyDataType(property.m_shtType);
+	const std::string editorTypeText = DecodeUnitPropertyType(property.m_shtType);
+	fields.emplace_back(dataTypeText);
+	AppendNamedField(fields, "英文名", propertyEnglishName);
+	if (editorTypeText != dataTypeText) {
+		AppendNamedField(fields, "属性类型", editorTypeText);
+	}
+	AppendNamedField(fields, "可选值", DecodeUnitPropertyPickValues(property));
+	if (!stateLabels.empty()) {
+		AppendNamedField(fields, "属性", JoinTextParts(stateLabels, "|"));
+	}
+	AppendNamedField(fields, "说明", propertyExplain);
+	lines.push_back(JoinCommaFields(fields));
+}
+
+void AppendElementMemberLine(
+	std::vector<std::string>& lines,
+	const LIB_DATA_TYPE_INFO& dataType,
+	const LIB_DATA_TYPE_ELEMENT& element,
+	const LIB_INFO* libInfo,
+	const std::string& indent)
+{
+	const std::string memberName = ReadAnsiText(element.m_szName);
+	const std::string memberExplain = ReadAnsiText(element.m_szExplain);
+	const std::string memberEnglishName = ReadAnsiText(element.m_szEgName);
+	const auto stateLabels = BuildElementStateLabels(element.m_dwState);
+	const bool isEnum = (dataType.m_dwState & LDT_ENUM) != 0;
+
+	std::vector<std::string> fields;
+	fields.emplace_back(indent + ".成员 " + DisplayNameOrPlaceholder(memberName));
+	fields.emplace_back(DecodeSupportLibraryDataType(element.m_dtType, libInfo));
+	AppendNamedField(fields, "英文名", memberEnglishName);
+	if (element.m_pArySpec != nullptr) {
+		fields.emplace_back("数组");
+	}
+	if (isEnum) {
+		AppendNamedField(fields, "值", std::to_string(element.m_nDefault));
+	}
+	else if ((element.m_dwState & LES_HAS_DEFAULT_VALUE) != 0) {
+		AppendNamedField(fields, "默认值", DecodeDefaultValue(element.m_dtType, element.m_nDefault));
+	}
+	if (!stateLabels.empty()) {
+		AppendNamedField(fields, "属性", JoinTextParts(stateLabels, "|"));
+	}
+	AppendNamedField(fields, "说明", memberExplain);
+	lines.push_back(JoinCommaFields(fields));
+}
+
+void AppendEventDetails(
+	std::vector<std::string>& lines,
+	const EVENT_INFO2& eventInfo,
+	const LIB_INFO* libInfo,
+	const std::string& indent)
+{
+	const std::string eventName = ReadAnsiText(eventInfo.m_szName);
+	const std::string eventExplain = ReadAnsiText(eventInfo.m_szExplain);
+	const auto stateLabels = BuildEventStateLabels(eventInfo.m_dwState);
+
+	std::vector<std::string> fields;
+	fields.emplace_back(indent + ".事件 " + DisplayNameOrPlaceholder(eventName));
+	AppendNamedField(fields, "返回值", DecodeEventReturnType(eventInfo, libInfo));
+	fields.emplace_back("参数数=" + std::to_string(eventInfo.m_nArgCount));
+	if (!stateLabels.empty()) {
+		AppendNamedField(fields, "属性", JoinTextParts(stateLabels, "|"));
+	}
+	lines.push_back(JoinCommaFields(fields));
+
+	if (!eventExplain.empty()) {
+		lines.push_back(indent + "  说明：" + eventExplain);
+	}
+	if (eventInfo.m_nArgCount <= 0) {
+		return;
+	}
+	if (eventInfo.m_pEventArgInfo == nullptr ||
+		eventInfo.m_nArgCount > kMaxSupportLibraryArrayCount) {
+		lines.push_back(indent + "  参数：<无法读取>");
+		return;
+	}
+
+	const bool isVersion2 = (eventInfo.m_dwState & EV_IS_VER2) != 0;
+	if (isVersion2) {
+		if (!IsReadableMemoryRange(
+				eventInfo.m_pEventArgInfo,
+				sizeof(EVENT_ARG_INFO2) * static_cast<size_t>(eventInfo.m_nArgCount))) {
+			lines.push_back(indent + "  参数：<无法读取>");
+			return;
+		}
+		for (int argIndex = 0; argIndex < eventInfo.m_nArgCount; ++argIndex) {
+			const EVENT_ARG_INFO2& arg = eventInfo.m_pEventArgInfo[argIndex];
+			const auto argStateLabels = BuildEventArgumentStateLabels(arg.m_dwState);
+			std::vector<std::string> argFields;
+			argFields.emplace_back(indent + "  .参数 " + DisplayNameOrPlaceholder(ReadAnsiText(arg.m_szName)));
+			argFields.emplace_back(DecodeSupportLibraryDataType(arg.m_dtDataType, libInfo));
+			if (!argStateLabels.empty()) {
+				AppendNamedField(argFields, "属性", JoinTextParts(argStateLabels, "|"));
+			}
+			AppendNamedField(argFields, "说明", ReadAnsiText(arg.m_szExplain));
+			lines.push_back(JoinCommaFields(argFields));
+		}
+		return;
+	}
+
+	const auto* oldArgs = reinterpret_cast<const EVENT_ARG_INFO*>(eventInfo.m_pEventArgInfo);
+	if (!IsReadableMemoryRange(
+			oldArgs,
+			sizeof(EVENT_ARG_INFO) * static_cast<size_t>(eventInfo.m_nArgCount))) {
+		lines.push_back(indent + "  参数：<无法读取>");
+		return;
+	}
+	for (int argIndex = 0; argIndex < eventInfo.m_nArgCount; ++argIndex) {
+		const EVENT_ARG_INFO& arg = oldArgs[argIndex];
+		std::vector<std::string> argFields;
+		argFields.emplace_back(indent + "  .参数 " + DisplayNameOrPlaceholder(ReadAnsiText(arg.m_szName)));
+		argFields.emplace_back((arg.m_dwState & EAS_IS_BOOL_ARG) != 0 ? "逻辑型" : "整数型");
+		AppendNamedField(argFields, "说明", ReadAnsiText(arg.m_szExplain));
+		lines.push_back(JoinCommaFields(argFields));
+	}
+}
+
+void AppendDataTypeDetails(
+	std::vector<std::string>& lines,
+	const LIB_DATA_TYPE_INFO& dataType,
+	const LIB_INFO* libInfo)
+{
+	const std::string typeName = ReadAnsiText(dataType.m_szName);
+	const std::string typeExplain = ReadAnsiText(dataType.m_szExplain);
+	const std::string typeEnglishName = ReadAnsiText(dataType.m_szEgName);
+	const auto stateLabels = BuildDataTypeStateLabels(dataType.m_dwState);
+	const bool isWinUnit =
+		(dataType.m_dwState & LDT_WIN_UNIT) != 0 &&
+		(dataType.m_dwState & LDT_ENUM) == 0;
+
+	std::vector<std::string> headerFields;
+	headerFields.emplace_back(".数据类型 " + DisplayNameOrPlaceholder(typeName));
+	AppendNamedField(headerFields, "类型", DecodeDataTypeKind(dataType));
+	headerFields.emplace_back("成员数=" + std::to_string(isWinUnit ? dataType.m_nPropertyCount : dataType.m_nElementCount));
+	headerFields.emplace_back("事件数=" + std::to_string(dataType.m_nEventCount));
+	headerFields.emplace_back("成员命令数=" + std::to_string(dataType.m_nCmdCount));
+	AppendNamedField(headerFields, "英文名", typeEnglishName);
+	if (!stateLabels.empty()) {
+		AppendNamedField(headerFields, "属性", JoinTextParts(stateLabels, "|"));
+	}
+	lines.push_back(JoinCommaFields(headerFields));
+
+	if (!typeExplain.empty()) {
+		lines.push_back("  说明：" + typeExplain);
+	}
+
+	if (isWinUnit) {
+		if (dataType.m_nPropertyCount > 0 &&
+			dataType.m_nPropertyCount <= kMaxSupportLibraryArrayCount &&
+			dataType.m_pPropertyBegin != nullptr &&
+			IsReadableMemoryRange(
+				dataType.m_pPropertyBegin,
+				sizeof(UNIT_PROPERTY) * static_cast<size_t>(dataType.m_nPropertyCount))) {
+			for (int propertyIndex = 0; propertyIndex < dataType.m_nPropertyCount; ++propertyIndex) {
+				AppendPropertyMemberLine(lines, dataType.m_pPropertyBegin[propertyIndex], "  ");
+			}
+		}
+		else {
+			struct FixedProperty {
+				const char* name;
+				const char* type;
+			};
+			static constexpr std::array<FixedProperty, FIXED_WIN_UNIT_PROPERTY_COUNT> kFixedWinUnitProperties = {{
+				{"左边", "整数型"},
+				{"顶边", "整数型"},
+				{"宽度", "整数型"},
+				{"高度", "整数型"},
+				{"标记", "文本型"},
+				{"可视", "逻辑型"},
+				{"禁止", "逻辑型"},
+				{"鼠标指针", "光标"},
+			}};
+			for (const auto& property : kFixedWinUnitProperties) {
+				lines.push_back("  .成员 " + std::string(property.name) + ", " + property.type);
+			}
+		}
+	}
+	else if (dataType.m_nElementCount > 0 &&
+		dataType.m_nElementCount <= kMaxSupportLibraryArrayCount &&
+		dataType.m_pElementBegin != nullptr &&
+		IsReadableMemoryRange(
+			dataType.m_pElementBegin,
+			sizeof(LIB_DATA_TYPE_ELEMENT) * static_cast<size_t>(dataType.m_nElementCount))) {
+		for (int memberIndex = 0; memberIndex < dataType.m_nElementCount; ++memberIndex) {
+			AppendElementMemberLine(lines, dataType, dataType.m_pElementBegin[memberIndex], libInfo, "  ");
+		}
+	}
+
+	if (dataType.m_nEventCount > 0 &&
+		dataType.m_nEventCount <= kMaxSupportLibraryArrayCount &&
+		dataType.m_pEventBegin != nullptr &&
+		IsReadableMemoryRange(
+			dataType.m_pEventBegin,
+			sizeof(EVENT_INFO2) * static_cast<size_t>(dataType.m_nEventCount))) {
+		for (int eventIndex = 0; eventIndex < dataType.m_nEventCount; ++eventIndex) {
+			AppendEventDetails(lines, dataType.m_pEventBegin[eventIndex], libInfo, "  ");
+		}
+	}
+
+	if (dataType.m_nCmdCount > 0 &&
+		dataType.m_nCmdCount <= kMaxSupportLibraryArrayCount &&
+		dataType.m_pnCmdsIndex != nullptr &&
+		IsReadableMemoryRange(
+			dataType.m_pnCmdsIndex,
+			sizeof(int) * static_cast<size_t>(dataType.m_nCmdCount)) &&
+		libInfo->m_pBeginCmdInfo != nullptr &&
+		IsReadableMemoryRange(
+			libInfo->m_pBeginCmdInfo,
+			sizeof(CMD_INFO) * static_cast<size_t>(libInfo->m_nCmdCount))) {
+		for (int cmdIndex = 0; cmdIndex < dataType.m_nCmdCount; ++cmdIndex) {
+			const int globalCmdIndex = dataType.m_pnCmdsIndex[cmdIndex];
+			if (globalCmdIndex < 0 || globalCmdIndex >= libInfo->m_nCmdCount) {
+				continue;
+			}
+			AppendCommandDetails(lines, libInfo->m_pBeginCmdInfo[globalCmdIndex], libInfo, "  ", ".成员命令");
+		}
 	}
 }
 
@@ -573,12 +1299,16 @@ bool TryLoadSupportLibraryDump(
 #else
 	HMODULE module = nullptr;
 	const LIB_INFO* libInfo = nullptr;
+	bool moduleCanBeFreed = true;
 
 	const auto closeModule = [&]() {
 		if (module != nullptr) {
-			FreeLibrary(module);
+			if (moduleCanBeFreed) {
+				FreeLibrary(module);
+			}
 			module = nullptr;
 		}
+		moduleCanBeFreed = true;
 	};
 
 	auto tryLoad = [&](const DWORD flags, std::string& outAttemptError) -> bool {
@@ -587,6 +1317,7 @@ bool TryLoadSupportLibraryDump(
 			outAttemptError = "LoadLibraryEx failed";
 			return false;
 		}
+		moduleCanBeFreed = flags != 0;
 
 		auto* getInfoProc = reinterpret_cast<PFN_GET_LIB_INFO>(GetProcAddress(module, FUNCNAME_GET_LIB_INFO));
 		if (getInfoProc == nullptr) {
@@ -607,7 +1338,24 @@ bool TryLoadSupportLibraryDump(
 	};
 
 	std::string attemptError;
-	if (!tryLoad(DONT_RESOLVE_DLL_REFERENCES, attemptError) && !tryLoad(0, attemptError)) {
+	if (!tryLoad(DONT_RESOLVE_DLL_REFERENCES, attemptError)) {
+		if (!tryLoad(0, attemptError)) {
+			outError = attemptError;
+			return false;
+		}
+	}
+	else if (ShouldRetrySupportLibraryWithDllInitialization(libInfo)) {
+		closeModule();
+		libInfo = nullptr;
+		std::string initializedAttemptError;
+		if (!tryLoad(0, initializedAttemptError) &&
+			!tryLoad(DONT_RESOLVE_DLL_REFERENCES, attemptError)) {
+			outError = initializedAttemptError.empty() ? attemptError : initializedAttemptError;
+			return false;
+		}
+	}
+
+	if (libInfo == nullptr) {
 		outError = attemptError;
 		return false;
 	}
@@ -649,40 +1397,10 @@ bool TryLoadSupportLibraryDump(
 		lines.push_back("");
 		lines.push_back("[命令]");
 		for (int i = 0; i < libInfo->m_nCmdCount; ++i) {
-			const CMD_INFO& cmd = libInfo->m_pBeginCmdInfo[i];
-			const std::string cmdName = ReadAnsiText(cmd.m_szName);
-			std::ostringstream header;
-			header << ".命令 "
-				<< (cmdName.empty() ? std::string("<未命名>") : cmdName)
-				<< ", " << DecodeSupportLibraryDataType(cmd.m_dtRetValType)
-				<< ", 分类=" << cmd.m_shtCategory;
-			lines.push_back(header.str());
-
-			const std::string cmdExplain = ReadAnsiText(cmd.m_szExplain);
-			if (!cmdExplain.empty()) {
-				lines.push_back("  说明：" + cmdExplain);
+			if (i != 0) {
+				lines.push_back("");
 			}
-
-			if (cmd.m_nArgCount > 0 &&
-				cmd.m_nArgCount <= kMaxSupportLibraryArrayCount &&
-				cmd.m_pBeginArgInfo != nullptr &&
-				IsReadableMemoryRange(
-					cmd.m_pBeginArgInfo,
-					sizeof(ARG_INFO) * static_cast<size_t>(cmd.m_nArgCount))) {
-				for (int argIndex = 0; argIndex < cmd.m_nArgCount; ++argIndex) {
-					const ARG_INFO& arg = cmd.m_pBeginArgInfo[argIndex];
-					const std::string argName = ReadAnsiText(arg.m_szName);
-					const std::string argExplain = ReadAnsiText(arg.m_szExplain);
-					std::string argLine =
-						"  .参数 " +
-						std::string(argName.empty() ? "<未命名>" : argName) +
-						", " + DecodeSupportLibraryDataType(arg.m_dtType);
-					if (!argExplain.empty()) {
-						argLine += ", " + argExplain;
-					}
-					lines.push_back(std::move(argLine));
-				}
-			}
+			AppendCommandDetails(lines, libInfo->m_pBeginCmdInfo[i], libInfo, "", ".命令");
 		}
 	}
 
@@ -696,40 +1414,10 @@ bool TryLoadSupportLibraryDump(
 		lines.push_back("");
 		lines.push_back("[数据类型]");
 		for (int i = 0; i < libInfo->m_nDataTypeCount; ++i) {
-			const LIB_DATA_TYPE_INFO& dataType = libInfo->m_pDataType[i];
-			const std::string typeName = ReadAnsiText(dataType.m_szName);
-			lines.push_back(".数据类型 " + std::string(typeName.empty() ? "<未命名>" : typeName));
-
-			const std::string typeExplain = ReadAnsiText(dataType.m_szExplain);
-			if (!typeExplain.empty()) {
-				lines.push_back("  说明：" + typeExplain);
+			if (i != 0) {
+				lines.push_back("");
 			}
-
-			for (const auto& memberName : BuildSupportTypeMemberNames(dataType)) {
-				lines.push_back("  .成员 " + (memberName.empty() ? std::string("<未命名>") : memberName));
-			}
-			for (const auto& eventName : BuildSupportTypeEventNames(dataType)) {
-				lines.push_back("  .事件 " + (eventName.empty() ? std::string("<未命名>") : eventName));
-			}
-			if (dataType.m_nCmdCount > 0 &&
-				dataType.m_nCmdCount <= kMaxSupportLibraryArrayCount &&
-				dataType.m_pnCmdsIndex != nullptr &&
-				IsReadableMemoryRange(
-					dataType.m_pnCmdsIndex,
-					sizeof(int) * static_cast<size_t>(dataType.m_nCmdCount)) &&
-				libInfo->m_pBeginCmdInfo != nullptr &&
-				IsReadableMemoryRange(
-					libInfo->m_pBeginCmdInfo,
-					sizeof(CMD_INFO) * static_cast<size_t>(libInfo->m_nCmdCount))) {
-				for (int cmdIndex = 0; cmdIndex < dataType.m_nCmdCount; ++cmdIndex) {
-					const int globalCmdIndex = dataType.m_pnCmdsIndex[cmdIndex];
-					if (globalCmdIndex < 0 || globalCmdIndex >= libInfo->m_nCmdCount) {
-						continue;
-					}
-					const std::string memberCommandName = ReadAnsiText(libInfo->m_pBeginCmdInfo[globalCmdIndex].m_szName);
-					lines.push_back("  .成员命令 " + (memberCommandName.empty() ? std::string("<未命名>") : memberCommandName));
-				}
-			}
+			AppendDataTypeDetails(lines, libInfo->m_pDataType[i], libInfo);
 		}
 	}
 
@@ -746,21 +1434,14 @@ bool TryLoadSupportLibraryDump(
 			const LIB_CONST_INFO& item = libInfo->m_pLibConst[i];
 			const std::string name = ReadAnsiText(item.m_szName);
 			const std::string explain = ReadAnsiText(item.m_szExplain);
-			const std::string textValue = ReadAnsiText(item.m_szText);
-			std::ostringstream line;
-			line << ".常量 "
-				<< (name.empty() ? std::string("<未命名>") : name)
-				<< ", " << DecodeSupportLibraryConstType(item.m_shtType);
-			if (!textValue.empty()) {
-				line << ", " << textValue;
-			}
-			else {
-				line << ", " << item.m_dbValue;
-			}
-			if (!explain.empty()) {
-				line << ", " << explain;
-			}
-			lines.push_back(line.str());
+			const std::string englishName = ReadAnsiText(item.m_szEgName);
+			std::vector<std::string> fields;
+			fields.emplace_back(".常量 " + DisplayNameOrPlaceholder(name));
+			fields.emplace_back(DecodeSupportLibraryConstType(item.m_shtType));
+			AppendNamedField(fields, "值", DecodeSupportLibraryConstValue(item));
+			AppendNamedField(fields, "英文名", englishName);
+			AppendNamedField(fields, "说明", explain);
+			lines.push_back(JoinCommaFields(fields));
 		}
 	}
 
