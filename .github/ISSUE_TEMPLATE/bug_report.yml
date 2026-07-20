@@ -57,11 +57,11 @@ body:
     id: command_line
     attributes:
       label: 完整命令行
-      description: 粘贴你实际执行的完整命令（可对敏感路径做脱敏，但请保留选项）。
+      description: 粘贴你实际执行的完整命令（可对敏感路径做脱敏，但请保留选项）。若是拖放到 exe 上直接运行的，请在此说明。
       render: shell
       placeholder: e-packager unpack MyApp.e MyApp\ --password ***
     validations:
-      required: true
+      required: false
 
   - type: textarea
     id: steps
@@ -118,24 +118,13 @@ body:
     validations:
       required: true
 
-  - type: dropdown
-    id: arch
-    attributes:
-      label: 使用的构建版本
-      options:
-        - Win32 / x86
-        - x64
-        - 不确定
-    validations:
-      required: true
-
   - type: input
     id: os
     attributes:
       label: 操作系统
       placeholder: 例如 Windows 11 24H2 / Windows 10 22H2
     validations:
-      required: true
+      required: false
 
   - type: input
     id: eplang
