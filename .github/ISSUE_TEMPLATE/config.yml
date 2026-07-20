@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使用文档
+    url: https://github.com/aiqinxuancai/e-packager/blob/master/README.md
+    about: 提问前请先查阅 README，确认命令用法与选项是否正确。
+  - name: 易语言 × AI Agent 实践白皮书
+    url: https://github.com/aiqinxuancai/Awesome-E-Agent
+    about: 了解本项目的典型使用场景与配套工具。

@@ -1,0 +1,39 @@
+name: 💡 功能建议 / 需求
+description: 希望新增命令、选项或改进现有行为时使用此模板。
+title: "[Feature] 请用一句话概括你的建议"
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你想解决什么问题
+      description: 先说清楚你在实际使用中遇到的困难或场景，而不是直接给方案。
+      placeholder: 例如：解包大量工程时，希望能批量处理一个目录下的所有 .e 文件。
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望的功能 / 方案
+      description: 你希望 e-packager 怎么做？如果能给出命令行的设想会更好。
+      placeholder: |
+        例如：新增 `e-packager unpack-batch <dir>` 递归解包目录下所有 .e/.ec。
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 现有的替代做法
+      description: 目前你是怎么绕过这个问题的？有没有其他工具或手动方式？
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充说明
+      description: 其他相关信息、参考链接或截图。
+    validations:
+      required: false

@@ -1,0 +1,160 @@
+name: 🐞 问题反馈 / Bug 报告
+description: 解包、回包、刷新或导出等操作出现错误、结果不符合预期时，请用此模板反馈。
+title: "[Bug] 请用一句话概括问题"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！**信息越完整，定位越快，也能避免反复追问。**
+
+        请尽量填全下面每一项，尤其是**复现步骤**和**最小可复现的 `.e` / `.ec` 源文件**——没有可复现的文件，很多问题无法排查。
+
+        > ⚠️ 提交前请先确认：已阅读 [README](https://github.com/aiqinxuancai/e-packager/blob/master/README.md)，并已用 `e-packager /update` 更新到最新版本。
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已阅读 README，确认命令用法和选项没有用错。
+          required: true
+        - label: 我已更新到最新版本，问题仍然存在。
+          required: true
+        - label: 我已搜索过 issues，没有找到相同的问题。
+          required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: 问题描述
+      description: 清楚地说明发生了什么。不要只写"报错了""不行"，请具体描述现象。
+      placeholder: |
+        例如：解包一个引用了多个易模块的 .e 工程时，程序在导出 elib/ 阶段崩溃退出，没有生成任何文件。
+    validations:
+      required: true
+
+  - type: dropdown
+    id: command
+    attributes:
+      label: 涉及的操作
+      description: 出问题的是哪个命令？可多选。
+      multiple: true
+      options:
+        - unpack（解包）
+        - pack（回包）
+        - update（刷新派生内容）
+        - decrypt-fne（导出支持库接口）
+        - compare-bundle（比较）
+        - roundtrip / verify-roundtrip（往返校验）
+        - 拖放 exe 解包
+        - /update（自更新）
+        - 其他 / 不确定
+    validations:
+      required: true
+
+  - type: textarea
+    id: command_line
+    attributes:
+      label: 完整命令行
+      description: 粘贴你实际执行的完整命令（可对敏感路径做脱敏，但请保留选项）。
+      render: shell
+      placeholder: e-packager unpack MyApp.e MyApp\ --password ***
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 一步一步写清楚，让我们能照着重现问题。
+      placeholder: |
+        1. 准备 xxx 文件（引用了 xxx 模块 / 使用了 xxx 支持库）
+        2. 执行 `e-packager unpack ...`
+        3. 观察到 ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果
+      description: 你原本期望发生什么？
+      placeholder: 期望正常解包并生成完整的目录结构。
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果 / 报错信息
+      description: 实际发生了什么？请**完整粘贴**控制台的全部输出与报错，不要只截取一行。
+      render: shell
+      placeholder: |
+        在此粘贴控制台完整输出……
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro_file
+    attributes:
+      label: 最小可复现的 .e / .ec 源文件（重要）
+      description: |
+        请提供能**稳定复现**问题的源文件。这是最关键的信息。
+        - GitHub 不支持直接上传 `.e` / `.ec`，请先压缩成 `.zip` 再拖入本框；
+        - 请尽量精简到仍能复现问题的**最小工程**（删掉无关的窗口、模块、代码）；
+        - 若涉及密码，请一并说明打开密码。
+        - 如确实无法公开，可说明原因，并留下联系方式以便私下提供。
+      placeholder: 把打包好的 zip 拖到这里上传……
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: e-packager 版本
+      description: 运行 `e-packager version` 查看，直接粘贴输出。
+      placeholder: e-packager 1.x.x
+    validations:
+      required: true
+
+  - type: dropdown
+    id: arch
+    attributes:
+      label: 使用的构建版本
+      options:
+        - Win32 / x86
+        - x64
+        - 不确定
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: 操作系统
+      placeholder: 例如 Windows 11 24H2 / Windows 10 22H2
+    validations:
+      required: true
+
+  - type: input
+    id: eplang
+    attributes:
+      label: 易语言版本
+      description: 出问题的工程是用哪个版本的易语言编写/编译的。
+      placeholder: 例如 易语言 5.8 / 5.9
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 日志、截图及其他补充
+      description: |
+        可附上更多有助于定位的信息：
+        - 相关截图（可直接拖入图片）；
+        - 目录下的 `info.json`、`project/*.json` 等；
+        - 任何你觉得相关的上下文。
+      placeholder: 拖入截图，或粘贴日志片段……
+    validations:
+      required: false
