@@ -361,6 +361,8 @@ struct ProjectBundle {
 
 // 计算目录工程包可见内容的稳定摘要。
 std::string ComputeBundleDigest(const ProjectBundle& bundle);
+// 计算除程序集源码外其它目录工程内容的稳定摘要。
+std::string ComputeBundleDigestWithoutSourceFiles(const ProjectBundle& bundle);
 // 计算文本内容的稳定摘要。
 std::string ComputeTextDigest(const std::string& text);
 // 运行期警告收集。

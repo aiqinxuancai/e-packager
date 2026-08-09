@@ -8246,10 +8246,14 @@ void ParseDllPage(const Page& page, std::vector<ParsedDllDef>& outDlls)
 	}
 }
 
-void ParseConstantPage(const Page& page, std::vector<ParsedConstantDef>& outConstants)
+bool ParseConstantPage(
+	const Page& page,
+	std::vector<ParsedConstantDef>& outConstants,
+	std::string* outError)
 {
 	std::vector<std::string> fields;
-	for (const auto& line : page.lines) {
+	for (size_t lineIndex = 0; lineIndex < page.lines.size(); ++lineIndex) {
+		const auto& line = page.lines[lineIndex];
 		const std::string trimmed = TrimAsciiCopy(line);
 		if (!StartsWith(trimmed, ".常量")) {
 			continue;
@@ -8267,10 +8271,32 @@ void ParseConstantPage(const Page& page, std::vector<ParsedConstantDef>& outCons
 			item.isLongText = true;
 		}
 		(void)decodedText;
-		item.isPublic = GetFieldOrEmpty(fields, 3) == "公开";
-		item.comment = ExtractRemainingDefinitionFieldText(trimmed, "常量", 4);
+
+		const std::string publicField = GetFieldOrEmpty(fields, 2);
+		size_t commentFieldIndex = 3;
+		if (publicField == "公开") {
+			item.isPublic = true;
+		}
+		else if (!publicField.empty()) {
+			if (outError != nullptr) {
+				*outError = FormatPageSyntaxError(page, lineIndex, "constant_public_flag_invalid");
+			}
+			return false;
+		}
+		else {
+			const std::string legacyPublicField = GetFieldOrEmpty(fields, 3);
+			const bool usesLegacyFiveFields =
+				legacyPublicField == "公开" ||
+				(fields.size() > 4 && legacyPublicField.empty());
+			if (usesLegacyFiveFields) {
+				item.isPublic = legacyPublicField == "公开";
+				commentFieldIndex = 4;
+			}
+		}
+		item.comment = ExtractRemainingDefinitionFieldText(trimmed, "常量", commentFieldIndex);
 		outConstants.push_back(std::move(item));
 	}
+	return true;
 }
 
 void ParseWindowPage(const Page& page, std::vector<ParsedFormDef>& outForms)
@@ -8812,12 +8838,19 @@ Document BuildDocumentFromBundle(const ProjectBundle& bundle)
 
 bool HasPersistedEComPathOverride(const ProjectBundle& bundle);
 
-bool CanReuseNativeBytesForSemanticEquivalentSources(const ProjectBundle& bundle, const Document& document)
+bool CanReuseNativeBytesForSemanticEquivalentSources(
+	const ProjectBundle& bundle,
+	const ProjectBundle& originalBundle,
+	const Document& document)
 {
 	if (bundle.nativeSourceBytes.empty() || bundle.nativeSourceSnapshots.empty()) {
 		return false;
 	}
 	if (HasPersistedEComPathOverride(bundle)) {
+		return false;
+	}
+	if (ComputeBundleDigestWithoutSourceFiles(bundle) !=
+		ComputeBundleDigestWithoutSourceFiles(originalBundle)) {
 		return false;
 	}
 
@@ -9059,7 +9092,9 @@ bool BuildRestoreModel(
 			ParseDllPage(page, parsedDlls);
 		}
 		else if (page.typeName == "常量资源") {
-			ParseConstantPage(page, parsedConstants);
+			if (!ParseConstantPage(page, parsedConstants, outError)) {
+				return false;
+			}
 		}
 	}
 
@@ -9573,7 +9608,9 @@ bool BuildRestoreModel(
 				ParseDllPage(page, dependencyDlls);
 			}
 			else if (page.typeName == "常量资源") {
-				ParseConstantPage(page, dependencyConstants);
+				if (!ParseConstantPage(page, dependencyConstants, outError)) {
+					return false;
+				}
 			}
 		}
 
@@ -12906,11 +12943,6 @@ bool RestoreBundleToBytesInternal(
 		}
 		return false;
 	}
-	if (CanReuseNativeBytesForSemanticEquivalentSources(bundle, document)) {
-		outBytes = bundle.nativeSourceBytes;
-		return true;
-	}
-
 	ProjectBundle originalBundle;
 	ProjectBundle* originalBundlePtr = nullptr;
 	if (!bundle.nativeSourceBytes.empty()) {
@@ -12919,6 +12951,11 @@ bool RestoreBundleToBytesInternal(
 		if (generator.GenerateBundleFromBytes(bundle.nativeSourceBytes, bundle.sourcePath, originalBundle, &ignoredError)) {
 			originalBundlePtr = &originalBundle;
 		}
+	}
+	if (originalBundlePtr != nullptr &&
+		CanReuseNativeBytesForSemanticEquivalentSources(bundle, *originalBundlePtr, document)) {
+		outBytes = bundle.nativeSourceBytes;
+		return true;
 	}
 
 	RestoreDocumentModel model;

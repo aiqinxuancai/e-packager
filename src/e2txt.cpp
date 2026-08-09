@@ -5913,7 +5913,6 @@ void BuildConstantPage(const ModuleSections& sections, Document& outDocument)
 			{
 				TrimAsciiCopy(resolver.ResolveUserName(item.marker)),
 				Quote(valueText),
-				std::string(),
 				(item.attr & 0x2) != 0 ? "公开" : std::string(),
 				TrimAsciiCopy(item.comment),
 			}));
@@ -6632,7 +6631,6 @@ std::string BuildPublicHeaderText(
 			{
 				TrimAsciiCopy(resolver.ResolveUserName(item.marker)),
 				Quote(valueText),
-				std::string(),
 				"公开",
 				TrimAsciiCopy(item.comment),
 			}));
@@ -7939,7 +7937,9 @@ std::string ComputeTextDigest(const std::string& text)
 	return writer.FinishHex();
 }
 
-std::string ComputeBundleDigest(const ProjectBundle& bundle)
+namespace {
+
+std::string ComputeBundleDigestInternal(const ProjectBundle& bundle, const bool includeSourceFiles)
 {
 	BundleDigestWriter writer;
 	writer.WriteString(bundle.projectName);
@@ -7956,12 +7956,14 @@ std::string ComputeBundleDigest(const ProjectBundle& bundle)
 		writer.WriteBool(item.reExport);
 	}
 
-	writer.WriteU64(static_cast<std::uint64_t>(bundle.sourceFiles.size()));
-	for (const auto& item : bundle.sourceFiles) {
-		writer.WriteString(item.key);
-		writer.WriteString(item.logicalName);
-		writer.WriteString(item.relativePath);
-		writer.WriteString(item.content);
+	writer.WriteU64(includeSourceFiles ? static_cast<std::uint64_t>(bundle.sourceFiles.size()) : 0);
+	if (includeSourceFiles) {
+		for (const auto& item : bundle.sourceFiles) {
+			writer.WriteString(item.key);
+			writer.WriteString(item.logicalName);
+			writer.WriteString(item.relativePath);
+			writer.WriteString(item.content);
+		}
 	}
 
 	writer.WriteU64(static_cast<std::uint64_t>(bundle.formFiles.size()));
@@ -8012,6 +8014,18 @@ std::string ComputeBundleDigest(const ProjectBundle& bundle)
 		writer.WriteString(item.className);
 	}
 	return writer.FinishHex();
+}
+
+}  // namespace
+
+std::string ComputeBundleDigest(const ProjectBundle& bundle)
+{
+	return ComputeBundleDigestInternal(bundle, true);
+}
+
+std::string ComputeBundleDigestWithoutSourceFiles(const ProjectBundle& bundle)
+{
+	return ComputeBundleDigestInternal(bundle, false);
 }
 
 bool Generator::GenerateDocument(
