@@ -1546,9 +1546,11 @@ int RunDefaultPack()
 int RunCompareBundle(const char* inputPath, const char* inputDir, const e2txt::ReadOptions& readOptions = {})
 {
 	e2txt::Generator generator;
+	e2txt::Restorer restorer;
 	e2txt::BundleDirectoryCodec codec;
 	e2txt::ProjectBundle bundleFromE;
 	e2txt::ProjectBundle bundleFromDir;
+	e2txt::ProjectBundle rebuiltBundleFromDir;
 	std::string error;
 	const std::filesystem::path effectiveInputPath = ResolveAbsolutePath(std::filesystem::path(inputPath));
 	const std::filesystem::path effectiveInputDir = ResolveAbsolutePath(std::filesystem::path(inputDir));
@@ -1558,7 +1560,25 @@ int RunCompareBundle(const char* inputPath, const char* inputDir, const e2txt::R
 	if (!codec.ReadBundle(PathToUtf8(effectiveInputDir), bundleFromDir, &error)) {
 		return PrintStringResult("compare-bundle", -1, error.c_str());
 	}
-	const std::string summary = BuildBundleDigestCompareText(bundleFromE, bundleFromDir);
+
+	std::vector<std::uint8_t> rebuiltBytes;
+	const bool restored = bundleFromDir.sourceFileKind == e2txt::SourceFileKind::EC
+		? restorer.RestoreBundleToBytesForEcBridge(bundleFromDir, rebuiltBytes, &error)
+		: restorer.RestoreBundleToBytes(bundleFromDir, rebuiltBytes, &error);
+	if (!restored) {
+		const std::string restoreError = "restore_directory_bundle_failed: " + error;
+		return PrintStringResult("compare-bundle", -1, restoreError.c_str());
+	}
+	if (!generator.GenerateBundleFromBytes(
+			rebuiltBytes,
+			bundleFromDir.sourcePath,
+			rebuiltBundleFromDir,
+			&error)) {
+		const std::string generateError = "parse_rebuilt_directory_bundle_failed: " + error;
+		return PrintStringResult("compare-bundle", -1, generateError.c_str());
+	}
+
+	const std::string summary = BuildBundleDigestCompareText(bundleFromE, rebuiltBundleFromDir);
 	return PrintStringResult("compare-bundle", 0, summary.c_str());
 }
 

@@ -217,10 +217,10 @@ std::vector<std::filesystem::path> BuildLibraryFileVariants(const std::string& l
 		return variants;
 	}
 
-	variants.push_back(filePath);
 	variants.push_back(filePath.string() + ".fne");
 	variants.push_back(filePath.string() + ".fnr");
 	variants.push_back(filePath.string() + ".dll");
+	variants.push_back(filePath);
 	return variants;
 }
 
@@ -284,7 +284,7 @@ bool ResolveSupportLibraryPath(
 	outResolvedPath.clear();
 	for (const auto& candidate : BuildSupportLibraryCandidatePaths(sourcePath, libraryFileName)) {
 		std::error_code ec;
-		if (!std::filesystem::exists(candidate, ec)) {
+		if (!std::filesystem::is_regular_file(candidate, ec)) {
 			continue;
 		}
 		outResolvedPath = candidate;
@@ -1314,7 +1314,9 @@ bool TryLoadSupportLibraryDump(
 	auto tryLoad = [&](const DWORD flags, std::string& outAttemptError) -> bool {
 		module = LoadLibraryExA(filePath.string().c_str(), nullptr, flags);
 		if (module == nullptr) {
-			outAttemptError = "LoadLibraryEx failed";
+			const DWORD errorCode = GetLastError();
+			outAttemptError =
+				"LoadLibraryEx failed (Win32 error=" + std::to_string(errorCode) + ")";
 			return false;
 		}
 		moduleCanBeFreed = flags != 0;
