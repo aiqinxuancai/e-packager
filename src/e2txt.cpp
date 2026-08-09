@@ -1118,6 +1118,11 @@ bool NeedsEscapedBodyLine(const std::string& text)
 
 void AppendRenderedBodyLine(std::vector<std::string>& outLines, const int indent, const std::string& body)
 {
+	if (body.empty()) {
+		outLines.emplace_back();
+		return;
+	}
+
 	const std::string indentText = BuildIndent(indent);
 	if (!NeedsEscapedBodyLine(body)) {
 		outLines.push_back(indentText + body);
@@ -4539,23 +4544,23 @@ void AppendStatementLines(const StatementBlock& block, SymbolResolver& resolver,
 bool TryGetOperatorInfo(std::int32_t methodId, OperatorInfo& outInfo)
 {
 	switch (methodId) {
-	case 15: outInfo = { "*", 2, OperatorInfo::Type::Multi }; return true;
-	case 16: outInfo = { "/", 2, OperatorInfo::Type::Multi }; return true;
+	case 15: outInfo = { "×", 2, OperatorInfo::Type::Multi }; return true;
+	case 16: outInfo = { "÷", 2, OperatorInfo::Type::Multi }; return true;
 	case 17: outInfo = { "\\", 3, OperatorInfo::Type::Multi }; return true;
 	case 18: outInfo = { "%", 4, OperatorInfo::Type::Multi }; return true;
-	case 19: outInfo = { "+", 5, OperatorInfo::Type::Multi }; return true;
-	case 20: outInfo = { "-", 5, OperatorInfo::Type::Multi }; return true;
-	case 21: outInfo = { "-", 1, OperatorInfo::Type::Unary }; return true;
-	case 38: outInfo = { "==", 6, OperatorInfo::Type::Binary }; return true;
-	case 39: outInfo = { "!=", 6, OperatorInfo::Type::Binary }; return true;
-	case 40: outInfo = { "<", 6, OperatorInfo::Type::Binary }; return true;
-	case 41: outInfo = { ">", 6, OperatorInfo::Type::Binary }; return true;
-	case 42: outInfo = { "<=", 6, OperatorInfo::Type::Binary }; return true;
-	case 43: outInfo = { ">=", 6, OperatorInfo::Type::Binary }; return true;
+	case 19: outInfo = { "＋", 5, OperatorInfo::Type::Multi }; return true;
+	case 20: outInfo = { "－", 5, OperatorInfo::Type::Multi }; return true;
+	case 21: outInfo = { "－", 1, OperatorInfo::Type::Unary }; return true;
+	case 38: outInfo = { "＝", 6, OperatorInfo::Type::Binary }; return true;
+	case 39: outInfo = { "≠", 6, OperatorInfo::Type::Binary }; return true;
+	case 40: outInfo = { "＜", 6, OperatorInfo::Type::Binary }; return true;
+	case 41: outInfo = { "＞", 6, OperatorInfo::Type::Binary }; return true;
+	case 42: outInfo = { "≤", 6, OperatorInfo::Type::Binary }; return true;
+	case 43: outInfo = { "≥", 6, OperatorInfo::Type::Binary }; return true;
 	case 44: outInfo = { "?=", 6, OperatorInfo::Type::Binary }; return true;
-	case 45: outInfo = { "&&", 7, OperatorInfo::Type::Multi }; return true;
-	case 46: outInfo = { "||", 8, OperatorInfo::Type::Multi }; return true;
-	case 52: outInfo = { "=", 9, OperatorInfo::Type::Binary }; return true;
+	case 45: outInfo = { "且", 7, OperatorInfo::Type::Multi }; return true;
+	case 46: outInfo = { "或", 8, OperatorInfo::Type::Multi }; return true;
+	case 52: outInfo = { "＝", 9, OperatorInfo::Type::Binary }; return true;
 	default: return false;
 	}
 }
@@ -5621,7 +5626,6 @@ void BuildProgramPages(const ModuleSections& sections, const GenerateOptions& op
 		&sections.losable.removedDefinedItems);
 	std::vector<EComDependencyRecord> dependencyRecords;
 	(void)ParseEComDependencies(sections.ecomSectionBytes, dependencyRecords);
-	bool firstProgramPage = true;
 	TraceLine("BuildProgramPages begin");
 	for (const auto& pageInfo : sections.program.codePages) {
 		const auto functions = CollectPageFunctions(sections.program, pageInfo);
@@ -5635,18 +5639,14 @@ void BuildProgramPages(const ModuleSections& sections, const GenerateOptions& op
 		page.typeName = "程序集";
 		page.name = logicalPageName;
 		AppendLine(page, ".版本 2");
-		AppendLine(page, "");
-		if (firstProgramPage) {
-			for (const auto& item : outDocument.dependencies) {
-				if (item.kind == DependencyKind::ELib && !item.name.empty()) {
-					AppendLine(page, ".支持库 " + item.name);
-				}
+		for (const auto& item : outDocument.dependencies) {
+			if (item.kind == DependencyKind::ELib &&
+				!item.fileName.empty() &&
+				!IsCoreSupportLibraryFileName(item.fileName)) {
+				AppendLine(page, ".支持库 " + item.fileName);
 			}
-			if (!page.lines.empty() && page.lines.back() != "") {
-				AppendLine(page, "");
-			}
-			firstProgramPage = false;
 		}
+		AppendLine(page, "");
 
 		std::string baseClassName;
 		if (pageInfo.baseClass != 0 && pageInfo.baseClass != -1) {
@@ -5666,14 +5666,11 @@ void BuildProgramPages(const ModuleSections& sections, const GenerateOptions& op
 			: BuildDefinitionLine(
 			"程序集",
 			headerFields));
-		AppendLine(page, "");
 
 		for (const auto& pageVar : pageInfo.pageVars) {
 			AppendLine(page, BuildClassVariableLine(pageVar, resolver));
 		}
-		if (!pageInfo.pageVars.empty()) {
-			AppendLine(page, "");
-		}
+		AppendLine(page, "");
 
 		for (const auto* functionInfo : functions) {
 			if (functionInfo == nullptr || IsImportedFunction(*functionInfo)) {
@@ -5726,7 +5723,6 @@ void BuildProgramPages(const ModuleSections& sections, const GenerateOptions& op
 				AppendLine(page, "' native_parse_failed: " + error);
 			}
 
-			AppendLine(page, "");
 			AppendLine(page, "");
 		}
 

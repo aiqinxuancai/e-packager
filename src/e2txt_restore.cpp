@@ -4111,6 +4111,82 @@ bool TryGetNativeTextQuoteLength(const std::string& text, const size_t offset, s
 	return false;
 }
 
+bool IsNativeLogicalOperatorBoundary(const std::string& text, const size_t offset)
+{
+	if (offset >= text.size()) {
+		return true;
+	}
+	const unsigned char ch = static_cast<unsigned char>(text[offset]);
+	return std::isspace(ch) != 0 ||
+		ch == '(' || ch == ')' || ch == '[' || ch == ']' || ch == ',' ||
+		ch == '+' || ch == '-' || ch == '*' || ch == '/' || ch == '\\' || ch == '%' ||
+		ch == '<' || ch == '>' || ch == '=' || ch == '!' || ch == '&' || ch == '|' || ch == '?';
+}
+
+std::string NormalizeNativeOperatorSyntaxForParsing(const std::string& text)
+{
+	struct OperatorAlias {
+		std::string_view source;
+		std::string_view target;
+		bool needsWordBoundary = false;
+	};
+	constexpr std::array<OperatorAlias, 12> kAliases = {
+		OperatorAlias{ "≠", "!=" },
+		{ "≤", "<=" },
+		{ "≥", ">=" },
+		{ "＝", "==" },
+		{ "＜", "<" },
+		{ "＞", ">" },
+		{ "＋", "+" },
+		{ "－", "-" },
+		{ "×", "*" },
+		{ "÷", "/" },
+		{ "且", "&&", true },
+		{ "或", "||", true },
+	};
+
+	std::string normalized;
+	normalized.reserve(text.size());
+	bool inChineseQuote = false;
+	bool inAsciiQuote = false;
+	for (size_t index = 0; index < text.size();) {
+		size_t quoteLength = 0;
+		if (!inAsciiQuote && TryGetNativeTextQuoteLength(text, index, quoteLength)) {
+			inChineseQuote = !inChineseQuote;
+			normalized.append(text, index, quoteLength);
+			index += quoteLength;
+			continue;
+		}
+		if (!inChineseQuote && text[index] == '"') {
+			inAsciiQuote = !inAsciiQuote;
+			normalized.push_back(text[index++]);
+			continue;
+		}
+
+		bool replaced = false;
+		if (!inChineseQuote && !inAsciiQuote) {
+			for (const auto& alias : kAliases) {
+				if (!StartsWithAt(text, index, alias.source)) {
+					continue;
+				}
+				if (alias.needsWordBoundary &&
+					(!IsNativeLogicalOperatorBoundary(text, index == 0 ? text.size() : index - 1) ||
+						!IsNativeLogicalOperatorBoundary(text, index + alias.source.size()))) {
+					continue;
+				}
+				normalized.append(alias.target);
+				index += alias.source.size();
+				replaced = true;
+				break;
+			}
+		}
+		if (!replaced) {
+			normalized.push_back(text[index++]);
+		}
+	}
+	return normalized;
+}
+
 bool SplitTopLevelExpressionByChar(
 	const std::string& text,
 	const char separator,
@@ -5046,7 +5122,7 @@ bool TryEncodeNativeExpression(
 	std::vector<std::int32_t>& constantReferences,
 	std::string* outError = nullptr)
 {
-	const std::string expression = StripOuterParentheses(rawExpression);
+	const std::string expression = NormalizeNativeOperatorSyntaxForParsing(StripOuterParentheses(rawExpression));
 	if (expression.empty()) {
 		writer.WriteU8(0x16);
 		return true;
