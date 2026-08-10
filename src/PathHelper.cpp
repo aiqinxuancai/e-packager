@@ -299,8 +299,8 @@ std::string Utf8Literal(const std::u8string_view text) {
     return std::string(reinterpret_cast<const char*>(text.data()), text.size());
 }
 
-std::vector<std::filesystem::path> GetRegisteredEplOpenCommandBaseDirs() {
-    std::vector<std::filesystem::path> baseDirs;
+std::vector<std::filesystem::path> GetRegisteredEplOpenCommandExecutablePaths() {
+    std::vector<std::filesystem::path> executablePaths;
     const std::pair<HKEY, const wchar_t*> registryLocations[] = {
         { HKEY_CLASSES_ROOT, L"E.Document\\Shell\\Open\\Command" },
         { HKEY_LOCAL_MACHINE, L"SOFTWARE\\Classes\\E.Document\\Shell\\Open\\Command" },
@@ -329,10 +329,18 @@ std::vector<std::filesystem::path> GetRegisteredEplOpenCommandBaseDirs() {
             executablePath = ExpandEnvironmentStringsCopy(executablePath);
 
             std::filesystem::path exePath(executablePath);
-            PushUniquePath(baseDirs, exePath.parent_path());
+            PushUniquePath(executablePaths, exePath);
         }
     }
 
+    return executablePaths;
+}
+
+std::vector<std::filesystem::path> GetRegisteredEplOpenCommandBaseDirs() {
+    std::vector<std::filesystem::path> baseDirs;
+    for (const auto& executablePath : GetRegisteredEplOpenCommandExecutablePaths()) {
+        PushUniquePath(baseDirs, executablePath.parent_path());
+    }
     return baseDirs;
 }
 

@@ -165,12 +165,17 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="src\AutoLinkerCompileCheck.cpp" />
     <ClCompile Include="src\BundlePathUtils.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\EFolderCodec.cpp">
       <ObjectFileName>$(IntDir)EFolderCodecCore.obj</ObjectFileName>
     </ClCompile>
     <ClCompile Include="src\SelfUpdater.cpp" />
+    <ClCompile Include="src\SimpleXmlDocument.cpp" />
+    <ClCompile Include="src\SourceExpressionParser.cpp" />
+    <ClCompile Include="src\SourcePreflightValidator.cpp" />
+    <ClCompile Include="src\SourceSemanticValidator.cpp" />
     <ClCompile Include="src\UpdateCheck.cpp" />
     <ClCompile Include="src\WorkspaceProjectSupport.cpp" />
     <ClCompile Include="src\e2txt.cpp" />
@@ -179,9 +184,14 @@
     <ClCompile Include="src\SupportLibraryPublicInfo.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\AutoLinkerCompileCheck.h" />
     <ClInclude Include="src\BundlePathUtils.h" />
     <ClInclude Include="src\EFolderCodec.h" />
     <ClInclude Include="src\SelfUpdater.h" />
+    <ClInclude Include="src\SimpleXmlDocument.h" />
+    <ClInclude Include="src\SourceExpressionParser.h" />
+    <ClInclude Include="src\SourcePreflightValidator.h" />
+    <ClInclude Include="src\SourceSemanticValidator.h" />
     <ClInclude Include="src\UpdateCheck.h" />
     <ClInclude Include="src\version.h" />
     <ClInclude Include="src\WorkspaceProjectSupport.h" />

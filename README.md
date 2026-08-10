@@ -82,6 +82,48 @@ e-packager
 e-packager pack MyApp\ MyApp-protected.e --password 111222333
 ```
 
+### 回包前预检
+
+可以只读取工作区并执行快速预检，不生成 `.e` 文件：
+
+```
+e-packager validate <input-dir>
+```
+
+`pack` 和无参默认回包会自动执行同一套预检。发现确定性错误时，命令返回失败并且不会写出目标文件；诊断包含源码文件、行号和错误代码。
+
+当前预检覆盖声明槽位及属性、严格数组维数、自定义数据类型数组成员的零维限制、声明顺序与同作用域重复名称、跨页面类型/资源名称冲突、未知点指令、流程块配对、智能引号和括号配对、缺少赋值左值/右值、误用半角赋值符号、只读目标赋值、窗体 XML 及窗口程序集绑定、控件成员和事件处理器存在性，以及可静态确定的符号、成员、调用签名、返回值和表达式类型错误。例如 `整数变量 ＝ “文本”`、`a ＝`、`#常量 ＝ 1`、`.局部变量 a 整数型` 会被阻止。
+
+声明的行尾空槽可以省略，预检不会强制补齐固定字段数；填写后续属性、数组维数或说明时，中间空槽仍须用逗号保留。例如 `.局部变量 arr, 整数型, , "0"` 合法，不能压缩为 `.局部变量 arr, 整数型, "0"`。`"0"` 可用于动态局部变量或全局变量，但自定义数据类型的数组成员不能包含零维。
+
+预检不是完整的易语言编译器。目前仍未完整覆盖类继承及访问权限、普通程序集方法与类实例方法的调用边界、支持库或易模块的重载和特殊命令规则、变体型及泛型类型流、窗口事件参数签名、全部隐式类型转换和特殊表达式。DLL 入口是否存在以及数组越界、空对象、文件或动态资源缺失等运行期问题也不属于源码预检。依赖元数据缺失或语义无法可靠确定时会标记为未知而不是臆测报错。因此 `errors=0` 表示没有发现当前覆盖范围内的确定性错误，不代表最终编译一定成功。
+
+对已修改或新增的可执行语句，回包器还会要求其能够生成原生语义表达式；编码失败会中止回包，不再静默写入未检查的原始代码。未修改语句继续复用原生快照，注释、空行和屏蔽代码仍可保留。需要 IDE 级别结论时，可使用下面的 `--compile-check`。
+
+### 权威无头编译检查
+
+如果本机安装了易语言和 AutoLinker，可以让封包在提交 `.e` 前执行一次真实编译：
+
+```powershell
+tool\e-packager.exe pack . .\pack\checked.e `
+  --compile-check `
+  --eide "C:\path\to\e.exe" `
+  --autolinker-test "D:\git\AutoLinker\bin\fne_release\AutoLinkerTest.exe" `
+  --compile-static --compile-timeout 120
+```
+
+也可以只对已有 `.e` 文件检查，不生成新的 `.e`：
+
+```powershell
+e-packager compile-check checked.e `
+  --eide "C:\path\to\e.exe" `
+  --autolinker-test "D:\git\AutoLinker\bin\fne_release\AutoLinkerTest.exe"
+```
+
+`--eide` 可以省略，封包器会从 `E.Document` 注册表打开命令中查找易语言主程序；`--autolinker-test` 可以省略，封包器会依次尝试环境变量 `E_PACKAGER_AUTOLINKER_TEST`、程序同目录和 `PATH`。也可以用 `E_PACKAGER_EIDE` 提供 IDE 路径。编译失败会输出 AutoLinker 的 IDE 页面、行号和输出窗口内容，并且不会覆盖已有目标文件。`--compile-static` 用于同时验证静态链接；不指定时执行 IDE 的普通编译检查。
+
+这一步依赖当前机器的易语言版本、支持库、易模块和链接器配置，失败时应先修复环境或源码，再交付 `.e`。
+
 ### 刷新派生内容
 
 解包后，若依赖的易模块或支持库发生变化，或需要新增图片、音频等二进制资源，可用 `update` 命令刷新 `ecom/` 与 `elib/` 中的派生内容并写入资源索引，无需重新解包整个工程。
@@ -135,6 +177,9 @@ e-packager version
 
 # 导出单个 .fne 支持库公开接口（仅 Win32 版）
 e-packager decrypt-fne <input.fne> [output.txt]
+
+# 快速检查目录工程，不生成 .e
+e-packager validate <input-dir>
 
 # 比较原文件与目录内容是否一致
 e-packager compare-bundle <input.e|input.ec> <input-dir> [--password <text>]

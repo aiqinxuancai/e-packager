@@ -9,6 +9,8 @@
 
 // 获取程序所在目录。
 std::string GetBasePath();
+// 获取注册表中易语言打开命令对应的主程序路径。
+std::vector<std::filesystem::path> GetRegisteredEplOpenCommandExecutablePaths();
 // 获取注册表中易语言打开命令对应的安装目录。
 std::vector<std::filesystem::path> GetRegisteredEplOpenCommandBaseDirs();
 // 构建易模块依赖文件的候选查找路径列表。

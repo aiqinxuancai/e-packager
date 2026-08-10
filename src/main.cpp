@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cwctype>
 #include <exception>
@@ -18,9 +19,11 @@
 #include <vector>
 
 #include "..\thirdparty\json.hpp"
+#include "AutoLinkerCompileCheck.h"
 #include "EFolderCodec.h"
 #include "PathHelper.h"
 #include "SelfUpdater.h"
+#include "SourcePreflightValidator.h"
 #include "SupportLibraryPublicInfo.h"
 #include "UpdateCheck.h"
 #include "WorkspaceProjectSupport.h"
@@ -148,6 +151,12 @@ struct UnpackOptions {
 	bool unpackDependencyModules = true;
 	size_t dependencyExportThreadCount = e2txt::kDefaultDependencyExportThreadCount;
 	e2txt::ReadOptions readOptions;
+};
+
+struct PackCommandOptions {
+	e2txt::WriteOptions writeOptions;
+	bool compileCheck = false;
+	autolinker_compile_check::Options compileOptions;
 };
 
 struct DependencyModuleAnnotation {
@@ -1471,27 +1480,128 @@ bool ParseUnpackOptions(
 	return true;
 }
 
-bool ParseWriteOptions(
+bool TryParseUnsignedInt(const std::string& text, unsigned int& outValue)
+{
+	if (text.empty()) {
+		return false;
+	}
+	unsigned int value = 0;
+	const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+	if (error != std::errc() || end != text.data() + text.size()) {
+		return false;
+	}
+	outValue = value;
+	return true;
+}
+
+bool ParseCompileCheckOption(
+	const int argc,
+	char* argv[],
+	int& index,
+	autolinker_compile_check::Options& outOptions,
+	bool& outRecognized)
+{
+	outRecognized = true;
+	const std::string option = argv[index];
+	const auto readValue = [&](std::string& outValue) -> bool {
+		if (index + 1 >= argc) {
+			return false;
+		}
+		outValue = argv[++index];
+		return !outValue.empty();
+	};
+
+	std::string value;
+	if (option == "--eide") {
+		if (!readValue(value)) return false;
+		outOptions.eIdePath = std::filesystem::path(value);
+		return true;
+	}
+	if (option.rfind("--eide=", 0) == 0) {
+		outOptions.eIdePath = std::filesystem::path(option.substr(std::string("--eide=").size()));
+		return !outOptions.eIdePath.empty();
+	}
+	if (option == "--autolinker-test") {
+		if (!readValue(value)) return false;
+		outOptions.launcherPath = std::filesystem::path(value);
+		return true;
+	}
+	if (option.rfind("--autolinker-test=", 0) == 0) {
+		outOptions.launcherPath = std::filesystem::path(option.substr(std::string("--autolinker-test=").size()));
+		return !outOptions.launcherPath.empty();
+	}
+	if (option == "--compile-target") {
+		if (!readValue(value)) return false;
+		outOptions.target = value;
+		return true;
+	}
+	if (option.rfind("--compile-target=", 0) == 0) {
+		outOptions.target = option.substr(std::string("--compile-target=").size());
+		return !outOptions.target.empty();
+	}
+	if (option == "--compile-static") {
+		outOptions.staticCompile = true;
+		return true;
+	}
+	if (option == "--compile-timeout") {
+		if (!readValue(value)) return false;
+		return TryParseUnsignedInt(value, outOptions.timeoutSeconds);
+	}
+	if (option.rfind("--compile-timeout=", 0) == 0) {
+		return TryParseUnsignedInt(
+			option.substr(std::string("--compile-timeout=").size()),
+			outOptions.timeoutSeconds);
+	}
+	outRecognized = false;
+	return true;
+}
+
+bool ParsePackCommandOptions(
 	const int argc,
 	char* argv[],
 	const int startIndex,
-	e2txt::WriteOptions& outWriteOptions)
+	PackCommandOptions& outOptions)
 {
-	outWriteOptions = {};
+	outOptions = {};
 	for (int index = startIndex; index < argc; ++index) {
 		const std::string option = argv[index];
 		if (option == "--password") {
-			if (index + 1 >= argc) {
-				return false;
-			}
-			outWriteOptions.password = argv[++index];
+			if (index + 1 >= argc) return false;
+			outOptions.writeOptions.password = argv[++index];
 			continue;
 		}
 		if (option.rfind("--password=", 0) == 0) {
-			outWriteOptions.password = option.substr(std::string("--password=").size());
+			outOptions.writeOptions.password = option.substr(std::string("--password=").size());
 			continue;
 		}
-		return false;
+		if (option == "--compile-check") {
+			outOptions.compileCheck = true;
+			continue;
+		}
+		bool recognized = false;
+		if (!ParseCompileCheckOption(argc, argv, index, outOptions.compileOptions, recognized)) {
+			return false;
+		}
+		if (!recognized) {
+			return false;
+		}
+		outOptions.compileCheck = true;
+	}
+	return true;
+}
+
+bool ParseStandaloneCompileCheckOptions(
+	const int argc,
+	char* argv[],
+	const int startIndex,
+	autolinker_compile_check::Options& outOptions)
+{
+	outOptions = {};
+	for (int index = startIndex; index < argc; ++index) {
+		bool recognized = false;
+		if (!ParseCompileCheckOption(argc, argv, index, outOptions, recognized) || !recognized) {
+			return false;
+		}
 	}
 	return true;
 }
@@ -1511,14 +1621,215 @@ int RunUnpack(const char* inputPath, const char* outputDir, const UnpackOptions&
 	return PrintStringResult("unpack", 0, summary.c_str());
 }
 
-int RunPack(const char* inputDir, const char* outputPath, const e2txt::WriteOptions& writeOptions = {})
+bool CreateStagedPackOutputPath(
+	const std::filesystem::path& finalOutputPath,
+	std::filesystem::path& outStagedPath,
+	std::string& outError)
 {
-	std::string summary;
+	outStagedPath.clear();
+	const std::filesystem::path parent = finalOutputPath.parent_path();
+	const std::wstring stem = finalOutputPath.stem().wstring().empty()
+		? std::wstring(L"project")
+		: finalOutputPath.stem().wstring();
+	const std::wstring extension = finalOutputPath.extension().wstring();
+	const std::uint64_t seed = static_cast<std::uint64_t>(GetTickCount64());
+	for (unsigned int attempt = 0; attempt < 100; ++attempt) {
+		const std::wstring name = L"." + stem + L".e-packager-compile-check-" +
+			std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(seed) + L"-" +
+			std::to_wstring(attempt) + extension;
+		const std::filesystem::path candidate = parent / name;
+		const HANDLE file = CreateFileW(
+			candidate.c_str(),
+			GENERIC_WRITE,
+			0,
+			nullptr,
+			CREATE_NEW,
+			FILE_ATTRIBUTE_TEMPORARY,
+			nullptr);
+		if (file != INVALID_HANDLE_VALUE) {
+			CloseHandle(file);
+			outStagedPath = candidate;
+			return true;
+		}
+		if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) {
+			outError = "compile_check_staging_create_failed: " + PathToUtf8(candidate) +
+				", win32_error=" + std::to_string(GetLastError());
+			return false;
+		}
+	}
+	outError = "compile_check_staging_path_collision";
+	return false;
+}
+
+bool RemoveStagedPackOutput(const std::filesystem::path& path, std::string* outCleanupError = nullptr)
+{
+	std::error_code ec;
+	const bool removed = std::filesystem::remove(path, ec);
+	if (!ec && (removed || !std::filesystem::exists(path, ec))) {
+		return true;
+	}
+	if (outCleanupError != nullptr) {
+		*outCleanupError = "compile_check_staging_cleanup_failed: " + PathToUtf8(path);
+	}
+	return false;
+}
+
+bool CommitStagedPackOutput(
+	const std::filesystem::path& stagedPath,
+	const std::filesystem::path& finalPath,
+	std::string& outError)
+{
+	if (MoveFileExW(
+			stagedPath.c_str(),
+			finalPath.c_str(),
+			MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE) {
+		return true;
+	}
+	outError = "compile_check_output_commit_failed: " + PathToUtf8(finalPath) +
+		", win32_error=" + std::to_string(GetLastError()) +
+		", staged_output=" + PathToUtf8(stagedPath);
+	return false;
+}
+
+void ReplacePackSummaryOutput(std::string& summary, const std::filesystem::path& outputPath)
+{
+	const std::string marker = ", output=";
+	const std::size_t position = summary.find(marker);
+	if (position != std::string::npos) {
+		summary.resize(position);
+	}
+	if (!summary.empty()) {
+		summary += ", ";
+	}
+	summary += "output=" + PathToUtf8(outputPath);
+}
+
+int RunPack(const char* inputDir, const char* outputPath, const PackCommandOptions& options = {})
+{
+	if (!options.compileCheck) {
+		std::string summary;
+		std::string error;
+		if (!DoPack(
+				std::filesystem::path(inputDir),
+				std::filesystem::path(outputPath),
+				summary,
+				error,
+				nullptr,
+				options.writeOptions)) {
+			return PrintStringResult("pack", -1, error.c_str());
+		}
+		return PrintStringResult("pack", 0, summary.c_str());
+	}
+
+	if (!options.writeOptions.password.empty()) {
+		return PrintStringResult(
+			"pack",
+			-1,
+			"compile_check_encrypted_source_unsupported: AutoLinker cannot receive the pack password");
+	}
+
+	autolinker_compile_check::PreparedOptions preparedCompileOptions;
 	std::string error;
-	if (!DoPack(std::filesystem::path(inputDir), std::filesystem::path(outputPath), summary, error, nullptr, writeOptions)) {
+	if (!autolinker_compile_check::Prepare(
+			options.compileOptions,
+			preparedCompileOptions,
+			error)) {
 		return PrintStringResult("pack", -1, error.c_str());
 	}
+
+	const std::filesystem::path effectiveInputDir = ResolveAbsolutePath(std::filesystem::path(inputDir));
+	const std::filesystem::path requestedOutputPath = ResolveAbsolutePath(std::filesystem::path(outputPath));
+	std::filesystem::path finalOutputPath;
+	if (!workspace_support::ResolvePackOutputPath(
+			effectiveInputDir,
+			requestedOutputPath,
+			finalOutputPath,
+			error)) {
+		return PrintStringResult("pack", -1, error.c_str());
+	}
+	std::string extension = finalOutputPath.extension().string();
+	std::transform(extension.begin(), extension.end(), extension.begin(), [](const unsigned char ch) {
+		return static_cast<char>(std::tolower(ch));
+	});
+	if (extension != ".e") {
+		return PrintStringResult(
+			"pack",
+			-1,
+			"compile_check_requires_e_output: choose an output path ending in .e");
+	}
+
+	std::filesystem::path stagedOutputPath;
+	if (!CreateStagedPackOutputPath(finalOutputPath, stagedOutputPath, error)) {
+		return PrintStringResult("pack", -1, error.c_str());
+	}
+
+	std::string summary;
+	std::filesystem::path writtenOutputPath;
+	if (!DoPack(
+			effectiveInputDir,
+			stagedOutputPath,
+			summary,
+			error,
+			&writtenOutputPath,
+			options.writeOptions)) {
+		RemoveStagedPackOutput(stagedOutputPath);
+		return PrintStringResult("pack", -1, error.c_str());
+	}
+
+	const autolinker_compile_check::Result compileResult =
+		autolinker_compile_check::Run(writtenOutputPath, preparedCompileOptions);
+	if (!compileResult.ok) {
+		std::string cleanupError;
+		const bool removed = RemoveStagedPackOutput(writtenOutputPath, &cleanupError);
+		error = compileResult.error + "\npack_output_not_committed: " + PathToUtf8(finalOutputPath);
+		if (!removed) {
+			error += "\n" + cleanupError;
+		}
+		return PrintStringResult("pack", -1, error.c_str());
+	}
+
+	if (!CommitStagedPackOutput(writtenOutputPath, finalOutputPath, error)) {
+		return PrintStringResult("pack", -1, error.c_str());
+	}
+	ReplacePackSummaryOutput(summary, finalOutputPath);
+	summary += ", " + compileResult.summary;
 	return PrintStringResult("pack", 0, summary.c_str());
+}
+
+int RunCompileCheck(
+	const char* sourcePath,
+	const autolinker_compile_check::Options& options)
+{
+	autolinker_compile_check::PreparedOptions preparedOptions;
+	std::string error;
+	if (!autolinker_compile_check::Prepare(options, preparedOptions, error)) {
+		return PrintStringResult("compile-check", -1, error.c_str());
+	}
+	const autolinker_compile_check::Result result =
+		autolinker_compile_check::Run(std::filesystem::path(sourcePath), preparedOptions);
+	return PrintStringResult(
+		"compile-check",
+		result.ok ? 0 : -1,
+		result.ok ? result.summary.c_str() : result.error.c_str());
+}
+
+int RunValidate(const char* inputDir)
+{
+	const std::filesystem::path effectiveInputDir = ResolveAbsolutePath(std::filesystem::path(inputDir));
+	std::string error;
+	if (!workspace_support::ValidateInfoJsonVersion(effectiveInputDir, error)) {
+		return PrintStringResult("validate", -1, error.c_str());
+	}
+
+	e2txt::BundleDirectoryCodec codec;
+	e2txt::ProjectBundle bundle;
+	if (!codec.ReadBundle(PathToUtf8(effectiveInputDir), bundle, &error)) {
+		return PrintStringResult("validate", -1, error.c_str());
+	}
+
+	const e2txt::SourcePreflightReport report = e2txt::ValidateProjectBundleSource(bundle);
+	const std::string summary = e2txt::FormatSourcePreflightReport(report);
+	return PrintStringResult("validate", report.IsValid() ? 0 : -1, summary.c_str());
 }
 
 int RunDefaultPack()
@@ -1996,7 +2307,10 @@ void PrintUsage()
 	std::cout << Utf8Literal(u8"  e-packager <input.fne>               # 导出支持库公开接口到同目录 .txt（仅 Win32 版可用）") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager unpack <input.e|input.ec> <output-dir> [--password <text>] [--main-only]    # 拆包到指定目录") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager decrypt-fne <input.fne> [output.txt]      # 导出支持库公开接口单文件（仅 Win32 版可用）") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager pack <input-dir> <output.e|output.ec> [--password <text>]      # 将目录封包为 .e/.ec 文件") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager pack <input-dir> <output.e|output.ec> [--password <text>] [--compile-check ...]  # 封包，可选 AutoLinker 无头编译确认") << std::endl;
+	std::cout << Utf8Literal(u8"       --compile-check [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--compile-target auto|win_exe|win_console_exe|win_dll|ecom] [--compile-static] [--compile-timeout <seconds>]") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager validate <input-dir>        # 快速检查声明、基础语法和可确定的类型错误") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager compile-check <input.e|input.ec> [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--compile-target ...] [--compile-static] [--compile-timeout <seconds>]  # 直接执行权威无头编译") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager update <input-dir> [--add-ecom <file.ec>]... [--add-elib <name|file.fne>]... [--add-image <file|name=file>]... [--add-audio <file|name=file>]...   # 刷新派生内容并新增资源") << std::endl;
 #if defined(_M_X64)
 	std::cout << Utf8Literal(u8"  e-packager /update [--force]         # x64 构建不启用自更新") << std::endl;
@@ -2063,12 +2377,31 @@ int RunCommand(int argc, char* argv[])
 			PrintUsage();
 			return EXIT_FAILURE;
 		}
-		e2txt::WriteOptions writeOptions;
-		if (!ParseWriteOptions(argc, argv, 4, writeOptions)) {
+		PackCommandOptions packOptions;
+		if (!ParsePackCommandOptions(argc, argv, 4, packOptions)) {
 			PrintUsage();
 			return EXIT_FAILURE;
 		}
-		return RunPack(argv[2], argv[3], writeOptions);
+		return RunPack(argv[2], argv[3], packOptions);
+	}
+	if (command == "validate") {
+		if (argc != 3) {
+			PrintUsage();
+			return EXIT_FAILURE;
+		}
+		return RunValidate(argv[2]);
+	}
+	if (command == "compile-check") {
+		if (argc < 3) {
+			PrintUsage();
+			return EXIT_FAILURE;
+		}
+		autolinker_compile_check::Options options;
+		if (!ParseStandaloneCompileCheckOptions(argc, argv, 3, options)) {
+			PrintUsage();
+			return EXIT_FAILURE;
+		}
+		return RunCompileCheck(argv[2], options);
 	}
 	if (command == "update") {
 		if (argc < 3) {

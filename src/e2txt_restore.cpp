@@ -27,6 +27,8 @@
 
 #include "EFolderCodec.h"
 #include "PathHelper.h"
+#include "SimpleXmlDocument.h"
+#include "SourcePreflightValidator.h"
 
 namespace e2txt {
 
@@ -552,6 +554,11 @@ std::string Utf8ToLocalText(const std::string& text)
 	return ConvertCodePage(text, CP_UTF8, CP_ACP, MB_ERR_INVALID_CHARS);
 }
 
+std::string LocalTextToUtf8(const std::string& text)
+{
+	return ConvertCodePage(text, CP_ACP, CP_UTF8, 0);
+}
+
 std::string NormalizeUtf8OrLocalTextToLocal(const std::string& text)
 {
 	return Utf8ToLocalText(text);
@@ -953,42 +960,6 @@ std::vector<std::uint8_t> DecodeBase64(const std::string& text)
 			}
 			chunkSize = 0;
 			padding = 0;
-		}
-	}
-	return out;
-}
-
-std::string DecodeXmlEntities(const std::string& text)
-{
-	std::string out;
-	out.reserve(text.size());
-	for (size_t i = 0; i < text.size(); ++i) {
-		if (text[i] != '&') {
-			out.push_back(text[i]);
-			continue;
-		}
-		if (StartsWith(std::string_view(text).substr(i), "&amp;")) {
-			out.push_back('&');
-			i += 4;
-		}
-		else if (StartsWith(std::string_view(text).substr(i), "&lt;")) {
-			out.push_back('<');
-			i += 3;
-		}
-		else if (StartsWith(std::string_view(text).substr(i), "&gt;")) {
-			out.push_back('>');
-			i += 3;
-		}
-		else if (StartsWith(std::string_view(text).substr(i), "&quot;")) {
-			out.push_back('"');
-			i += 5;
-		}
-		else if (StartsWith(std::string_view(text).substr(i), "&apos;")) {
-			out.push_back('\'');
-			i += 5;
-		}
-		else {
-			out.push_back(text[i]);
 		}
 	}
 	return out;
@@ -2128,7 +2099,11 @@ private:
 		};
 
 		Section section = Section::None;
-		std::vector<std::string> commandNames;
+		struct TextCommandInfo {
+			std::string name;
+			bool memberOnly = false;
+		};
+		std::vector<TextCommandInfo> commands;
 		std::vector<std::string> constantNames;
 		std::vector<SupportLibraryTextTypeInfo> typeInfos;
 		SupportLibraryTextTypeInfo* currentType = nullptr;
@@ -2162,7 +2137,10 @@ private:
 			if (section == Section::Commands) {
 				std::string name = ExtractSupportLibraryTextName(line, ".命令 ");
 				if (!name.empty()) {
-					commandNames.push_back(std::move(name));
+					commands.push_back(TextCommandInfo {
+						.name = std::move(name),
+						.memberOnly = line.find("分类=成员命令") != std::string::npos,
+					});
 				}
 				continue;
 			}
@@ -2193,22 +2171,25 @@ private:
 			}
 		}
 
-		if (commandNames.empty() && constantNames.empty() && typeInfos.empty()) {
+		if (commands.empty() && constantNames.empty() && typeInfos.empty()) {
 			return false;
 		}
 
 		const auto libraryId = static_cast<std::int16_t>(supportIndex - 1);
 		std::unordered_map<std::string, std::int32_t> commandIndexByName;
-		for (size_t index = 0; index < commandNames.size(); ++index) {
-			const std::string normalizedName = NormalizeTypeName(commandNames[index]);
+		for (size_t index = 0; index < commands.size(); ++index) {
+			const std::string normalizedName = NormalizeTypeName(commands[index].name);
 			if (normalizedName.empty()) {
 				continue;
 			}
 			const auto commandIndex = static_cast<std::int32_t>(index);
 			commandIndexByName.insert_or_assign(normalizedName, commandIndex);
-			m_supportCommands.insert_or_assign(
-				normalizedName,
-				SupportLibraryCommandInfo{ libraryId, commandIndex });
+			if (!commands[index].memberOnly) {
+				// 同名成员命令不能覆盖先加载支持库中的全局命令。
+				m_supportCommands.emplace(
+					normalizedName,
+					SupportLibraryCommandInfo{ libraryId, commandIndex });
+			}
 		}
 
 		for (size_t index = 0; index < constantNames.size(); ++index) {
@@ -2546,6 +2527,20 @@ bool MatchesBodyTokenBoundary(const std::string& code, const std::string_view to
 	}
 	const char next = code[token.size()];
 	return next == ' ' || next == '(';
+}
+
+bool StartsWithBodyCall(const std::string& code, const std::string_view token)
+{
+	if (!StartsWith(code, token)) {
+		return false;
+	}
+	const std::string rest = TrimAsciiCopy(code.substr(token.size()));
+	return !rest.empty() && rest.front() == '(';
+}
+
+bool IsSwitchStartCode(const std::string& code)
+{
+	return code == ".判断开始" || StartsWithBodyCall(code, ".判断开始");
 }
 
 bool MatchesBodyEndToken(const std::string& code, const std::unordered_set<std::string>& endTokens)
@@ -3145,7 +3140,7 @@ bool ParseBodyBlock(
 			break;
 		}
 
-		if (StartsWith(code, ".如果真 ")) {
+		if (StartsWithBodyCall(code, ".如果真")) {
 			BodyStatement statement;
 			statement.kind = BodyStatementKind::IfTrue;
 			statement.mask = mask;
@@ -3180,7 +3175,7 @@ bool ParseBodyBlock(
 			continue;
 		}
 
-		if (StartsWith(code, ".如果 ")) {
+		if (StartsWithBodyCall(code, ".如果")) {
 			BodyStatement statement;
 			statement.kind = BodyStatementKind::IfElse;
 			statement.mask = mask;
@@ -3240,7 +3235,7 @@ bool ParseBodyBlock(
 			continue;
 		}
 
-		if (StartsWith(code, ".判断循环首 ")) {
+		if (StartsWithBodyCall(code, ".判断循环首")) {
 			BodyStatement statement;
 			statement.kind = BodyStatementKind::WhileLoop;
 			statement.mask = mask;
@@ -3278,7 +3273,7 @@ bool ParseBodyBlock(
 			continue;
 		}
 
-		if (StartsWith(code, ".循环判断首 ()")) {
+		if (StartsWithBodyCall(code, ".循环判断首")) {
 			BodyStatement statement;
 			statement.kind = BodyStatementKind::DoWhileLoop;
 			statement.mask = mask;
@@ -3320,7 +3315,7 @@ bool ParseBodyBlock(
 			continue;
 		}
 
-		if (StartsWith(code, ".计次循环首 ")) {
+		if (StartsWithBodyCall(code, ".计次循环首")) {
 			BodyStatement statement;
 			statement.kind = BodyStatementKind::CounterLoop;
 			statement.mask = mask;
@@ -3358,7 +3353,7 @@ bool ParseBodyBlock(
 			continue;
 		}
 
-		if (StartsWith(code, ".变量循环首 ")) {
+		if (StartsWithBodyCall(code, ".变量循环首")) {
 			BodyStatement statement;
 			statement.kind = BodyStatementKind::ForLoop;
 			statement.mask = mask;
@@ -3396,7 +3391,7 @@ bool ParseBodyBlock(
 			continue;
 		}
 
-		if (StartsWith(code, ".判断开始")) {
+		if (IsSwitchStartCode(code)) {
 			++index;
 			std::string firstCaseCode = "判断" + code.substr(std::string(".判断开始").size());
 			if (!ParseSwitchBlock(lines, index, expectedIndent, mask, firstCaseCode, outStatements, outError, outErrorLineIndex)) {
@@ -5080,6 +5075,11 @@ bool TryEncodeNativeIn38Expression(
 				}
 				writer.WriteU8(0x37);
 			}
+			else if (std::int32_t literalIndex = 0; TryParseInt32(TrimAsciiCopy(step.indexExpression), literalIndex)) {
+				// 数组下标常量在 IDE 原生表达式中使用 0x3B + int32，不能按普通 double 字面量写入。
+				writer.WriteU8(0x3B);
+				writer.WriteI32(literalIndex);
+			}
 			else if (!TryEncodeNativeExpression(
 						step.indexExpression,
 						context,
@@ -5174,6 +5174,32 @@ bool TryEncodeNativeExpression(
 			*outError = "constant_not_found: " + constantName;
 		}
 		return false;
+	}
+
+	if (expression.size() >= 2 && expression.front() == '{' && expression.back() == '}') {
+		std::vector<std::string> items;
+		const std::string itemText = expression.substr(1, expression.size() - 2);
+		if (!SplitNativeObjectCallArguments(itemText, items)) {
+			if (outError != nullptr) {
+				*outError = "array_literal_parse_failed: " + expression;
+			}
+			return false;
+		}
+		writer.WriteU8(0x1F);
+		for (const auto& item : items) {
+			if (!TryEncodeNativeExpression(
+					item,
+					context,
+					writer,
+					methodReferences,
+					variableReferences,
+					constantReferences,
+					outError)) {
+				return false;
+			}
+		}
+		writer.WriteU8(0x20);
+		return true;
 	}
 
 	ParsedNativeVariableAccessExpression accessExpression;
@@ -5548,6 +5574,7 @@ bool TryEncodeNativeRawStatementLine(
 {
 	std::string lastError;
 	std::string objectCallError;
+	std::string assignmentError;
 	const bool objectCallLike = LooksLikeReusableObjectMethodLine(statement.code);
 	if (TryEncodeNativeObjectMethodCallLine(statement, context, outExpression, &lastError)) {
 		return true;
@@ -5556,11 +5583,20 @@ bool TryEncodeNativeRawStatementLine(
 	if (TryEncodeNativeAssignmentLine(statement, context, outExpression, &lastError)) {
 		return true;
 	}
+	assignmentError = lastError;
 	if (TryEncodeNativeFunctionCallStatementLine(statement, context, outExpression, &lastError)) {
 		return true;
 	}
 	if (outError != nullptr) {
-		*outError = objectCallLike && !objectCallError.empty() ? objectCallError : lastError;
+		size_t assignmentOffset = std::string::npos;
+		size_t assignmentLength = 0;
+		if (FindTopLevelNativeAssignmentOperator(statement.code, assignmentOffset, assignmentLength) &&
+			!assignmentError.empty()) {
+			*outError = assignmentError;
+		}
+		else {
+			*outError = objectCallLike && !objectCallError.empty() ? objectCallError : lastError;
+		}
 	}
 	return false;
 }
@@ -5584,6 +5620,12 @@ bool RequiresSemanticRawStatementEncoding(
 		return true;
 	}
 	return false;
+}
+
+bool CanWriteUnexaminedRawStatement(const BodyStatement& statement)
+{
+	const std::string code = TrimAsciiCopy(statement.code);
+	return statement.mask || code.empty() || code.front() == '\'';
 }
 
 bool TryEncodeNativeStructuredCall(
@@ -5674,16 +5716,25 @@ bool ContainsPotentialObjectMethodCall(const std::string& text)
 bool ShouldEncodeStructuredConditionSemantically(const std::string& code)
 {
 	(void)code;
-	return false;
+	return true;
 }
 
 template <typename RawWriter>
-void WriteBlockWithStructuredControlEncoding(
+bool WriteBlockWithStructuredControlEncoding(
 	MethodCodeWriter& writer,
 	const std::vector<BodyStatement>& statements,
 	RawWriter& writeRaw,
-	const NativeObjectMethodEncodeContext& context)
+	const NativeObjectMethodEncodeContext& context,
+	std::string* outError)
 {
+	const auto failStructuredEncode = [&](const std::string& code, const std::string& encodeError) {
+		if (outError != nullptr) {
+			*outError = encodeError.empty()
+				? "structured_control_encode_failed: " + code
+				: encodeError;
+		}
+	};
+
 	for (const auto& statement : statements) {
 		switch (statement.kind) {
 		case BodyStatementKind::Raw:
@@ -5691,6 +5742,7 @@ void WriteBlockWithStructuredControlEncoding(
 			break;
 		case BodyStatementKind::IfTrue: {
 			EncodedNativeExpression header;
+			std::string encodeError;
 			const bool encoded =
 				ShouldEncodeStructuredConditionSemantically(statement.code) &&
 				TryEncodeNativeStructuredCall(
@@ -5700,7 +5752,8 @@ void WriteBlockWithStructuredControlEncoding(
 					statement.code,
 					"如果真",
 					context,
-					header);
+					header,
+					&encodeError);
 			writer.BeginBlock(2);
 			if (encoded) {
 				writer.WriteNativeExpressionStatement(
@@ -5709,11 +5762,17 @@ void WriteBlockWithStructuredControlEncoding(
 					header.variableReferences,
 					header.constantReferences);
 			}
-			else {
+			else if (statement.mask) {
 				writer.WriteCurrentLineOffset();
 				writer.WriteUnexaminedCallPublic(0x6C, 0, 1, statement.mask, statement.code);
 			}
-			WriteBlockWithStructuredControlEncoding(writer, statement.block, writeRaw, context);
+			else {
+				failStructuredEncode(statement.code, encodeError);
+				return false;
+			}
+			if (!WriteBlockWithStructuredControlEncoding(writer, statement.block, writeRaw, context, outError)) {
+				return false;
+			}
 			writer.WriteMarker(0x52);
 			writer.EndBlock();
 			writer.WriteMarker(0x73);
@@ -5724,6 +5783,7 @@ void WriteBlockWithStructuredControlEncoding(
 		}
 		case BodyStatementKind::IfElse: {
 			EncodedNativeExpression header;
+			std::string encodeError;
 			const bool encoded =
 				ShouldEncodeStructuredConditionSemantically(statement.code) &&
 				TryEncodeNativeStructuredCall(
@@ -5733,7 +5793,8 @@ void WriteBlockWithStructuredControlEncoding(
 					statement.code,
 					"如果",
 					context,
-					header);
+					header,
+					&encodeError);
 			writer.BeginBlock(1);
 			if (encoded) {
 				writer.WriteNativeExpressionStatement(
@@ -5742,13 +5803,21 @@ void WriteBlockWithStructuredControlEncoding(
 					header.variableReferences,
 					header.constantReferences);
 			}
-			else {
+			else if (statement.mask) {
 				writer.WriteCurrentLineOffset();
 				writer.WriteUnexaminedCallPublic(0x6B, 0, 0, statement.mask, statement.code);
 			}
-			WriteBlockWithStructuredControlEncoding(writer, statement.block, writeRaw, context);
+			else {
+				failStructuredEncode(statement.code, encodeError);
+				return false;
+			}
+			if (!WriteBlockWithStructuredControlEncoding(writer, statement.block, writeRaw, context, outError)) {
+				return false;
+			}
 			writer.WriteMarker(0x50);
-			WriteBlockWithStructuredControlEncoding(writer, statement.elseBlock, writeRaw, context);
+			if (!WriteBlockWithStructuredControlEncoding(writer, statement.elseBlock, writeRaw, context, outError)) {
+				return false;
+			}
 			writer.WriteMarker(0x51);
 			writer.EndBlock();
 			writer.WriteMarker(0x72);
@@ -5756,6 +5825,7 @@ void WriteBlockWithStructuredControlEncoding(
 		}
 		case BodyStatementKind::WhileLoop: {
 			EncodedNativeExpression header;
+			std::string encodeError;
 			const bool encoded =
 				ShouldEncodeStructuredConditionSemantically(statement.code) &&
 				TryEncodeNativeStructuredCall(
@@ -5765,7 +5835,8 @@ void WriteBlockWithStructuredControlEncoding(
 					statement.code,
 					"判断循环首",
 					context,
-					header);
+					header,
+					&encodeError);
 			writer.BeginBlock(3);
 			if (encoded) {
 				writer.WriteNativeExpressionStatement(
@@ -5774,11 +5845,17 @@ void WriteBlockWithStructuredControlEncoding(
 					header.variableReferences,
 					header.constantReferences);
 			}
-			else {
+			else if (statement.mask) {
 				writer.WriteCurrentLineOffset();
 				writer.WriteUnexaminedCallPublic(0x70, 0, 3, statement.mask, statement.code);
 			}
-			WriteBlockWithStructuredControlEncoding(writer, statement.block, writeRaw, context);
+			else {
+				failStructuredEncode(statement.code, encodeError);
+				return false;
+			}
+			if (!WriteBlockWithStructuredControlEncoding(writer, statement.block, writeRaw, context, outError)) {
+				return false;
+			}
 			writer.WriteMarker(0x55);
 			writer.EndBlock();
 			writer.WriteFixedCallPublic(0x71, 0, 4, statement.maskOnEnd, statement.fixedEndComment);
@@ -5786,6 +5863,7 @@ void WriteBlockWithStructuredControlEncoding(
 		}
 		case BodyStatementKind::DoWhileLoop: {
 			EncodedNativeExpression tail;
+			std::string encodeError;
 			const bool encoded =
 				ShouldEncodeStructuredConditionSemantically(statement.endCode) &&
 				TryEncodeNativeStructuredCall(
@@ -5795,10 +5873,13 @@ void WriteBlockWithStructuredControlEncoding(
 					statement.endCode,
 					"循环判断尾",
 					context,
-					tail);
+					tail,
+					&encodeError);
 			writer.BeginBlock(3);
 			writer.WriteFixedCallPublic(0x70, 0, 5, statement.mask, statement.fixedComment);
-			WriteBlockWithStructuredControlEncoding(writer, statement.block, writeRaw, context);
+			if (!WriteBlockWithStructuredControlEncoding(writer, statement.block, writeRaw, context, outError)) {
+				return false;
+			}
 			writer.WriteMarker(0x55);
 			writer.EndBlock();
 			if (encoded) {
@@ -5808,14 +5889,19 @@ void WriteBlockWithStructuredControlEncoding(
 					tail.variableReferences,
 					tail.constantReferences);
 			}
-			else {
+			else if (statement.maskOnEnd) {
 				writer.WriteCurrentLineOffset();
 				writer.WriteUnexaminedCallPublic(0x71, 0, 6, statement.maskOnEnd, statement.endCode);
+			}
+			else {
+				failStructuredEncode(statement.endCode, encodeError);
+				return false;
 			}
 			break;
 		}
 		case BodyStatementKind::CounterLoop: {
 			EncodedNativeExpression header;
+			std::string encodeError;
 			const bool encoded =
 				ShouldEncodeStructuredConditionSemantically(statement.code) &&
 				TryEncodeNativeStructuredCall(
@@ -5825,7 +5911,8 @@ void WriteBlockWithStructuredControlEncoding(
 					statement.code,
 					"计次循环首",
 					context,
-					header);
+					header,
+					&encodeError);
 			writer.BeginBlock(3);
 			if (encoded) {
 				writer.WriteNativeExpressionStatement(
@@ -5834,11 +5921,17 @@ void WriteBlockWithStructuredControlEncoding(
 					header.variableReferences,
 					header.constantReferences);
 			}
-			else {
+			else if (statement.mask) {
 				writer.WriteCurrentLineOffset();
 				writer.WriteUnexaminedCallPublic(0x70, 0, 7, statement.mask, statement.code);
 			}
-			WriteBlockWithStructuredControlEncoding(writer, statement.block, writeRaw, context);
+			else {
+				failStructuredEncode(statement.code, encodeError);
+				return false;
+			}
+			if (!WriteBlockWithStructuredControlEncoding(writer, statement.block, writeRaw, context, outError)) {
+				return false;
+			}
 			writer.WriteMarker(0x55);
 			writer.EndBlock();
 			writer.WriteFixedCallPublic(0x71, 0, 8, statement.maskOnEnd, statement.fixedEndComment);
@@ -5846,6 +5939,7 @@ void WriteBlockWithStructuredControlEncoding(
 		}
 		case BodyStatementKind::ForLoop: {
 			EncodedNativeExpression header;
+			std::string encodeError;
 			const bool encoded =
 				ShouldEncodeStructuredConditionSemantically(statement.code) &&
 				TryEncodeNativeStructuredCall(
@@ -5855,7 +5949,8 @@ void WriteBlockWithStructuredControlEncoding(
 					statement.code,
 					"变量循环首",
 					context,
-					header);
+					header,
+					&encodeError);
 			writer.BeginBlock(3);
 			if (encoded) {
 				writer.WriteNativeExpressionStatement(
@@ -5864,11 +5959,17 @@ void WriteBlockWithStructuredControlEncoding(
 					header.variableReferences,
 					header.constantReferences);
 			}
-			else {
+			else if (statement.mask) {
 				writer.WriteCurrentLineOffset();
 				writer.WriteUnexaminedCallPublic(0x70, 0, 9, statement.mask, statement.code);
 			}
-			WriteBlockWithStructuredControlEncoding(writer, statement.block, writeRaw, context);
+			else {
+				failStructuredEncode(statement.code, encodeError);
+				return false;
+			}
+			if (!WriteBlockWithStructuredControlEncoding(writer, statement.block, writeRaw, context, outError)) {
+				return false;
+			}
 			writer.WriteMarker(0x55);
 			writer.EndBlock();
 			writer.WriteFixedCallPublic(0x71, 0, 10, statement.maskOnEnd, statement.fixedEndComment);
@@ -5879,6 +5980,7 @@ void WriteBlockWithStructuredControlEncoding(
 			writer.WriteMarker(0x6D);
 			for (const auto& caseItem : statement.cases) {
 				EncodedNativeExpression header;
+				std::string encodeError;
 				const bool encoded =
 					ShouldEncodeStructuredConditionSemantically(caseItem.code) &&
 					TryEncodeNativeStructuredCall(
@@ -5888,7 +5990,8 @@ void WriteBlockWithStructuredControlEncoding(
 						caseItem.code,
 						"判断",
 						context,
-						header);
+						header,
+						&encodeError);
 				if (encoded) {
 					writer.WriteNativeExpressionStatement(
 						header.data,
@@ -5896,21 +5999,30 @@ void WriteBlockWithStructuredControlEncoding(
 						header.variableReferences,
 						header.constantReferences);
 				}
-				else {
+				else if (caseItem.mask) {
 					writer.WriteCurrentLineOffset();
 					writer.WriteUnexaminedCallPublic(0x6E, 0, 2, caseItem.mask, caseItem.code);
 				}
-				WriteBlockWithStructuredControlEncoding(writer, caseItem.block, writeRaw, context);
+				else {
+					failStructuredEncode(caseItem.code, encodeError);
+					return false;
+				}
+				if (!WriteBlockWithStructuredControlEncoding(writer, caseItem.block, writeRaw, context, outError)) {
+					return false;
+				}
 				writer.WriteMarker(0x53);
 			}
 			writer.WriteMarker(0x6F);
-			WriteBlockWithStructuredControlEncoding(writer, statement.defaultBlock, writeRaw, context);
+			if (!WriteBlockWithStructuredControlEncoding(writer, statement.defaultBlock, writeRaw, context, outError)) {
+				return false;
+			}
 			writer.WriteMarker(0x54);
 			writer.EndBlock();
 			writer.WriteMarker(0x74);
 			break;
 		}
 	}
+	return true;
 }
 
 bool LooksLikeReusableObjectMethodLine(const std::string& code)
@@ -6462,8 +6574,7 @@ bool TryBuildMethodCodeDataWithReusableNativeLineSegments(
 			return;
 		}
 
-		std::string semanticOnlyCommandName;
-		if (!RequiresSemanticRawStatementEncoding(statement, encodeContext, &semanticOnlyCommandName)) {
+		if (CanWriteUnexaminedRawStatement(statement)) {
 			writer.WriteRawStatement(statement.mask, statement.code);
 			return;
 		}
@@ -6479,15 +6590,10 @@ bool TryBuildMethodCodeDataWithReusableNativeLineSegments(
 			return;
 		}
 
-		if (!semanticOnlyCommandName.empty() || LooksLikeReusableObjectMethodLine(statement.code)) {
-			ok = false;
-			semanticError = encodeError.empty()
-				? "native_raw_encode_failed: " + statement.code
-				: encodeError;
-			return;
-		}
-
-		writer.WriteRawStatement(statement.mask, statement.code);
+		ok = false;
+		semanticError = encodeError.empty()
+			? "native_statement_encode_failed: " + statement.code
+			: encodeError;
 	};
 
 	const auto writeStructuredHeader =
@@ -6509,6 +6615,7 @@ bool TryBuildMethodCodeDataWithReusableNativeLineSegments(
 			}
 
 			EncodedNativeExpression header;
+			std::string encodeError;
 			const bool encoded =
 				ShouldEncodeStructuredConditionSemantically(statement.code) &&
 				TryEncodeNativeStructuredCall(
@@ -6518,7 +6625,8 @@ bool TryBuildMethodCodeDataWithReusableNativeLineSegments(
 					statement.code,
 					expectedName,
 					encodeContext,
-					header);
+					header,
+					&encodeError);
 			if (encoded) {
 				writer.WriteNativeExpressionStatement(
 					header.data,
@@ -6528,8 +6636,15 @@ bool TryBuildMethodCodeDataWithReusableNativeLineSegments(
 				return;
 			}
 
-			writer.WriteCurrentLineOffset();
-			writer.WriteUnexaminedCallPublic(type, 0, methodId, statement.mask, statement.code);
+			if (statement.mask) {
+				writer.WriteCurrentLineOffset();
+				writer.WriteUnexaminedCallPublic(type, 0, methodId, statement.mask, statement.code);
+				return;
+			}
+			ok = false;
+			semanticError = encodeError.empty()
+				? "structured_control_encode_failed: " + statement.code
+				: encodeError;
 		};
 
 	const auto writeDoWhileEnd = [&](const BodyStatement& statement) {
@@ -6545,6 +6660,7 @@ bool TryBuildMethodCodeDataWithReusableNativeLineSegments(
 		}
 
 		EncodedNativeExpression tail;
+		std::string encodeError;
 		const bool encoded =
 			ShouldEncodeStructuredConditionSemantically(statement.endCode) &&
 			TryEncodeNativeStructuredCall(
@@ -6554,7 +6670,8 @@ bool TryBuildMethodCodeDataWithReusableNativeLineSegments(
 				statement.endCode,
 				"循环判断尾",
 				encodeContext,
-				tail);
+				tail,
+				&encodeError);
 		if (encoded) {
 			writer.WriteNativeExpressionStatement(
 				tail.data,
@@ -6564,8 +6681,15 @@ bool TryBuildMethodCodeDataWithReusableNativeLineSegments(
 			return;
 		}
 
-		writer.WriteCurrentLineOffset();
-		writer.WriteUnexaminedCallPublic(0x71, 0, 6, statement.maskOnEnd, statement.endCode);
+		if (statement.maskOnEnd) {
+			writer.WriteCurrentLineOffset();
+			writer.WriteUnexaminedCallPublic(0x71, 0, 6, statement.maskOnEnd, statement.endCode);
+			return;
+		}
+		ok = false;
+		semanticError = encodeError.empty()
+			? "structured_control_encode_failed: " + statement.endCode
+			: encodeError;
 	};
 
 	const auto writeSwitchCaseHeader = [&](const BodySwitchCase& caseItem) {
@@ -6581,6 +6705,7 @@ bool TryBuildMethodCodeDataWithReusableNativeLineSegments(
 		}
 
 		EncodedNativeExpression header;
+		std::string encodeError;
 		const bool encoded =
 			ShouldEncodeStructuredConditionSemantically(caseItem.code) &&
 			TryEncodeNativeStructuredCall(
@@ -6590,7 +6715,8 @@ bool TryBuildMethodCodeDataWithReusableNativeLineSegments(
 				caseItem.code,
 				"判断",
 				encodeContext,
-				header);
+				header,
+				&encodeError);
 		if (encoded) {
 			writer.WriteNativeExpressionStatement(
 				header.data,
@@ -6600,8 +6726,15 @@ bool TryBuildMethodCodeDataWithReusableNativeLineSegments(
 			return;
 		}
 
-		writer.WriteCurrentLineOffset();
-		writer.WriteUnexaminedCallPublic(0x6E, 0, 2, caseItem.mask, caseItem.code);
+		if (caseItem.mask) {
+			writer.WriteCurrentLineOffset();
+			writer.WriteUnexaminedCallPublic(0x6E, 0, 2, caseItem.mask, caseItem.code);
+			return;
+		}
+		ok = false;
+		semanticError = encodeError.empty()
+			? "structured_control_encode_failed: " + caseItem.code
+			: encodeError;
 	};
 
 	const auto writeBlock =
@@ -6782,8 +6915,7 @@ bool TryBuildMethodCodeDataWithRawStatementReuse(
 			return;
 		}
 
-		std::string semanticOnlyCommandName;
-		if (!RequiresSemanticRawStatementEncoding(statement, encodeContext, &semanticOnlyCommandName)) {
+		if (CanWriteUnexaminedRawStatement(statement)) {
 			writer.WriteRawStatement(statement.mask, statement.code);
 			return;
 		}
@@ -6798,24 +6930,24 @@ bool TryBuildMethodCodeDataWithRawStatementReuse(
 				encodedExpression.constantReferences);
 			return;
 		}
-		if (!semanticOnlyCommandName.empty() || LooksLikeReusableObjectMethodLine(statement.code)) {
-			ok = false;
-			if (!semanticOnlyCommandName.empty()) {
-				semanticError = encodeError.empty()
-					? "core_support_command_encode_failed: " + semanticOnlyCommandName + " => " + statement.code
-					: encodeError;
-			}
-			else {
-				semanticError = encodeError.empty()
-					? "native_object_method_encode_failed: " + statement.code
-					: encodeError;
-			}
-			return;
-		}
-		writer.WriteRawStatement(statement.mask, statement.code);
+		ok = false;
+		semanticError = encodeError.empty()
+			? "native_statement_encode_failed: " + statement.code
+			: encodeError;
 	};
 
-	WriteBlockWithStructuredControlEncoding(writer, currentStatements, writeRaw, encodeContext);
+	std::string structuredError;
+	if (!WriteBlockWithStructuredControlEncoding(
+			writer,
+			currentStatements,
+			writeRaw,
+			encodeContext,
+			&structuredError)) {
+		ok = false;
+		if (semanticError.empty()) {
+			semanticError = std::move(structuredError);
+		}
+	}
 	if (!ok || rawStatementIndex != currentRawStatements.size()) {
 		if (outError != nullptr) {
 			*outError = semanticError.empty()
@@ -6859,8 +6991,7 @@ bool BuildMethodCodeDataWithSemanticNativeObjectCalls(
 		if (!ok) {
 			return;
 		}
-		std::string semanticOnlyCommandName;
-		if (!RequiresSemanticRawStatementEncoding(statement, encodeContext, &semanticOnlyCommandName)) {
+		if (CanWriteUnexaminedRawStatement(statement)) {
 			writer.WriteRawStatement(statement.mask, statement.code);
 			return;
 		}
@@ -6874,23 +7005,23 @@ bool BuildMethodCodeDataWithSemanticNativeObjectCalls(
 				encodedExpression.constantReferences);
 			return;
 		}
-		if (!semanticOnlyCommandName.empty() || LooksLikeReusableObjectMethodLine(statement.code)) {
-			ok = false;
-			if (!semanticOnlyCommandName.empty()) {
-				semanticError = encodeError.empty()
-					? "core_support_command_encode_failed: " + semanticOnlyCommandName + " => " + statement.code
-					: encodeError;
-			}
-			else {
-				semanticError = encodeError.empty()
-					? "native_object_method_encode_failed: " + statement.code
-					: encodeError;
-			}
-			return;
-		}
-		writer.WriteRawStatement(statement.mask, statement.code);
+		ok = false;
+		semanticError = encodeError.empty()
+			? "native_statement_encode_failed: " + statement.code
+			: encodeError;
 	};
-	WriteBlockWithStructuredControlEncoding(writer, statements, writeRaw, encodeContext);
+	std::string structuredError;
+	if (!WriteBlockWithStructuredControlEncoding(
+			writer,
+			statements,
+			writeRaw,
+			encodeContext,
+			&structuredError)) {
+		ok = false;
+		if (semanticError.empty()) {
+			semanticError = std::move(structuredError);
+		}
+	}
 	if (!ok) {
 		if (outError != nullptr) {
 			*outError = semanticError;
@@ -6992,222 +7123,6 @@ bool TryBuildMethodCodeDataWithNativeLineReuse(
 	outMethod.expressionData = writer.TakeExpressionData();
 	return true;
 }
-
-struct XmlNode {
-	std::string name;
-	std::unordered_map<std::string, std::string> attributes;
-	std::vector<XmlNode> children;
-};
-
-class SimpleXmlParser {
-public:
-	explicit SimpleXmlParser(const std::string& text)
-		: m_text(text)
-	{
-	}
-
-	bool Parse(XmlNode& outRoot, std::string* outError)
-	{
-		SkipWhitespace();
-		if (StartsWith(std::string_view(m_text).substr(m_pos), "<?xml")) {
-			const size_t end = m_text.find("?>", m_pos);
-			if (end == std::string::npos) {
-				if (outError != nullptr) {
-					*outError = "xml_declaration_invalid";
-				}
-				return false;
-			}
-			m_pos = end + 2;
-		}
-		SkipWhitespace();
-		if (!ParseNode(outRoot, outError)) {
-			return false;
-		}
-		SkipWhitespace();
-		return true;
-	}
-
-	size_t CurrentLineIndex() const
-	{
-		size_t lineIndex = 0;
-		for (size_t i = 0; i < (std::min)(m_pos, m_text.size()); ++i) {
-			if (m_text[i] == '\n') {
-				++lineIndex;
-			}
-		}
-		return lineIndex;
-	}
-
-private:
-	void SkipWhitespace()
-	{
-		while (m_pos < m_text.size() && std::isspace(static_cast<unsigned char>(m_text[m_pos])) != 0) {
-			++m_pos;
-		}
-	}
-
-	bool ParseName(std::string& outName)
-	{
-		const size_t start = m_pos;
-		while (m_pos < m_text.size()) {
-			const unsigned char ch = static_cast<unsigned char>(m_text[m_pos]);
-			if (std::isspace(ch) != 0 || ch == '/' || ch == '>' || ch == '=' || ch == '?') {
-				break;
-			}
-			++m_pos;
-		}
-		if (m_pos == start) {
-			return false;
-		}
-		outName = m_text.substr(start, m_pos - start);
-		return true;
-	}
-
-	bool ParseQuotedValue(std::string& outValue)
-	{
-		if (m_pos >= m_text.size() || m_text[m_pos] != '"') {
-			return false;
-		}
-		++m_pos;
-		const size_t start = m_pos;
-		while (m_pos < m_text.size() && m_text[m_pos] != '"') {
-			++m_pos;
-		}
-		if (m_pos >= m_text.size()) {
-			return false;
-		}
-		outValue = DecodeXmlEntities(m_text.substr(start, m_pos - start));
-		++m_pos;
-		return true;
-	}
-
-	bool ParseAttributes(
-		std::unordered_map<std::string, std::string>& outAttributes,
-		bool& outSelfClosing,
-		std::string* outError)
-	{
-		outSelfClosing = false;
-		while (m_pos < m_text.size()) {
-			SkipWhitespace();
-			if (m_pos >= m_text.size()) {
-				break;
-			}
-			if (m_text[m_pos] == '/') {
-				++m_pos;
-				if (m_pos >= m_text.size() || m_text[m_pos] != '>') {
-					if (outError != nullptr) {
-						*outError = "xml_self_closing_invalid";
-					}
-					return false;
-				}
-				++m_pos;
-				outSelfClosing = true;
-				return true;
-			}
-			if (m_text[m_pos] == '>') {
-				++m_pos;
-				return true;
-			}
-
-			std::string key;
-			if (!ParseName(key)) {
-				if (outError != nullptr) {
-					*outError = "xml_attr_name_invalid";
-				}
-				return false;
-			}
-			SkipWhitespace();
-			if (m_pos >= m_text.size() || m_text[m_pos] != '=') {
-				if (outError != nullptr) {
-					*outError = "xml_attr_assign_missing";
-				}
-				return false;
-			}
-			++m_pos;
-			SkipWhitespace();
-			std::string value;
-			if (!ParseQuotedValue(value)) {
-				if (outError != nullptr) {
-					*outError = "xml_attr_value_invalid";
-				}
-				return false;
-			}
-			outAttributes.insert_or_assign(key, value);
-		}
-
-		if (outError != nullptr) {
-			*outError = "xml_attr_eof";
-		}
-		return false;
-	}
-
-	bool ParseNode(XmlNode& outNode, std::string* outError)
-	{
-		if (m_pos >= m_text.size() || m_text[m_pos] != '<') {
-			if (outError != nullptr) {
-				*outError = "xml_tag_missing";
-			}
-			return false;
-		}
-		++m_pos;
-		if (!ParseName(outNode.name)) {
-			if (outError != nullptr) {
-				*outError = "xml_tag_name_invalid";
-			}
-			return false;
-		}
-
-		bool selfClosing = false;
-		if (!ParseAttributes(outNode.attributes, selfClosing, outError)) {
-			return false;
-		}
-		if (selfClosing) {
-			return true;
-		}
-
-		while (m_pos < m_text.size()) {
-			SkipWhitespace();
-			if (StartsWith(std::string_view(m_text).substr(m_pos), "</")) {
-				m_pos += 2;
-				std::string closeName;
-				if (!ParseName(closeName) || closeName != outNode.name) {
-					if (outError != nullptr) {
-						*outError = "xml_close_tag_invalid";
-					}
-					return false;
-				}
-				SkipWhitespace();
-				if (m_pos >= m_text.size() || m_text[m_pos] != '>') {
-					if (outError != nullptr) {
-						*outError = "xml_close_tag_end_missing";
-					}
-					return false;
-				}
-				++m_pos;
-				return true;
-			}
-			if (m_pos < m_text.size() && m_text[m_pos] == '<') {
-				XmlNode child;
-				if (!ParseNode(child, outError)) {
-					return false;
-				}
-				outNode.children.push_back(std::move(child));
-				continue;
-			}
-			while (m_pos < m_text.size() && m_text[m_pos] != '<') {
-				++m_pos;
-			}
-		}
-
-		if (outError != nullptr) {
-			*outError = "xml_close_tag_missing";
-		}
-		return false;
-	}
-
-	const std::string& m_text;
-	size_t m_pos = 0;
-};
 
 struct ParsedVariableDef {
 	std::string name;
@@ -8391,7 +8306,7 @@ void ParseWindowPage(const Page& page, std::vector<ParsedFormDef>& outForms)
 	}
 }
 
-std::string GetXmlAttribute(const XmlNode& node, const std::string& key)
+std::string GetXmlAttribute(const SimpleXmlNode& node, const std::string& key)
 {
 	if (const auto it = node.attributes.find(key); it != node.attributes.end()) {
 		return it->second;
@@ -8399,13 +8314,13 @@ std::string GetXmlAttribute(const XmlNode& node, const std::string& key)
 	return std::string();
 }
 
-std::int32_t GetXmlIntAttribute(const XmlNode& node, const std::string& key, const std::int32_t defaultValue)
+std::int32_t GetXmlIntAttribute(const SimpleXmlNode& node, const std::string& key, const std::int32_t defaultValue)
 {
 	std::int32_t value = 0;
 	return TryParseInt32(GetXmlAttribute(node, key), value) ? value : defaultValue;
 }
 
-bool GetXmlBoolAttribute(const XmlNode& node, const std::string& key, const bool defaultValue)
+bool GetXmlBoolAttribute(const SimpleXmlNode& node, const std::string& key, const bool defaultValue)
 {
 	const auto value = ParseBoolLiteral(GetXmlAttribute(node, key));
 	return value.has_value() ? *value : defaultValue;
@@ -8485,7 +8400,7 @@ std::int32_t ResolveHandlerMethodId(
 }
 
 std::vector<std::pair<std::int32_t, std::int32_t>> ReadFormControlEventsFromXml(
-	const XmlNode& node,
+	const SimpleXmlNode& node,
 	const std::string& eventNodeName,
 	const std::int32_t preferredOwnerClassId,
 	const RestoreDocumentModel& model)
@@ -8506,7 +8421,7 @@ std::vector<std::pair<std::int32_t, std::int32_t>> ReadFormControlEventsFromXml(
 }
 
 std::int32_t ReadFormMenuClickEventFromXml(
-	const XmlNode& node,
+	const SimpleXmlNode& node,
 	const std::int32_t preferredOwnerClassId,
 	const RestoreDocumentModel& model)
 {
@@ -8566,7 +8481,7 @@ std::int32_t ResolveFormElementTypeId(const std::string& tagName, TypeResolver& 
 }
 
 void BuildFormControlTree(
-	const XmlNode& node,
+	const SimpleXmlNode& node,
 	const std::int32_t parentId,
 	const std::int32_t preferredOwnerClassId,
 	const RestoreDocumentModel& model,
@@ -8628,7 +8543,7 @@ void BuildFormControlTree(
 }
 
 void BuildFormMenus(
-	const XmlNode& node,
+	const SimpleXmlNode& node,
 	const int level,
 	const std::int32_t preferredOwnerClassId,
 	const RestoreDocumentModel& model,
@@ -8701,14 +8616,14 @@ bool BuildFormsFromXml(
 				return stream.str();
 			}();
 
-			XmlNode root;
-			SimpleXmlParser parser(xmlText);
-			if (!parser.Parse(root, outError)) {
+			SimpleXmlNode root;
+			SimpleXmlParseError parseError;
+			if (!ParseSimpleXmlDocument(xmlText, root, &parseError)) {
 				if (outError != nullptr) {
 					*outError = FormatFormXmlSyntaxError(
 						*formDef.formXml,
-						parser.CurrentLineIndex(),
-						*outError);
+						parseError.lineIndex,
+						parseError.code);
 				}
 				return false;
 			}
@@ -9260,6 +9175,7 @@ bool BuildRestoreModel(
 		}
 	}
 
+	std::vector<std::string> unresolvedTypeNames;
 	auto ensureTypeId = [&](const std::string& rawTypeName) -> std::int32_t {
 		const std::string typeName = TypeResolver::NormalizeTypeName(rawTypeName);
 		if (typeName.empty()) {
@@ -9267,6 +9183,12 @@ bool BuildRestoreModel(
 		}
 		if (const std::int32_t typeId = resolver.ResolveTypeId(typeName); typeId != 0) {
 			return typeId;
+		}
+		if (bundle != nullptr) {
+			if (std::find(unresolvedTypeNames.begin(), unresolvedTypeNames.end(), typeName) == unresolvedTypeNames.end()) {
+				unresolvedTypeNames.push_back(typeName);
+			}
+			return 0;
 		}
 
 		RestoreStruct placeholder;
@@ -9281,11 +9203,15 @@ bool BuildRestoreModel(
 	};
 
 	auto resolveTypeIdWithNativeFallback = [&](const std::string& rawTypeName, const std::int32_t nativeTypeId) -> std::int32_t {
-		// 源码里已经明确写出类型时，以源码为准；native 只用于旧工程缺失类型文本的兜底。
-		if (!TypeResolver::NormalizeTypeName(rawTypeName).empty()) {
-			return ensureTypeId(rawTypeName);
+		const std::string typeName = TypeResolver::NormalizeTypeName(rawTypeName);
+		if (typeName.empty()) {
+			return nativeTypeId;
 		}
-		return nativeTypeId;
+		if (const std::int32_t typeId = resolver.ResolveTypeId(typeName); typeId != 0) {
+			return typeId;
+		}
+		// 未修改声明可复用原生类型 ID；新声明或改名后的未知类型必须失败。
+		return nativeTypeId != 0 ? nativeTypeId : ensureTypeId(typeName);
 	};
 
 	auto convertVariableWithId = [&](
@@ -10811,7 +10737,10 @@ bool BuildRestoreModel(
 				if (snapshot == nullptr || snapshot->id == 0) {
 					continue;
 				}
-				addNativeObjectVariable(globalDefinition.name, snapshot->id, ensureTypeId(globalDefinition.typeName));
+				addNativeObjectVariable(
+					globalDefinition.name,
+					snapshot->id,
+					resolveTypeIdWithNativeFallback(globalDefinition.typeName, snapshot->dataType));
 			}
 			for (const auto& [formName, matchedClassIndex] : formClassMatches) {
 				if (matchedClassIndex != classIndex ||
@@ -10894,48 +10823,37 @@ bool BuildRestoreModel(
 			else if (identityNativeMethodSnapshot != nullptr) {
 				std::string semanticError;
 				std::string reusableLineError;
-				std::string rawReuseError;
-				const bool rebuiltWithNativeObjectReuse = false;
-				const bool rebuiltWithReusableNativeLines = false;
-				const bool rebuiltWithRawStatementReuse = false;
-				const bool rebuiltWithCanonicalRaw =
-					BuildMethodCodeData(
+				const bool rebuiltWithReusableNativeLines =
+					originalParsedMethod != nullptr &&
+					TryBuildMethodCodeDataWithReusableNativeLineSegments(
 						parsedMethod.bodyLines,
+						originalParsedMethod->bodyLines,
+						*identityNativeMethodSnapshot,
 						method,
-						&semanticError,
-						nullptr);
+						nativeObjectEncodeContext,
+						&reusableLineError);
 				const bool rebuiltWithSemantic =
-					!rebuiltWithCanonicalRaw &&
+					!rebuiltWithReusableNativeLines &&
 					BuildMethodCodeDataWithSemanticNativeObjectCalls(
 						parsedMethod.bodyLines,
 						method,
 						nativeObjectEncodeContext,
 						&semanticError);
-				if (!rebuiltWithNativeObjectReuse &&
-					!rebuiltWithReusableNativeLines &&
-					!rebuiltWithRawStatementReuse &&
-					!rebuiltWithSemantic &&
-					!rebuiltWithCanonicalRaw) {
+				if (!rebuiltWithReusableNativeLines && !rebuiltWithSemantic) {
 					if (semanticError.empty()) {
 						semanticError = reusableLineError;
 					}
 					else if (!reusableLineError.empty()) {
 						semanticError += " | reusable_line_rebuild_failed: " + reusableLineError;
 					}
-					if (semanticError.empty()) {
-						semanticError = rawReuseError;
-					}
-					else if (!rawReuseError.empty()) {
-						semanticError += " | raw_reuse_fallback_failed: " + rawReuseError;
-					}
 					if (outError != nullptr) {
-						*outError =
+						*outError = LocalTextToUtf8(
 							"semantic_method_rebuild_failed: " +
 							parsedClass.name + "." + parsedMethod.name +
 							" (" + parsedClass.sourcePath + ":" +
-							std::to_string(parsedMethod.bodyStartLineIndex + 1) + ")";
+							std::to_string(parsedMethod.bodyStartLineIndex + 1) + ")");
 						if (!semanticError.empty()) {
-							*outError += " => " + semanticError;
+							*outError += " => " + LocalTextToUtf8(semanticError);
 						}
 					}
 					return false;
@@ -10947,10 +10865,14 @@ bool BuildRestoreModel(
 						parsedMethod.bodyLines,
 						method,
 						nativeObjectEncodeContext,
-						&semanticError) &&
-					!BuildMethodCodeData(parsedMethod.bodyLines, method, outError, nullptr)) {
+						&semanticError)) {
 					if (outError != nullptr && !semanticError.empty()) {
-						*outError = semanticError;
+						*outError = LocalTextToUtf8(
+							"semantic_method_rebuild_failed: " +
+							parsedClass.name + "." + parsedMethod.name +
+							" (" + parsedClass.sourcePath + ":" +
+							std::to_string(parsedMethod.bodyStartLineIndex + 1) + ") => " +
+							semanticError);
 					}
 					return false;
 				}
@@ -11191,6 +11113,19 @@ bool BuildRestoreModel(
 		model.constants = std::move(reorderedConstants);
 	}
 
+	if (!unresolvedTypeNames.empty()) {
+		if (outError != nullptr) {
+			*outError = "type_id_resolution_failed: ";
+			for (size_t index = 0; index < unresolvedTypeNames.size(); ++index) {
+				if (index != 0) {
+					*outError += ", ";
+				}
+				*outError += LocalTextToUtf8(unresolvedTypeNames[index]);
+			}
+		}
+		return false;
+	}
+
 	outModel = std::move(model);
 	return true;
 }
@@ -11198,9 +11133,6 @@ bool BuildRestoreModel(
 bool CanReuseNativeBundleSnapshot(const ProjectBundle& bundle)
 {
 	if (bundle.nativeSourceBytes.empty() || bundle.nativeBundleDigest.empty()) {
-		return false;
-	}
-	if (HasPersistedEComPathOverride(bundle)) {
 		return false;
 	}
 	return ComputeBundleDigest(bundle) == bundle.nativeBundleDigest;
@@ -13007,6 +12939,21 @@ bool RestoreBundleToBytesInternal(
 	if (CanReuseNativeBundleSnapshot(bundle)) {
 		outBytes = bundle.nativeSourceBytes;
 		return true;
+	}
+
+	const SourcePreflightReport preflightReport = ValidateProjectBundleSource(bundle);
+	if (!preflightReport.IsValid()) {
+		if (outError != nullptr) {
+			*outError = "source_preflight_failed: " + FormatSourcePreflightReport(preflightReport);
+		}
+		return false;
+	}
+	for (const SourcePreflightDiagnostic& warning : preflightReport.warnings) {
+		AddRuntimeWarning(
+			"source_preflight_warning: file=" + warning.filePath +
+			", line=" + std::to_string(warning.line) +
+			", code=" + warning.code +
+			", detail=" + warning.message);
 	}
 
 	Document document;
