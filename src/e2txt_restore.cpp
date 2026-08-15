@@ -2367,9 +2367,14 @@ private:
 				sizeof(CMD_INFO) * static_cast<size_t>(libInfo->m_nCmdCount))) {
 			const auto libraryId = static_cast<std::int16_t>(supportIndex - 1);
 			for (int i = 0; i < libInfo->m_nCmdCount; ++i) {
-				const std::string name = NormalizeTypeName(ReadSupportLibraryName(libInfo->m_pBeginCmdInfo[i].m_szName));
+				const CMD_INFO& command = libInfo->m_pBeginCmdInfo[i];
+				if (command.m_shtCategory == -1) {
+					continue;
+				}
+				const std::string name = NormalizeTypeName(ReadSupportLibraryName(command.m_szName));
 				if (!name.empty()) {
-					m_supportCommands.insert_or_assign(name, SupportLibraryCommandInfo{ libraryId, i });
+					// 成员命令只通过所属类型解析；同名全局命令沿用先加载支持库中的定义。
+					m_supportCommands.emplace(name, SupportLibraryCommandInfo{ libraryId, i });
 				}
 			}
 		}
@@ -9384,6 +9389,17 @@ bool BuildRestoreModel(
 
 	std::vector<size_t> localClassModelIndices;
 	localClassModelIndices.reserve(parsedClasses.size());
+	struct NativeMethodSnapshotMatch {
+		const BundleNativeMethodSnapshot* snapshot = nullptr;
+		const ParsedMethodDef* originalParsedMethod = nullptr;
+	};
+	struct PreparedLocalMethod {
+		NativeMethodSnapshotMatch reusableMatch;
+		NativeMethodSnapshotMatch identityMatch;
+		std::int32_t id = 0;
+		std::int32_t memoryAddress = 0;
+	};
+	std::vector<std::vector<PreparedLocalMethod>> preparedLocalMethods(parsedClasses.size());
 	std::vector<size_t> localStructModelIndices;
 	localStructModelIndices.reserve(parsedStructs.size());
 	std::vector<const BundleNativeStructSnapshot*> nativeStructSnapshotsByIndex(parsedStructs.size(), nullptr);
@@ -10465,44 +10481,11 @@ bool BuildRestoreModel(
 				: allocator.Alloc(epl_system_id::kTypeConstant);
 	}
 
+	// 先为所有本地方法分配稳定 ID，方法体编码才能正确解析前向调用、递归和跨页调用。
 	for (size_t classIndex = 0; classIndex < parsedClasses.size(); ++classIndex) {
 		const auto& parsedClass = parsedClasses[classIndex];
 		const BundleNativeSourceFileSnapshot* nativeSourceSnapshot =
 			classIndex < nativeSourceSnapshotsByIndex.size() ? nativeSourceSnapshotsByIndex[classIndex] : nullptr;
-		auto& targetClass = model.classes[localClassModelIndices[classIndex]];
-		if (nativeSourceSnapshot != nullptr) {
-			targetClass.baseClass = nativeSourceSnapshot->baseClass;
-		}
-		else {
-			const std::string normalizedBaseClassName = TypeResolver::NormalizeTypeName(parsedClass.baseClassName);
-			targetClass.baseClass = parsedClass.isFormClass && normalizedBaseClassName.empty()
-				? 65537
-				: ((parsedClass.isUserClass && normalizedBaseClassName.empty()) ||
-					normalizedBaseClassName == "对象" ||
-					normalizedBaseClassName == "<对象>"
-					? -1
-					: ensureTypeId(parsedClass.baseClassName));
-		}
-		for (size_t variableIndex = 0; variableIndex < parsedClass.vars.size(); ++variableIndex) {
-			RestoreVariable variable =
-				convertVariableWithId(
-					parsedClass.vars[variableIndex],
-					epl_system_id::kTypeClassMember,
-					false,
-					false,
-					std::nullopt,
-					nativeSourceSnapshot != nullptr ? vectorTypeAt(nativeSourceSnapshot->classVarTypes, variableIndex) : 0);
-			if (nativeSourceSnapshot != nullptr && variableIndex < nativeSourceSnapshot->classVarIds.size() &&
-				nativeSourceSnapshot->classVarIds[variableIndex] != 0) {
-				variable.id = nativeSourceSnapshot->classVarIds[variableIndex];
-			}
-			targetClass.vars.push_back(std::move(variable));
-		}
-
-		struct NativeMethodSnapshotMatch {
-			const BundleNativeMethodSnapshot* snapshot = nullptr;
-			const ParsedMethodDef* originalParsedMethod = nullptr;
-		};
 		std::unordered_set<const BundleNativeMethodSnapshot*> usedNativeMethodSnapshots;
 		const auto originalMethodForSnapshot = [&](const size_t snapshotIndex) -> const ParsedMethodDef* {
 			if (classIndex >= originalParsedClasses.size() ||
@@ -10545,14 +10528,64 @@ bool BuildRestoreModel(
 			return {};
 		};
 
+		auto& preparedMethods = preparedLocalMethods[classIndex];
+		preparedMethods.reserve(parsedClass.methods.size());
+		for (const auto& parsedMethod : parsedClass.methods) {
+			PreparedLocalMethod prepared;
+			prepared.reusableMatch = findNativeMethodSnapshot(parsedMethod, true);
+			prepared.identityMatch = prepared.reusableMatch.snapshot != nullptr
+				? prepared.reusableMatch
+				: findNativeMethodSnapshot(parsedMethod, false);
+			if (prepared.identityMatch.snapshot != nullptr && prepared.identityMatch.snapshot->id != 0) {
+				prepared.id = prepared.identityMatch.snapshot->id;
+				prepared.memoryAddress = prepared.identityMatch.snapshot->memoryAddress;
+			}
+			else {
+				prepared.id = allocator.Alloc(epl_system_id::kTypeMethod);
+			}
+			preparedMethods.push_back(prepared);
+		}
+	}
+
+	for (size_t classIndex = 0; classIndex < parsedClasses.size(); ++classIndex) {
+		const auto& parsedClass = parsedClasses[classIndex];
+		const BundleNativeSourceFileSnapshot* nativeSourceSnapshot =
+			classIndex < nativeSourceSnapshotsByIndex.size() ? nativeSourceSnapshotsByIndex[classIndex] : nullptr;
+		auto& targetClass = model.classes[localClassModelIndices[classIndex]];
+		if (nativeSourceSnapshot != nullptr) {
+			targetClass.baseClass = nativeSourceSnapshot->baseClass;
+		}
+		else {
+			const std::string normalizedBaseClassName = TypeResolver::NormalizeTypeName(parsedClass.baseClassName);
+			targetClass.baseClass = parsedClass.isFormClass && normalizedBaseClassName.empty()
+				? 65537
+				: ((parsedClass.isUserClass && normalizedBaseClassName.empty()) ||
+					normalizedBaseClassName == "对象" ||
+					normalizedBaseClassName == "<对象>"
+					? -1
+					: ensureTypeId(parsedClass.baseClassName));
+		}
+		for (size_t variableIndex = 0; variableIndex < parsedClass.vars.size(); ++variableIndex) {
+			RestoreVariable variable =
+				convertVariableWithId(
+					parsedClass.vars[variableIndex],
+					epl_system_id::kTypeClassMember,
+					false,
+					false,
+					std::nullopt,
+					nativeSourceSnapshot != nullptr ? vectorTypeAt(nativeSourceSnapshot->classVarTypes, variableIndex) : 0);
+			if (nativeSourceSnapshot != nullptr && variableIndex < nativeSourceSnapshot->classVarIds.size() &&
+				nativeSourceSnapshot->classVarIds[variableIndex] != 0) {
+				variable.id = nativeSourceSnapshot->classVarIds[variableIndex];
+			}
+			targetClass.vars.push_back(std::move(variable));
+		}
+
 		for (size_t methodIndex = 0; methodIndex < parsedClass.methods.size(); ++methodIndex) {
 			const auto& parsedMethod = parsedClass.methods[methodIndex];
-			const NativeMethodSnapshotMatch reusableNativeMethodMatch =
-				findNativeMethodSnapshot(parsedMethod, true);
-			const NativeMethodSnapshotMatch identityNativeMethodMatch =
-				reusableNativeMethodMatch.snapshot != nullptr
-					? reusableNativeMethodMatch
-					: findNativeMethodSnapshot(parsedMethod, false);
+			const PreparedLocalMethod& preparedMethod = preparedLocalMethods[classIndex][methodIndex];
+			const NativeMethodSnapshotMatch& reusableNativeMethodMatch = preparedMethod.reusableMatch;
+			const NativeMethodSnapshotMatch& identityNativeMethodMatch = preparedMethod.identityMatch;
 			const BundleNativeMethodSnapshot* reusableNativeMethodSnapshot =
 				reusableNativeMethodMatch.snapshot;
 			const BundleNativeMethodSnapshot* identityNativeMethodSnapshot =
@@ -10560,13 +10593,8 @@ bool BuildRestoreModel(
 			const ParsedMethodDef* originalParsedMethod =
 				identityNativeMethodMatch.originalParsedMethod;
 			RestoreMethod method;
-			if (identityNativeMethodSnapshot != nullptr && identityNativeMethodSnapshot->id != 0) {
-				method.id = identityNativeMethodSnapshot->id;
-				method.memoryAddress = identityNativeMethodSnapshot->memoryAddress;
-			}
-			else {
-				method.id = allocator.Alloc(epl_system_id::kTypeMethod);
-			}
+			method.id = preparedMethod.id;
+			method.memoryAddress = preparedMethod.memoryAddress;
 			method.ownerClass = targetClass.id;
 			const std::int32_t defaultMethodAttr = ComputeDefaultMethodAttr(parsedMethod);
 			method.attr = defaultMethodAttr;
@@ -10797,6 +10825,23 @@ bool BuildRestoreModel(
 					.insert_or_assign(
 						TypeResolver::NormalizeTypeName(existingMethod.name),
 						NativeFunctionSymbol{ -2, existingMethod.id });
+			}
+			for (size_t sourceClassIndex = 0; sourceClassIndex < parsedClasses.size(); ++sourceClassIndex) {
+				const auto& sourceClass = parsedClasses[sourceClassIndex];
+				const std::int32_t sourceOwnerTypeId = model.classes[localClassModelIndices[sourceClassIndex]].id;
+				for (size_t sourceMethodIndex = 0; sourceMethodIndex < sourceClass.methods.size(); ++sourceMethodIndex) {
+					const std::string sourceMethodKey =
+						TypeResolver::NormalizeTypeName(sourceClass.methods[sourceMethodIndex].name);
+					const std::int32_t sourceMethodId = preparedLocalMethods[sourceClassIndex][sourceMethodIndex].id;
+					if (sourceMethodKey.empty() || sourceMethodId == 0) {
+						continue;
+					}
+					const NativeFunctionSymbol sourceMethodSymbol{ -2, sourceMethodId };
+					nativeObjectEncodeContext.functionsByName.insert_or_assign(sourceMethodKey, sourceMethodSymbol);
+					nativeObjectEncodeContext
+						.methodsByOwnerType[sourceOwnerTypeId]
+						.insert_or_assign(sourceMethodKey, sourceMethodSymbol);
+				}
 			}
 			const bool canReuseIdentityNativeMethodSnapshot =
 				identityNativeMethodSnapshot != nullptr &&
