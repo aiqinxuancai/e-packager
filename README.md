@@ -5,6 +5,8 @@
 > 📖 参考应用：[易语言 × AI Agent 实践白皮书](https://github.com/aiqinxuancai/Awesome-E-Agent)
 > 
 > 📖 [易语言AutoLinker支持库，提供**无头编译**，用于AI使用本项目编辑代码后的验证编译](https://github.com/aiqinxuancai/AutoLinker)
+>
+> 📊 使用 AI 编辑易语言源码前，可参考[易语言大模型基准评分](https://e-language-bench.apptest.dev)选择模型。
 
 ## 使用
 
