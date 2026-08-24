@@ -75,6 +75,7 @@ struct Callable {
 
 struct TypeSymbol {
 	TypeInfo type;
+	bool enumeration = false;
 	std::unordered_map<std::string, Symbol> members;
 	std::unordered_map<std::string, std::vector<Callable>> methods;
 };
@@ -115,6 +116,7 @@ struct EvaluatedExpression {
 	TypeInfo type;
 	bool lvalue = false;
 	std::string name;
+	bool indexedResult = false;
 };
 
 struct FlowContext {
@@ -187,7 +189,10 @@ ParsedDeclaration SplitFields(const std::string& rest)
 	bool quoted = false;
 	for (std::size_t index = 0; index < rest.size();) {
 		const char ch = rest[index];
-		if (ch == '"') quoted = !quoted;
+		if (ch == '"') {
+			if (quoted) quoted = false;
+			else if (Trim(field).empty()) quoted = true;
+		}
 		if (ch == ',' && !quoted) {
 			result.fields.push_back(Trim(field));
 			field.clear();
@@ -224,7 +229,17 @@ std::optional<std::size_t> ParseArrayRank(const ParsedDeclaration& declaration)
 	dimensions = dimensions.substr(1, dimensions.size() - 2);
 	if (dimensions.empty()) return std::nullopt;
 	std::size_t rank = 1;
-	for (const char ch : dimensions) if (ch == ',') ++rank;
+	std::size_t begin = 0;
+	for (;;) {
+		const std::size_t comma = dimensions.find(',', begin);
+		const std::string part = Trim(dimensions.substr(begin, comma == std::string::npos ? std::string::npos : comma - begin));
+		// A zero dimension denotes a dynamically resized array. Its rank is
+		// intentionally unknown until a RedefineArray operation supplies it.
+		if (part == "0") return std::nullopt;
+		if (comma == std::string::npos) break;
+		++rank;
+		begin = comma + 1;
+	}
 	return rank;
 }
 
@@ -244,11 +259,22 @@ TypeInfo ParseType(
 	return TypeInfo { .name = Trim(std::move(typeName)), .array = array, .arrayRank = arrayRank };
 }
 
+// 易语言变量、参数和成员声明可以省略类型，此时默认为整数型。
+// 返回值声明不经过此函数：空返回值仍表示无返回值。
+TypeInfo ParseDeclaredType(
+	std::string typeName,
+	const bool arrayHint = false,
+	std::optional<std::size_t> arrayRank = std::nullopt)
+{
+	if (Trim(typeName).empty()) typeName = "整数型";
+	return ParseType(std::move(typeName), arrayHint, arrayRank);
+}
+
 TypeCategory Category(const TypeInfo& type)
 {
 	if (type.name.empty()) return TypeCategory::Unknown;
 	if (type.array) return TypeCategory::Object;
-	if (type.name == "通用型") return TypeCategory::Generic;
+	if (type.name == "通用型" || type.name == "变体型" || type.name == "子语句") return TypeCategory::Generic;
 	if (type.name == "无返回值") return TypeCategory::Void;
 	if (type.name == "文本型") return TypeCategory::Text;
 	if (type.name == "逻辑型") return TypeCategory::Logical;
@@ -275,7 +301,7 @@ bool IsNumeric(const TypeInfo& type) { return Category(type) == TypeCategory::Nu
 bool IsLogical(const TypeInfo& type) { return Category(type) == TypeCategory::Logical; }
 bool IsGeneric(const TypeInfo& type) { return type.name == "通用型" || type.name == "变体型" || type.name == "子语句"; }
 
-bool Compatible(const TypeInfo& target, const TypeInfo& source)
+bool Compatible(const TypeInfo& target, const TypeInfo& source, const SemanticModel* model = nullptr)
 {
 	if (target.name.empty() || source.name.empty()) return false;
 	if (IsGeneric(target)) return true;
@@ -283,6 +309,13 @@ bool Compatible(const TypeInfo& target, const TypeInfo& source)
 	if (target.array != source.array) return false;
 	if (target.array && source.array && target.arrayRank.has_value() && source.arrayRank.has_value() &&
 		*target.arrayRank != *source.arrayRank) return false;
+	if (!target.array && model != nullptr) {
+		const auto targetType = model->types.find(target.name);
+		const auto sourceType = model->types.find(source.name);
+		const bool targetEnum = targetType != model->types.end() && targetType->second.enumeration;
+		const bool sourceEnum = sourceType != model->types.end() && sourceType->second.enumeration;
+		if ((targetEnum && IsNumeric(source)) || (sourceEnum && IsNumeric(target))) return true;
+	}
 	if (IsNumeric(target) && IsNumeric(source)) return true;
 	return target.name == source.name;
 }
@@ -373,7 +406,34 @@ bool IsOptionalField(const ParsedDeclaration& declaration)
 
 bool IsByReferenceField(const ParsedDeclaration& declaration)
 {
-	return Contains(Field(declaration, 2), "传址") || Contains(Field(declaration, 2), "只接收变量") || Contains(Field(declaration, 2), "参考");
+	return Contains(Field(declaration, 2), "只接收变量");
+}
+
+bool HasElibAttribute(const std::string& attributes, const std::string_view expected)
+{
+	std::size_t begin = 0;
+	for (;;) {
+		const std::size_t separator = attributes.find('|', begin);
+		if (Trim(attributes.substr(begin, separator == std::string::npos ? std::string::npos : separator - begin)) == expected) {
+			return true;
+		}
+		if (separator == std::string::npos) return false;
+		begin = separator + 1;
+	}
+}
+
+bool ElibParameterRequiresArray(const std::string& attributes)
+{
+	return HasElibAttribute(attributes, "数组") ||
+		HasElibAttribute(attributes, "接收数组数据") ||
+		HasElibAttribute(attributes, "只接收变量数组");
+}
+
+bool ElibParameterRequiresVariable(const std::string& attributes)
+{
+	return HasElibAttribute(attributes, "只接收变量") ||
+		HasElibAttribute(attributes, "只接收变量数组") ||
+		HasElibAttribute(attributes, "接收变量或数组");
 }
 
 std::string DirectiveToken(const std::string& line)
@@ -400,7 +460,7 @@ void CollectGlobalPage(const std::string& text, SemanticModel& model, SourcePref
 		const ParsedDeclaration declaration = SplitFields(rest);
 		const std::string name = Field(declaration, 0);
 		if (name.empty()) continue;
-		const TypeInfo type = ParseType(Field(declaration, 1), IsArrayField(declaration), ParseArrayRank(declaration));
+		const TypeInfo type = ParseDeclaredType(Field(declaration, 1), IsArrayField(declaration), ParseArrayRank(declaration));
 		model.globals.emplace(name, Symbol { .type = type });
 	}
 	(void)report;
@@ -425,7 +485,7 @@ void CollectStructPage(const std::string& text, SemanticModel& model)
 			const ParsedDeclaration declaration = SplitFields(rest);
 			const std::string name = Field(declaration, 0);
 			if (name.empty()) continue;
-			const TypeInfo type = ParseType(Field(declaration, 1), IsArrayField(declaration), ParseArrayRank(declaration));
+			const TypeInfo type = ParseDeclaredType(Field(declaration, 1), IsArrayField(declaration), ParseArrayRank(declaration));
 			current->members.emplace(name, Symbol { .type = type });
 		}
 	}
@@ -452,8 +512,9 @@ void CollectDllPage(const std::string& text, SemanticModel& model)
 			const ParsedDeclaration declaration = SplitFields(rest);
 			Parameter parameter;
 			parameter.name = Field(declaration, 0);
-			parameter.type = ParseType(Field(declaration, 1), IsParameterArrayField(declaration));
-			parameter.byReference = IsByReferenceField(declaration);
+			parameter.type = ParseDeclaredType(Field(declaration, 1), IsParameterArrayField(declaration));
+			// DLL 的“传址”描述 ABI 传参方式，易语言允许常量、空指针和
+			// 可计算表达式作为实参，不能据此施加项目子程序式的左值限制。
 			current->parameters.push_back(std::move(parameter));
 		}
 	}
@@ -514,7 +575,7 @@ void CollectProgramSource(const BundleSourceFile& file, SemanticModel& model)
 			const ParsedDeclaration declaration = SplitFields(rest);
 			const std::string name = Field(declaration, 0);
 			if (!name.empty()) {
-				program.classSymbols.emplace(name, Symbol { .type = ParseType(Field(declaration, 1), IsArrayField(declaration), ParseArrayRank(declaration)) });
+				program.classSymbols.emplace(name, Symbol { .type = ParseDeclaredType(Field(declaration, 1), IsArrayField(declaration), ParseArrayRank(declaration)) });
 			}
 			continue;
 		}
@@ -534,7 +595,7 @@ void CollectProgramSource(const BundleSourceFile& file, SemanticModel& model)
 			const ParsedDeclaration declaration = SplitFields(rest);
 			Parameter parameter;
 			parameter.name = Field(declaration, 0);
-			parameter.type = ParseType(Field(declaration, 1), IsParameterArrayField(declaration));
+			parameter.type = ParseDeclaredType(Field(declaration, 1), IsParameterArrayField(declaration));
 			parameter.optional = IsOptionalField(declaration);
 			parameter.byReference = IsByReferenceField(declaration);
 			current->callable.parameters.push_back(parameter);
@@ -545,7 +606,7 @@ void CollectProgramSource(const BundleSourceFile& file, SemanticModel& model)
 			const ParsedDeclaration declaration = SplitFields(rest);
 			const std::string name = Field(declaration, 0);
 			if (!name.empty()) {
-				const TypeInfo type = ParseType(Field(declaration, 1), IsArrayField(declaration), ParseArrayRank(declaration));
+				const TypeInfo type = ParseDeclaredType(Field(declaration, 1), IsArrayField(declaration), ParseArrayRank(declaration));
 				current->symbols.emplace(name, Symbol { .type = type });
 			}
 			continue;
@@ -704,7 +765,9 @@ void ParseElibText(const std::string& text, SemanticModel& model)
 			const std::string name = Field(declaration, 0);
 			if (!name.empty()) {
 				currentType = name;
-				model.types[name].type = TypeInfo { .name = name };
+				TypeSymbol& type = model.types[name];
+				type.type = TypeInfo { .name = name };
+				type.enumeration = GetValueField(declaration, "类型") == "枚举";
 			}
 			continue;
 		}
@@ -713,7 +776,7 @@ void ParseElibText(const std::string& text, SemanticModel& model)
 			const std::string name = Field(declaration, 0);
 			if (!name.empty()) {
 				model.types[currentType].members[name] = Symbol {
-					.type = ParseType(Field(declaration, 1)),
+					.type = model.types[currentType].enumeration ? TypeInfo { .name = currentType } : ParseDeclaredType(Field(declaration, 1)),
 					.lvalue = !Contains(GetValueField(declaration, "属性"), "只读"),
 				};
 			}
@@ -729,17 +792,18 @@ void ParseElibText(const std::string& text, SemanticModel& model)
 			const ParsedDeclaration declaration = SplitFields(rest);
 			const std::string name = Field(declaration, 0);
 			const bool explicitMemberCommand = StartsWith(line, ".成员命令");
-			if (!explicitMemberCommand && Contains(GetValueField(declaration, "分类"), "成员命令")) {
-				current = nullptr;
-				continue;
-			}
+			const bool sharedMemberCommand = !explicitMemberCommand && Contains(GetValueField(declaration, "分类"), "成员命令");
 			if (name == "<未命名>" || name.empty()) { current = nullptr; continue; }
 			Callable callable;
 			callable.name = name;
 			callable.ownerType = explicitMemberCommand ? currentType : std::string();
 			callable.returnType = ParseType(GetValueField(declaration, "返回值"));
 			callable.variadic = Contains(GetValueField(declaration, "属性"), "允许追加参数");
-			if (callable.ownerType.empty()) {
+			if (sharedMemberCommand) {
+				model.memberFunctions[name].push_back(std::move(callable));
+				current = &model.memberFunctions[name].back();
+			}
+			else if (callable.ownerType.empty()) {
 				model.functions[name].push_back(std::move(callable));
 				current = &model.functions[name].back();
 			}
@@ -755,10 +819,10 @@ void ParseElibText(const std::string& text, SemanticModel& model)
 			const std::string attributes = GetValueField(declaration, "属性");
 			Parameter parameter;
 			parameter.name = Field(declaration, 0);
-			parameter.type = ParseType(Field(declaration, 1), Contains(attributes, "数组"));
+			parameter.type = ParseDeclaredType(Field(declaration, 1), ElibParameterRequiresArray(attributes));
 			parameter.optional = Contains(attributes, "默认空") || Contains(attributes, "可空") || !GetValueField(declaration, "默认值").empty();
-			parameter.byReference = Contains(attributes, "只接收变量") || Contains(attributes, "接收变量") || Contains(attributes, "传址");
-			parameter.variableOnly = Contains(attributes, "只接收变量");
+			parameter.byReference = ElibParameterRequiresVariable(attributes);
+			parameter.variableOnly = ElibParameterRequiresVariable(attributes);
 			current->parameters.push_back(std::move(parameter));
 			continue;
 		}
@@ -809,7 +873,7 @@ void ParseEcomHeader(const std::string& text, SemanticModel& model)
 			const std::string name = Field(declaration, 0);
 			if (!name.empty()) {
 				model.types[currentType].members[name] = Symbol {
-					.type = ParseType(Field(declaration, 1)),
+					.type = ParseDeclaredType(Field(declaration, 1)),
 					.lvalue = !Contains(GetValueField(declaration, "属性"), "只读"),
 				};
 			}
@@ -819,7 +883,7 @@ void ParseEcomHeader(const std::string& text, SemanticModel& model)
 			const ParsedDeclaration declaration = SplitFields(rest);
 			Parameter parameter;
 			parameter.name = Field(declaration, 0);
-			parameter.type = ParseType(Field(declaration, 1), IsParameterArrayField(declaration));
+			parameter.type = ParseDeclaredType(Field(declaration, 1), IsParameterArrayField(declaration));
 			parameter.optional = IsOptionalField(declaration);
 			parameter.byReference = IsByReferenceField(declaration);
 			current->parameters.push_back(std::move(parameter));
@@ -909,6 +973,9 @@ std::vector<const Callable*> FindCallableCandidates(
 				for (const Callable& callable : methodIt->second) result.push_back(&callable);
 			}
 		}
+		if (const auto sharedIt = context.model.memberFunctions.find(name); sharedIt != context.model.memberFunctions.end()) {
+			for (const Callable& callable : sharedIt->second) result.push_back(&callable);
+		}
 		return result;
 	}
 	if (const auto it = context.model.functions.find(name); it != context.model.functions.end()) {
@@ -984,7 +1051,7 @@ bool MatchCallable(
 		const EvaluatedExpression value = EvaluateExpression(argument, context, report);
 		if (value.state == ResolveState::Invalid) return false;
 		if (value.state == ResolveState::Unknown) outUnknown = true;
-		if (value.state == ResolveState::Valid && !Compatible(parameter.type, value.type)) {
+		if (value.state == ResolveState::Valid && !Compatible(parameter.type, value.type, &context.model)) {
 			// 易语言命令参数允许把可转换的标量自动转为文本；严格类型错误仍由赋值和逻辑/数组参数检查拦截。
 			const bool implicitTextConversion = Category(parameter.type) == TypeCategory::Text && !value.type.array && Category(value.type) != TypeCategory::Void;
 			if (!implicitTextConversion) return false;
@@ -1014,10 +1081,18 @@ EvaluatedExpression EvaluateCall(
 	}
 	else if (callee.kind == SourceExpressionKind::Member && !callee.children.empty()) {
 		name = callee.text;
-		const EvaluatedExpression receiver = EvaluateExpression(*callee.children.front(), context, report);
-		if (receiver.state == ResolveState::Invalid) return receiver;
-		if (receiver.state == ResolveState::Unknown) return { ResolveState::Unknown, {}, false, name };
-		ownerType = receiver.type.name;
+		// 类名.静态方法() 的左侧是类型名而不是运行时对象。
+		// 先按类型名查找，避免把类名当作未声明变量。
+		if (callee.children.front()->kind == SourceExpressionKind::Name &&
+			context.model.types.contains(callee.children.front()->text)) {
+			ownerType = callee.children.front()->text;
+		}
+		else {
+			const EvaluatedExpression receiver = EvaluateExpression(*callee.children.front(), context, report);
+			if (receiver.state == ResolveState::Invalid) return receiver;
+			if (receiver.state == ResolveState::Unknown) return { ResolveState::Unknown, {}, false, name };
+			ownerType = receiver.type.name;
+		}
 	}
 	else {
 		return { ResolveState::Invalid, {}, false, {} };
@@ -1040,15 +1115,30 @@ EvaluatedExpression EvaluateCall(
 	}
 	bool anyUnknown = false;
 	const Callable* matched = nullptr;
+	std::size_t matchedDistance = (std::numeric_limits<std::size_t>::max)();
 	for (const Callable* candidate : candidates) {
 		bool unknown = false;
 		if (MatchCallable(*candidate, node, context, report, unknown)) {
-			matched = candidate;
-			anyUnknown = anyUnknown || unknown;
-			break;
+			const std::size_t actualCount = node.children.size() - 1;
+			const std::size_t distance = candidate->variadic
+				? 0
+				: candidate->parameters.size() >= actualCount
+				? candidate->parameters.size() - actualCount
+				: actualCount - candidate->parameters.size();
+			if (matched == nullptr || distance < matchedDistance) {
+				matched = candidate;
+				matchedDistance = distance;
+				anyUnknown = unknown;
+			}
 		}
 	}
 	if (matched == nullptr) {
+		// A module may intentionally omit support-library headers. In that case
+		// a known local overload is not enough to prove that the call is invalid;
+		// leave the result unknown until authoritative metadata is available.
+		if (!context.model.externalMetadataComplete) {
+			return { ResolveState::Unknown, {}, false, name };
+		}
 		std::ostringstream detail;
 		detail << "subprogram call has " << (node.children.size() - 1)
 			<< " argument(s), but none of " << candidates.size()
@@ -1056,7 +1146,8 @@ EvaluatedExpression EvaluateCall(
 		AddSemanticError(report, context.path, context.line, "call_signature_mismatch", detail.str());
 		return { ResolveState::Invalid, {}, false, name };
 	}
-	return { anyUnknown ? ResolveState::Unknown : ResolveState::Valid, matched->returnType, false, name };
+	const bool unknownResult = matched->returnType.name.empty() || matched->returnType.name == "通用型" || matched->returnType.name == "子语句";
+	return { anyUnknown || unknownResult ? ResolveState::Unknown : ResolveState::Valid, matched->returnType, false, name };
 }
 
 EvaluatedExpression EvaluateExpression(
@@ -1073,10 +1164,13 @@ EvaluatedExpression EvaluateExpression(
 		return { ResolveState::Valid, TypeInfo { .name = "文本型" }, false, {} };
 	case SourceExpressionKind::LogicalLiteral:
 		return { ResolveState::Valid, TypeInfo { .name = "逻辑型" }, false, {} };
+	case SourceExpressionKind::DateTimeLiteral:
+		return { ResolveState::Valid, TypeInfo { .name = "日期时间型" }, false, {} };
 	case SourceExpressionKind::ByteSetLiteral: {
 		ResolveState state = ResolveState::Valid;
 		TypeInfo elementType { .name = "通用型" };
 		bool hasKnownElement = false;
+		bool byteSetLiteral = true;
 		for (const auto& child : node.children) {
 			const EvaluatedExpression item = EvaluateExpression(*child, context, report);
 			if (item.state == ResolveState::Invalid) return item;
@@ -1088,14 +1182,22 @@ EvaluatedExpression EvaluateExpression(
 				AddSemanticError(report, context.path, context.line, "array_literal_nested", "array literal items cannot themselves be arrays");
 				return { ResolveState::Invalid, {}, false, {} };
 			}
+			if (!IsNumeric(item.type)) {
+				byteSetLiteral = false;
+			}
 			if (!hasKnownElement) {
 				elementType = item.type;
 				hasKnownElement = true;
 			}
-			else if (!Compatible(elementType, item.type) && !Compatible(item.type, elementType)) {
-				elementType = TypeInfo { .name = "通用型" };
+			else if (!Compatible(elementType, item.type, &context.model) && !Compatible(item.type, elementType, &context.model)) {
 				state = ResolveState::Unknown;
 			}
+		}
+		if (byteSetLiteral) {
+			return { state, TypeInfo { .name = "字节集" }, false, {} };
+		}
+		if (!hasKnownElement) {
+			return { ResolveState::Unknown, TypeInfo { .name = "通用型", .array = true, .arrayRank = 1 }, false, {} };
 		}
 		elementType.array = true;
 		elementType.arrayRank = 1;
@@ -1152,9 +1254,25 @@ EvaluatedExpression EvaluateExpression(
 		if (node.children.empty()) return { ResolveState::Invalid, {}, false, {} };
 		EvaluatedExpression base = EvaluateExpression(*node.children.front(), context, report);
 		if (base.state == ResolveState::Invalid) return base;
+		// E-language permits chained byte-set/array indexing in generated code.
+		// Once one index has already been applied, the element type is not
+		// reliable enough for a second index to be rejected as a scalar access.
+		if (base.indexedResult && base.state == ResolveState::Valid) {
+			for (std::size_t i = 1; i < node.children.size(); ++i) {
+				const EvaluatedExpression index = EvaluateExpression(*node.children[i], context, report);
+				if (index.state == ResolveState::Invalid) return index;
+			}
+			return { ResolveState::Unknown, {}, base.lvalue, base.name, true };
+		}
 		ResolveState state = base.state;
 		const bool byteSetIndex = base.state == ResolveState::Valid && !base.type.array && Category(base.type) == TypeCategory::ByteSet;
 		if (base.state == ResolveState::Valid && !base.type.array && !byteSetIndex) {
+			if (context.model.types.contains(base.type.name)) {
+				return { ResolveState::Unknown, {}, base.lvalue, base.name };
+			}
+			if (Category(base.type) == TypeCategory::Object || Category(base.type) == TypeCategory::Unknown) {
+				return { ResolveState::Unknown, {}, base.lvalue, base.name };
+			}
 			AddSemanticError(report, context.path, context.line, "index_target_not_array", "only an array value can be indexed");
 			return { ResolveState::Invalid, {}, false, {} };
 		}
@@ -1172,7 +1290,8 @@ EvaluatedExpression EvaluateExpression(
 			const EvaluatedExpression index = EvaluateExpression(*node.children[i], context, report);
 			if (index.state == ResolveState::Invalid) return index;
 			if (index.state == ResolveState::Unknown) state = ResolveState::Unknown;
-			if (index.state == ResolveState::Valid && !IsNumeric(index.type)) {
+			if (index.state == ResolveState::Valid && IsGeneric(index.type)) state = ResolveState::Unknown;
+			else if (index.state == ResolveState::Valid && !IsNumeric(index.type) && Category(index.type) != TypeCategory::ByteSet) {
 				AddSemanticError(report, context.path, context.line, "array_index_type_mismatch", "array indexes must be numeric expressions");
 				return { ResolveState::Invalid, {}, false, {} };
 			}
@@ -1180,7 +1299,7 @@ EvaluatedExpression EvaluateExpression(
 		TypeInfo type = base.type;
 		if (byteSetIndex) {
 			type = TypeInfo { .name = "字节型" };
-			return { state, type, base.lvalue, base.name };
+			return { state, type, base.lvalue, base.name, true };
 		}
 		if (base.type.arrayRank.has_value() && suppliedRank < *base.type.arrayRank) {
 			type.arrayRank = *base.type.arrayRank - suppliedRank;
@@ -1190,7 +1309,7 @@ EvaluatedExpression EvaluateExpression(
 			type.arrayRank.reset();
 			if (!base.type.arrayRank.has_value() && base.state == ResolveState::Valid) state = ResolveState::Unknown;
 		}
-		return { state, type, base.lvalue, base.name };
+		return { state, type, base.lvalue, base.name, true };
 	}
 	case SourceExpressionKind::Member: {
 		if (node.children.empty()) return { ResolveState::Invalid, {}, false, {} };
@@ -1215,7 +1334,7 @@ EvaluatedExpression EvaluateExpression(
 	case SourceExpressionKind::Unary: {
 		if (node.children.empty()) return { ResolveState::Invalid, {}, false, {} };
 		const EvaluatedExpression value = EvaluateExpression(*node.children.front(), context, report);
-		if (value.state != ResolveState::Valid) return value;
+		if (value.state != ResolveState::Valid || IsGeneric(value.type)) return value.state == ResolveState::Valid ? EvaluatedExpression { ResolveState::Unknown, {}, value.lvalue, value.name } : value;
 		if (node.text == "!" && !IsLogical(value.type)) {
 			AddSemanticError(report, context.path, context.line, "unary_logical_type_mismatch", "logical negation requires a logical expression");
 			return { ResolveState::Invalid, {}, false, {} };
@@ -1232,6 +1351,7 @@ EvaluatedExpression EvaluateExpression(
 		const EvaluatedExpression right = EvaluateExpression(*node.children[1], context, report);
 		if (left.state == ResolveState::Invalid || right.state == ResolveState::Invalid) return { ResolveState::Invalid, {}, false, {} };
 		if (left.state == ResolveState::Unknown || right.state == ResolveState::Unknown) return { ResolveState::Unknown, {}, false, {} };
+		if (IsGeneric(left.type) || IsGeneric(right.type)) return { ResolveState::Unknown, {}, false, {} };
 		const std::string& op = node.text;
 		if (op == "且" || op == "或" || op == "&" || op == "|") {
 			if (!IsLogical(left.type) || !IsLogical(right.type)) {
@@ -1240,9 +1360,9 @@ EvaluatedExpression EvaluateExpression(
 			}
 			return { ResolveState::Valid, TypeInfo { .name = "逻辑型" }, false, {} };
 		}
-		if (op == "＝" || op == "=" || op == "==" || op == "≠" || op == "!=" || op == "<>" ||
+		if (op == "＝" || op == "=" || op == "==" || op == "≠" || op == "!=" || op == "<>" || op == "?=" ||
 			op == "＜" || op == "<" || op == "＞" || op == ">" || op == "≤" || op == "<=" || op == "≥" || op == ">=") {
-			if (!Compatible(left.type, right.type)) {
+			if (!Compatible(left.type, right.type, &context.model)) {
 				AddSemanticError(report, context.path, context.line, "comparison_type_mismatch", "comparison operands have definitely incompatible types");
 				return { ResolveState::Invalid, {}, false, {} };
 			}
@@ -1311,10 +1431,16 @@ void ValidateCallStatement(
 		if (argumentCount == 0 || IsMissing(*parsed.root->children[1])) return;
 		const EvaluatedExpression value = EvaluateExpression(*parsed.root->children[1], context, report);
 		const TypeInfo& returnType = context.method.callable.returnType;
-		if (returnType.name.empty() || Category(returnType) == TypeCategory::Void) {
+		if (returnType.name.empty()) {
+			if (context.model.externalMetadataComplete) {
+				AddSemanticError(report, context.path, context.line, "return_value_unexpected", "a subprogram without a return type cannot return a value");
+			}
+			return;
+		}
+		if (Category(returnType) == TypeCategory::Void) {
 			AddSemanticError(report, context.path, context.line, "return_value_unexpected", "a subprogram without a return type cannot return a value");
 		}
-		else if (value.state == ResolveState::Valid && !Compatible(returnType, value.type)) {
+		else if (value.state == ResolveState::Valid && !Compatible(returnType, value.type, &context.model)) {
 			AddSemanticError(report, context.path, context.line, "return_type_mismatch", "returned expression is definitely incompatible with the subprogram return type");
 		}
 		return;
@@ -1399,7 +1525,8 @@ void ValidateAssignmentStatement(
 		(void)ValidateByteSetAssignmentLiteral(*right.root, context, report);
 		return;
 	}
-	if (target.state == ResolveState::Valid && value.state == ResolveState::Valid && !Compatible(target.type, value.type)) {
+	if (target.state == ResolveState::Valid && value.state == ResolveState::Valid && !Compatible(target.type, value.type, &context.model) &&
+		!(target.type.array && right.root->kind == SourceExpressionKind::ByteSetLiteral)) {
 		AddSemanticError(report, context.path, context.line, "assignment_type_mismatch", "assignment source and target types are definitely incompatible");
 	}
 }
@@ -1450,7 +1577,8 @@ void ValidateFlowStatement(
 		else requireLogical(0);
 	}
 	else if (token == ".计次循环首") {
-		if (arguments.size() != 2 || arguments[0].empty() || arguments[1].empty()) AddSemanticError(report, context.path, context.line, "flow_argument_count_invalid", "count loop requires count and receiving variable");
+		if ((arguments.size() != 1 && arguments.size() != 2) || arguments[0].empty()) AddSemanticError(report, context.path, context.line, "flow_argument_count_invalid", "count loop requires a count and optionally a receiving variable");
+		else if (arguments.size() == 1 || arguments[1].empty()) requireNumeric(0);
 		else {
 			requireNumeric(0);
 			const SourceExpressionParseResult parsed = ParseSourceExpression(arguments[1]);
@@ -1461,7 +1589,10 @@ void ValidateFlowStatement(
 		}
 	}
 	else if (token == ".变量循环首") {
-		if (arguments.size() != 4 || arguments[0].empty() || arguments[1].empty() || arguments[2].empty() || arguments[3].empty()) AddSemanticError(report, context.path, context.line, "flow_argument_count_invalid", "variable loop requires start, end, step, and receiving variable");
+		if ((arguments.size() != 3 && arguments.size() != 4) || arguments[0].empty() || arguments[1].empty() || arguments[2].empty()) AddSemanticError(report, context.path, context.line, "flow_argument_count_invalid", "variable loop requires start, end, step, and optionally a receiving variable");
+		else if (arguments.size() == 3 || arguments[3].empty()) {
+			requireNumeric(0); requireNumeric(1); requireNumeric(2);
+		}
 		else {
 			requireNumeric(0); requireNumeric(1); requireNumeric(2);
 			const SourceExpressionParseResult parsed = ParseSourceExpression(arguments[3]);
@@ -1472,11 +1603,11 @@ void ValidateFlowStatement(
 		}
 	}
 	else if (token == ".判断开始") {
-		if (arguments.size() > 1) AddSemanticError(report, context.path, context.line, "flow_argument_count_invalid", "switch start accepts zero or one selector expression");
-		if (!arguments.empty() && !arguments[0].empty()) {
-			const EvaluatedExpression selector = evaluateArgument(0);
-			if (selector.state != ResolveState::Invalid && context.flows != nullptr) context.flows->push_back(FlowContext { .kind = FlowContext::Kind::Switch, .switchType = selector.type, .conditionSwitch = false, .line = context.line });
-			return;
+		if (arguments.size() != 1 || arguments[0].empty()) {
+			AddSemanticError(report, context.path, context.line, "flow_argument_count_invalid", "switch start requires one logical condition");
+		}
+		else {
+			requireLogical(0);
 		}
 		if (context.flows != nullptr) context.flows->push_back(FlowContext { .kind = FlowContext::Kind::Switch, .conditionSwitch = true, .line = context.line });
 		return;
@@ -1488,7 +1619,7 @@ void ValidateFlowStatement(
 		}
 		if (context.flows != nullptr && !context.flows->empty() && context.flows->back().kind == FlowContext::Kind::Switch) {
 			const EvaluatedExpression value = evaluateArgument(0);
-			if (!context.flows->back().conditionSwitch && value.state == ResolveState::Valid && !Compatible(context.flows->back().switchType, value.type)) AddSemanticError(report, context.path, context.line, "switch_case_type_mismatch", "switch case expression is incompatible with the selector type");
+			if (!context.flows->back().conditionSwitch && value.state == ResolveState::Valid && !Compatible(context.flows->back().switchType, value.type, &context.model)) AddSemanticError(report, context.path, context.line, "switch_case_type_mismatch", "switch case expression is incompatible with the selector type");
 			if (context.flows->back().conditionSwitch && value.state == ResolveState::Valid && !IsLogical(value.type)) AddSemanticError(report, context.path, context.line, "switch_condition_type_mismatch", "condition-style switch cases must be logical expressions");
 		}
 	}
@@ -1599,6 +1730,12 @@ void ValidateCrossPageNames(const ProjectBundle& bundle, SourcePreflightReport& 
 void ValidateProjectBundleSemantics(const ProjectBundle& bundle, SourcePreflightReport& report)
 {
 	SemanticModel model;
+	// `.ec` 拆包通过内部 `.e` 桥接暴露源码。桥接源码中的匿名原生类、
+	// 支持库命令和窗体成员不一定能从公开头文件还原，但未修改源码仍可
+	// 依靠原生快照完整回封；这些符号只能判定为未知，不能当成确定错误。
+	if (bundle.sourceFileKind == SourceFileKind::EC) {
+		model.externalMetadataComplete = false;
+	}
 	for (const BundleBinaryResource& resource : bundle.resources) model.resources.insert(resource.logicalName);
 	CollectGlobalPage(bundle.globalText, model, report);
 	CollectStructPage(bundle.dataTypeText, model);
@@ -1612,6 +1749,27 @@ void ValidateProjectBundleSemantics(const ProjectBundle& bundle, SourcePreflight
 	ValidateDeclaredTypes(model, report);
 	for (const ProgramSource& program : model.programs) {
 		for (const MethodSymbol& method : program.methods) ValidateMethodBody(program, method, model, report);
+	}
+	if (!model.externalMetadataComplete) {
+		// `.ec` 公开源码不包含完整的支持库/匿名类型元数据。保留语法、
+		// 结构和名称冲突错误，但丢弃依赖这些元数据才能确定的类型诊断。
+		static const std::unordered_set<std::string> uncertainCodes = {
+			"address_of_target_not_found", "addition_type_mismatch", "arithmetic_type_mismatch",
+			"array_index_rank_mismatch", "array_index_type_mismatch", "assignment_type_mismatch",
+			"call_not_found", "call_signature_mismatch", "comparison_type_mismatch",
+			"constant_not_found", "flow_condition_type_mismatch", "flow_counter_variable_invalid",
+			"flow_numeric_type_mismatch", "form_event_handler_not_found", "index_target_not_array",
+			"logical_operator_type_mismatch", "member_not_found", "return_type_mismatch",
+			"symbol_not_found", "switch_case_type_mismatch",
+			"switch_condition_type_mismatch", "type_not_found", "unary_logical_type_mismatch",
+			"unary_numeric_type_mismatch",
+		};
+		report.errors.erase(
+			std::remove_if(
+				report.errors.begin(),
+				report.errors.end(),
+				[&](const SourcePreflightDiagnostic& diagnostic) { return uncertainCodes.contains(diagnostic.code); }),
+			report.errors.end());
 	}
 }
 

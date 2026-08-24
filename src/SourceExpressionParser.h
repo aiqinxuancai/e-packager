@@ -13,6 +13,7 @@ enum class SourceExpressionKind {
 	NumberLiteral,
 	TextLiteral,
 	LogicalLiteral,
+	DateTimeLiteral,
 	ByteSetLiteral,
 	AddressOf,
 	Name,

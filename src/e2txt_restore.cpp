@@ -9128,6 +9128,23 @@ bool BuildRestoreModel(
 
 	IdAllocator allocator;
 	TypeResolver resolver(document.sourcePath, model.dependencies);
+	// `.ec` 的公开源码可能引用原生快照中存在、但公开头文件未声明的
+	// 匿名类型。先注册快照名称，确保后续类型解析优先复用原生 ID。
+	if (bundle != nullptr && bundle->sourceFileKind == SourceFileKind::EC) {
+		for (const auto& snapshot : bundle->nativeStructSnapshots) {
+			if (snapshot.id != 0 && !snapshot.name.empty()) {
+				resolver.RegisterUserType(snapshot.name, snapshot.id);
+			}
+		}
+		const size_t classLimit = (std::min)(bundle->sourceFiles.size(), bundle->nativeSourceSnapshots.size());
+		for (size_t index = 0; index < classLimit; ++index) {
+			const auto& sourceFile = bundle->sourceFiles[index];
+			const auto& snapshot = bundle->nativeSourceSnapshots[index];
+			if (snapshot.classId != 0 && !sourceFile.logicalName.empty()) {
+				resolver.RegisterUserType(sourceFile.logicalName, snapshot.classId);
+			}
+		}
+	}
 
 	std::vector<const BundleNativeSourceFileSnapshot*> nativeSourceSnapshotsByIndex(parsedClasses.size(), nullptr);
 	if (bundle != nullptr) {
@@ -9189,7 +9206,7 @@ bool BuildRestoreModel(
 		if (const std::int32_t typeId = resolver.ResolveTypeId(typeName); typeId != 0) {
 			return typeId;
 		}
-		if (bundle != nullptr) {
+		if (bundle != nullptr && bundle->sourceFileKind != SourceFileKind::EC) {
 			if (std::find(unresolvedTypeNames.begin(), unresolvedTypeNames.end(), typeName) == unresolvedTypeNames.end()) {
 				unresolvedTypeNames.push_back(typeName);
 			}
@@ -12975,7 +12992,8 @@ bool RestoreBundleToBytesInternal(
 	const ProjectBundle& bundle,
 	std::vector<std::uint8_t>& outBytes,
 	std::string* outError,
-	const bool preferNativeMethodSnapshots)
+	const bool preferNativeMethodSnapshots,
+	const bool skipSourcePreflight)
 {
 	if (outError != nullptr) {
 		outError->clear();
@@ -12986,19 +13004,26 @@ bool RestoreBundleToBytesInternal(
 		return true;
 	}
 
-	const SourcePreflightReport preflightReport = ValidateProjectBundleSource(bundle);
-	if (!preflightReport.IsValid()) {
-		if (outError != nullptr) {
-			*outError = "source_preflight_failed: " + FormatSourcePreflightReport(preflightReport);
+	// The .ec unpack bridge is an internal conversion step used to expose
+	// module sources as a normal .e bundle. It must preserve source text and
+	// native method snapshots even when the stricter edit-time preflight cannot
+	// yet model every valid module construct. Normal pack and validate paths
+	// still run preflight before rebuilding edited sources.
+	if (!skipSourcePreflight) {
+		const SourcePreflightReport preflightReport = ValidateProjectBundleSource(bundle);
+		if (!preflightReport.IsValid()) {
+			if (outError != nullptr) {
+				*outError = "source_preflight_failed: " + FormatSourcePreflightReport(preflightReport);
+			}
+			return false;
 		}
-		return false;
-	}
-	for (const SourcePreflightDiagnostic& warning : preflightReport.warnings) {
-		AddRuntimeWarning(
-			"source_preflight_warning: file=" + warning.filePath +
-			", line=" + std::to_string(warning.line) +
-			", code=" + warning.code +
-			", detail=" + warning.message);
+		for (const SourcePreflightDiagnostic& warning : preflightReport.warnings) {
+			AddRuntimeWarning(
+				"source_preflight_warning: file=" + warning.filePath +
+				", line=" + std::to_string(warning.line) +
+				", code=" + warning.code +
+				", detail=" + warning.message);
+		}
 	}
 
 	Document document;
@@ -13061,12 +13086,17 @@ bool RestoreBundleToBytesInternal(
 
 bool Restorer::RestoreBundleToBytes(const ProjectBundle& bundle, std::vector<std::uint8_t>& outBytes, std::string* outError) const
 {
-	return RestoreBundleToBytesInternal(bundle, outBytes, outError, false);
+	return RestoreBundleToBytesInternal(bundle, outBytes, outError, false, false);
 }
 
 bool Restorer::RestoreBundleToBytesForEcBridge(const ProjectBundle& bundle, std::vector<std::uint8_t>& outBytes, std::string* outError) const
 {
-	return RestoreBundleToBytesInternal(bundle, outBytes, outError, true);
+	return RestoreBundleToBytesInternal(bundle, outBytes, outError, true, false);
+}
+
+bool Restorer::RestoreBundleToBytesForEcUnpackBridge(const ProjectBundle& bundle, std::vector<std::uint8_t>& outBytes, std::string* outError) const
+{
+	return RestoreBundleToBytesInternal(bundle, outBytes, outError, true, true);
 }
 
 bool Restorer::RestoreBundleToFile(

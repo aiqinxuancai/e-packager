@@ -15,6 +15,7 @@ enum class TokenKind {
 	Name,
 	Number,
 	Text,
+	DateTime,
 	Operator,
 	LeftParen,
 	RightParen,
@@ -68,7 +69,7 @@ bool IsOperatorStart(const std::string& text, const std::size_t position)
 {
 	static constexpr std::string_view kOperators[] = {
 		"＋", "－", "×", "÷", "＝", "≠", "＜", "＞", "≤", "≥",
-		"==", "!=", "<=", ">=", "<>", "+", "-", "*", "/", "\\", "%", "=", "<", ">", "&", "|",
+		"?=", "==", "!=", "<=", ">=", "<>", "+", "-", "*", "/", "\\", "%", "=", "<", ">", "&", "|",
 	};
 	for (const auto operatorText : kOperators) {
 		if (StartsAt(text, position, operatorText)) {
@@ -147,7 +148,21 @@ public:
 			const char ascii = source_[position_];
 			if (ascii == '(') { ++position_; tokens.push_back({ TokenKind::LeftParen, "(", tokenPosition }); continue; }
 			if (ascii == ')') { ++position_; tokens.push_back({ TokenKind::RightParen, ")", tokenPosition }); continue; }
-			if (ascii == '[') { ++position_; tokens.push_back({ TokenKind::LeftBracket, "[", tokenPosition }); continue; }
+			if (ascii == '[') {
+				const std::size_t closing = source_.find(']', position_ + 1);
+				if (closing != std::string::npos) {
+					const std::string content = source_.substr(position_ + 1, closing - position_ - 1);
+					if (content.find("年") != std::string::npos && content.find("月") != std::string::npos &&
+						content.find("日") != std::string::npos) {
+						position_ = closing + 1;
+						tokens.push_back({ TokenKind::DateTime, source_.substr(tokenPosition, position_ - tokenPosition), tokenPosition });
+						continue;
+					}
+				}
+				++position_;
+				tokens.push_back({ TokenKind::LeftBracket, "[", tokenPosition });
+				continue;
+			}
 			if (ascii == ']') { ++position_; tokens.push_back({ TokenKind::RightBracket, "]", tokenPosition }); continue; }
 			if (ascii == '{') { ++position_; tokens.push_back({ TokenKind::LeftBrace, "{", tokenPosition }); continue; }
 			if (ascii == '}') { ++position_; tokens.push_back({ TokenKind::RightBrace, "}", tokenPosition }); continue; }
@@ -156,7 +171,7 @@ public:
 			if (IsOperatorStart(source_, position_)) {
 				static constexpr std::string_view kOperators[] = {
 					"＋", "－", "×", "÷", "＝", "≠", "＜", "＞", "≤", "≥",
-					"==", "!=", "<=", ">=", "<>", "+", "-", "*", "/", "\\", "%", "=", "<", ">", "&", "|",
+					"?=", "==", "!=", "<=", ">=", "<>", "+", "-", "*", "/", "\\", "%", "=", "<", ">", "&", "|",
 				};
 				std::string_view matched;
 				for (const auto operatorText : kOperators) {
@@ -410,6 +425,9 @@ private:
 		if (Current().kind == TokenKind::Text) {
 			return MakeNode(SourceExpressionKind::TextLiteral, Consume().text);
 		}
+		if (Current().kind == TokenKind::DateTime) {
+			return MakeNode(SourceExpressionKind::DateTimeLiteral, Consume().text);
+		}
 		if (Match(TokenKind::LeftParen)) {
 			auto child = ParseExpression(0, result);
 			if (!child) return nullptr;
@@ -448,7 +466,7 @@ private:
 		if (op == "或" || op == "|") return 1;
 		if (op == "且" || op == "&") return 2;
 		if (op == "＝" || op == "=" || op == "==" || op == "≠" || op == "!=" || op == "<>" ||
-			op == "＜" || op == "<" || op == "＞" || op == ">" || op == "≤" || op == "<=" || op == "≥" || op == ">=") return 3;
+			op == "?=" || op == "＜" || op == "<" || op == "＞" || op == ">" || op == "≤" || op == "<=" || op == "≥" || op == ">=") return 3;
 		if (op == "＋" || op == "+" || op == "－" || op == "-") return 4;
 		if (op == "×" || op == "*" || op == "÷" || op == "/" || op == "\\" || op == "%") return 5;
 		return -1;

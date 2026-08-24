@@ -681,7 +681,7 @@ bool DoUnpackInternal(
 
 		e2txt::Restorer restorer;
 		std::vector<std::uint8_t> eBytes;
-		if (!restorer.RestoreBundleToBytesForEcBridge(bridgeSourceBundle, eBytes, &outError)) {
+		if (!restorer.RestoreBundleToBytesForEcUnpackBridge(bridgeSourceBundle, eBytes, &outError)) {
 			return false;
 		}
 
@@ -1865,7 +1865,28 @@ int RunCompareBundle(const char* inputPath, const char* inputDir, const e2txt::R
 	std::string error;
 	const std::filesystem::path effectiveInputPath = ResolveAbsolutePath(std::filesystem::path(inputPath));
 	const std::filesystem::path effectiveInputDir = ResolveAbsolutePath(std::filesystem::path(inputDir));
-	if (!generator.GenerateBundle(PathToUtf8(effectiveInputPath), bundleFromE, &error, readOptions)) {
+	std::string inputExtension = effectiveInputPath.extension().string();
+	std::transform(inputExtension.begin(), inputExtension.end(), inputExtension.begin(), [](unsigned char ch) {
+		return static_cast<char>(std::tolower(ch));
+	});
+	if (inputExtension == ".ec") {
+		// .ec 拆包使用内部 .e 桥接源码；比较时采用同一语义入口，
+		// 避免把原生 .ec 公开接口与桥接目录误判为源码不一致。
+		e2txt::ProjectBundle ecBundle;
+		if (!generator.GenerateBundle(PathToUtf8(effectiveInputPath), ecBundle, &error, readOptions)) {
+			return PrintStringResult("compare-bundle", -1, error.c_str());
+		}
+		ecBundle.nativeSourceBytes.clear();
+		ecBundle.nativeBundleDigest.clear();
+		std::vector<std::uint8_t> bridgeBytes;
+		if (!restorer.RestoreBundleToBytesForEcUnpackBridge(ecBundle, bridgeBytes, &error) ||
+			!generator.GenerateBundleFromBytes(bridgeBytes, PathToUtf8(effectiveInputPath), bundleFromE, &error)) {
+			return PrintStringResult("compare-bundle", -1, error.c_str());
+		}
+		bundleFromE.sourcePath = PathToUtf8(effectiveInputPath);
+		bundleFromE.sourceFileKind = e2txt::SourceFileKind::EC;
+	}
+	else if (!generator.GenerateBundle(PathToUtf8(effectiveInputPath), bundleFromE, &error, readOptions)) {
 		return PrintStringResult("compare-bundle", -1, error.c_str());
 	}
 	if (!codec.ReadBundle(PathToUtf8(effectiveInputDir), bundleFromDir, &error)) {

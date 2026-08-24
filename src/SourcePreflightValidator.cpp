@@ -38,6 +38,7 @@ enum class ValueKind {
 struct VariableSymbol {
 	std::string typeName;
 	bool isArray = false;
+	bool arrayRankKnown = false;
 };
 
 struct ParsedDeclaration {
@@ -231,7 +232,12 @@ ParsedDeclaration SplitDeclarationFields(const std::string& rest)
 	bool inQuote = false;
 	for (const char ch : rest) {
 		if (ch == '"') {
-			inQuote = !inQuote;
+			if (inQuote) {
+				inQuote = false;
+			}
+			else if (TrimAsciiCopy(field).empty()) {
+				inQuote = true;
+			}
 			field.push_back(ch);
 			continue;
 		}
@@ -252,6 +258,16 @@ std::string FieldOrEmpty(const ParsedDeclaration& declaration, const size_t inde
 	return index < declaration.fields.size() ? declaration.fields[index] : std::string();
 }
 
+bool IsEmptyDeclaration(const ParsedDeclaration& declaration, const size_t structuralFieldCount)
+{
+	for (size_t index = 0; index < structuralFieldCount; ++index) {
+		if (!TrimAsciiCopy(FieldOrEmpty(declaration, index)).empty()) {
+			return false;
+		}
+	}
+	return true;
+}
+
 ParsedDeclaration ParseDeclaration(
 	const std::string& line,
 	const std::string_view keyword,
@@ -265,9 +281,9 @@ ParsedDeclaration ParseDeclaration(
 		return {};
 	}
 	ParsedDeclaration declaration = SplitDeclarationFields(rest);
-	if (!declaration.quotesBalanced) {
-		AddError(report, path, lineNumber, "declaration_quote_unclosed", "ASCII declaration quote is not closed");
-	}
+	// Free-form description fields may contain ordinary ASCII quotes. Structural
+	// fields validate their own quoting below (array dimensions and DLL names),
+	// so a quote anywhere in the complete declaration is not by itself an error.
 	return declaration;
 }
 
@@ -454,7 +470,9 @@ void ValidateVariableDeclaration(
 	SourcePreflightReport& report)
 {
 	ValidateNameField(declaration, path, lineNumber, report);
-	ValidateTypeField(declaration, 1, true, path, lineNumber, report);
+	// 易语言变量/参数声明省略类型时默认为整数型；
+	// 数据类型成员仍由其所在页的结构规则单独约束。
+	ValidateTypeField(declaration, 1, false, path, lineNumber, report);
 	if (kind == "程序集变量") {
 		ValidateExactField(declaration, 2, { "" }, path, lineNumber, "class_variable_reserved_slot_not_empty", report);
 	}
@@ -476,7 +494,7 @@ void ValidateVariableDeclaration(
 bool IsQuotedArrayField(const ParsedDeclaration& declaration, const size_t index)
 {
 	const std::string field = FieldOrEmpty(declaration, index);
-	return !field.empty();
+	return field.size() >= 2 && field.front() == '"' && field.back() == '"';
 }
 
 std::string StripInlineComment(const std::string& line)
@@ -697,7 +715,13 @@ ValueKind ClassifyExpression(
 		if (it->second.isArray && !indexed) {
 			return ValueKind::Unknown;
 		}
-		return ClassifyTypeName(it->second.typeName);
+		if (indexed && it->second.isArray && !it->second.arrayRankKnown) {
+			return ValueKind::Unknown;
+		}
+		const ValueKind kind = ClassifyTypeName(it->second.typeName);
+		// A scalar byte-set is indexed to a byte; an array whose element type is
+		// byte-set remains a byte-set after one array index.
+		return indexed && !it->second.isArray && kind == ValueKind::ByteSet ? ValueKind::Numeric : kind;
 	};
 	if (!variableName.empty()) {
 		if (const auto value = findSymbolKind(methodSymbols); value.has_value()) {
@@ -796,7 +820,7 @@ void ValidateAssignment(
 		return;
 	}
 	const ValueKind declaredTargetKind = ClassifyTypeName(target->typeName);
-	const ValueKind targetKind = targetIndexed && declaredTargetKind == ValueKind::ByteSet
+	const ValueKind targetKind = targetIndexed && !target->isArray && declaredTargetKind == ValueKind::ByteSet
 		? ValueKind::Numeric
 		: declaredTargetKind;
 	const ValueKind sourceKind = ClassifyExpression(right, method.symbols, classSymbols, globalSymbols);
@@ -927,12 +951,17 @@ void InsertVariableSymbol(
 	if (name.empty()) {
 		return;
 	}
+	std::string typeName = FieldOrEmpty(declaration, 1);
+	if (TrimAsciiCopy(typeName).empty()) {
+		typeName = "整数型";
+	}
 	const auto [it, inserted] = symbols.emplace(
 		name,
 		VariableSymbol {
-			.typeName = FieldOrEmpty(declaration, 1),
+			.typeName = std::move(typeName),
 			.isArray = IsQuotedArrayField(declaration, 3) ||
 				FieldOrEmpty(declaration, 2).find("数组") != std::string::npos,
+			.arrayRankKnown = !HasZeroArrayDimension(declaration, 3),
 		});
 	(void)it;
 	if (!inserted) {
@@ -1045,7 +1074,6 @@ void ValidateDllPage(
 	report.checkedLines += lines.size();
 	ValidateVersionLine(lines, path, true, report);
 	std::unordered_set<std::string> dllNames;
-	std::unordered_set<std::string> parameterNames;
 	bool hasCurrentDll = false;
 	for (size_t index = 0; index < lines.size(); ++index) {
 		const std::string line = TrimAsciiCopy(lines[index]);
@@ -1064,20 +1092,15 @@ void ValidateDllPage(
 				AddError(report, path, index + 1, "dll_command_duplicate", "duplicate DLL command name");
 			}
 			hasCurrentDll = true;
-			parameterNames.clear();
 			continue;
 		}
 		if (MatchDirective(line, "参数")) {
 			const ParsedDeclaration declaration = ParseDeclaration(line, "参数", path, index + 1, report);
 			ValidateNameField(declaration, path, index + 1, report);
-			ValidateTypeField(declaration, 1, true, path, index + 1, report);
+			ValidateTypeField(declaration, 1, false, path, index + 1, report);
 			ValidateParameterFlags(declaration, true, path, index + 1, report);
 			if (!hasCurrentDll) {
 				AddError(report, path, index + 1, "dll_parameter_without_owner", "DLL parameter must follow a DLL command declaration");
-			}
-			const std::string name = FieldOrEmpty(declaration, 0);
-			if (!name.empty() && !parameterNames.insert(name).second) {
-				AddError(report, path, index + 1, "dll_parameter_duplicate", "duplicate parameter name in the same DLL command");
 			}
 			continue;
 		}
@@ -1107,8 +1130,7 @@ void ValidateConstantPage(
 		const ParsedDeclaration declaration = ParseDeclaration(line, "常量", path, index + 1, report);
 		// 旧工程常量表会把空白分隔行导出成 `.常量 , ""`。
 		if (FieldOrEmpty(declaration, 0).empty() &&
-			FieldOrEmpty(declaration, 1) == "\"\"" &&
-			declaration.fields.size() == 2) {
+			FieldOrEmpty(declaration, 1) == "\"\"") {
 			continue;
 		}
 		ValidateNameField(declaration, path, index + 1, report);
@@ -1181,6 +1203,9 @@ void ValidateProgramPage(
 		}
 		if (MatchDirective(line, "程序集变量")) {
 			const ParsedDeclaration declaration = ParseDeclaration(line, "程序集变量", path, lineNumber, report);
+			if (IsEmptyDeclaration(declaration, 4)) {
+				continue;
+			}
 			ValidateVariableDeclaration(declaration, "程序集变量", path, lineNumber, report);
 			if (sawMethod) {
 				AddError(report, path, lineNumber, "class_variable_misplaced", "assembly variables must appear before the first subprogram");
@@ -1208,8 +1233,11 @@ void ValidateProgramPage(
 		}
 		if (MatchDirective(line, "参数")) {
 			const ParsedDeclaration declaration = ParseDeclaration(line, "参数", path, lineNumber, report);
+			if (IsEmptyDeclaration(declaration, 3)) {
+				continue;
+			}
 			ValidateNameField(declaration, path, lineNumber, report);
-			ValidateTypeField(declaration, 1, true, path, lineNumber, report);
+			ValidateTypeField(declaration, 1, false, path, lineNumber, report);
 			ValidateParameterFlags(declaration, false, path, lineNumber, report);
 			if (!method.active || method.bodyStarted || method.sawLocal) {
 				AddError(report, path, lineNumber, "parameter_misplaced", "parameters must directly follow a subprogram and precede local variables");
@@ -1219,6 +1247,9 @@ void ValidateProgramPage(
 		}
 		if (MatchDirective(line, "局部变量")) {
 			const ParsedDeclaration declaration = ParseDeclaration(line, "局部变量", path, lineNumber, report);
+			if (IsEmptyDeclaration(declaration, 4)) {
+				continue;
+			}
 			ValidateVariableDeclaration(declaration, "局部变量", path, lineNumber, report);
 			if (!method.active || method.bodyStarted) {
 				AddError(report, path, lineNumber, "local_variable_misplaced", "local variables must appear before the first subprogram statement");

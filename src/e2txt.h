@@ -481,6 +481,8 @@ public:
 	bool RestoreBundleToBytes(const ProjectBundle& bundle, std::vector<std::uint8_t>& outBytes, std::string* outError) const;
 	// `.ec` 解包桥接为临时 `.e` 时使用：优先复用原生方法快照，避免生成源码再次语义重建。
 	bool RestoreBundleToBytesForEcBridge(const ProjectBundle& bundle, std::vector<std::uint8_t>& outBytes, std::string* outError) const;
+	// `.ec` 解包桥接专用：保留原始模块语法，不执行编辑态源码预检。
+	bool RestoreBundleToBytesForEcUnpackBridge(const ProjectBundle& bundle, std::vector<std::uint8_t>& outBytes, std::string* outError) const;
 	bool RestoreToFile(
 		const std::string& inputPath,
 		const std::string& outputPath,

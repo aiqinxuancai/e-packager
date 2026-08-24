@@ -3890,6 +3890,14 @@ bool MatchWndClassExShape(const std::vector<VariableInfo>& members)
 std::unordered_map<std::int32_t, std::string> BuildLocalAnonymousTypeAliasMap(const ModuleSections& sections)
 {
 	std::unordered_map<std::int32_t, std::string> aliases;
+	std::unordered_set<std::string> usedAliases;
+	const auto setUniqueAlias = [&](const std::int32_t typeId, const std::string& alias) {
+		if (typeId == 0 || alias.empty() || aliases.contains(typeId) || usedAliases.contains(alias)) {
+			return;
+		}
+		aliases.emplace(typeId, alias);
+		usedAliases.insert(alias);
+	};
 
 	for (const auto& item : sections.program.dataTypes) {
 		const std::string ownerName = TrimAsciiCopy(item.name);
@@ -3902,10 +3910,10 @@ std::unordered_map<std::int32_t, std::string> BuildLocalAnonymousTypeAliasMap(co
 				continue;
 			}
 			if (ownerName == "WFSYSCTLBTN" && memberName == "Tips") {
-				SetAnonymousTypeAlias(aliases, member.dataType, "WFTIPSINFO");
+				setUniqueAlias(member.dataType, "WFTIPSINFO");
 			}
 			else if (ownerName == "WFSHADOWINFO" && memberName == "Canvas") {
-				SetAnonymousTypeAlias(aliases, member.dataType, "WFCANVAS");
+				setUniqueAlias(member.dataType, "WFCANVAS");
 			}
 		}
 	}
@@ -3922,10 +3930,10 @@ std::unordered_map<std::int32_t, std::string> BuildLocalAnonymousTypeAliasMap(co
 			}
 			if ((dllName == "GdipDrawString" || dllName == "GdipMeasureString") &&
 				(paramName == "layoutRect" || paramName == "boundingBox")) {
-				SetAnonymousTypeAlias(aliases, param.dataType, "RectF");
+				setUniqueAlias(param.dataType, "RectF");
 			}
 			else if (dllName == "RegisterClassExW" && paramName == "pcWndClassEx") {
-				SetAnonymousTypeAlias(aliases, param.dataType, "WNDCLASSEXW");
+				setUniqueAlias(param.dataType, "WNDCLASSEXW");
 			}
 		}
 	}
@@ -3938,10 +3946,10 @@ std::unordered_map<std::int32_t, std::string> BuildLocalAnonymousTypeAliasMap(co
 			continue;
 		}
 		if (MatchAllMemberTypes(item.members, static_cast<std::int32_t>(0x80000501u), 4)) {
-			SetAnonymousTypeAlias(aliases, item.header.dwId, "RectF");
+			setUniqueAlias(item.header.dwId, "RectF");
 		}
 		else if (MatchWndClassExShape(item.members)) {
-			SetAnonymousTypeAlias(aliases, item.header.dwId, "WNDCLASSEXW");
+			setUniqueAlias(item.header.dwId, "WNDCLASSEXW");
 		}
 	}
 
