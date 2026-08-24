@@ -365,7 +365,19 @@ private:
 					Fail(result, "member_name_missing", Current().position);
 					return nullptr;
 				}
-				auto member = MakeNode(SourceExpressionKind::Member, Consume().text);
+				std::string memberName = Consume().text;
+				// 支持库回调名称可能含有连字符和数字，例如 `_Lib-4Cmd0`。
+				// 仅在连字符后同时出现数字和名称片段时合并，避免把普通
+				// `对象.成员 - 1` 误识别成成员名。
+				if (Current().kind == TokenKind::Operator && Current().text == "-" &&
+					index_ + 2 < tokens_.size() &&
+					tokens_[index_ + 1].kind == TokenKind::Number &&
+					tokens_[index_ + 2].kind == TokenKind::Name) {
+					memberName += Consume().text;
+					memberName += Consume().text;
+					memberName += Consume().text;
+				}
+				auto member = MakeNode(SourceExpressionKind::Member, std::move(memberName));
 				member->children.push_back(std::move(node));
 				node = std::move(member);
 				continue;

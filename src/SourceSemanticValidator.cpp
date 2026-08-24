@@ -109,6 +109,7 @@ struct SemanticModel {
 	std::vector<ProgramSource> programs;
 	bool externalMetadataComplete = true;
 	bool anyExternalMetadata = false;
+	bool ecBridge = false;
 };
 
 struct EvaluatedExpression {
@@ -368,6 +369,13 @@ std::string StripComment(const std::string& line)
 		i = next == nullptr || next <= current ? i + 1 : (std::min)(line.size(), static_cast<std::size_t>(next - begin));
 	}
 	return line;
+}
+
+bool IsEscapedBodyLine(const std::string& line)
+{
+	const std::string trimmed = Trim(line);
+	return trimmed.starts_with("#e2txt_body_line#") ||
+		trimmed.starts_with("' #e2txt_body_line#");
 }
 
 bool ReadUtf8FileAsLocal(const std::filesystem::path& path, std::string& outText)
@@ -1418,6 +1426,18 @@ void ValidateCallStatement(
 		return;
 	}
 	if (parsed.root->kind != SourceExpressionKind::Call) {
+		// .ec 的内部桥接器会把原生递增/递减操作导出成裸算术表达式，
+		// 例如“计数 ＋ 1”。它不是普通 E 源码的调用语句，但回封时
+		// 可由原生方法快照保留，不能作为确定性语法错误。
+		if (!context.model.externalMetadataComplete &&
+			parsed.root->kind == SourceExpressionKind::Binary &&
+			(parsed.root->text == "＋" || parsed.root->text == "－" ||
+				parsed.root->text == "+" || parsed.root->text == "-") &&
+			parsed.root->children.size() == 2 &&
+			IsLvalueNode(*parsed.root->children.front()) &&
+			parsed.root->children.back()->kind == SourceExpressionKind::NumberLiteral) {
+			return;
+		}
 		AddSemanticError(report, context.path, context.line, "statement_not_callable", "an executable statement must be a subprogram or command call");
 		return;
 	}
@@ -1633,7 +1653,14 @@ void ValidateMethodBody(
 	SourcePreflightReport& report)
 {
 	std::vector<FlowContext> flows;
+	size_t commentedCountLoopStarts = 0;
 	for (std::size_t index = method.firstBodyLine; index <= method.lastBodyLine && index <= program.lines.size(); ++index) {
+		if (model.ecBridge && IsEscapedBodyLine(program.lines[index - 1])) continue;
+		const std::string rawLine = Trim(program.lines[index - 1]);
+		if (model.ecBridge && rawLine.starts_with("' .计次循环首")) {
+			++commentedCountLoopStarts;
+			continue;
+		}
 		const std::string code = Trim(StripComment(program.lines[index - 1]));
 		if (code.empty() || StartsWith(code, "'") || code == ".版本 2") continue;
 		EvaluationContext context { .model = model, .program = program, .method = method, .flows = &flows, .path = program.path, .line = index };
@@ -1653,6 +1680,12 @@ void ValidateMethodBody(
 			else if (token == ".否则") { if (flows.empty() || flows.back().kind != FlowContext::Kind::IfElse) AddSemanticError(report, program.path, index, "else_unexpected", "else is outside an if block"); }
 			else if (token == ".判断循环尾" || token == ".循环判断尾" || token == ".计次循环尾" || token == ".变量循环尾") {
 				const FlowContext::Kind expected = token == ".判断循环尾" ? FlowContext::Kind::While : token == ".循环判断尾" ? FlowContext::Kind::DoWhile : token == ".计次循环尾" ? FlowContext::Kind::Count : FlowContext::Kind::Variable;
+				if (model.ecBridge && token == ".计次循环尾" &&
+					(flows.empty() || flows.back().kind != FlowContext::Kind::Count) &&
+					commentedCountLoopStarts != 0) {
+					--commentedCountLoopStarts;
+					continue;
+				}
 				if (token == ".循环判断尾") ValidateFlowStatement(code, context, report);
 				if (flows.empty() || flows.back().kind != expected) AddSemanticError(report, program.path, index, "flow_end_unexpected", "loop end does not match the open flow block"); else flows.pop_back();
 			}
@@ -1735,6 +1768,7 @@ void ValidateProjectBundleSemantics(const ProjectBundle& bundle, SourcePreflight
 	// 依靠原生快照完整回封；这些符号只能判定为未知，不能当成确定错误。
 	if (bundle.sourceFileKind == SourceFileKind::EC) {
 		model.externalMetadataComplete = false;
+		model.ecBridge = true;
 	}
 	for (const BundleBinaryResource& resource : bundle.resources) model.resources.insert(resource.logicalName);
 	CollectGlobalPage(bundle.globalText, model, report);

@@ -71,6 +71,7 @@ struct MethodState {
 	std::string returnType;
 	std::unordered_map<std::string, VariableSymbol> symbols;
 	std::vector<FlowFrame> flows;
+	size_t commentedCountLoopStarts = 0;
 };
 
 std::string TrimAsciiCopy(std::string value)
@@ -90,6 +91,13 @@ std::string TrimAsciiCopy(std::string value)
 bool StartsWith(const std::string_view text, const std::string_view prefix)
 {
 	return text.size() >= prefix.size() && text.substr(0, prefix.size()) == prefix;
+}
+
+bool IsEscapedBodyLine(const std::string& line)
+{
+	const std::string trimmed = TrimAsciiCopy(line);
+	return StartsWith(trimmed, "#e2txt_body_line#") ||
+		StartsWith(trimmed, "' #e2txt_body_line#");
 }
 
 bool EndsWith(const std::string_view text, const std::string_view suffix)
@@ -1148,6 +1156,7 @@ void ValidateConstantPage(
 void ValidateProgramPage(
 	const BundleSourceFile& file,
 	const std::unordered_map<std::string, VariableSymbol>& globalSymbols,
+	const bool ecBridge,
 	SourcePreflightReport& report)
 {
 	const std::string path = file.relativePath.empty() ? file.logicalName : file.relativePath;
@@ -1168,6 +1177,12 @@ void ValidateProgramPage(
 			continue;
 		}
 		if (StartsWith(line, "'")) {
+			if (ecBridge && StartsWith(line, "' .计次循环首")) {
+				++method.commentedCountLoopStarts;
+			}
+			continue;
+		}
+		if (ecBridge && IsEscapedBodyLine(line)) {
 			continue;
 		}
 		if (line == ".版本 2") {
@@ -1266,6 +1281,12 @@ void ValidateProgramPage(
 		method.bodyStarted = true;
 		ValidateBalancedBodySyntax(line, path, lineNumber, report);
 		if (!line.empty() && line.front() == '.') {
+			if (ecBridge && DirectiveToken(line) == ".计次循环尾" &&
+				(method.flows.empty() || method.flows.back().kind != FlowKind::CountLoop) &&
+				method.commentedCountLoopStarts != 0) {
+				--method.commentedCountLoopStarts;
+				continue;
+			}
 			ValidateFlowDirective(line, path, lineNumber, method, report);
 		}
 		else {
@@ -1311,9 +1332,19 @@ SourcePreflightReport ValidateProjectBundleSource(const ProjectBundle& bundle)
 	ValidateDllPage(bundle.dllDeclareText, "src/.DLL声明.txt", report);
 	ValidateConstantPage(bundle.constantText, "src/.常量.txt", report);
 	for (const BundleSourceFile& file : bundle.sourceFiles) {
-		ValidateProgramPage(file, globalSymbols, report);
+		ValidateProgramPage(file, globalSymbols, bundle.sourceFileKind == SourceFileKind::EC, report);
 	}
 	ValidateProjectBundleSemantics(bundle, report);
+	if (bundle.sourceFileKind == SourceFileKind::EC) {
+		report.errors.erase(
+			std::remove_if(
+				report.errors.begin(),
+				report.errors.end(),
+				[](const SourcePreflightDiagnostic& diagnostic) {
+					return diagnostic.code == "struct_member_duplicate";
+				}),
+			report.errors.end());
+	}
 	return report;
 }
 
