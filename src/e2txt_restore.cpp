@@ -8186,6 +8186,7 @@ void ParseStructPage(const Page& page, std::vector<ParsedStructDef>& outStructs)
 {
 	std::vector<std::string> fields;
 	ParsedStructDef* current = nullptr;
+	ParsedVariableDef* currentMember = nullptr;
 	for (const auto& line : page.lines) {
 		const std::string trimmed = TrimAsciiCopy(line);
 		if (StartsWith(trimmed, ".数据类型")) {
@@ -8196,6 +8197,7 @@ void ParseStructPage(const Page& page, std::vector<ParsedStructDef>& outStructs)
 			item.comment = ExtractRemainingDefinitionFieldText(trimmed, "数据类型", 2);
 			outStructs.push_back(std::move(item));
 			current = &outStructs.back();
+			currentMember = nullptr;
 			continue;
 		}
 		if (current != nullptr && StartsWith(trimmed, ".成员")) {
@@ -8207,6 +8209,13 @@ void ParseStructPage(const Page& page, std::vector<ParsedStructDef>& outStructs)
 			member.arrayText = GetFieldOrEmpty(fields, 3);
 			member.comment = ExtractRemainingDefinitionFieldText(trimmed, "成员", 4);
 			current->members.push_back(std::move(member));
+			currentMember = &current->members.back();
+			continue;
+		}
+		if (!trimmed.empty() && current != nullptr && trimmed.front() != '.') {
+			std::string& comment = currentMember != nullptr ? currentMember->comment : current->comment;
+			if (!comment.empty()) comment += "\r\n";
+			comment += trimmed;
 		}
 	}
 }
@@ -8215,6 +8224,7 @@ void ParseDllPage(const Page& page, std::vector<ParsedDllDef>& outDlls)
 {
 	std::vector<std::string> fields;
 	ParsedDllDef* current = nullptr;
+	ParsedVariableDef* currentParam = nullptr;
 	for (const auto& line : page.lines) {
 		const std::string trimmed = TrimAsciiCopy(line);
 		if (StartsWith(trimmed, ".DLL命令")) {
@@ -8228,6 +8238,7 @@ void ParseDllPage(const Page& page, std::vector<ParsedDllDef>& outDlls)
 			dll.comment = ExtractRemainingDefinitionFieldText(trimmed, "DLL命令", 5);
 			outDlls.push_back(std::move(dll));
 			current = &outDlls.back();
+			currentParam = nullptr;
 			continue;
 		}
 		if (current != nullptr && StartsWith(trimmed, ".参数")) {
@@ -8238,6 +8249,13 @@ void ParseDllPage(const Page& page, std::vector<ParsedDllDef>& outDlls)
 			param.flagsText = GetFieldOrEmpty(fields, 2);
 			param.comment = ExtractRemainingDefinitionFieldText(trimmed, "参数", 3);
 			current->params.push_back(std::move(param));
+			currentParam = &current->params.back();
+			continue;
+		}
+		if (!trimmed.empty() && current != nullptr && trimmed.front() != '.') {
+			std::string& comment = currentParam != nullptr ? currentParam->comment : current->comment;
+			if (!comment.empty()) comment += "\r\n";
+			comment += trimmed;
 		}
 	}
 }
@@ -11798,7 +11816,7 @@ void WriteConstants(ByteWriter& writer, const std::vector<RestoreConstant>& cons
 		}
 		if (const auto boolValue = ParseBoolLiteral(valueText); boolValue.has_value()) {
 			out.WriteU8(kConstTypeBool);
-			out.WriteBool32(*boolValue);
+			out.WriteI16(*boolValue ? static_cast<std::int16_t>(-1) : static_cast<std::int16_t>(0));
 			return;
 		}
 

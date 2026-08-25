@@ -2010,8 +2010,8 @@ bool ParseConstants(std::int32_t count, const std::vector<std::uint8_t>& bytes, 
 				break;
 			}
 			case kConstTypeBool: {
-				std::int32_t value = 0;
-				if (!itemReader.ReadI32(value)) {
+				std::int16_t value = 0;
+				if (!itemReader.ReadI16(value)) {
 					return false;
 				}
 				item.valueText = value != 0 ? "真" : "假";

@@ -17,6 +17,7 @@
 #include <utility>
 
 #include "PathHelper.h"
+#include "SourceExpressionParser.h"
 #include "SourceSemanticValidator.h"
 #include "e2txt.h"
 
@@ -801,18 +802,14 @@ void ValidateAssignment(
 	if (code.empty() || code.front() == '.') {
 		return;
 	}
-	constexpr std::string_view kAssignment = "＝";
-	const auto assignment = FindTopLevelOperator(code, kAssignment);
-	if (!assignment.has_value()) {
-		const auto asciiEquals = FindTopLevelOperator(code, "=");
-		if (asciiEquals.has_value()) {
-			AddError(report, path, lineNumber, "halfwidth_assignment_operator", "use the full-width E-language assignment operator");
-		}
+	size_t assignment = 0;
+	size_t assignmentLength = 0;
+	if (!FindSourceTopLevelAssignment(code, assignment, assignmentLength)) {
 		return;
 	}
 
-	const std::string left = TrimAsciiCopy(code.substr(0, *assignment));
-	const std::string right = TrimAsciiCopy(code.substr(*assignment + kAssignment.size()));
+	const std::string left = TrimAsciiCopy(code.substr(0, assignment));
+	const std::string right = TrimAsciiCopy(code.substr(assignment + assignmentLength));
 	if (left.empty() || right.empty()) {
 		AddError(report, path, lineNumber, "assignment_empty_side", "assignment requires both a target and a value");
 		return;
@@ -1019,7 +1016,7 @@ void ValidateGlobalPage(
 		}
 		const ParsedDeclaration declaration = ParseDeclaration(line, "全局变量", path, index + 1, report);
 		// 旧工程的原生变量表可能保留一个完全空白的末尾网格行。
-		if (declaration.fields.empty()) {
+		if (IsEmptyDeclaration(declaration, 4)) {
 			continue;
 		}
 		ValidateVariableDeclaration(declaration, "全局变量", path, index + 1, report);
@@ -1037,7 +1034,6 @@ void ValidateStructPage(
 	report.checkedLines += lines.size();
 	ValidateVersionLine(lines, path, true, report);
 	std::unordered_set<std::string> structNames;
-	std::unordered_set<std::string> memberNames;
 	bool hasCurrentStruct = false;
 	for (size_t index = 0; index < lines.size(); ++index) {
 		const std::string line = TrimAsciiCopy(lines[index]);
@@ -1046,6 +1042,10 @@ void ValidateStructPage(
 		}
 		if (MatchDirective(line, "数据类型")) {
 			const ParsedDeclaration declaration = ParseDeclaration(line, "数据类型", path, index + 1, report);
+			if (IsEmptyDeclaration(declaration, 2)) {
+				hasCurrentStruct = false;
+				continue;
+			}
 			ValidateNameField(declaration, path, index + 1, report);
 			ValidateExactField(declaration, 1, { "", "公开" }, path, index + 1, "struct_attribute_invalid", report);
 			const std::string name = FieldOrEmpty(declaration, 0);
@@ -1053,19 +1053,22 @@ void ValidateStructPage(
 				AddError(report, path, index + 1, "struct_duplicate", "duplicate data type name");
 			}
 			hasCurrentStruct = true;
-			memberNames.clear();
 			continue;
 		}
 		if (MatchDirective(line, "成员")) {
 			const ParsedDeclaration declaration = ParseDeclaration(line, "成员", path, index + 1, report);
+			// 原生数据类型表允许用空白成员行或仅带说明的成员行作分隔。
+			if (IsEmptyDeclaration(declaration, 4)) {
+				continue;
+			}
 			ValidateVariableDeclaration(declaration, "成员", path, index + 1, report);
 			if (!hasCurrentStruct) {
 				AddError(report, path, index + 1, "struct_member_without_owner", "member declaration must follow a data type declaration");
 			}
-			const std::string name = FieldOrEmpty(declaration, 0);
-			if (!name.empty() && !memberNames.insert(name).second) {
-				AddError(report, path, index + 1, "struct_member_duplicate", "duplicate member name in the same data type");
-			}
+			continue;
+		}
+		if (hasCurrentStruct && line.front() != '.') {
+			// 声明说明可包含原生换行，拆包后后续行保持为说明正文。
 			continue;
 		}
 		AddError(report, path, index + 1, "fixed_page_directive_invalid", "data-type page may only contain data-type and member declarations");
@@ -1090,6 +1093,10 @@ void ValidateDllPage(
 		}
 		if (MatchDirective(line, "DLL命令")) {
 			const ParsedDeclaration declaration = ParseDeclaration(line, "DLL命令", path, index + 1, report);
+			if (IsEmptyDeclaration(declaration, 5)) {
+				hasCurrentDll = false;
+				continue;
+			}
 			ValidateNameField(declaration, path, index + 1, report);
 			ValidateTypeField(declaration, 1, false, path, index + 1, report);
 			ValidateQuotedDllField(declaration, 2, path, index + 1, report);
@@ -1104,12 +1111,19 @@ void ValidateDllPage(
 		}
 		if (MatchDirective(line, "参数")) {
 			const ParsedDeclaration declaration = ParseDeclaration(line, "参数", path, index + 1, report);
+			if (IsEmptyDeclaration(declaration, 3)) {
+				continue;
+			}
 			ValidateNameField(declaration, path, index + 1, report);
 			ValidateTypeField(declaration, 1, false, path, index + 1, report);
 			ValidateParameterFlags(declaration, true, path, index + 1, report);
 			if (!hasCurrentDll) {
 				AddError(report, path, index + 1, "dll_parameter_without_owner", "DLL parameter must follow a DLL command declaration");
 			}
+			continue;
+		}
+		if (hasCurrentDll && line.front() != '.') {
+			// DLL 命令及参数的说明字段可以包含原生换行。
 			continue;
 		}
 		AddError(report, path, index + 1, "fixed_page_directive_invalid", "DLL page may only contain DLL-command and parameter declarations");
@@ -1141,7 +1155,10 @@ void ValidateConstantPage(
 			FieldOrEmpty(declaration, 1) == "\"\"") {
 			continue;
 		}
-		ValidateNameField(declaration, path, index + 1, report);
+		// 原生常量表允许保留没有公开名称的内部常量槽位。
+		if (!FieldOrEmpty(declaration, 0).empty()) {
+			ValidateNameField(declaration, path, index + 1, report);
+		}
 		if (FieldOrEmpty(declaration, 1).empty()) {
 			AddError(report, path, index + 1, "constant_value_missing", "constant value is required");
 		}

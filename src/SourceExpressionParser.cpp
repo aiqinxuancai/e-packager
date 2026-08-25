@@ -553,6 +553,15 @@ bool FindSourceTopLevelAssignment(
 		else if (text[pos] == '}') --braces;
 		else if (parentheses == 0 && brackets == 0 && braces == 0) {
 			if (IsQuoteAt(text, pos, "＝")) { outPosition = pos; outLength = std::string("＝").size(); return true; }
+			if (text[pos] == '=') {
+				const char previous = pos == 0 ? '\0' : text[pos - 1];
+				const char next = pos + 1 >= text.size() ? '\0' : text[pos + 1];
+				if (previous != '=' && previous != '!' && previous != '<' && previous != '>' && next != '=') {
+					outPosition = pos;
+					outLength = 1;
+					return true;
+				}
+			}
 		}
 		pos = NextCharacterIndex(text, pos);
 	}

@@ -1451,16 +1451,11 @@ void ValidateCallStatement(
 		if (argumentCount == 0 || IsMissing(*parsed.root->children[1])) return;
 		const EvaluatedExpression value = EvaluateExpression(*parsed.root->children[1], context, report);
 		const TypeInfo& returnType = context.method.callable.returnType;
-		if (returnType.name.empty()) {
-			if (context.model.externalMetadataComplete) {
-				AddSemanticError(report, context.path, context.line, "return_value_unexpected", "a subprogram without a return type cannot return a value");
-			}
+		if (returnType.name.empty() || Category(returnType) == TypeCategory::Void) {
+			// 易语言的“返回”命令允许携带值；无返回类型的调用方不会取得该值。
 			return;
 		}
-		if (Category(returnType) == TypeCategory::Void) {
-			AddSemanticError(report, context.path, context.line, "return_value_unexpected", "a subprogram without a return type cannot return a value");
-		}
-		else if (value.state == ResolveState::Valid && !Compatible(returnType, value.type, &context.model)) {
+		if (value.state == ResolveState::Valid && !Compatible(returnType, value.type, &context.model)) {
 			AddSemanticError(report, context.path, context.line, "return_type_mismatch", "returned expression is definitely incompatible with the subprogram return type");
 		}
 		return;
@@ -1719,29 +1714,6 @@ void ValidateDeclaredTypes(const SemanticModel& model, SourcePreflightReport& re
 void ValidateCrossPageNames(const ProjectBundle& bundle, SourcePreflightReport& report)
 {
 	struct Origin { std::string path; std::size_t line = 0; };
-	std::unordered_map<std::string, Origin> localTypes;
-	const std::vector<std::string> dataTypeLines = SplitLines(bundle.dataTypeText);
-	for (std::size_t index = 0; index < dataTypeLines.size(); ++index) {
-		const std::string line = Trim(StripComment(dataTypeLines[index]));
-		std::string rest;
-		if (!MatchDirective(line, "数据类型", &rest)) continue;
-		const std::string name = Field(SplitFields(rest), 0);
-		if (!name.empty()) localTypes.emplace(name, Origin { "src/.数据类型.txt", index + 1 });
-	}
-	for (const BundleSourceFile& file : bundle.sourceFiles) {
-		const std::string path = file.relativePath.empty() ? file.logicalName : file.relativePath;
-		const std::vector<std::string> lines = SplitLines(file.content);
-		for (std::size_t index = 0; index < lines.size(); ++index) {
-			const std::string line = Trim(StripComment(lines[index]));
-			std::string rest;
-			if (!MatchDirective(line, "程序集", &rest)) continue;
-			const std::string name = Field(SplitFields(rest), 0);
-			if (name.empty()) continue;
-			const auto [it, inserted] = localTypes.emplace(name, Origin { path, index + 1 });
-			if (!inserted) AddSemanticError(report, path, index + 1, "type_name_conflict", "assembly and data-type names must be unique across source pages");
-		}
-	}
-
 	std::unordered_map<std::string, Origin> constantNames;
 	const std::vector<std::string> constantLines = SplitLines(bundle.constantText);
 	for (std::size_t index = 0; index < constantLines.size(); ++index) {
@@ -1763,12 +1735,21 @@ void ValidateCrossPageNames(const ProjectBundle& bundle, SourcePreflightReport& 
 void ValidateProjectBundleSemantics(const ProjectBundle& bundle, SourcePreflightReport& report)
 {
 	SemanticModel model;
-	// `.ec` 拆包通过内部 `.e` 桥接暴露源码。桥接源码中的匿名原生类、
-	// 支持库命令和窗体成员不一定能从公开头文件还原，但未修改源码仍可
-	// 依靠原生快照完整回封；这些符号只能判定为未知，不能当成确定错误。
-	if (bundle.sourceFileKind == SourceFileKind::EC) {
+	std::unordered_set<std::string> nativeEquivalentSourcePaths;
+	// 拆包目录的公开文本不一定能还原匿名原生类型、隐藏符号和全部支持库
+	// 元数据。只要原生快照仍在，这些符号只能判定为未知，不能当成确定错误。
+	if (bundle.sourceFileKind == SourceFileKind::EC || !bundle.nativeSourceBytes.empty()) {
 		model.externalMetadataComplete = false;
-		model.ecBridge = true;
+		model.ecBridge = bundle.sourceFileKind == SourceFileKind::EC;
+		const size_t sourceLimit = (std::min)(bundle.sourceFiles.size(), bundle.nativeSourceSnapshots.size());
+		for (size_t index = 0; index < sourceLimit; ++index) {
+			const BundleSourceFile& file = bundle.sourceFiles[index];
+			const BundleNativeSourceFileSnapshot& snapshot = bundle.nativeSourceSnapshots[index];
+			if (!snapshot.contentDigest.empty() && snapshot.contentDigest == ComputeTextDigest(file.content)) {
+				const std::string path = file.relativePath.empty() ? file.logicalName : file.relativePath;
+				nativeEquivalentSourcePaths.insert(LocalTextToUtf8(path));
+			}
+		}
 	}
 	for (const BundleBinaryResource& resource : bundle.resources) model.resources.insert(resource.logicalName);
 	CollectGlobalPage(bundle.globalText, model, report);
@@ -1785,8 +1766,7 @@ void ValidateProjectBundleSemantics(const ProjectBundle& bundle, SourcePreflight
 		for (const MethodSymbol& method : program.methods) ValidateMethodBody(program, method, model, report);
 	}
 	if (!model.externalMetadataComplete) {
-		// `.ec` 公开源码不包含完整的支持库/匿名类型元数据。保留语法、
-		// 结构和名称冲突错误，但丢弃依赖这些元数据才能确定的类型诊断。
+		// 保留语法和结构错误，丢弃必须依赖完整原生元数据才能确定的诊断。
 		static const std::unordered_set<std::string> uncertainCodes = {
 			"address_of_target_not_found", "addition_type_mismatch", "arithmetic_type_mismatch",
 			"array_index_rank_mismatch", "array_index_type_mismatch", "assignment_type_mismatch",
@@ -1802,7 +1782,10 @@ void ValidateProjectBundleSemantics(const ProjectBundle& bundle, SourcePreflight
 			std::remove_if(
 				report.errors.begin(),
 				report.errors.end(),
-				[&](const SourcePreflightDiagnostic& diagnostic) { return uncertainCodes.contains(diagnostic.code); }),
+				[&](const SourcePreflightDiagnostic& diagnostic) {
+					return uncertainCodes.contains(diagnostic.code) &&
+						(bundle.sourceFileKind == SourceFileKind::EC || nativeEquivalentSourcePaths.contains(diagnostic.filePath));
+				}),
 			report.errors.end());
 	}
 }
