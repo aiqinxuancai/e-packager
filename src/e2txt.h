@@ -404,6 +404,9 @@ struct Document {
 // 导出选项。
 struct GenerateOptions {
 	bool includeImportedPages = false;
+	// 编译器读取易模块时保留已嵌入模块二进制的导入函数体。
+	// 普通拆包继续隐藏它们，避免把上游模块实现重复写入工作区。
+	bool includeImportedFunctions = false;
 };
 
 // 读取源工程文件时的附加选项。
@@ -443,6 +446,12 @@ public:
 		ProjectBundle& outBundle,
 		std::string* outError,
 		const ReadOptions& readOptions = {}) const;
+	// 为独立编译器生成模块包，保留模块内已嵌入的导入函数体。
+	bool GenerateCompilerBundle(
+		const std::string& inputPath,
+		ProjectBundle& outBundle,
+		std::string* outError,
+		const ReadOptions& readOptions = {}) const;
 	// 按内存中的 .e 二进制直接生成文档。
 	bool GenerateDocumentFromBytes(
 		const std::vector<std::uint8_t>& inputBytes,
@@ -464,6 +473,12 @@ public:
 		const GenerateOptions& options = {}) const;
 
 private:
+	bool GenerateBundleInternal(
+		const std::string& inputPath,
+		const GenerateOptions& options,
+		const ReadOptions& readOptions,
+		ProjectBundle& outBundle,
+		std::string* outError) const;
 	bool GenerateDocumentInternal(
 		const std::string& inputPath,
 		const GenerateOptions& options,

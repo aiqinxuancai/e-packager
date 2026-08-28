@@ -200,10 +200,13 @@ bool WriteImportDefinition(
 
 bool IsPlatformImportModule(const std::string& moduleName)
 {
-	std::string normalized = moduleName;
+	std::filesystem::path modulePath = Utf8PathToPath(moduleName);
+	std::string normalized = modulePath.filename().string();
+	if (normalized.empty()) normalized = moduleName;
 	std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](const unsigned char value) {
 		return static_cast<char>(std::tolower(value));
 	});
+	if (std::filesystem::path(normalized).extension().empty()) normalized += ".dll";
 	return normalized == "kernel32.dll" || normalized == "user32.dll" || normalized == "gdi32.dll" ||
 		normalized == "advapi32.dll" || normalized == "shell32.dll" || normalized == "ole32.dll" ||
 		normalized == "oleaut32.dll" || normalized == "comdlg32.dll" || normalized == "winmm.dll" ||

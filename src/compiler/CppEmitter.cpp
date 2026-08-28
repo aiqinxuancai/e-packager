@@ -119,10 +119,13 @@ bool IsCompilePrimitive(const support_library_public_info::CommandMetadata& comm
 
 bool IsPlatformImportModule(const std::string& moduleName)
 {
-	std::string normalized = moduleName;
+	std::filesystem::path modulePath = Utf8PathToPath(moduleName);
+	std::string normalized = modulePath.filename().string();
+	if (normalized.empty()) normalized = moduleName;
 	std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](const unsigned char value) {
 		return static_cast<char>(std::tolower(value));
 	});
+	if (std::filesystem::path(normalized).extension().empty()) normalized += ".dll";
 	return normalized == "kernel32.dll" || normalized == "user32.dll" || normalized == "gdi32.dll" ||
 		normalized == "advapi32.dll" || normalized == "shell32.dll" || normalized == "ole32.dll" ||
 		normalized == "oleaut32.dll" || normalized == "comdlg32.dll" || normalized == "winmm.dll" ||
@@ -954,6 +957,8 @@ static void DestroyValue(Value& value) {
         return;
     }
     if(descriptor!=nullptr) {
+        // 文本和字节集由 Value 自身的容器管理；不需要也不能按对象
+        // 析构路径处理。只有嵌套复合字段可能注册生命周期回调。
         for(auto& field:value.fields) if(FindType(field.type)!=nullptr) DestroyValue(field);
     }
     value.object.clear();
@@ -1240,6 +1245,11 @@ private:
 		return nullptr;
 	}
 
+	const Method* ResolveOwnedMethod(const Method& owner, const std::string& name, const std::size_t argumentCount) const
+	{
+		return owner.ownerType.valid ? ResolveMemberMethod(owner.ownerType, name, argumentCount) : nullptr;
+	}
+
 	const DllCommand* ResolveDllCommand(const std::string& name, const std::size_t argumentCount) const
 	{
 		const auto found = program_.dllCommandByName.find(name);
@@ -1298,6 +1308,7 @@ private:
 			if (node.children.empty()) return {};
 			const auto& callee = *node.children.front(); const std::size_t count = node.children.size() - 1;
 			if (callee.kind == Kind::Name) {
+				if (const Method* owned = ResolveOwnedMethod(method, callee.text, count)) return owned->returnType;
 				if (const auto methodFound = program_.methodByName.find(callee.text); methodFound != program_.methodByName.end()) return program_.methods[methodFound->second].returnType;
 				if (const DllCommand* dll = ResolveDllCommand(callee.text, count)) return dll->returnType;
 				if (const auto command = ResolveGlobalCommand(callee.text, count)) {
@@ -1503,6 +1514,14 @@ private:
 				continue;
 			}
 			if (!parameter.byReference) {
+				const bool platformComposite = IsPlatformImportModule(command.fileName) &&
+					program_.FindType(type.code) != nullptr;
+				if (referenceable && platformComposite) {
+					result << "Value& __dll_target_" << index << "=" << EmitLvalue(method, *source) << ";";
+					syncStatements.push_back(
+						"if(!" + valueName + ".object.empty()) { ReadObject(" + valueName + "," + valueName + ".object.data()); Assign(__dll_target_" +
+						std::to_string(index) + "," + valueName + "); }");
+				}
 				callArguments.push_back(DllValueExpression(type, valueName));
 				continue;
 			}
@@ -1579,13 +1598,7 @@ private:
 	{
 		const auto found = dllImportSymbols_.find(commandIndex);
 		if (found != dllImportSymbols_.end()) return found->second;
-		std::string module = command.fileName;
-		std::transform(module.begin(), module.end(), module.begin(), [](const unsigned char value) {
-			return static_cast<char>(std::tolower(value));
-		});
-		const bool platformImport = module == "kernel32.dll" || module == "user32.dll" || module == "gdi32.dll" ||
-			module == "advapi32.dll" || module == "shell32.dll" || module == "ole32.dll" || module == "oleaut32.dll" ||
-			module == "comdlg32.dll" || module == "winmm.dll" || module == "odbc32.dll" || module == "odbccp32.dll" || module == "ws2_32.dll";
+		const bool platformImport = IsPlatformImportModule(command.fileName);
 		const std::string symbol = platformImport && IsCppIdentifier(command.entryName) ? command.entryName : "ecompiler_import_" + std::to_string(commandIndex);
 		if (platformImport) {
 			imports_.push_back({commandIndex, command.fileName, command.entryName, symbol, command.usesCdecl, command.parameters.size() * 4});
@@ -1653,6 +1666,15 @@ private:
 		if (node.children.empty()) { Fail("call_target_missing"); return "Empty()"; }
 		const auto& callee = *node.children.front(); const std::size_t argumentCount = node.children.size() - 1;
 		if (callee.kind == Kind::Name) {
+			if (const Method* owned = ResolveOwnedMethod(method, callee.text, argumentCount)) {
+				if (argumentCount > owned->parameters.size()) { Fail("too_many_owned_method_arguments:" + callee.text); return "Empty()"; }
+				QueueMethod(owned->id); std::string arguments = "{";
+				for (std::size_t index = 1; index < node.children.size(); ++index) {
+					const bool byReference = index - 1 < owned->parameters.size() && owned->parameters[index - 1].byReference;
+					arguments += EmitArg(method, *node.children[index], byReference) + ',';
+				}
+				arguments += '}'; return "method_" + std::to_string(owned->id) + '(' + arguments + ',' + (method.ownerType.valid ? "self" : "nullptr") + ')';
+			}
 			if (const auto target = program_.methodByName.find(callee.text); target != program_.methodByName.end()) {
 				const Method& targetMethod = program_.methods[target->second];
 				if (argumentCount > targetMethod.parameters.size()) { Fail("too_many_method_arguments:" + callee.text); return "Empty()"; }
@@ -1843,16 +1865,33 @@ private:
 		}
 		if (machineStatement != nullptr) {
 			const std::string helper = "ecompiler_machine_" + std::to_string(method.id);
-			body_ << "\nextern \"C\" __declspec(naked) int " << (method.usesCdecl ? "__cdecl" : "__stdcall") << ' ' << helper << "(";
+			const bool hasExplicitReturn = std::any_of(
+				machineStatement->machineCode.begin(),
+				machineStatement->machineCode.end(),
+				[](const std::uint8_t byte) { return byte == 0xC2 || byte == 0xC3 || byte == 0xCA || byte == 0xCB; });
+			// 不带 ret 的片段是 IDE 嵌入到正常子程序框架中的代码；
+			// 该框架提供 EBP 参数槽及尾声。带 ret 的片段自行管理 ABI。
+			const bool usesEbpFrame = !hasExplicitReturn ||
+				std::find(machineStatement->machineCode.begin(), machineStatement->machineCode.end(), static_cast<std::uint8_t>(0xC9)) != machineStatement->machineCode.end() ||
+				std::find(machineStatement->machineCode.begin(), machineStatement->machineCode.end(), static_cast<std::uint8_t>(0x55)) != machineStatement->machineCode.end();
+			const bool returnsLong = method.returnType.code == kTypeInt64;
+			const std::string helperReturn = returnsLong ? "long long" : "int";
+			body_ << "\nextern \"C\" __declspec(naked) " << helperReturn << ' ' << (method.usesCdecl ? "__cdecl" : "__stdcall") << ' ' << helper << "(";
 			for (std::size_t index = 0; index < method.parameters.size(); ++index) {
 				if (index != 0) body_ << ',';
 				body_ << "int arg" << index;
 			}
 			body_ << ") {\n    __asm {\n";
+			if (usesEbpFrame) body_ << "        push ebp\n        mov ebp, esp\n";
 			for (const std::uint8_t byte : machineStatement->machineCode) {
 				std::ostringstream instruction;
 				instruction << "        _emit 0x" << std::hex << std::uppercase << static_cast<unsigned int>(byte) << "\n";
 				body_ << instruction.str();
+			}
+			if (!hasExplicitReturn) {
+				if (usesEbpFrame) body_ << "        mov esp, ebp\n        pop ebp\n";
+				if (method.usesCdecl || method.parameters.empty()) body_ << "        ret\n";
+				else body_ << "        ret " << (method.parameters.size() * sizeof(std::uint32_t)) << "\n";
 			}
 			body_ << "    }\n}\n";
 			body_ << "\nstatic Value method_" << method.id << "(std::vector<Arg> a,Value* self) {\n";
@@ -1869,6 +1908,10 @@ private:
 			}
 			call += ")";
 			if (method.returnType.code == kTypeNull) Line(1, "(void)" + call + ";");
+			else if (returnsLong) {
+				Line(1, "long long __machine_result=" + call + ";");
+				Line(1, "Value __machine_value=MakeVar(" + Hex(method.returnType.code) + "); __machine_value.integer=__machine_result; return __machine_value;");
+			}
 			else Line(1, "return Integer(" + call + "," + Hex(method.returnType.code) + ");");
 			if (method.returnType.code == kTypeNull) Line(1, "return Empty();");
 			body_ << "}\n";

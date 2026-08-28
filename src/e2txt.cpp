@@ -3198,6 +3198,7 @@ public:
 		, m_sourceFileKind(DetectSourceFileKindFromPath(sourcePath))
 		, m_removedDefinedItems(removedDefinedItems)
 	{
+		BuildClassTypePageMap();
 		BuildUserNameCache();
 	}
 
@@ -3205,6 +3206,13 @@ public:
 	{
 		if (typeValue == 0) {
 			return std::string();
+		}
+		// 易模块内联后，函数的 ownerClass 可能仍保留上游模块的
+		// 类型 ID，而实际实现页使用本模块分配的代码页 ID。优先
+		// 将该类型 ID 映射回承载实现的代码页，保证声明和引用一致。
+		if (const auto mappedPage = m_classTypePageById.find(typeValue);
+			mappedPage != m_classTypePageById.end()) {
+			return ResolveUserName(mappedPage->second);
 		}
 		for (const auto& dataType : m_program.dataTypes) {
 			if (dataType.header.dwId == typeValue || dataType.header.dwUnk == typeValue) {
@@ -3485,6 +3493,30 @@ private:
 			return name;
 		}
 		return BuildSequentialPlaceholderName(prefix, counter);
+	}
+
+	void BuildClassTypePageMap()
+	{
+		std::unordered_set<std::int32_t> ambiguousTypeIds;
+		for (const auto& page : m_program.codePages) {
+			for (const std::int32_t functionId : page.functionIds) {
+				const auto function = std::find_if(
+					m_program.functions.begin(),
+					m_program.functions.end(),
+					[functionId](const FunctionInfo& item) { return item.header.dwId == functionId; });
+				if (function == m_program.functions.end() ||
+					function->ownerClass == 0 || function->ownerClass == -1) {
+					continue;
+				}
+				const auto [existing, inserted] = m_classTypePageById.emplace(function->ownerClass, page.header.dwId);
+				if (!inserted && existing->second != page.header.dwId) {
+					ambiguousTypeIds.insert(function->ownerClass);
+				}
+			}
+		}
+		for (const std::int32_t typeId : ambiguousTypeIds) {
+			m_classTypePageById.erase(typeId);
+		}
 	}
 
 	void BuildUserNameCache()
@@ -3823,6 +3855,7 @@ private:
 	SourceFileKind m_sourceFileKind = SourceFileKind::E;
 	const std::vector<RemovedDefinedItemInfo>* m_removedDefinedItems = nullptr;
 	std::unordered_map<std::int32_t, std::string> m_userNameCache;
+	std::unordered_map<std::int32_t, std::int32_t> m_classTypePageById;
 	std::unordered_map<std::int32_t, std::string> m_methodOwnerNameCache;
 	std::unordered_map<std::uint16_t, SupportLibrarySymbols> m_supportCache;
 };
@@ -4268,9 +4301,15 @@ bool IsAnonymousRootProgramPage(const CodePageInfo& page)
 	return IsRootProgramPage(page) && IsAnonymousProgramPage(page);
 }
 
-std::string ResolveProgramPageLogicalName(const ProgramSection& program, const CodePageInfo& page)
+std::string ResolveProgramPageLogicalName(
+	const ProgramSection& program,
+	const CodePageInfo& page,
+	SymbolResolver& resolver)
 {
-	std::string logicalName = TrimAsciiCopy(page.name);
+	// 程序页名必须与变量/类型引用使用同一套原生符号解析规则。
+	// 特别是 `.ec` 内嵌类可能没有页名，只在调试符号或可丢失段中
+	// 保留导入时的类型名。
+	std::string logicalName = TrimAsciiCopy(resolver.ResolveUserName(page.header.dwId));
 	if (!logicalName.empty()) {
 		return logicalName;
 	}
@@ -4294,10 +4333,16 @@ bool ShouldKeepPage(
 	const std::vector<EComDependencyRecord>& dependencyRecords,
 	const CodePageInfo& page,
 	const std::vector<const FunctionInfo*>& functions,
-	bool includeImportedPages)
+	const GenerateOptions& options)
 {
 	if (page.name == "__HIDDEN_TEMP_MOD__") {
 		return false;
+	}
+	// 易模块已经把其上游模块的实现复制进原生程序段。独立编译时
+	// 必须保留这些隐藏页和导入函数，才能在不重新加载上游 .ec 的
+	// 前提下重建该模块的完整实现闭包。
+	if (options.includeImportedFunctions) {
+		return true;
 	}
 	if (IsClassHidden(sections, page.header.dwId) || IsDependencyDefinedId(dependencyRecords, page.header.dwId)) {
 		return false;
@@ -4314,7 +4359,7 @@ bool ShouldKeepPage(
 			functions.end(),
 			[](const FunctionInfo* item) { return item != nullptr && !IsImportedFunction(*item); });
 	}
-	if (includeImportedPages) {
+	if (options.includeImportedPages) {
 		return true;
 	}
 	if (functions.empty()) {
@@ -5637,10 +5682,10 @@ void BuildProgramPages(const ModuleSections& sections, const GenerateOptions& op
 	TraceLine("BuildProgramPages begin");
 	for (const auto& pageInfo : sections.program.codePages) {
 		const auto functions = CollectPageFunctions(sections.program, pageInfo);
-		if (!ShouldKeepPage(sections, dependencyRecords, pageInfo, functions, options.includeImportedPages)) {
+		if (!ShouldKeepPage(sections, dependencyRecords, pageInfo, functions, options)) {
 			continue;
 		}
-		const std::string logicalPageName = ResolveProgramPageLogicalName(sections.program, pageInfo);
+		const std::string logicalPageName = ResolveProgramPageLogicalName(sections.program, pageInfo, resolver);
 		TraceLine("BuildProgramPages page=" + logicalPageName + " funcs=" + std::to_string(functions.size()));
 
 		Page page;
@@ -5681,7 +5726,7 @@ void BuildProgramPages(const ModuleSections& sections, const GenerateOptions& op
 		AppendLine(page, "");
 
 		for (const auto* functionInfo : functions) {
-			if (functionInfo == nullptr || IsImportedFunction(*functionInfo)) {
+			if (functionInfo == nullptr || (!options.includeImportedFunctions && IsImportedFunction(*functionInfo))) {
 				continue;
 			}
 			try {
@@ -5739,7 +5784,7 @@ void BuildProgramPages(const ModuleSections& sections, const GenerateOptions& op
 	TraceLine("BuildProgramPages end count=" + std::to_string(outDocument.pages.size()));
 }
 
-void BuildGlobalPage(const ModuleSections& sections, Document& outDocument)
+void BuildGlobalPage(const ModuleSections& sections, const GenerateOptions& options, Document& outDocument)
 {
 	if (sections.program.globals.empty()) {
 		return;
@@ -5758,7 +5803,8 @@ void BuildGlobalPage(const ModuleSections& sections, Document& outDocument)
 	AppendLine(page, ".版本 2");
 	AppendLine(page, "");
 	for (const auto& item : sections.program.globals) {
-		if (IsGlobalHidden(item) || IsDependencyDefinedId(dependencyRecords, item.marker)) {
+		if (!options.includeImportedFunctions &&
+			(IsGlobalHidden(item) || IsDependencyDefinedId(dependencyRecords, item.marker))) {
 			continue;
 		}
 		AppendLine(page, BuildGlobalVariableLine(item, resolver));
@@ -5768,7 +5814,11 @@ void BuildGlobalPage(const ModuleSections& sections, Document& outDocument)
 	}
 }
 
-void BuildStructPage(const ModuleSections& sections, const AnonymousTypeHints& hints, Document& outDocument)
+void BuildStructPage(
+	const ModuleSections& sections,
+	const AnonymousTypeHints& hints,
+	const GenerateOptions& options,
+	Document& outDocument)
 {
 	if (sections.program.dataTypes.empty()) {
 		return;
@@ -5788,8 +5838,8 @@ void BuildStructPage(const ModuleSections& sections, const AnonymousTypeHints& h
 	AppendLine(page, "");
 	for (const auto& item : sections.program.dataTypes) {
 		if (IsTxt2EPlaceholderStruct(item) ||
-			IsStructHidden(item) ||
-			IsDependencyDefinedId(dependencyRecords, item.header.dwId)) {
+			(!options.includeImportedFunctions &&
+				(IsStructHidden(item) || IsDependencyDefinedId(dependencyRecords, item.header.dwId)))) {
 			continue;
 		}
 		std::string typeName = TrimAsciiCopy(item.name);
@@ -5819,7 +5869,11 @@ void BuildStructPage(const ModuleSections& sections, const AnonymousTypeHints& h
 	}
 }
 
-void BuildDllPage(const ModuleSections& sections, const AnonymousTypeHints& hints, Document& outDocument)
+void BuildDllPage(
+	const ModuleSections& sections,
+	const AnonymousTypeHints& hints,
+	const GenerateOptions& options,
+	Document& outDocument)
 {
 	if (sections.program.dlls.empty()) {
 		return;
@@ -5838,7 +5892,8 @@ void BuildDllPage(const ModuleSections& sections, const AnonymousTypeHints& hint
 	AppendLine(page, ".版本 2");
 	AppendLine(page, "");
 	for (const auto& item : sections.program.dlls) {
-		if (IsDllHidden(item) || IsDependencyDefinedId(dependencyRecords, item.header.dwId)) {
+		if (!options.includeImportedFunctions &&
+			(IsDllHidden(item) || IsDependencyDefinedId(dependencyRecords, item.header.dwId))) {
 			continue;
 		}
 		const std::string dllName = TrimAsciiCopy(resolver.ResolveUserName(item.header.dwId));
@@ -5863,7 +5918,7 @@ void BuildDllPage(const ModuleSections& sections, const AnonymousTypeHints& hint
 	}
 }
 
-void BuildConstantPage(const ModuleSections& sections, Document& outDocument)
+void BuildConstantPage(const ModuleSections& sections, const GenerateOptions& options, Document& outDocument)
 {
 	std::vector<EComDependencyRecord> dependencyRecords;
 	(void)ParseEComDependencies(sections.ecomSectionBytes, dependencyRecords);
@@ -5872,8 +5927,8 @@ void BuildConstantPage(const ModuleSections& sections, Document& outDocument)
 		sections.resources.constants.end(),
 		[&](const ConstantInfo& item) {
 			return item.pageType == kConstPageValue &&
-				!IsConstantHidden(item) &&
-				!IsDependencyDefinedId(dependencyRecords, item.marker);
+				(options.includeImportedFunctions ||
+					(!IsConstantHidden(item) && !IsDependencyDefinedId(dependencyRecords, item.marker)));
 		});
 	if (!hasValueConstants) {
 		return;
@@ -5893,8 +5948,8 @@ void BuildConstantPage(const ModuleSections& sections, Document& outDocument)
 		if (item.pageType != kConstPageValue ||
 			item.valueText == "<图片>" ||
 			item.valueText == "<声音>" ||
-			IsConstantHidden(item) ||
-			IsDependencyDefinedId(dependencyRecords, item.marker)) {
+			(!options.includeImportedFunctions &&
+				(IsConstantHidden(item) || IsDependencyDefinedId(dependencyRecords, item.marker)))) {
 			continue;
 		}
 		std::string valueText = item.valueText;
@@ -6390,12 +6445,12 @@ bool BuildDocumentFromSections(
 	BuildDependencies(sections, document);
 	const AnonymousTypeHints anonymousTypeHints = BuildAnonymousTypeHints(sections, sourcePath);
 	BuildProgramPages(sections, options, document);
-	BuildGlobalPage(sections, document);
-	BuildStructPage(sections, anonymousTypeHints, document);
-	BuildDllPage(sections, anonymousTypeHints, document);
+	BuildGlobalPage(sections, options, document);
+	BuildStructPage(sections, anonymousTypeHints, options, document);
+	BuildDllPage(sections, anonymousTypeHints, options, document);
 	BuildFormPage(sections, document);
 	BuildFormXmlEntries(sections, document);
-	BuildConstantPage(sections, document);
+	BuildConstantPage(sections, options, document);
 	outDocument = std::move(document);
 	return true;
 }
@@ -6485,10 +6540,12 @@ std::string BuildPublicHeaderText(
 	};
 
 	bool hasBodyContent = false;
+	GenerateOptions publicHeaderOptions;
+	publicHeaderOptions.includeImportedPages = true;
 	const auto appendProgramPages = [&](const bool classPagesOnly) {
 		for (const auto& pageInfo : sections.program.codePages) {
 			const auto functions = CollectPageFunctions(sections.program, pageInfo);
-			if (!ShouldKeepPage(sections, dependencyRecords, pageInfo, functions, true)) {
+			if (!ShouldKeepPage(sections, dependencyRecords, pageInfo, functions, publicHeaderOptions)) {
 				continue;
 			}
 
@@ -7113,10 +7170,11 @@ std::string BuildRelativePath(
 bool BuildBundleFromSections(
 	const ModuleSections& sections,
 	const std::string& sourcePath,
+	const GenerateOptions& requestedOptions,
 	ProjectBundle& outBundle)
 {
 	Document document;
-	GenerateOptions options;
+	GenerateOptions options = requestedOptions;
 	options.includeImportedPages = true;
 	if (!BuildDocumentFromSections(sections, sourcePath, options, document)) {
 		return false;
@@ -7156,12 +7214,12 @@ bool BuildBundleFromSections(
 	std::unordered_map<std::string, int> keyCounters;
 	for (const auto& pageInfo : sections.program.codePages) {
 		const auto functions = CollectPageFunctions(sections.program, pageInfo);
-		if (!ShouldKeepPage(sections, dependencyRecords, pageInfo, functions, true)) {
+		if (!ShouldKeepPage(sections, dependencyRecords, pageInfo, functions, options)) {
 			continue;
 		}
 		itemKeys.insert_or_assign(
 			pageInfo.header.dwId,
-			BuildItemKey("class", ResolveProgramPageLogicalName(sections.program, pageInfo), keyCounters));
+			BuildItemKey("class", ResolveProgramPageLogicalName(sections.program, pageInfo, resolver), keyCounters));
 	}
 	for (const auto& item : sections.program.globals) {
 		if (IsGlobalHidden(item) || IsDependencyDefinedId(dependencyRecords, item.marker)) {
@@ -7225,7 +7283,7 @@ bool BuildBundleFromSections(
 			while (programPageIndex < sections.program.codePages.size()) {
 				const auto& candidate = sections.program.codePages[programPageIndex];
 				const auto functions = CollectPageFunctions(sections.program, candidate);
-				if (ShouldKeepPage(sections, dependencyRecords, candidate, functions, true)) {
+				if (ShouldKeepPage(sections, dependencyRecords, candidate, functions, options)) {
 					break;
 				}
 				++programPageIndex;
@@ -7240,7 +7298,7 @@ bool BuildBundleFromSections(
 			file.key = itemKeys[pageInfo.header.dwId];
 			file.logicalName = TrimAsciiCopy(page.name);
 			if (file.logicalName.empty()) {
-				file.logicalName = ResolveProgramPageLogicalName(sections.program, pageInfo);
+				file.logicalName = ResolveProgramPageLogicalName(sections.program, pageInfo, resolver);
 			}
 			file.relativePath = MakeUniqueRelativePath(
 				BuildRelativePath(
@@ -7473,7 +7531,7 @@ bool BuildBundleFromSections(
 
 	for (const auto& item : sections.program.codePages) {
 		const auto functions = CollectPageFunctions(sections.program, item);
-		if (!ShouldKeepPage(sections, dependencyRecords, item, functions, true)) {
+		if (!ShouldKeepPage(sections, dependencyRecords, item, functions, options)) {
 			continue;
 		}
 		appendRootItemKey(item.header.dwId);
@@ -8041,11 +8099,12 @@ bool Generator::GenerateDocument(
 	return GenerateDocumentInternal(inputPath, {}, readOptions, outDocument, outError);
 }
 
-bool Generator::GenerateBundle(
+bool Generator::GenerateBundleInternal(
 	const std::string& inputPath,
+	const GenerateOptions& options,
+	const ReadOptions& readOptions,
 	ProjectBundle& outBundle,
-	std::string* outError,
-	const ReadOptions& readOptions) const
+	std::string* outError) const
 {
 	if (outError != nullptr) {
 		outError->clear();
@@ -8060,7 +8119,7 @@ bool Generator::GenerateBundle(
 	if (!ParseModuleSectionsFromBytes(inputBytes, sections, outError)) {
 		return false;
 	}
-	if (!BuildBundleFromSections(sections, inputPath, outBundle)) {
+	if (!BuildBundleFromSections(sections, inputPath, options, outBundle)) {
 		if (outError != nullptr && outError->empty()) {
 			*outError = "build_bundle_failed";
 		}
@@ -8069,6 +8128,26 @@ bool Generator::GenerateBundle(
 	outBundle.nativeSourceBytes = std::move(inputBytes);
 	outBundle.nativeBundleDigest = ComputeBundleDigest(outBundle);
 	return true;
+}
+
+bool Generator::GenerateBundle(
+	const std::string& inputPath,
+	ProjectBundle& outBundle,
+	std::string* outError,
+	const ReadOptions& readOptions) const
+{
+	return GenerateBundleInternal(inputPath, {}, readOptions, outBundle, outError);
+}
+
+bool Generator::GenerateCompilerBundle(
+	const std::string& inputPath,
+	ProjectBundle& outBundle,
+	std::string* outError,
+	const ReadOptions& readOptions) const
+{
+	GenerateOptions options;
+	options.includeImportedFunctions = true;
+	return GenerateBundleInternal(inputPath, options, readOptions, outBundle, outError);
 }
 
 bool ValidateNativeMethodBodyBytes(
@@ -8244,7 +8323,7 @@ bool Generator::GenerateBundleFromBytes(
 	if (!ParseModuleSectionsFromBytes(inputBytes, sections, outError)) {
 		return false;
 	}
-	if (!BuildBundleFromSections(sections, sourcePath, outBundle)) {
+	if (!BuildBundleFromSections(sections, sourcePath, {}, outBundle)) {
 		if (outError != nullptr && outError->empty()) {
 			*outError = "build_bundle_failed";
 		}

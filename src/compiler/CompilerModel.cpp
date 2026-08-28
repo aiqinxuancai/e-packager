@@ -82,6 +82,121 @@ std::vector<std::string> SplitLines(const std::string& text)
 	return lines;
 }
 
+void AppendPageText(std::string& destination, const std::string& source)
+{
+	if (Trim(source).empty()) return;
+	if (!destination.empty() && destination.back() != '\n' && destination.back() != '\r') destination += "\r\n";
+	destination += source;
+	if (destination.empty() || destination.back() != '\n') destination += "\r\n";
+}
+
+std::string RemoveEcomStartupMethod(const std::string& text);
+
+bool ExpandEComDependencies(e2txt::ProjectBundle& bundle, const std::filesystem::path& inputRoot, std::string& error)
+{
+	std::vector<e2txt::Dependency> additionalDependencies;
+	std::unordered_set<std::string> knownECom;
+	for (const auto& dependency : bundle.dependencies) {
+		if (dependency.kind != e2txt::DependencyKind::ECom) continue;
+		const std::string identity = dependency.resolvedPath.empty() ? dependency.path : dependency.resolvedPath;
+		if (!knownECom.insert(identity).second) continue;
+		std::error_code ec;
+		std::filesystem::path path = dependency.resolvedPath.empty() ? Utf8PathToPath(dependency.path) : Utf8PathToPath(dependency.resolvedPath);
+		if (!path.is_absolute()) {
+			if (!dependency.localWorkspace.empty()) path = inputRoot / Utf8PathToPath(dependency.localWorkspace);
+			else path = inputRoot / path;
+		}
+		if (!path.is_absolute() || !std::filesystem::exists(path)) {
+			const std::filesystem::path configuredPath = path;
+			std::filesystem::path normalizedConfiguredPath = configuredPath;
+			std::wstring normalizedFileName = normalizedConfiguredPath.filename().wstring();
+			if (!normalizedFileName.empty() && normalizedFileName.front() == L'$') {
+				normalizedFileName.erase(normalizedFileName.begin());
+				normalizedConfiguredPath.replace_filename(normalizedFileName);
+			}
+			const std::filesystem::path baseDirectory = inputRoot.parent_path();
+			for (const auto& candidate : {
+				baseDirectory / configuredPath,
+				baseDirectory / normalizedConfiguredPath,
+				baseDirectory / L"ecom" / configuredPath.filename(),
+				baseDirectory / L"ecom" / normalizedConfiguredPath.filename(),
+				std::filesystem::path(L"C:\\Users\\aiqin\\OneDrive\\e5.6\\ecom") / configuredPath.filename(),
+				std::filesystem::path(L"C:\\Users\\aiqin\\OneDrive\\e5.6\\ecom") / normalizedConfiguredPath.filename(),
+			}) {
+				if (std::filesystem::is_regular_file(candidate, ec)) { path = candidate; break; }
+			}
+		}
+		if (!std::filesystem::is_regular_file(path, ec)) {
+			error = "ecom_module_not_found:" + PathToUtf8(path);
+			return false;
+		}
+		e2txt::Generator generator;
+		e2txt::ProjectBundle module;
+		std::string moduleError;
+		// `.ec` 内部已经保存了上游模块的导入实现。编译模式必须读取
+		// 这些隐藏函数和声明，不能把模块再次降级为外部源码依赖。
+		if (!generator.GenerateCompilerBundle(PathToUtf8(path), module, &moduleError)) {
+			error = "ecom_module_read_failed:" + PathToUtf8(path) + ":" + moduleError;
+			return false;
+		}
+		const std::string moduleSourcePrefix = "ecom/" +
+			(!module.projectName.empty() ? module.projectName : PathToUtf8(path.stem()));
+		for (auto source : module.sourceFiles) {
+			const std::string sourcePath = source.relativePath.empty() ? source.logicalName : source.relativePath;
+			source.relativePath = moduleSourcePrefix + "/" + sourcePath;
+			source.content = RemoveEcomStartupMethod(source.content);
+			if (source.content.find(".程序集 ") != std::string::npos) {
+				const auto sourceLines = SplitLines(source.content);
+				std::ostringstream renamed;
+				for (const std::string& rawLine : sourceLines) {
+					std::string line = rawLine;
+					if (StartsWith(Trim(line), ".子程序 ")) {
+						const std::string declaration = Trim(line.substr(line.find(".子程序 ") + std::string(".子程序 ").size()));
+						if (declaration.rfind("_临时子程序", 0) == 0) line.replace(line.find("_临时子程序"), std::string("_临时子程序").size(), "__ecom_temp_subprogram");
+					}
+					renamed << line << "\r\n";
+				}
+				source.content = renamed.str();
+			}
+			if (!source.content.empty()) bundle.sourceFiles.push_back(std::move(source));
+		}
+		AppendPageText(bundle.dataTypeText, module.dataTypeText);
+		AppendPageText(bundle.dllDeclareText, module.dllDeclareText);
+		AppendPageText(bundle.constantText, module.constantText);
+		AppendPageText(bundle.globalText, module.globalText);
+		for (const auto& nested : module.dependencies) {
+			if (nested.kind != e2txt::DependencyKind::ELib) continue;
+			const std::string nestedName = nested.fileName.empty() ? nested.name : nested.fileName;
+			bool exists = false;
+			for (const auto& current : bundle.dependencies) {
+				const std::string currentName = current.fileName.empty() ? current.name : current.fileName;
+				if (current.kind == e2txt::DependencyKind::ELib && currentName == nestedName) { exists = true; break; }
+			}
+			if (!exists) additionalDependencies.push_back(nested);
+		}
+	}
+	for (auto& dependency : additionalDependencies) bundle.dependencies.push_back(std::move(dependency));
+	return true;
+}
+
+std::string RemoveEcomStartupMethod(const std::string& text)
+{
+	const auto lines = SplitLines(text);
+	std::ostringstream output;
+	bool skipping = false;
+	for (const std::string& line : lines) {
+		const std::string trimmed = Trim(StripComment(line));
+		if (StartsWith(trimmed, ".子程序 ")) {
+			const std::string declaration = Trim(trimmed.substr(std::string(".子程序 ").size()));
+			const std::size_t comma = declaration.find(',');
+			const std::string name = Trim(declaration.substr(0, comma));
+			skipping = name == "_启动子程序";
+		}
+		if (!skipping) output << line << "\r\n";
+	}
+	return output.str();
+}
+
 std::vector<std::string> SplitFields(const std::string& text)
 {
 	std::vector<std::string> result;
@@ -1105,6 +1220,16 @@ bool RegisterLibraryTypes(Program& program, std::string& error)
 
 bool ResolveVariables(Program& program, std::string& error)
 {
+	const auto sourceDeclaration = [&](const std::string& sourceFile, const std::size_t sourceLine) {
+		for (const auto& source : program.bundle.sourceFiles) {
+			const std::string path = source.relativePath.empty() ? source.logicalName : source.relativePath;
+			if (path != sourceFile) continue;
+			const std::vector<std::string> lines = SplitLines(source.content);
+			if (sourceLine == 0 || sourceLine > lines.size()) break;
+			return ":source=" + Trim(StripComment(lines[sourceLine - 1]));
+		}
+		return std::string();
+	};
 	for (Variable& variable : program.globals) {
 		variable.type = ResolveTypeName(program, variable.typeName, variable.type.isArray);
 		if (!variable.type.valid) {
@@ -1125,14 +1250,18 @@ bool ResolveVariables(Program& program, std::string& error)
 		for (Variable& variable : method.parameters) {
 			variable.type = ResolveTypeName(program, variable.typeName, variable.type.isArray);
 			if (!variable.type.valid) {
-				error = method.sourceFile + ":" + std::to_string(variable.sourceLine) + ": unknown_parameter_type:" + variable.typeName;
+				error = method.sourceFile + ":" + std::to_string(variable.sourceLine) +
+					": unknown_parameter_type:" + variable.typeName + ":method=" + method.name +
+					sourceDeclaration(method.sourceFile, variable.sourceLine);
 				return false;
 			}
 		}
 		for (Variable& variable : method.locals) {
 			variable.type = ResolveTypeName(program, variable.typeName, variable.type.isArray);
 			if (!variable.type.valid) {
-				error = method.sourceFile + ":" + std::to_string(variable.sourceLine) + ": unknown_local_type:" + variable.typeName;
+				error = method.sourceFile + ":" + std::to_string(variable.sourceLine) +
+					": unknown_local_type:" + variable.typeName + ":method=" + method.name +
+					sourceDeclaration(method.sourceFile, variable.sourceLine);
 				return false;
 			}
 		}
@@ -1224,8 +1353,11 @@ bool ParseSources(Program& program, std::string& error)
 			}
 			std::size_t parseIndex = bodyBegin;
 			if (!ParseStatements(lines, parseIndex, bodyEnd, {}, fileName, method.body, error)) return false;
-			if (!program.methodByName.emplace(method.name, method.id).second) {
-				error = "duplicate_method_name:" + method.name;
+			const std::string methodKey = program.assemblies[assemblyIndex].isClass
+				? program.assemblies[assemblyIndex].name + "." + method.name
+				: method.name;
+			if (!program.methodByName.emplace(methodKey, method.id).second) {
+				error = "duplicate_method_name:" + methodKey;
 				return false;
 			}
 			program.assemblies[assemblyIndex].methodIds.push_back(method.id);
@@ -1357,6 +1489,7 @@ bool BuildCompilerModel(
 	outProgram.bundle = std::move(bundle);
 	outProgram.inputRoot = inputRoot;
 	outProgram.supportLibrarySearchDirectories = supportLibrarySearchDirectories;
+	if (!ExpandEComDependencies(outProgram.bundle, inputRoot, outError)) return false;
 	for (std::string macro : conditionMacros) {
 		std::transform(macro.begin(), macro.end(), macro.begin(), [](const unsigned char value) {
 			return static_cast<char>(std::toupper(value));
