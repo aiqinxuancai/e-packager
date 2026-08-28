@@ -126,6 +126,24 @@ e-packager compile-check checked.e `
 
 这一步依赖当前机器的易语言版本、支持库、易模块和链接器配置，失败时应先修复环境或源码，再交付 `.e`。
 
+### 编译后端
+
+`compile` 默认使用本项目的源码直编后端。Win32 版还提供黑月链接后端，可选择体积从小到大的汇编、C/C++ 与 MFC 入口：
+
+```powershell
+bin\Win32\Release\e-packager.exe compile MyApp.e .\out\MyApp.exe `
+  --backend blackmoon --blackmoon-mode asm `
+  --eide "C:\Users\aiqin\OneDrive\e5.6\e5.95.exe" `
+  --autolinker-test "D:\git\AutoLinker\bin\fne_release\AutoLinkerTest.exe" `
+  --blackmoon-dir "C:\Users\aiqin\OneDrive\e5.6\BlackMoon"
+```
+
+`--blackmoon-mode` 可取 `asm`、`cpp` 或 `mfc`。黑月后端会保留 `<输出名>.blackmoon.ecode.exe/.dll` 和 `<输出名>.blackmoon.obj` 供检查；`--blackmoon-timeout <秒>` 同时限制无头易代码阶段和最终链接阶段。它只支持 Win32，因为黑月的 OBJ、入口桩和静态库均为 x86。
+
+该模式不加载 `BlackMoon.fne`。它通过 AutoLinker 无头生成原生易代码 PE，再调用内置的 BlackMoonNG 易代码转换实现并链接黑月静态库；因此仍要求本机已安装易语言、AutoLinker 和黑月工具链。
+
+黑月核心库和第三方静态库可能在实际使用的归档成员中带有 MFC 依赖。此时 `asm`/`cpp` 会先按请求的入口尝试链接；若链接器明确报告 `nafxcw`/MFC 运行库冲突，后端会自动改用 MFC 入口和完整 CRT 初始化重试，并在结果中同时写出 `mode`（请求模式）与 `effective_mode=mfc`（实际模式）。不需要 MFC 的工程不会触发重试，仍使用原有的最小入口。
+
 ### 刷新派生内容
 
 解包后，若依赖的易模块或支持库发生变化，或需要新增图片、音频等二进制资源，可用 `update` 命令刷新 `ecom/` 与 `elib/` 中的派生内容并写入资源索引，无需重新解包整个工程。

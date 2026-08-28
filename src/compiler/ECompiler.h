@@ -6,11 +6,32 @@
 
 namespace ecompiler {
 
+// 独立编译后端类型。
+enum class Backend {
+	NativeCpp,
+	BlackMoon,
+};
+
+// 黑月链接入口模式，产物体积通常从小到大为汇编、C/C++、MFC。
+enum class BlackMoonMode {
+	Assembly,
+	Cpp,
+	Mfc,
+};
+
 // 独立 Win32 编译选项。编译器和链接器均可显式覆盖。
 struct Options {
 	std::filesystem::path compilerPath;
 	std::filesystem::path linkerPath;
 	std::filesystem::path libraryPath;
+	Backend backend = Backend::NativeCpp;
+	BlackMoonMode blackMoonMode = BlackMoonMode::Assembly;
+	// 黑月目录，包含 bin/ 与 lib/；留空时根据 e.exe 自动推导。
+	std::filesystem::path blackMoonDirectory;
+	// 黑月后端用于生成原生易代码 PE 的无头 IDE 工具。
+	std::filesystem::path eIdePath;
+	std::filesystem::path autoLinkerTestPath;
+	unsigned int blackMoonTimeoutSeconds = 120;
 	bool keepObject = true;
 	bool buildDll = false;
 	std::vector<std::string> conditionMacros;

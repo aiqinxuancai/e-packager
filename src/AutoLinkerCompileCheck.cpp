@@ -364,31 +364,32 @@ bool Prepare(const Options& options, PreparedOptions& outOptions, std::string& o
 	return true;
 }
 
-Result Run(const std::filesystem::path& sourcePath, const PreparedOptions& options)
+Result RunToArtifact(
+	const std::filesystem::path& sourcePath,
+	const std::filesystem::path& artifactPath,
+	const PreparedOptions& options,
+	const std::filesystem::path& invocationDirectory)
 {
 	Result checkResult;
 	const std::filesystem::path effectiveSourcePath = ResolveAbsolutePath(sourcePath);
+	const std::filesystem::path effectiveArtifactPath = ResolveAbsolutePath(artifactPath);
 	if (!IsRegularFile(effectiveSourcePath)) {
 		checkResult.error = "compile_check_source_not_found: " + PathToUtf8(effectiveSourcePath);
 		return checkResult;
 	}
-
-	std::filesystem::path temporaryDirectory;
-	if (!CreateTemporaryDirectory(temporaryDirectory, checkResult.error)) {
+	if (effectiveArtifactPath.empty()) {
+		checkResult.error = "compile_check_output_path_missing";
 		return checkResult;
 	}
-	const TemporaryDirectory temporaryDirectoryGuard(temporaryDirectory);
-	const std::filesystem::path artifactPath =
-		temporaryDirectory / (L"artifact" + Utf8PathToPath(ArtifactExtension(options.target)).wstring());
-	const std::filesystem::path resultPath = temporaryDirectory / L"result.json";
-	const std::filesystem::path launcherLogPath = temporaryDirectory / L"launcher.log";
+	const std::filesystem::path resultPath = invocationDirectory / L"result.json";
+	const std::filesystem::path launcherLogPath = invocationDirectory / L"launcher.log";
 
 	std::wstring commandLine;
 	AppendCommandLineArgument(commandLine, options.launcherPath.wstring());
 	AppendCommandLineArgument(commandLine, L"headless-compile");
 	AppendCommandLineArgument(commandLine, options.eIdePath.wstring());
 	AppendCommandLineArgument(commandLine, effectiveSourcePath.wstring());
-	AppendCommandLineArgument(commandLine, artifactPath.wstring());
+	AppendCommandLineArgument(commandLine, effectiveArtifactPath.wstring());
 	AppendCommandLineArgument(commandLine, L"--target");
 	AppendCommandLineArgument(commandLine, Utf8PathToPath(options.target).wstring());
 	if (options.staticCompile) {
@@ -491,7 +492,8 @@ Result Run(const std::filesystem::path& sourcePath, const PreparedOptions& optio
 		}
 	}
 
-	checkResult.ok = !launcherTimedOut && launcherExitCode == 0 && jsonOk && artifactVerified;
+	checkResult.ok = !launcherTimedOut && launcherExitCode == 0 && jsonOk && artifactVerified &&
+		IsRegularFile(effectiveArtifactPath);
 	if (!checkResult.ok) {
 		checkResult.error = BuildFailureDiagnostic(
 			resultPointer,
@@ -515,6 +517,33 @@ Result Run(const std::filesystem::path& sourcePath, const PreparedOptions& optio
 		", static=" + (options.staticCompile ? "true" : "false") +
 		", artifact_bytes=" + std::to_string(artifactBytes);
 	return checkResult;
+}
+
+Result Run(const std::filesystem::path& sourcePath, const PreparedOptions& options)
+{
+	Result result;
+	std::filesystem::path temporaryDirectory;
+	if (!CreateTemporaryDirectory(temporaryDirectory, result.error)) {
+		return result;
+	}
+	const TemporaryDirectory temporaryDirectoryGuard(temporaryDirectory);
+	const std::filesystem::path artifactPath =
+		temporaryDirectory / (L"artifact" + Utf8PathToPath(ArtifactExtension(options.target)).wstring());
+	return RunToArtifact(sourcePath, artifactPath, options, temporaryDirectory);
+}
+
+Result CompileToOutput(
+	const std::filesystem::path& sourcePath,
+	const std::filesystem::path& outputPath,
+	const PreparedOptions& options)
+{
+	Result result;
+	std::filesystem::path temporaryDirectory;
+	if (!CreateTemporaryDirectory(temporaryDirectory, result.error)) {
+		return result;
+	}
+	const TemporaryDirectory temporaryDirectoryGuard(temporaryDirectory);
+	return RunToArtifact(sourcePath, outputPath, options, temporaryDirectory);
 }
 
 }  // namespace autolinker_compile_check

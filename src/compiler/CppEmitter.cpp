@@ -2071,7 +2071,9 @@ private:
 			prefix << "extern \"C\" void __cdecl E_Init(); extern \"C\" void __cdecl E_DestroyRes();\n";
 			prefix << "extern \"C\" BOOL WINAPI DllMain(HINSTANCE module,DWORD reason,LPVOID reserved){(void)reserved;if(reason==DLL_PROCESS_ATTACH){DisableThreadLibraryCalls(module);E_Init();ECodeStart();}else if(reason==DLL_PROCESS_DETACH){E_DestroyRes();}return TRUE;}\n";
 		}
-		prefix << "extern \"C\" void __cdecl E_Init(){hBlackMoonHeap=GetProcessHeap();using Notify= int(__stdcall*)(int,unsigned long,unsigned long);for(unsigned int* item=BlackMoonCalleLibList;item!=nullptr&&*item;++item)reinterpret_cast<Notify>(*item)(ecompiler_nl_sys_notify_function,BlackMoonFuncForeLib,0);}\n";
+		// 规范 FNE ABI 在 param1 传入通知函数；部分旧静态库实际从
+		// param2 读取。两个槽位传同一指针，兼容两种历史实现。
+		prefix << "extern \"C\" void __cdecl E_Init(){hBlackMoonHeap=GetProcessHeap();using Notify= int(__stdcall*)(int,unsigned long,unsigned long);for(unsigned int* item=BlackMoonCalleLibList;item!=nullptr&&*item;++item)reinterpret_cast<Notify>(*item)(ecompiler_nl_sys_notify_function,BlackMoonFuncForeLib,BlackMoonFuncForeLib);}\n";
 		prefix << "extern \"C\" void __cdecl E_DestroyRes(){";
 		for (std::size_t index = 0; index < program_.globals.size(); ++index) prefix << "ert::DestroyValue(g_global_" << index << "());";
 		for (std::size_t assemblyIndex = 0; assemblyIndex < program_.assemblies.size(); ++assemblyIndex)

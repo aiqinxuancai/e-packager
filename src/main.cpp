@@ -160,6 +160,10 @@ struct PackCommandOptions {
 	autolinker_compile_check::Options compileOptions;
 };
 
+struct CompileCommandOptions {
+	ecompiler::Options compilerOptions;
+};
+
 struct DependencyModuleAnnotation {
 	size_t dependencyIndex = 0;
 	std::string resolvedPath;
@@ -1495,6 +1499,46 @@ bool TryParseUnsignedInt(const std::string& text, unsigned int& outValue)
 	return true;
 }
 
+std::string ToLowerAscii(std::string value)
+{
+	std::transform(value.begin(), value.end(), value.begin(), [](const unsigned char character) {
+		return static_cast<char>(std::tolower(character));
+	});
+	return value;
+}
+
+bool ParseCompilerBackend(const std::string& text, ecompiler::Backend& outBackend)
+{
+	const std::string normalized = ToLowerAscii(text);
+	if (normalized == "native" || normalized == "cpp") {
+		outBackend = ecompiler::Backend::NativeCpp;
+		return true;
+	}
+	if (normalized == "blackmoon" || normalized == "bm") {
+		outBackend = ecompiler::Backend::BlackMoon;
+		return true;
+	}
+	return false;
+}
+
+bool ParseBlackMoonMode(const std::string& text, ecompiler::BlackMoonMode& outMode)
+{
+	const std::string normalized = ToLowerAscii(text);
+	if (normalized == "asm" || normalized == "assembly") {
+		outMode = ecompiler::BlackMoonMode::Assembly;
+		return true;
+	}
+	if (normalized == "cpp" || normalized == "c++" || normalized == "c") {
+		outMode = ecompiler::BlackMoonMode::Cpp;
+		return true;
+	}
+	if (normalized == "mfc" || normalized == "vc++" || normalized == "vc") {
+		outMode = ecompiler::BlackMoonMode::Mfc;
+		return true;
+	}
+	return false;
+}
+
 bool ParseCompileCheckOption(
 	const int argc,
 	char* argv[],
@@ -1833,13 +1877,8 @@ int RunValidate(const char* inputDir)
 	return PrintStringResult("validate", report.IsValid() ? 0 : -1, summary.c_str());
 }
 
-int RunCompile(const char* inputPath, const char* outputPath, const char* linkerPath = nullptr, const char* libraryPath = nullptr, const bool buildDll = false, const std::vector<std::string>& conditionMacros = {})
+int RunCompile(const char* inputPath, const char* outputPath, ecompiler::Options options = {})
 {
-	ecompiler::Options options;
-	options.buildDll = buildDll;
-	options.conditionMacros = conditionMacros;
-	if (linkerPath != nullptr) options.linkerPath = ResolveAbsolutePath(std::filesystem::path(linkerPath));
-	if (libraryPath != nullptr) options.libraryPath = ResolveAbsolutePath(std::filesystem::path(libraryPath));
 	ecompiler::Result result;
 	if (!ecompiler::Compile(
 		ResolveAbsolutePath(std::filesystem::path(inputPath)),
@@ -2350,7 +2389,7 @@ void PrintUsage()
 	std::cout << Utf8Literal(u8"  e-packager pack <input-dir> <output.e|output.ec> [--password <text>] [--compile-check ...]  # 封包，可选 AutoLinker 无头编译确认") << std::endl;
 	std::cout << Utf8Literal(u8"       --compile-check [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--compile-target auto|win_exe|win_console_exe|win_dll|ecom] [--compile-static] [--compile-timeout <seconds>]") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager validate <input-dir>        # 快速检查声明、基础语法和可确定的类型错误") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager compile <input.e|input-dir> <output.exe|output.dll> [--dll] [--define <macro>]... [--linker <link.exe>] [--lib <lib-dir>]  # 独立静态编译 Win32 程序，不调用易语言 IDE") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager compile <input.e|input-dir> <output.exe|output.dll> [--backend native|blackmoon] [--blackmoon-mode asm|cpp|mfc] [--dll] [--define <macro>]... [--linker <link.exe>] [--lib <lib-dir>] [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--blackmoon-dir <dir>] [--blackmoon-timeout <seconds>]  # 默认直接 C++ 后端；黑月后端转换原生易代码并按模式链接") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager compile-check <input.e|input.ec> [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--compile-target ...] [--compile-static] [--compile-timeout <seconds>]  # 直接执行权威无头编译") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager update <input-dir> [--add-ecom <file.ec>]... [--add-elib <name|file.fne>]... [--add-image <file|name=file>]... [--add-audio <file|name=file>]...   # 刷新派生内容并新增资源") << std::endl;
 #if defined(_M_X64)
@@ -2437,29 +2476,80 @@ int RunCommand(int argc, char* argv[])
 			PrintUsage();
 			return EXIT_FAILURE;
 		}
-		const char* linkerPath = nullptr;
-		const char* libraryPath = nullptr;
-		bool buildDll = false;
-		std::vector<std::string> conditionMacros;
+		CompileCommandOptions commandOptions;
+		ecompiler::Options& options = commandOptions.compilerOptions;
 		for (int index = 4; index < argc; ++index) {
 			const std::string option = argv[index];
 			if (option == "--dll") {
-				buildDll = true;
+				options.buildDll = true;
+				continue;
+			}
+			if (option == "--blackmoon") {
+				options.backend = ecompiler::Backend::BlackMoon;
+				continue;
+			}
+			if (option == "--backend" && index + 1 < argc) {
+				if (!ParseCompilerBackend(argv[++index], options.backend)) {
+					PrintUsage();
+					return EXIT_FAILURE;
+				}
+				continue;
+			}
+			if (option.rfind("--backend=", 0) == 0) {
+				if (!ParseCompilerBackend(option.substr(std::string("--backend=").size()), options.backend)) {
+					PrintUsage();
+					return EXIT_FAILURE;
+				}
+				continue;
+			}
+			if (option == "--blackmoon-mode" && index + 1 < argc) {
+				if (!ParseBlackMoonMode(argv[++index], options.blackMoonMode)) {
+					PrintUsage();
+					return EXIT_FAILURE;
+				}
+				options.backend = ecompiler::Backend::BlackMoon;
+				continue;
+			}
+			if (option.rfind("--blackmoon-mode=", 0) == 0) {
+				if (!ParseBlackMoonMode(option.substr(std::string("--blackmoon-mode=").size()), options.blackMoonMode)) {
+					PrintUsage();
+					return EXIT_FAILURE;
+				}
+				options.backend = ecompiler::Backend::BlackMoon;
 				continue;
 			}
 			if ((option == "--linker" || option == "--lib") && index + 1 < argc) {
-				if (option == "--linker") linkerPath = argv[++index];
-				else libraryPath = argv[++index];
+				if (option == "--linker") options.linkerPath = ResolveAbsolutePath(std::filesystem::path(argv[++index]));
+				else options.libraryPath = ResolveAbsolutePath(std::filesystem::path(argv[++index]));
 				continue;
 			}
 			if ((option == "--define" || option == "-D") && index + 1 < argc) {
-				conditionMacros.emplace_back(argv[++index]);
+				options.conditionMacros.emplace_back(argv[++index]);
+				continue;
+			}
+			if (option == "--eide" && index + 1 < argc) {
+				options.eIdePath = ResolveAbsolutePath(std::filesystem::path(argv[++index]));
+				continue;
+			}
+			if (option == "--autolinker-test" && index + 1 < argc) {
+				options.autoLinkerTestPath = ResolveAbsolutePath(std::filesystem::path(argv[++index]));
+				continue;
+			}
+			if (option == "--blackmoon-dir" && index + 1 < argc) {
+				options.blackMoonDirectory = ResolveAbsolutePath(std::filesystem::path(argv[++index]));
+				continue;
+			}
+			if (option == "--blackmoon-timeout" && index + 1 < argc) {
+				if (!TryParseUnsignedInt(argv[++index], options.blackMoonTimeoutSeconds)) {
+					PrintUsage();
+					return EXIT_FAILURE;
+				}
 				continue;
 			}
 			PrintUsage();
 			return EXIT_FAILURE;
 		}
-		return RunCompile(argv[2], argv[3], linkerPath, libraryPath, buildDll, conditionMacros);
+		return RunCompile(argv[2], argv[3], std::move(options));
 	}
 	if (command == "compile-check") {
 		if (argc < 3) {

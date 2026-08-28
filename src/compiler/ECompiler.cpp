@@ -1,5 +1,6 @@
 ﻿#include "ECompiler.h"
 
+#include "BlackMoonCompiler.h"
 #include "CompilerModel.h"
 #include "CppEmitter.h"
 #include "../PathHelper.h"
@@ -432,6 +433,9 @@ bool Compile(
 	const Options& options,
 	Result& result)
 {
+	if (options.backend == Backend::BlackMoon) {
+		return blackmoon_backend::Compile(inputPath, outputPath, options, result);
+	}
 	result = {};
 	result.outputPath = outputPath;
 	std::string error;

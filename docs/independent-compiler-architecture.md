@@ -393,7 +393,63 @@ TestPub1
 4. 设计窗口项目的独立运行时边界，再实现窗口资源和事件，而不是把窗口源码硬塞进控制台入口。
 5. 在具备对应 x64 FNE/静态库之后，再增加真正的 x64 后端；不对现有 x86 二进制做跨位数猜测。
 
-## 16. 结论
+## 16. 黑月源码后端
+
+除默认的 `native` C++ 后端外，`compile` 还支持 `blackmoon` 后端：
+
+```powershell
+bin\Win32\Release\e-packager.exe compile <input.e|input-dir> <output.exe|output.dll> `
+  --backend blackmoon --blackmoon-mode asm `
+  --eide C:\Users\aiqin\OneDrive\e5.6\e5.95.exe `
+  --autolinker-test D:\git\AutoLinker\bin\fne_release\AutoLinkerTest.exe `
+  --blackmoon-dir C:\Users\aiqin\OneDrive\e5.6\BlackMoon
+```
+
+该后端不加载、不注入、也不调用 `BlackMoon.fne`。它采用 BlackMoonNG 的易代码到 COFF 转换实现：
+
+```text
+.e / 拆包目录
+  -> AutoLinker 无头动态编译（取得原生易代码 PE）
+  -> BlackMoonNG EcodeToObjFile 源码转换
+  -> BlackMoon.obj
+  -> BlackMoonKernelStaticLib 入口 OBJ + krnln.lib
+  -> link.exe
+  -> output.exe / output.dll
+```
+
+动态阶段仍需 `e.exe`，因为黑月转换器的输入是 IDE 生成 PE 中 `E0000040` 标志的易代码段，而不是 `.e` 源码文本。该步骤通过 AutoLinker 无头接口完成；黑月 FNE 插件不参与其中。
+
+`--blackmoon-timeout <seconds>` 同时限制无头易代码阶段和最终 `LINK.EXE` 阶段，允许范围为 1 至 3600 秒。
+
+| 参数 | 首选黑月入口 | 实测最小工程尺寸 |
+| --- | --- | --- |
+| `--blackmoon-mode asm` | `BlackMoonExe.obj` + `EyInit.obj`，自定义 `BMEntrypoint` | 3,584 B |
+| `--blackmoon-mode cpp` | `BlackMoonExe.obj` + `EyInit.obj` | 36,864 B |
+| `--blackmoon-mode mfc` | `MFCBlackMoonCon.obj` / `MFCBlackMoon.obj` | 114,688 B |
+
+上述实测均来自 `e-console-exe-new-proj.e`，三个产物均可运行并以 `0` 退出。DLL 会选择相应 `BlackMoonDll*.obj` 或 `BlackMoonMFCdll*.obj` 并生成导出 `.def`；`e-win32-dll-new-proj.e` 的汇编模式产物为 20,480 B，导出 `TestPub1`。
+
+入口选择是能力驱动的，而不是按函数名写死。当核心归档的实际链接成员带入 `nafxcw`/MFC 运行库时，非 MFC 请求模式的第一次链接会被拒绝；后端随后改用对应的 `MFCBlackMoon*.obj`、`EyInit.obj`/`EyMFCComInit.obj` 和 CRT 初始化路径重试。结果消息会保留两项信息，例如：
+
+```text
+mode=asm;effective_mode=mfc;runtime_fallback=mfc
+```
+
+这不是忽略 `LNK2005` 的 `/FORCE` 方案。它避免混用 `MSVCRT`、`LIBCMT` 与 MFC 的对象，确保全局构造、浮点环境和 MFC 状态先完成初始化。当前 `e-console-exe-full-test.e` 含有核心拼音命令，所用 `PY.OBJ` 需要 MFC；重新测试时 `asm`、`cpp`、`mfc` 三种请求均以退出码 `0` 运行完成，输出均为 345 行并到达结束标记，前两种的 `effective_mode` 为 `mfc`。
+
+默认保留 `<output>.blackmoon.ecode.exe`（或 `.dll`）和 `<output>.blackmoon.obj`，用于检查原生易代码和 COFF 转换结果。
+
+黑月后端使用黑月核心静态库自己的命令映射和实现，不等同于默认后端所使用的 `krnln_static.lib`。因此它只支持黑月核心库实际实现过的命令。若 FNE 中存在声明但归档没有实现，转换阶段会明确报告命令英文名，例如旧版测试工程曾报告：
+
+```text
+黑月核心归档未提供核心库命令337的实现“_krnln_fnGetErrCode” [core_command=GetErrCode]
+```
+
+这是归档能力差异，不是针对项目或函数名写入的特殊分支。当前完整测试源码已移除该不兼容调用；如果更换为包含对应符号的新版黑月核心归档，无需修改编译器逻辑即可恢复该命令。
+
+转换器代码位于 `src/compiler/blackmoon/`，来源为 BlackMoonNG，并在同目录保留其 MIT 许可证；黑月核心静态库遵循其仓库附带的 BSD 3-Clause 许可证。
+
+## 17. 结论
 
 当前成果已经把“`.e` 源码 → 语义模型 → 元数据驱动的 FNE 调用 → C++/OBJ → VC6/现代 CRT/支持库链接 → Win32 EXE 或 DLL”串成一条可运行链路。核心价值不在于为少数函数增加兼容补丁，而在于建立了可扩展的中间模型、ABI 转换层和标准 PE 链接路径。
 
