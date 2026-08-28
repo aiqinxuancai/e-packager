@@ -20,6 +20,7 @@
 
 #include "..\thirdparty\json.hpp"
 #include "AutoLinkerCompileCheck.h"
+#include "compiler/ECompiler.h"
 #include "EFolderCodec.h"
 #include "PathHelper.h"
 #include "SelfUpdater.h"
@@ -1832,6 +1833,24 @@ int RunValidate(const char* inputDir)
 	return PrintStringResult("validate", report.IsValid() ? 0 : -1, summary.c_str());
 }
 
+int RunCompile(const char* inputPath, const char* outputPath, const char* linkerPath = nullptr, const char* libraryPath = nullptr, const bool buildDll = false, const std::vector<std::string>& conditionMacros = {})
+{
+	ecompiler::Options options;
+	options.buildDll = buildDll;
+	options.conditionMacros = conditionMacros;
+	if (linkerPath != nullptr) options.linkerPath = ResolveAbsolutePath(std::filesystem::path(linkerPath));
+	if (libraryPath != nullptr) options.libraryPath = ResolveAbsolutePath(std::filesystem::path(libraryPath));
+	ecompiler::Result result;
+	if (!ecompiler::Compile(
+		ResolveAbsolutePath(std::filesystem::path(inputPath)),
+		ResolveAbsolutePath(std::filesystem::path(outputPath)),
+		options,
+		result)) {
+		return PrintStringResult("compile", -1, result.message.c_str());
+	}
+	return PrintStringResult("compile", 0, result.message.c_str());
+}
+
 int RunDefaultPack()
 {
 	std::filesystem::path projectRoot;
@@ -2331,6 +2350,7 @@ void PrintUsage()
 	std::cout << Utf8Literal(u8"  e-packager pack <input-dir> <output.e|output.ec> [--password <text>] [--compile-check ...]  # 封包，可选 AutoLinker 无头编译确认") << std::endl;
 	std::cout << Utf8Literal(u8"       --compile-check [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--compile-target auto|win_exe|win_console_exe|win_dll|ecom] [--compile-static] [--compile-timeout <seconds>]") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager validate <input-dir>        # 快速检查声明、基础语法和可确定的类型错误") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager compile <input.e|input-dir> <output.exe|output.dll> [--dll] [--define <macro>]... [--linker <link.exe>] [--lib <lib-dir>]  # 独立静态编译 Win32 程序，不调用易语言 IDE") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager compile-check <input.e|input.ec> [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--compile-target ...] [--compile-static] [--compile-timeout <seconds>]  # 直接执行权威无头编译") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager update <input-dir> [--add-ecom <file.ec>]... [--add-elib <name|file.fne>]... [--add-image <file|name=file>]... [--add-audio <file|name=file>]...   # 刷新派生内容并新增资源") << std::endl;
 #if defined(_M_X64)
@@ -2411,6 +2431,35 @@ int RunCommand(int argc, char* argv[])
 			return EXIT_FAILURE;
 		}
 		return RunValidate(argv[2]);
+	}
+	if (command == "compile") {
+		if (argc < 4) {
+			PrintUsage();
+			return EXIT_FAILURE;
+		}
+		const char* linkerPath = nullptr;
+		const char* libraryPath = nullptr;
+		bool buildDll = false;
+		std::vector<std::string> conditionMacros;
+		for (int index = 4; index < argc; ++index) {
+			const std::string option = argv[index];
+			if (option == "--dll") {
+				buildDll = true;
+				continue;
+			}
+			if ((option == "--linker" || option == "--lib") && index + 1 < argc) {
+				if (option == "--linker") linkerPath = argv[++index];
+				else libraryPath = argv[++index];
+				continue;
+			}
+			if ((option == "--define" || option == "-D") && index + 1 < argc) {
+				conditionMacros.emplace_back(argv[++index]);
+				continue;
+			}
+			PrintUsage();
+			return EXIT_FAILURE;
+		}
+		return RunCompile(argv[2], argv[3], linkerPath, libraryPath, buildDll, conditionMacros);
 	}
 	if (command == "compile-check") {
 		if (argc < 3) {

@@ -403,6 +403,20 @@ const LIB_INFO* CallGetLibInfoSafely(const PFN_GET_LIB_INFO getInfoProc)
 #endif
 }
 
+INT CallNotifyLibrarySafely(const PFN_NOTIFY_LIB notifyProc, const INT message)
+{
+#if defined(_MSC_VER)
+	__try {
+		return notifyProc == nullptr ? NR_ERR : notifyProc(message, 0, 0);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return NR_ERR;
+	}
+#else
+	return notifyProc == nullptr ? NR_ERR : notifyProc(message, 0, 0);
+#endif
+}
+
 std::string DisplayNameOrPlaceholder(const std::string& name)
 {
 	return name.empty() ? std::string("<未命名>") : name;
@@ -1287,10 +1301,14 @@ struct SupportLibraryAnnotationEntry {
 bool TryLoadSupportLibraryDump(
 	const std::filesystem::path& filePath,
 	LoadedSupportLibraryDump& outDump,
-	std::string& outError)
+	std::string& outError,
+	LibraryMetadata* outMetadata = nullptr)
 {
 	outDump = {};
 	outError.clear();
+	if (outMetadata != nullptr) {
+		*outMetadata = {};
+	}
 
 #if !defined(_M_IX86)
 	(void)filePath;
@@ -1372,6 +1390,17 @@ bool TryLoadSupportLibraryDump(
 	outDump.minorVersion = libInfo->m_nMinorVersion;
 	outDump.buildNumber = libInfo->m_nBuildNumber;
 
+	if (outMetadata != nullptr) {
+		outMetadata->filePath = filePath;
+		outMetadata->fileName = filePath.filename().string();
+		outMetadata->name = outDump.name;
+		outMetadata->guid = outDump.guid;
+		outMetadata->state = libInfo->m_dwState;
+		outMetadata->majorVersion = outDump.majorVersion;
+		outMetadata->minorVersion = outDump.minorVersion;
+		outMetadata->buildNumber = outDump.buildNumber;
+	}
+
 	std::vector<std::string>& lines = outDump.lines;
 	if (!outDump.name.empty()) {
 		lines.push_back("支持库名称：" + outDump.name);
@@ -1404,6 +1433,44 @@ bool TryLoadSupportLibraryDump(
 			}
 			AppendCommandDetails(lines, libInfo->m_pBeginCmdInfo[i], libInfo, "", ".命令");
 		}
+
+		if (outMetadata != nullptr) {
+			const INT namesAddress = CallNotifyLibrarySafely(libInfo->m_pfnNotify, NL_GET_CMD_FUNC_NAMES);
+			const auto* executeNames = namesAddress == 0 || namesAddress == NR_ERR
+				? nullptr
+				: reinterpret_cast<const char* const*>(static_cast<std::uintptr_t>(static_cast<std::uint32_t>(namesAddress)));
+			const bool namesReadable = executeNames != nullptr && IsReadableMemoryRange(
+				executeNames,
+				sizeof(const char*) * static_cast<size_t>(libInfo->m_nCmdCount));
+			outMetadata->commands.reserve(static_cast<size_t>(libInfo->m_nCmdCount));
+			for (int i = 0; i < libInfo->m_nCmdCount; ++i) {
+				const CMD_INFO& source = libInfo->m_pBeginCmdInfo[i];
+				CommandMetadata command;
+				command.index = static_cast<size_t>(i);
+				command.name = ReadAnsiText(source.m_szName);
+				command.englishName = ReadAnsiText(source.m_szEgName);
+				command.executeSymbol = namesReadable ? ReadAnsiText(executeNames[i]) : std::string();
+				command.category = source.m_shtCategory;
+				command.state = source.m_wState;
+				command.returnType = source.m_dtRetValType;
+				if (source.m_nArgCount > 0 && source.m_nArgCount <= kMaxSupportLibraryArrayCount &&
+					source.m_pBeginArgInfo != nullptr && IsReadableMemoryRange(
+						source.m_pBeginArgInfo,
+						sizeof(ARG_INFO) * static_cast<size_t>(source.m_nArgCount))) {
+					command.arguments.reserve(static_cast<size_t>(source.m_nArgCount));
+					for (int argumentIndex = 0; argumentIndex < source.m_nArgCount; ++argumentIndex) {
+						const ARG_INFO& argumentSource = source.m_pBeginArgInfo[argumentIndex];
+						ArgumentMetadata argument;
+						argument.name = ReadAnsiText(argumentSource.m_szName);
+						argument.dataType = argumentSource.m_dtType;
+						argument.state = argumentSource.m_dwState;
+						argument.defaultValue = argumentSource.m_nDefault;
+						command.arguments.push_back(std::move(argument));
+					}
+				}
+				outMetadata->commands.push_back(std::move(command));
+			}
+		}
 	}
 
 	if (libInfo->m_nDataTypeCount > 0 &&
@@ -1420,6 +1487,46 @@ bool TryLoadSupportLibraryDump(
 				lines.push_back("");
 			}
 			AppendDataTypeDetails(lines, libInfo->m_pDataType[i], libInfo);
+		}
+
+		if (outMetadata != nullptr) {
+			outMetadata->dataTypes.reserve(static_cast<size_t>(libInfo->m_nDataTypeCount));
+			for (int i = 0; i < libInfo->m_nDataTypeCount; ++i) {
+				const LIB_DATA_TYPE_INFO& source = libInfo->m_pDataType[i];
+				DataTypeMetadata dataType;
+				dataType.index = static_cast<size_t>(i);
+				dataType.name = ReadAnsiText(source.m_szName);
+				dataType.englishName = ReadAnsiText(source.m_szEgName);
+				dataType.state = source.m_dwState;
+				if (source.m_nCmdCount > 0 && source.m_nCmdCount <= kMaxSupportLibraryArrayCount &&
+					source.m_pnCmdsIndex != nullptr && IsReadableMemoryRange(
+						source.m_pnCmdsIndex,
+						sizeof(INT) * static_cast<size_t>(source.m_nCmdCount))) {
+					for (int commandIndex = 0; commandIndex < source.m_nCmdCount; ++commandIndex) {
+						const INT value = source.m_pnCmdsIndex[commandIndex];
+						if (value >= 0 && value < libInfo->m_nCmdCount) {
+							dataType.commandIndexes.push_back(static_cast<size_t>(value));
+						}
+					}
+				}
+				if (source.m_nElementCount > 0 && source.m_nElementCount <= kMaxSupportLibraryArrayCount &&
+					source.m_pElementBegin != nullptr && IsReadableMemoryRange(
+						source.m_pElementBegin,
+						sizeof(LIB_DATA_TYPE_ELEMENT) * static_cast<size_t>(source.m_nElementCount))) {
+					for (int elementIndex = 0; elementIndex < source.m_nElementCount; ++elementIndex) {
+						const LIB_DATA_TYPE_ELEMENT& elementSource = source.m_pElementBegin[elementIndex];
+						DataTypeElementMetadata element;
+						element.name = ReadAnsiText(elementSource.m_szName);
+						element.englishName = ReadAnsiText(elementSource.m_szEgName);
+						element.dataType = elementSource.m_dtType;
+						element.state = elementSource.m_dwState;
+						element.defaultValue = elementSource.m_nDefault;
+						element.isArray = elementSource.m_pArySpec != nullptr;
+						dataType.elements.push_back(std::move(element));
+					}
+				}
+				outMetadata->dataTypes.push_back(std::move(dataType));
+			}
 		}
 	}
 
@@ -1444,6 +1551,35 @@ bool TryLoadSupportLibraryDump(
 			AppendNamedField(fields, "英文名", englishName);
 			AppendNamedField(fields, "说明", explain);
 			lines.push_back(JoinCommaFields(fields));
+		}
+
+		if (outMetadata != nullptr) {
+			outMetadata->constants.reserve(static_cast<size_t>(libInfo->m_nLibConstCount));
+			for (int i = 0; i < libInfo->m_nLibConstCount; ++i) {
+				const LIB_CONST_INFO& source = libInfo->m_pLibConst[i];
+				ConstantMetadata constant;
+				constant.index = static_cast<size_t>(i);
+				constant.name = ReadAnsiText(source.m_szName);
+				constant.englishName = ReadAnsiText(source.m_szEgName);
+				constant.type = source.m_shtType;
+				constant.numberValue = source.m_dbValue;
+				constant.textValue = ReadAnsiText(source.m_szText);
+				outMetadata->constants.push_back(std::move(constant));
+			}
+		}
+	}
+
+	if (outMetadata != nullptr) {
+		const INT notifyNameAddress = CallNotifyLibrarySafely(libInfo->m_pfnNotify, NL_GET_NOTIFY_LIB_FUNC_NAME);
+		if (notifyNameAddress != 0 && notifyNameAddress != NR_ERR) {
+			outMetadata->notifySymbol = ReadAnsiText(reinterpret_cast<const char*>(
+				static_cast<std::uintptr_t>(static_cast<std::uint32_t>(notifyNameAddress))));
+		}
+		const INT dependenciesAddress = CallNotifyLibrarySafely(libInfo->m_pfnNotify, NL_GET_DEPENDENT_LIBS);
+		if (dependenciesAddress != 0 && dependenciesAddress != NR_ERR) {
+			outMetadata->dependentLibraries = ReadNullSeparatedStringList(
+				reinterpret_cast<const char*>(static_cast<std::uintptr_t>(static_cast<std::uint32_t>(dependenciesAddress))),
+				kMaxSupportLibraryArrayCount);
 		}
 	}
 
@@ -1501,6 +1637,15 @@ bool IsEquivalentDependency(const e2txt::Dependency& left, const e2txt::Dependen
 }
 
 }  // namespace
+
+bool LoadSupportLibraryMetadata(
+	const std::filesystem::path& inputPath,
+	LibraryMetadata& outMetadata,
+	std::string& outError)
+{
+	LoadedSupportLibraryDump ignoredDump;
+	return TryLoadSupportLibraryDump(inputPath, ignoredDump, outError, &outMetadata);
+}
 
 bool DumpSupportLibraryPublicInfoToFile(
 	const std::filesystem::path& inputPath,

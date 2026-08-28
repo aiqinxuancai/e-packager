@@ -180,6 +180,9 @@
     <ClCompile Include="src\WorkspaceProjectSupport.cpp" />
     <ClCompile Include="src\e2txt.cpp" />
     <ClCompile Include="src\e2txt_restore.cpp" />
+    <ClCompile Include="src\compiler\CompilerModel.cpp" />
+	<ClCompile Include="src\compiler\CppEmitter.cpp" />
+    <ClCompile Include="src\compiler\ECompiler.cpp" />
     <ClCompile Include="src\PathHelper.cpp" />
     <ClCompile Include="src\SupportLibraryPublicInfo.cpp" />
   </ItemGroup>
@@ -196,6 +199,9 @@
     <ClInclude Include="src\version.h" />
     <ClInclude Include="src\WorkspaceProjectSupport.h" />
     <ClInclude Include="src\e2txt.h" />
+    <ClInclude Include="src\compiler\CompilerModel.h" />
+	<ClInclude Include="src\compiler\CppEmitter.h" />
+    <ClInclude Include="src\compiler\ECompiler.h" />
     <ClInclude Include="src\PathHelper.h" />
     <ClInclude Include="src\SupportLibraryPublicInfo.h" />
     <ClInclude Include="elib\lib2.h" />

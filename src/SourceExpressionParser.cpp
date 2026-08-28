@@ -69,7 +69,7 @@ bool IsOperatorStart(const std::string& text, const std::size_t position)
 {
 	static constexpr std::string_view kOperators[] = {
 		"＋", "－", "×", "÷", "＝", "≠", "＜", "＞", "≤", "≥",
-		"?=", "==", "!=", "<=", ">=", "<>", "+", "-", "*", "/", "\\", "%", "=", "<", ">", "&", "|",
+		"％", "?=", "==", "!=", "<=", ">=", "<>", "+", "-", "*", "/", "\\", "%", "=", "<", ">", "&", "|",
 	};
 	for (const auto operatorText : kOperators) {
 		if (StartsAt(text, position, operatorText)) {
@@ -109,9 +109,12 @@ public:
 				const std::string_view left = chinese ? kChineseLeftQuote : std::string_view("\"");
 				const std::string_view right = chinese ? kChineseRightQuote : std::string_view("\"");
 				position_ += left.size();
+				const std::size_t contentPosition = position_;
+				std::size_t contentLength = 0;
 				bool closed = false;
 				while (position_ < source_.size()) {
 					if (StartsAt(source_, position_, right)) {
+						contentLength = position_ - contentPosition;
 						position_ += right.size();
 						closed = true;
 						break;
@@ -123,7 +126,7 @@ public:
 					outErrorOffset = tokenPosition;
 					return {};
 				}
-				tokens.push_back({ TokenKind::Text, source_.substr(tokenPosition, position_ - tokenPosition), tokenPosition });
+				tokens.push_back({ TokenKind::Text, source_.substr(contentPosition, contentLength), tokenPosition });
 				continue;
 			}
 			if (IsNumberStart(source_, position_)) {
@@ -171,7 +174,7 @@ public:
 			if (IsOperatorStart(source_, position_)) {
 				static constexpr std::string_view kOperators[] = {
 					"＋", "－", "×", "÷", "＝", "≠", "＜", "＞", "≤", "≥",
-					"?=", "==", "!=", "<=", ">=", "<>", "+", "-", "*", "/", "\\", "%", "=", "<", ">", "&", "|",
+					"％", "?=", "==", "!=", "<=", ">=", "<>", "+", "-", "*", "/", "\\", "%", "=", "<", ">", "&", "|",
 				};
 				std::string_view matched;
 				for (const auto operatorText : kOperators) {
@@ -481,6 +484,7 @@ private:
 			op == "?=" || op == "＜" || op == "<" || op == "＞" || op == ">" || op == "≤" || op == "<=" || op == "≥" || op == ">=") return 3;
 		if (op == "＋" || op == "+" || op == "－" || op == "-") return 4;
 		if (op == "×" || op == "*" || op == "÷" || op == "/" || op == "\\" || op == "%") return 5;
+		if (op == "％") return 5;
 		return -1;
 	}
 

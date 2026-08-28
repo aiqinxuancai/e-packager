@@ -1,0 +1,184 @@
+﻿#pragma once
+
+#include "../SourceExpressionParser.h"
+#include "../SupportLibraryPublicInfo.h"
+#include "../e2txt.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <unordered_set>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace ecompiler {
+
+// 独立编译器使用的系统数据类型编码。
+inline constexpr std::uint32_t kTypeNull = 0;
+inline constexpr std::uint32_t kTypeAll = 0x80000000u;
+inline constexpr std::uint32_t kTypeByte = 0x80000101u;
+inline constexpr std::uint32_t kTypeShort = 0x80000201u;
+inline constexpr std::uint32_t kTypeInt = 0x80000301u;
+inline constexpr std::uint32_t kTypeInt64 = 0x80000401u;
+inline constexpr std::uint32_t kTypeFloat = 0x80000501u;
+inline constexpr std::uint32_t kTypeDouble = 0x80000601u;
+inline constexpr std::uint32_t kTypeBool = 0x80000002u;
+inline constexpr std::uint32_t kTypeDateTime = 0x80000003u;
+inline constexpr std::uint32_t kTypeText = 0x80000004u;
+inline constexpr std::uint32_t kTypeBinary = 0x80000005u;
+inline constexpr std::uint32_t kTypeSubroutine = 0x80000006u;
+inline constexpr std::uint32_t kTypeArrayFlag = 0x20000000u;
+
+struct TypeRef {
+	std::uint32_t code = kTypeNull;
+	bool isArray = false;
+	bool valid = false;
+};
+
+struct Variable {
+	std::string name;
+	std::string typeName;
+	TypeRef type;
+	bool byReference = false;
+	bool nullable = false;
+	std::vector<int> arrayDimensions;
+	std::size_t sourceLine = 0;
+};
+
+enum class StatementKind {
+	Expression,
+	Assignment,
+	Return,
+	IfTrue,
+	IfElse,
+	Switch,
+	While,
+	DoWhile,
+	CountLoop,
+	ForLoop,
+	Break,
+	Continue,
+	MachineCode,
+};
+
+struct StatementBranch {
+	std::unique_ptr<e2txt::SourceExpressionNode> condition;
+	std::vector<struct Statement> body;
+};
+
+struct Statement {
+	StatementKind kind = StatementKind::Expression;
+	std::size_t sourceLine = 0;
+	std::unique_ptr<e2txt::SourceExpressionNode> expression;
+	std::unique_ptr<e2txt::SourceExpressionNode> target;
+	std::vector<std::unique_ptr<e2txt::SourceExpressionNode>> arguments;
+	std::vector<Statement> body;
+	std::vector<Statement> elseBody;
+	std::vector<StatementBranch> branches;
+	std::vector<std::uint8_t> machineCode;
+};
+
+struct Method {
+	std::size_t id = 0;
+	std::size_t assemblyIndex = 0;
+	std::string name;
+	std::string sourceFile;
+	std::size_t sourceLine = 0;
+	TypeRef returnType;
+	TypeRef ownerType;
+	std::string exportName;
+	bool isPublic = false;
+	bool usesCdecl = false;
+	std::vector<Variable> parameters;
+	std::vector<Variable> locals;
+	std::vector<Statement> body;
+};
+
+struct Assembly {
+	std::string name;
+	std::string sourceFile;
+	bool isClass = false;
+	std::vector<Variable> variables;
+	std::vector<std::size_t> methodIds;
+};
+
+struct Library {
+	std::size_t ordinal = 0;
+	e2txt::Dependency dependency;
+	support_library_public_info::LibraryMetadata metadata;
+};
+
+// 项目 DLL 声明页中的外部命令。
+struct DllCommand {
+	std::string name;
+	std::string fileName;
+	std::string entryName;
+	TypeRef returnType;
+	bool usesCdecl = false;
+	std::vector<Variable> parameters;
+	std::size_t sourceLine = 0;
+};
+
+struct Constant {
+	std::string name;
+	std::uint32_t type = kTypeNull;
+	double numberValue = 0;
+	std::string textValue;
+};
+
+struct TypeElement {
+	std::string name;
+	TypeRef type;
+	std::size_t offset = 0;
+	std::int32_t defaultValue = 0;
+};
+
+struct TypeInfo {
+	TypeRef type;
+	std::string name;
+	std::size_t libraryIndex = static_cast<std::size_t>(-1);
+	std::size_t dataTypeIndex = static_cast<std::size_t>(-1);
+	std::size_t size = 0;
+	bool isEnum = false;
+	std::vector<TypeElement> elements;
+	std::vector<std::size_t> memberCommandIndexes;
+	std::vector<std::size_t> memberMethodIds;
+};
+
+struct Program {
+	bool buildDll = false;
+	// 当前编译配置启用的条件宏。宏名称按易语言规则不区分大小写。
+	std::unordered_set<std::string> conditionMacros;
+	e2txt::ProjectBundle bundle;
+	std::filesystem::path inputRoot;
+	std::vector<std::filesystem::path> supportLibrarySearchDirectories;
+	std::vector<Library> libraries;
+	std::vector<DllCommand> dllCommands;
+	std::vector<Assembly> assemblies;
+	// 项目级全局变量页（与程序集变量使用同一类型模型）。
+	std::vector<Variable> globals;
+	std::vector<Method> methods;
+	std::vector<TypeInfo> types;
+	std::unordered_map<std::string, TypeRef> typeByName;
+	std::unordered_map<std::uint32_t, std::size_t> typeByCode;
+	std::unordered_map<std::string, std::size_t> methodByName;
+	std::unordered_map<std::string, std::vector<std::pair<std::size_t, std::size_t>>> globalCommands;
+	std::unordered_map<std::string, std::size_t> dllCommandByName;
+	std::unordered_map<std::string, Constant> constants;
+
+	const TypeInfo* FindType(std::uint32_t code) const;
+	std::uint32_t NormalizeLibraryType(std::size_t libraryIndex, std::uint32_t code) const;
+};
+
+// 从目录包或原生工程生成语义模型，并直接从每个 FNE 读取绑定信息。
+bool BuildCompilerModel(
+	e2txt::ProjectBundle bundle,
+	const std::filesystem::path& inputRoot,
+	const std::vector<std::filesystem::path>& supportLibrarySearchDirectories,
+	const std::vector<std::string>& conditionMacros,
+	Program& outProgram,
+	std::string& outError);
+
+}  // namespace ecompiler
