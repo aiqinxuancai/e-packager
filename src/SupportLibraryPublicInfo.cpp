@@ -26,6 +26,8 @@ namespace {
 constexpr size_t kMaxSupportLibraryStringLength = 4096;
 constexpr int kMaxSupportLibraryArrayCount = 16384;
 
+bool IsValidUtf8(const std::string& text);
+
 std::string TrimAsciiCopy(std::string text)
 {
 	size_t begin = 0;
@@ -380,13 +382,66 @@ size_t GetSafeCStringLength(const char* text, const size_t maxLength)
 #endif
 }
 
+bool IsValidUtf8(const std::string& text)
+{
+	for (std::size_t index = 0; index < text.size();) {
+		const unsigned char lead = static_cast<unsigned char>(text[index]);
+		if (lead < 0x80) {
+			++index;
+			continue;
+		}
+		std::size_t continuationCount = 0;
+		std::uint32_t codePoint = 0;
+		std::uint32_t minimum = 0;
+		if (lead >= 0xC2 && lead <= 0xDF) {
+			continuationCount = 1;
+			codePoint = lead & 0x1Fu;
+			minimum = 0x80;
+		}
+		else if (lead >= 0xE0 && lead <= 0xEF) {
+			continuationCount = 2;
+			codePoint = lead & 0x0Fu;
+			minimum = 0x800;
+		}
+		else if (lead >= 0xF0 && lead <= 0xF4) {
+			continuationCount = 3;
+			codePoint = lead & 0x07u;
+			minimum = 0x10000;
+		}
+		else {
+			return false;
+		}
+		if (index + continuationCount >= text.size()) return false;
+		for (std::size_t offset = 1; offset <= continuationCount; ++offset) {
+			const unsigned char byte = static_cast<unsigned char>(text[index + offset]);
+			if ((byte & 0xC0u) != 0x80u) return false;
+			codePoint = (codePoint << 6) | (byte & 0x3Fu);
+		}
+		if (codePoint < minimum || codePoint > 0x10FFFFu ||
+			(codePoint >= 0xD800u && codePoint <= 0xDFFFu)) return false;
+		index += continuationCount + 1;
+	}
+	return true;
+}
+
 std::string ReadAnsiText(const char* text)
 {
 	const size_t length = GetSafeCStringLength(text, kMaxSupportLibraryStringLength);
 	if (length == static_cast<size_t>(-1)) {
 		return std::string();
 	}
-	return text == nullptr ? std::string() : std::string(text, length);
+	if (text == nullptr || length == 0) return std::string();
+	const std::string raw(text, length);
+	// Classic Win32 FNEs store GBK/CP_ACP strings. Newer x64 FNEs store UTF-8.
+	// Do not decide from byte validity: GBK text can form a valid UTF-8 byte
+	// sequence by coincidence (for example D0 A1 CA B1 for "小时").
+#if defined(_WIN64) || defined(_M_X64)
+	return IsValidUtf8(raw)
+		? ConvertCodePage(raw, CP_UTF8, CP_ACP, MB_ERR_INVALID_CHARS)
+		: raw;
+#else
+	return raw;
+#endif
 }
 
 const LIB_INFO* CallGetLibInfoSafely(const PFN_GET_LIB_INFO getInfoProc)
@@ -403,7 +458,7 @@ const LIB_INFO* CallGetLibInfoSafely(const PFN_GET_LIB_INFO getInfoProc)
 #endif
 }
 
-INT CallNotifyLibrarySafely(const PFN_NOTIFY_LIB notifyProc, const INT message)
+INT_PTR CallNotifyLibrarySafely(const PFN_NOTIFY_LIB notifyProc, const INT message)
 {
 #if defined(_MSC_VER)
 	__try {
@@ -674,7 +729,7 @@ std::optional<std::string> ReadMultiStringItem(const char* text, const int oneBa
 			return std::nullopt;
 		}
 		if (index == oneBasedIndex) {
-			return std::string(current, length);
+			return ReadAnsiText(current);
 		}
 		current += length + 1;
 	}
@@ -861,7 +916,7 @@ std::vector<std::string> ReadNullSeparatedStringList(const char* text, const int
 		if (length == static_cast<size_t>(-1) || length == 0) {
 			break;
 		}
-		items.emplace_back(current, length);
+		items.push_back(ReadAnsiText(current));
 		current += length + 1;
 	}
 	return items;
@@ -1310,11 +1365,6 @@ bool TryLoadSupportLibraryDump(
 		*outMetadata = {};
 	}
 
-#if !defined(_M_IX86)
-	(void)filePath;
-	outError = "support_library_dump_requires_win32";
-	return false;
-#else
 	HMODULE module = nullptr;
 	const LIB_INFO* libInfo = nullptr;
 	bool moduleCanBeFreed = true;
@@ -1330,7 +1380,7 @@ bool TryLoadSupportLibraryDump(
 	};
 
 	auto tryLoad = [&](const DWORD flags, std::string& outAttemptError) -> bool {
-		module = LoadLibraryExA(filePath.string().c_str(), nullptr, flags);
+		module = LoadLibraryExW(filePath.c_str(), nullptr, flags);
 		if (module == nullptr) {
 			const DWORD errorCode = GetLastError();
 			outAttemptError =
@@ -1358,12 +1408,22 @@ bool TryLoadSupportLibraryDump(
 	};
 
 	std::string attemptError;
+#if defined(_M_X64)
+	// x64 support libraries may initialize their metadata tables from DllMain;
+	// loading them without dependency resolution leaves the command pointers
+	// null even though GetNewInf itself succeeds.
+	if (!tryLoad(0, attemptError)) {
+		outError = attemptError;
+		return false;
+	}
+#else
 	if (!tryLoad(DONT_RESOLVE_DLL_REFERENCES, attemptError)) {
 		if (!tryLoad(0, attemptError)) {
 			outError = attemptError;
 			return false;
 		}
 	}
+#endif
 	else if (ShouldRetrySupportLibraryWithDllInitialization(libInfo)) {
 		closeModule();
 		libInfo = nullptr;
@@ -1380,8 +1440,8 @@ bool TryLoadSupportLibraryDump(
 		return false;
 	}
 
-	outDump.filePath = filePath.string();
-	outDump.fileName = filePath.filename().string();
+	outDump.filePath = PathToUtf8(filePath);
+	outDump.fileName = PathToUtf8(filePath.filename());
 	outDump.name = ReadAnsiText(libInfo->m_szName);
 	outDump.guid = ReadAnsiText(libInfo->m_szGuid);
 	outDump.author = ReadAnsiText(libInfo->m_szAuthor);
@@ -1392,7 +1452,7 @@ bool TryLoadSupportLibraryDump(
 
 	if (outMetadata != nullptr) {
 		outMetadata->filePath = filePath;
-		outMetadata->fileName = filePath.filename().string();
+		outMetadata->fileName = PathToUtf8(filePath.filename());
 		outMetadata->name = outDump.name;
 		outMetadata->guid = outDump.guid;
 		outMetadata->state = libInfo->m_dwState;
@@ -1435,10 +1495,10 @@ bool TryLoadSupportLibraryDump(
 		}
 
 		if (outMetadata != nullptr) {
-			const INT namesAddress = CallNotifyLibrarySafely(libInfo->m_pfnNotify, NL_GET_CMD_FUNC_NAMES);
+			const INT_PTR namesAddress = CallNotifyLibrarySafely(libInfo->m_pfnNotify, NL_GET_CMD_FUNC_NAMES);
 			const auto* executeNames = namesAddress == 0 || namesAddress == NR_ERR
 				? nullptr
-				: reinterpret_cast<const char* const*>(static_cast<std::uintptr_t>(static_cast<std::uint32_t>(namesAddress)));
+				: reinterpret_cast<const char* const*>(static_cast<std::uintptr_t>(namesAddress));
 			const bool namesReadable = executeNames != nullptr && IsReadableMemoryRange(
 				executeNames,
 				sizeof(const char*) * static_cast<size_t>(libInfo->m_nCmdCount));
@@ -1570,22 +1630,21 @@ bool TryLoadSupportLibraryDump(
 	}
 
 	if (outMetadata != nullptr) {
-		const INT notifyNameAddress = CallNotifyLibrarySafely(libInfo->m_pfnNotify, NL_GET_NOTIFY_LIB_FUNC_NAME);
+		const INT_PTR notifyNameAddress = CallNotifyLibrarySafely(libInfo->m_pfnNotify, NL_GET_NOTIFY_LIB_FUNC_NAME);
 		if (notifyNameAddress != 0 && notifyNameAddress != NR_ERR) {
 			outMetadata->notifySymbol = ReadAnsiText(reinterpret_cast<const char*>(
-				static_cast<std::uintptr_t>(static_cast<std::uint32_t>(notifyNameAddress))));
+				static_cast<std::uintptr_t>(notifyNameAddress)));
 		}
-		const INT dependenciesAddress = CallNotifyLibrarySafely(libInfo->m_pfnNotify, NL_GET_DEPENDENT_LIBS);
+		const INT_PTR dependenciesAddress = CallNotifyLibrarySafely(libInfo->m_pfnNotify, NL_GET_DEPENDENT_LIBS);
 		if (dependenciesAddress != 0 && dependenciesAddress != NR_ERR) {
 			outMetadata->dependentLibraries = ReadNullSeparatedStringList(
-				reinterpret_cast<const char*>(static_cast<std::uintptr_t>(static_cast<std::uint32_t>(dependenciesAddress))),
+				reinterpret_cast<const char*>(static_cast<std::uintptr_t>(dependenciesAddress)),
 				kMaxSupportLibraryArrayCount);
 		}
 	}
 
 	closeModule();
 	return true;
-#endif
 }
 
 std::string JoinLines(const std::vector<std::string>& lines)

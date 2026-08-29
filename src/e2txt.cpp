@@ -2972,7 +2972,65 @@ std::string ReadSupportLibraryName(const char* text)
 	if (length == static_cast<size_t>(-1)) {
 		return std::string();
 	}
-	return text == nullptr ? std::string() : std::string(text, length);
+	if (text == nullptr || length == 0) {
+		return std::string();
+	}
+
+	const std::string raw(text, length);
+	// The FNE format has two historical string encodings. Classic Win32 FNEs
+	// publish the active code page (GBK on a Chinese Windows installation),
+	// while the x64 FNEs used by the independent compiler publish UTF-8. A
+	// byte sequence such as GBK "小时" (D0 A1 CA B1) is also valid UTF-8, so
+	// validity probing alone is not an encoding discriminator.
+#if defined(_WIN64) || defined(_M_X64)
+	const int wideLength = MultiByteToWideChar(
+		CP_UTF8,
+		MB_ERR_INVALID_CHARS,
+		raw.data(),
+		static_cast<int>(raw.size()),
+		nullptr,
+		0);
+	if (wideLength <= 0) {
+		return raw;
+	}
+	std::wstring wide(static_cast<size_t>(wideLength), L'\0');
+	if (MultiByteToWideChar(
+		CP_UTF8,
+		MB_ERR_INVALID_CHARS,
+		raw.data(),
+		static_cast<int>(raw.size()),
+		wide.data(),
+		wideLength) <= 0) {
+		return raw;
+	}
+	const int localLength = WideCharToMultiByte(
+		CP_ACP,
+		0,
+		wide.data(),
+		wideLength,
+		nullptr,
+		0,
+		nullptr,
+		nullptr);
+	if (localLength <= 0) {
+		return raw;
+	}
+	std::string local(static_cast<size_t>(localLength), '\0');
+	if (WideCharToMultiByte(
+		CP_ACP,
+		0,
+		wide.data(),
+		wideLength,
+		local.data(),
+		localLength,
+		nullptr,
+		nullptr) <= 0) {
+		return raw;
+	}
+	return local;
+#else
+	return raw;
+#endif
 }
 
 std::vector<std::string> BuildSupportTypeMemberNames(const LIB_DATA_TYPE_INFO& dataType)
@@ -3035,24 +3093,6 @@ std::vector<std::string> BuildSupportTypeEventNames(const LIB_DATA_TYPE_INFO& da
 	return eventNames;
 }
 
-std::string ResolveCoreLibraryFallbackMemberName(std::int32_t typeId, std::int32_t memberId)
-{
-	if (memberId == 8) {
-		switch (typeId) {
-		case 0:
-		case 9:
-		case 10:
-		case 13:
-		case 14:
-		case 15:
-			return "标题";
-		default:
-			break;
-		}
-	}
-	return std::string();
-}
-
 void PushUniqueCandidate(std::vector<std::filesystem::path>& candidates, const std::filesystem::path& candidate)
 {
 	if (candidate.empty()) {
@@ -3070,7 +3110,9 @@ void PushUniqueCandidate(std::vector<std::filesystem::path>& candidates, const s
 
 std::vector<std::filesystem::path> BuildSupportLibraryCandidatePaths(
 	const std::string& sourcePath,
-	const std::string& libraryFileName)
+	const std::string& libraryFileName,
+	const std::vector<std::filesystem::path>* configuredDirectories,
+	const bool restrictToConfiguredDirectories)
 {
 	std::vector<std::filesystem::path> candidates;
 	if (libraryFileName.empty()) {
@@ -3080,6 +3122,34 @@ std::vector<std::filesystem::path> BuildSupportLibraryCandidatePaths(
 	std::filesystem::path filePath = std::filesystem::path(libraryFileName);
 	if (!filePath.has_extension()) {
 		filePath += ".fne";
+	}
+
+	if (filePath.is_absolute()) {
+		// An absolute path embedded in an .e file may point to an x86
+		// installation.  Architecture-aware callers get a chance to resolve
+		// the same library name from their configured directory first.
+		if (configuredDirectories == nullptr || configuredDirectories->empty()) {
+			PushUniqueCandidate(candidates, filePath);
+			return candidates;
+		}
+	}
+
+	if (configuredDirectories != nullptr && !configuredDirectories->empty()) {
+		for (const auto& directory : *configuredDirectories) {
+			if (directory.empty()) {
+				continue;
+			}
+			if (filePath.is_absolute()) {
+				PushUniqueCandidate(candidates, directory / filePath.filename());
+			}
+			else {
+				PushUniqueCandidate(candidates, directory / filePath);
+			}
+			PushUniqueCandidate(candidates, directory / "lib" / filePath.filename());
+		}
+		if (restrictToConfiguredDirectories) {
+			return candidates;
+		}
 	}
 
 	if (filePath.is_absolute()) {
@@ -3191,12 +3261,16 @@ public:
 		const ProgramSection& program,
 		const ResourceSection& resources,
 		const std::string& sourcePath,
-		const std::vector<RemovedDefinedItemInfo>* removedDefinedItems = nullptr)
+		const std::vector<RemovedDefinedItemInfo>* removedDefinedItems = nullptr,
+		const std::vector<std::filesystem::path>* supportLibrarySearchDirectories = nullptr,
+		const bool restrictSupportLibrarySearch = false)
 		: m_program(program)
 		, m_resources(resources)
 		, m_sourcePath(sourcePath)
 		, m_sourceFileKind(DetectSourceFileKindFromPath(sourcePath))
 		, m_removedDefinedItems(removedDefinedItems)
+		, m_supportLibrarySearchDirectories(supportLibrarySearchDirectories)
+		, m_restrictSupportLibrarySearch(restrictSupportLibrarySearch)
 	{
 		BuildClassTypePageMap();
 		BuildUserNameCache();
@@ -3338,13 +3412,6 @@ public:
 
 	std::string ResolveLibTypeMemberName(std::int16_t libraryIndex, std::int32_t typeId, std::int32_t memberId)
 	{
-		if (libraryIndex == 0) {
-			const std::string fallbackName = ResolveCoreLibraryFallbackMemberName(typeId, memberId);
-			if (!fallbackName.empty()) {
-				return fallbackName;
-			}
-		}
-
 		if (!EnsureSupportLibraryCacheByLibraryId(libraryIndex)) {
 			std::ostringstream stream;
 			stream << "_Lib" << libraryIndex << "Type" << typeId << "Mem" << memberId;
@@ -3400,10 +3467,6 @@ public:
 
 	bool IsTabControlDataType(std::int32_t typeValue)
 	{
-		if (typeValue == 65557) {
-			return true;
-		}
-
 		const auto rawValue = static_cast<std::uint32_t>(typeValue);
 		if ((rawValue & 0x80000000u) != 0) {
 			return false;
@@ -3721,7 +3784,11 @@ private:
 			return false;
 		}
 
-		const auto candidates = BuildSupportLibraryCandidatePaths(m_sourcePath, symbols.fileName);
+		const auto candidates = BuildSupportLibraryCandidatePaths(
+			m_sourcePath,
+			symbols.fileName,
+			m_supportLibrarySearchDirectories,
+			m_restrictSupportLibrarySearch);
 		HMODULE module = nullptr;
 		bool candidateExists = false;
 		bool moduleLoaded = false;
@@ -3854,6 +3921,8 @@ private:
 	std::string m_sourcePath;
 	SourceFileKind m_sourceFileKind = SourceFileKind::E;
 	const std::vector<RemovedDefinedItemInfo>* m_removedDefinedItems = nullptr;
+	const std::vector<std::filesystem::path>* m_supportLibrarySearchDirectories = nullptr;
+	bool m_restrictSupportLibrarySearch = false;
 	std::unordered_map<std::int32_t, std::string> m_userNameCache;
 	std::unordered_map<std::int32_t, std::int32_t> m_classTypePageById;
 	std::unordered_map<std::int32_t, std::string> m_methodOwnerNameCache;
@@ -5676,7 +5745,9 @@ void BuildProgramPages(const ModuleSections& sections, const GenerateOptions& op
 		sections.program,
 		sections.resources,
 		outDocument.sourcePath,
-		&sections.losable.removedDefinedItems);
+		&sections.losable.removedDefinedItems,
+		&options.supportLibrarySearchDirectories,
+		options.restrictSupportLibrarySearch);
 	std::vector<EComDependencyRecord> dependencyRecords;
 	(void)ParseEComDependencies(sections.ecomSectionBytes, dependencyRecords);
 	TraceLine("BuildProgramPages begin");
@@ -5796,7 +5867,9 @@ void BuildGlobalPage(const ModuleSections& sections, const GenerateOptions& opti
 		sections.program,
 		sections.resources,
 		outDocument.sourcePath,
-		&sections.losable.removedDefinedItems);
+		&sections.losable.removedDefinedItems,
+		&options.supportLibrarySearchDirectories,
+		options.restrictSupportLibrarySearch);
 	Page page;
 	page.typeName = "全局变量";
 	page.name = "全局变量";
@@ -5830,7 +5903,9 @@ void BuildStructPage(
 		sections.program,
 		sections.resources,
 		outDocument.sourcePath,
-		&sections.losable.removedDefinedItems);
+		&sections.losable.removedDefinedItems,
+		&options.supportLibrarySearchDirectories,
+		options.restrictSupportLibrarySearch);
 	Page page;
 	page.typeName = "自定义数据类型";
 	page.name = "自定义数据类型";
@@ -5885,7 +5960,9 @@ void BuildDllPage(
 		sections.program,
 		sections.resources,
 		outDocument.sourcePath,
-		&sections.losable.removedDefinedItems);
+		&sections.losable.removedDefinedItems,
+		&options.supportLibrarySearchDirectories,
+		options.restrictSupportLibrarySearch);
 	Page page;
 	page.typeName = "DLL命令";
 	page.name = "Dll命令";
@@ -5938,7 +6015,9 @@ void BuildConstantPage(const ModuleSections& sections, const GenerateOptions& op
 		sections.program,
 		sections.resources,
 		outDocument.sourcePath,
-		&sections.losable.removedDefinedItems);
+		&sections.losable.removedDefinedItems,
+		&options.supportLibrarySearchDirectories,
+		options.restrictSupportLibrarySearch);
 	Page page;
 	page.typeName = "常量资源";
 	page.name = "常量表...";
@@ -6237,7 +6316,10 @@ void AppendFormMenuEventXmlLines(
 	AppendXmlLine(formXml, indent, BuildXmlOpenTag("菜单.事件", attributes, true));
 }
 
-void BuildFormXmlEntries(const ModuleSections& sections, Document& outDocument)
+void BuildFormXmlEntries(
+	const ModuleSections& sections,
+	const GenerateOptions& options,
+	Document& outDocument)
 {
 	if (sections.resources.forms.empty()) {
 		return;
@@ -6247,7 +6329,9 @@ void BuildFormXmlEntries(const ModuleSections& sections, Document& outDocument)
 		sections.program,
 		sections.resources,
 		outDocument.sourcePath,
-		&sections.losable.removedDefinedItems);
+		&sections.losable.removedDefinedItems,
+		&options.supportLibrarySearchDirectories,
+		options.restrictSupportLibrarySearch);
 	for (const auto& form : sections.resources.forms) {
 		FormXml formXml;
 		formXml.name = TrimAsciiCopy(form.name);
@@ -6449,7 +6533,7 @@ bool BuildDocumentFromSections(
 	BuildStructPage(sections, anonymousTypeHints, options, document);
 	BuildDllPage(sections, anonymousTypeHints, options, document);
 	BuildFormPage(sections, document);
-	BuildFormXmlEntries(sections, document);
+	BuildFormXmlEntries(sections, options, document);
 	BuildConstantPage(sections, options, document);
 	outDocument = std::move(document);
 	return true;
@@ -6488,7 +6572,8 @@ std::string BuildPublicHeaderText(
 	const ModuleSections& sections,
 	const std::string& sourcePath,
 	const std::vector<EComDependencyRecord>& dependencyRecords,
-	const AnonymousTypeHints& anonymousTypeHints)
+	const AnonymousTypeHints& anonymousTypeHints,
+	const GenerateOptions& options)
 {
 	if (DetectSourceFileKindFromPath(sourcePath) != SourceFileKind::EC) {
 		return std::string();
@@ -6506,7 +6591,9 @@ std::string BuildPublicHeaderText(
 		sections.program,
 		sections.resources,
 		sourcePath,
-		&sections.losable.removedDefinedItems);
+		&sections.losable.removedDefinedItems,
+		&options.supportLibrarySearchDirectories,
+		options.restrictSupportLibrarySearch);
 	std::vector<std::string> lines;
 	lines.push_back("模块名称：" + projectName);
 	lines.push_back("作者：" + author);
@@ -7203,12 +7290,19 @@ bool BuildBundleFromSections(
 	std::vector<EComDependencyRecord> dependencyRecords;
 	(void)ParseEComDependencies(sections.ecomSectionBytes, dependencyRecords);
 	const AnonymousTypeHints anonymousTypeHints = BuildAnonymousTypeHints(sections, sourcePath);
-	bundle.publicHeaderText = BuildPublicHeaderText(sections, sourcePath, dependencyRecords, anonymousTypeHints);
+	bundle.publicHeaderText = BuildPublicHeaderText(
+		sections,
+		sourcePath,
+		dependencyRecords,
+		anonymousTypeHints,
+		options);
 	SymbolResolver resolver(
 		sections.program,
 		sections.resources,
 		sourcePath,
-		&sections.losable.removedDefinedItems);
+		&sections.losable.removedDefinedItems,
+		&options.supportLibrarySearchDirectories,
+		options.restrictSupportLibrarySearch);
 
 	std::unordered_map<std::int32_t, std::string> itemKeys;
 	std::unordered_map<std::string, int> keyCounters;
@@ -8119,7 +8213,10 @@ bool Generator::GenerateBundleInternal(
 	if (!ParseModuleSectionsFromBytes(inputBytes, sections, outError)) {
 		return false;
 	}
-	if (!BuildBundleFromSections(sections, inputPath, options, outBundle)) {
+	GenerateOptions effectiveOptions = options;
+	effectiveOptions.supportLibrarySearchDirectories = readOptions.supportLibrarySearchDirectories;
+	effectiveOptions.restrictSupportLibrarySearch = readOptions.restrictSupportLibrarySearch;
+	if (!BuildBundleFromSections(sections, inputPath, effectiveOptions, outBundle)) {
 		if (outError != nullptr && outError->empty()) {
 			*outError = "build_bundle_failed";
 		}
@@ -8366,7 +8463,10 @@ bool Generator::GenerateDocumentInternal(
 		" forms=" + std::to_string(sections.resources.forms.size()) +
 		" constants=" + std::to_string(sections.resources.constants.size()));
 
-	if (!BuildDocumentFromSections(sections, inputPath, options, outDocument)) {
+	GenerateOptions effectiveOptions = options;
+	effectiveOptions.supportLibrarySearchDirectories = readOptions.supportLibrarySearchDirectories;
+	effectiveOptions.restrictSupportLibrarySearch = readOptions.restrictSupportLibrarySearch;
+	if (!BuildDocumentFromSections(sections, inputPath, effectiveOptions, outDocument)) {
 		if (outError != nullptr && outError->empty()) {
 			*outError = "build_document_failed";
 		}

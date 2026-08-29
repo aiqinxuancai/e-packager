@@ -2,12 +2,16 @@
 
 #include "../PathHelper.h"
 
+#include <Windows.h>
+
 #include <algorithm>
 #include <charconv>
 #include <cstdlib>
 #include <functional>
 #include <fstream>
+#include <limits>
 #include <set>
+#include <sstream>
 #include <string_view>
 #include <utility>
 
@@ -17,7 +21,7 @@ namespace {
 constexpr std::uint32_t kLibraryEnumState = 1u << 22;
 constexpr std::uint32_t kUserTypeMask = 0x40000000u;
 
-std::size_t SystemTypeSize(std::uint32_t type);
+std::size_t SystemTypeSize(std::uint32_t type, TargetArchitecture architecture);
 
 std::string Trim(std::string value)
 {
@@ -33,6 +37,19 @@ std::string StripUtf8Bom(std::string value)
 		value.erase(0, 3);
 	}
 	return value;
+}
+
+bool IsRegularFilePath(const std::filesystem::path& path)
+{
+	std::error_code error;
+	return std::filesystem::is_regular_file(path, error);
+}
+
+std::filesystem::path AbsolutePathValue(const std::filesystem::path& path)
+{
+	std::error_code error;
+	const auto absolute = std::filesystem::absolute(path, error);
+	return error ? path : absolute;
 }
 
 bool StartsWith(const std::string& text, const std::string_view prefix)
@@ -92,7 +109,11 @@ void AppendPageText(std::string& destination, const std::string& source)
 
 std::string RemoveEcomStartupMethod(const std::string& text);
 
-bool ExpandEComDependencies(e2txt::ProjectBundle& bundle, const std::filesystem::path& inputRoot, std::string& error)
+bool ExpandEComDependencies(
+	e2txt::ProjectBundle& bundle,
+	const std::filesystem::path& inputRoot,
+	const e2txt::ReadOptions& readOptions,
+	std::string& error)
 {
 	std::vector<e2txt::Dependency> additionalDependencies;
 	std::unordered_set<std::string> knownECom;
@@ -107,23 +128,12 @@ bool ExpandEComDependencies(e2txt::ProjectBundle& bundle, const std::filesystem:
 			else path = inputRoot / path;
 		}
 		if (!path.is_absolute() || !std::filesystem::exists(path)) {
-			const std::filesystem::path configuredPath = path;
-			std::filesystem::path normalizedConfiguredPath = configuredPath;
-			std::wstring normalizedFileName = normalizedConfiguredPath.filename().wstring();
-			if (!normalizedFileName.empty() && normalizedFileName.front() == L'$') {
-				normalizedFileName.erase(normalizedFileName.begin());
-				normalizedConfiguredPath.replace_filename(normalizedFileName);
-			}
-			const std::filesystem::path baseDirectory = inputRoot.parent_path();
-			for (const auto& candidate : {
-				baseDirectory / configuredPath,
-				baseDirectory / normalizedConfiguredPath,
-				baseDirectory / L"ecom" / configuredPath.filename(),
-				baseDirectory / L"ecom" / normalizedConfiguredPath.filename(),
-				std::filesystem::path(L"C:\\Users\\aiqin\\OneDrive\\e5.6\\ecom") / configuredPath.filename(),
-				std::filesystem::path(L"C:\\Users\\aiqin\\OneDrive\\e5.6\\ecom") / normalizedConfiguredPath.filename(),
-			}) {
-				if (std::filesystem::is_regular_file(candidate, ec)) { path = candidate; break; }
+			const auto candidates = BuildModuleFileLookupCandidates(inputRoot, dependency.path);
+			for (const auto& candidate : candidates) {
+				if (std::filesystem::is_regular_file(candidate, ec)) {
+					path = candidate;
+					break;
+				}
 			}
 		}
 		if (!std::filesystem::is_regular_file(path, ec)) {
@@ -135,7 +145,7 @@ bool ExpandEComDependencies(e2txt::ProjectBundle& bundle, const std::filesystem:
 		std::string moduleError;
 		// `.ec` 内部已经保存了上游模块的导入实现。编译模式必须读取
 		// 这些隐藏函数和声明，不能把模块再次降级为外部源码依赖。
-		if (!generator.GenerateCompilerBundle(PathToUtf8(path), module, &moduleError)) {
+		if (!generator.GenerateCompilerBundle(PathToUtf8(path), module, &moduleError, readOptions)) {
 			error = "ecom_module_read_failed:" + PathToUtf8(path) + ":" + moduleError;
 			return false;
 		}
@@ -942,11 +952,13 @@ bool RegisterProjectTypes(Program& program, std::string& error)
 		for (TypeElement& element : type.elements) {
 			element.offset = offset;
 			const TypeRef memberType = element.type;
-			std::size_t size = memberType.isArray ? 4 : SystemTypeSize(memberType.code);
+			std::size_t size = memberType.isArray
+				? (program.targetArchitecture == TargetArchitecture::X64 ? 8u : 4u)
+				: SystemTypeSize(memberType.code, program.targetArchitecture);
 			if (size == 0) {
 				const auto nested = program.typeByCode.find(memberType.code);
 				if (nested == program.typeByCode.end() || !calculate(nested->second, active)) return false;
-				size = 4;
+				size = program.targetArchitecture == TargetArchitecture::X64 ? 8u : 4u;
 			}
 			offset += size;
 		}
@@ -965,14 +977,37 @@ bool RegisterProjectTypes(Program& program, std::string& error)
 std::filesystem::path ResolveSupportLibraryPath(
 	const e2txt::Dependency& dependency,
 	const std::filesystem::path& inputRoot,
-	const std::vector<std::filesystem::path>& searchDirectories)
+	const std::vector<std::filesystem::path>& searchDirectories,
+	const TargetArchitecture architecture)
 {
 	std::vector<std::filesystem::path> candidates;
-	if (!dependency.resolvedPath.empty()) candidates.push_back(Utf8PathToPath(dependency.resolvedPath));
+	const auto isCompatible = [&](const std::filesystem::path& candidate) {
+		const std::wstring extension = candidate.extension().wstring();
+		if (extension != L".fne" && extension != L".fnr" && extension != L".dll") return true;
+		std::ifstream input(candidate, std::ios::binary);
+		if (!input) return true;
+		std::uint16_t dosMagic = 0;
+		std::int32_t peOffset = 0;
+		input.read(reinterpret_cast<char*>(&dosMagic), sizeof(dosMagic));
+		input.seekg(0x3C, std::ios::beg);
+		input.read(reinterpret_cast<char*>(&peOffset), sizeof(peOffset));
+		if (!input || dosMagic != 0x5A4D || peOffset < 0 || peOffset > 0x1000000) return true;
+		input.seekg(peOffset + 4, std::ios::beg);
+		std::uint16_t machine = 0;
+		input.read(reinterpret_cast<char*>(&machine), sizeof(machine));
+		if (!input) return true;
+		return architecture == TargetArchitecture::X64 ? machine == 0x8664 : machine == 0x014c;
+	};
+	const auto appendCandidate = [&](const std::filesystem::path& candidate) {
+		if (!candidate.empty() && isCompatible(candidate)) candidates.push_back(candidate);
+	};
+	// For an x64 build, an embedded dependency often still points to the
+	// installed x86 FNE.  Search architecture-specific roots first and only
+	// accept an explicitly resolved path after its PE header matches.
 	if (!dependency.path.empty()) {
 		const std::filesystem::path configured = Utf8PathToPath(dependency.path);
-		candidates.push_back(configured);
-		if (configured.is_relative()) candidates.push_back(inputRoot / configured);
+		appendCandidate(configured);
+		if (configured.is_relative()) appendCandidate(inputRoot / configured);
 	}
 	const std::string libraryName = !dependency.fileName.empty() ? dependency.fileName : dependency.name;
 	if (!libraryName.empty()) {
@@ -987,10 +1022,17 @@ std::filesystem::path ResolveSupportLibraryPath(
 			variants.push_back(configuredName);
 		}
 		for (const auto& variant : variants) {
-			candidates.push_back(inputRoot / variant);
-			for (const auto& directory : searchDirectories) candidates.push_back(directory / variant);
+			for (const auto& directory : searchDirectories) {
+				if (architecture == TargetArchitecture::X64) {
+					appendCandidate(directory / L"x64" / variant);
+				}
+				appendCandidate(directory / variant);
+			}
+			appendCandidate(inputRoot / L"x64" / variant);
+			appendCandidate(inputRoot / variant);
 		}
 	}
+	if (!dependency.resolvedPath.empty()) appendCandidate(Utf8PathToPath(dependency.resolvedPath));
 	std::error_code ec;
 	for (const auto& candidate : candidates) {
 		if (std::filesystem::is_regular_file(candidate, ec)) return std::filesystem::absolute(candidate, ec);
@@ -999,17 +1041,705 @@ std::filesystem::path ResolveSupportLibraryPath(
 	return {};
 }
 
-std::size_t SystemTypeSize(const std::uint32_t type)
+// Support-library text exports are architecture-neutral interface metadata.
+// They are useful when a project declares a library for which no target-
+// architecture FNE is installed, but they must never be treated as executable
+// implementations.  Keep this parser here so the compiler model has one
+// fallback path for both source files and unpacked project directories.
+struct SidecarRawArgument {
+	support_library_public_info::ArgumentMetadata metadata;
+	std::string typeName;
+};
+
+struct SidecarRawCommand {
+	support_library_public_info::CommandMetadata metadata;
+	std::string returnTypeName;
+	std::vector<SidecarRawArgument> arguments;
+};
+
+struct SidecarRawElement {
+	support_library_public_info::DataTypeElementMetadata metadata;
+	std::string typeName;
+};
+
+struct SidecarRawType {
+	support_library_public_info::DataTypeMetadata metadata;
+	std::vector<SidecarRawElement> elements;
+	std::vector<SidecarRawCommand> memberCommands;
+};
+
+std::string ConvertUtf8TextToLocal(std::string text)
+{
+	if (text.empty()) return text;
+	const int wideLength = MultiByteToWideChar(
+		CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()), nullptr, 0);
+	if (wideLength <= 0) return text;
+	std::wstring wide(static_cast<std::size_t>(wideLength), L'\0');
+	if (MultiByteToWideChar(
+		CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()),
+		wide.data(), wideLength) <= 0) return text;
+	const int localLength = WideCharToMultiByte(
+		CP_ACP, 0, wide.data(), wideLength, nullptr, 0, nullptr, nullptr);
+	if (localLength <= 0) return text;
+	std::string local(static_cast<std::size_t>(localLength), '\0');
+	if (WideCharToMultiByte(
+		CP_ACP, 0, wide.data(), wideLength, local.data(), localLength,
+		nullptr, nullptr) <= 0) return text;
+	return local;
+}
+
+bool ReadSidecarText(const std::filesystem::path& path, std::string& outText)
+{
+	outText.clear();
+	std::ifstream input(path, std::ios::binary);
+	if (!input) return false;
+	std::ostringstream buffer;
+	buffer << input.rdbuf();
+	if (!input.good() && !input.eof()) return false;
+	std::string raw = buffer.str();
+	const bool hasUtf8Bom = raw.size() >= 3 &&
+		static_cast<unsigned char>(raw[0]) == 0xEF &&
+		static_cast<unsigned char>(raw[1]) == 0xBB &&
+		static_cast<unsigned char>(raw[2]) == 0xBF;
+	if (hasUtf8Bom) raw.erase(0, 3);
+	// e-packager's elib exports always carry UTF-8 BOM.  For hand-authored
+	// sidecars, accept UTF-8 when it is valid and otherwise preserve ACP text.
+	outText = hasUtf8Bom ? ConvertUtf8TextToLocal(std::move(raw)) : ConvertUtf8TextToLocal(raw);
+	return true;
+}
+
+std::string SidecarFieldValue(
+	const std::vector<std::string>& fields,
+	const std::string_view prefix)
+{
+	for (const auto& field : fields) {
+		if (StartsWith(field, prefix)) return Trim(field.substr(prefix.size()));
+	}
+	return {};
+}
+
+int SidecarCategoryValue(const std::string& value)
+{
+	if (value.find("成员命令") != std::string::npos) return -1;
+	const std::size_t left = value.rfind('(');
+	const std::size_t right = value.rfind(')');
+	if (left == std::string::npos || right == std::string::npos || right <= left + 1) return 0;
+	char* end = nullptr;
+	const long number = std::strtol(value.substr(left + 1, right - left - 1).c_str(), &end, 10);
+	return end != nullptr && *end == '\0' ? static_cast<int>(number) : 0;
+}
+
+std::uint16_t SidecarCommandState(const std::string& attributes)
+{
+	std::uint16_t state = 0;
+	if (attributes.find("隐藏") != std::string::npos) state |= 1u << 2;
+	if (attributes.find("不可用") != std::string::npos) state |= 1u << 3;
+	if (attributes.find("发布版禁用") != std::string::npos) state |= 1u << 4;
+	if (attributes.find("允许追加参数") != std::string::npos) state |= 1u << 5;
+	if (attributes.find("返回数组") != std::string::npos) state |= 1u << 6;
+	if (attributes.find("对象复制") != std::string::npos) state |= 1u << 7;
+	if (attributes.find("对象释放") != std::string::npos) state |= 1u << 8;
+	if (attributes.find("对象构造") != std::string::npos) state |= 1u << 9;
+	return state;
+}
+
+std::uint32_t SidecarArgumentState(const std::string& attributes)
+{
+	std::uint32_t state = 0;
+	if (attributes.find("默认值=") != std::string::npos) state |= 1u << 0;
+	if (attributes.find("默认空") != std::string::npos) state |= 1u << 1;
+	if (attributes.find("只接收变量") != std::string::npos) state |= 1u << 2;
+	if (attributes.find("只接收变量数组") != std::string::npos) state |= 1u << 3;
+	if (attributes.find("接收变量或数组") != std::string::npos) state |= 1u << 4;
+	if (attributes.find("接收数组数据") != std::string::npos) state |= 1u << 5;
+	if (attributes.find("接收任意类型") != std::string::npos) state |= 1u << 6;
+	if (attributes.find("接收变量或表达式") != std::string::npos) state |= 1u << 9;
+	return state;
+}
+
+bool ParseSidecarCommandHeader(
+	const std::string& line,
+	const std::string_view prefix,
+	SidecarRawCommand& outCommand)
+{
+	if (!StartsWith(line, prefix)) return false;
+	const std::vector<std::string> fields = SplitFields(line.substr(prefix.size()));
+	if (fields.empty()) return false;
+	outCommand = {};
+	outCommand.metadata.name = Trim(fields[0]);
+	if (outCommand.metadata.name == "<未命名>") outCommand.metadata.name.clear();
+	outCommand.returnTypeName = SidecarFieldValue(fields, "返回值=");
+	outCommand.metadata.category = static_cast<std::int16_t>(SidecarCategoryValue(SidecarFieldValue(fields, "分类=")));
+	outCommand.metadata.englishName = SidecarFieldValue(fields, "英文名=");
+	outCommand.metadata.state = SidecarCommandState(SidecarFieldValue(fields, "属性="));
+	return true;
+}
+
+bool ParseSidecarArgumentLine(const std::string& line, SidecarRawArgument& outArgument)
+{
+	if (!StartsWith(line, ".参数 ")) return false;
+	const std::vector<std::string> fields = SplitFields(line.substr(std::string(".参数 ").size()));
+	if (fields.empty()) return false;
+	outArgument = {};
+	outArgument.metadata.name = Trim(fields[0]);
+	if (fields.size() >= 2) outArgument.typeName = Trim(fields[1]);
+	std::string attributes;
+	for (std::size_t index = 2; index < fields.size(); ++index) {
+		if (!attributes.empty()) attributes += ",";
+		attributes += fields[index];
+	}
+	outArgument.metadata.state = SidecarArgumentState(attributes);
+	const std::string defaultValue = SidecarFieldValue(fields, "默认值=");
+	if (!defaultValue.empty()) {
+		char* end = nullptr;
+		const long parsed = std::strtol(defaultValue.c_str(), &end, 10);
+		if (end != nullptr && end != defaultValue.c_str() && *end == '\0') {
+			outArgument.metadata.defaultValue = static_cast<std::int32_t>(parsed);
+		}
+	}
+	return true;
+}
+
+bool ParseSidecarTypeHeader(const std::string& line, SidecarRawType& outType)
+{
+	if (!StartsWith(line, ".数据类型 ")) return false;
+	const std::vector<std::string> fields = SplitFields(line.substr(std::string(".数据类型 ").size()));
+	if (fields.empty()) return false;
+	outType = {};
+	outType.metadata.name = Trim(fields[0]);
+	outType.metadata.englishName = SidecarFieldValue(fields, "英文名=");
+	const std::string attributes = SidecarFieldValue(fields, "属性=");
+	const std::string typeKind = SidecarFieldValue(fields, "类型=");
+	if (attributes.find("枚举") != std::string::npos || typeKind.find("枚举") != std::string::npos) {
+		outType.metadata.state |= (1u << 22);
+	}
+	return !outType.metadata.name.empty();
+}
+
+bool ParseSidecarElementLine(const std::string& line, SidecarRawElement& outElement)
+{
+	if (!StartsWith(line, ".成员 ")) return false;
+	const std::vector<std::string> fields = SplitFields(line.substr(std::string(".成员 ").size()));
+	if (fields.size() < 2 || Trim(fields[0]).empty()) return false;
+	outElement = {};
+	outElement.metadata.name = Trim(fields[0]);
+	outElement.typeName = Trim(fields[1]);
+	if (outElement.typeName.size() >= 2 &&
+		outElement.typeName.compare(outElement.typeName.size() - 2, 2, "[]") == 0) {
+		outElement.metadata.isArray = true;
+		outElement.typeName.erase(outElement.typeName.size() - 2);
+	}
+	const std::string attributes = fields.size() >= 3 ? fields[2] : std::string();
+	if (attributes.find("数组") != std::string::npos) outElement.metadata.isArray = true;
+	const std::string defaultValue = SidecarFieldValue(fields, "默认值=");
+	if (!defaultValue.empty()) {
+		char* end = nullptr;
+		const long parsed = std::strtol(defaultValue.c_str(), &end, 10);
+		if (end != nullptr && end != defaultValue.c_str() && *end == '\0') {
+			outElement.metadata.defaultValue = static_cast<std::int32_t>(parsed);
+		}
+	}
+	return true;
+}
+
+std::uint32_t SidecarTypeCode(
+	std::string typeName,
+	const std::unordered_map<std::string, std::uint32_t>& customTypes,
+	bool& isArray)
+{
+	typeName = Trim(std::move(typeName));
+	isArray = false;
+	if (typeName.size() >= 2 && typeName.compare(typeName.size() - 2, 2, "[]") == 0) {
+		isArray = true;
+		typeName.erase(typeName.size() - 2);
+		typeName = Trim(std::move(typeName));
+	}
+	if (typeName.empty() || typeName == "无返回值") return kTypeNull;
+	if (typeName == "通用型") return kTypeAll;
+	if (typeName == "字节型") return kTypeByte;
+	if (typeName == "短整数型") return kTypeShort;
+	if (typeName == "整数型") return kTypeInt;
+	if (typeName == "长整数型") return kTypeInt64;
+	if (typeName == "小数型") return kTypeFloat;
+	if (typeName == "双精度小数型" || typeName == "数值") return kTypeDouble;
+	if (typeName == "逻辑型") return kTypeBool;
+	if (typeName == "日期时间型") return kTypeDateTime;
+	if (typeName == "文本型") return kTypeText;
+	if (typeName == "字节集" || typeName == "字节集型") return kTypeBinary;
+	if (typeName == "子程序指针" || typeName == "子程序指针型") return kTypeSubroutine;
+	if (const auto found = customTypes.find(typeName); found != customTypes.end()) return found->second;
+	return kTypeNull;
+}
+
+int SidecarCommandMatchScore(
+	const SidecarRawCommand& left,
+	const SidecarRawCommand& right)
+{
+	if (left.arguments.size() != right.arguments.size()) return -1;
+	if (!left.metadata.englishName.empty() && !right.metadata.englishName.empty() &&
+		left.metadata.englishName == right.metadata.englishName) return 90;
+	if (!left.metadata.name.empty() && !right.metadata.name.empty() &&
+		left.metadata.name == right.metadata.name) return 100;
+	if (left.metadata.name.empty() && left.metadata.englishName.empty() &&
+		right.metadata.name.empty() && right.metadata.englishName.empty() &&
+		left.metadata.state == right.metadata.state && left.metadata.category == right.metadata.category) return 60;
+	return -1;
+}
+
+bool LoadSupportLibrarySidecarMetadata(
+	const std::filesystem::path& sidecarPath,
+	const e2txt::Dependency& dependency,
+	support_library_public_info::LibraryMetadata& outMetadata,
+	std::string& outError)
+{
+	outMetadata = {};
+	outError.clear();
+	std::string text;
+	if (!ReadSidecarText(sidecarPath, text)) {
+		outError = "open_support_library_sidecar_failed:" + PathToUtf8(sidecarPath);
+		return false;
+	}
+	std::vector<SidecarRawCommand> commands;
+	std::vector<SidecarRawType> types;
+	std::vector<support_library_public_info::ConstantMetadata> constants;
+	enum class Section { None, Commands, Types, Constants };
+	Section section = Section::None;
+	SidecarRawCommand* currentCommand = nullptr;
+	SidecarRawCommand* currentMemberCommand = nullptr;
+	SidecarRawType* currentType = nullptr;
+	for (const std::string& rawLine : SplitLines(text)) {
+		const std::string line = Trim(StripComment(rawLine));
+		if (line == "[命令]") {
+			section = Section::Commands;
+			currentCommand = nullptr;
+			currentMemberCommand = nullptr;
+			currentType = nullptr;
+			continue;
+		}
+		if (line == "[数据类型]") {
+			section = Section::Types;
+			currentCommand = nullptr;
+			currentMemberCommand = nullptr;
+			currentType = nullptr;
+			continue;
+		}
+		if (line == "[常量]") {
+			section = Section::Constants;
+			currentCommand = nullptr;
+			currentMemberCommand = nullptr;
+			currentType = nullptr;
+			continue;
+		}
+		if (line.empty()) continue;
+		if (section == Section::Commands) {
+			SidecarRawCommand command;
+			if (ParseSidecarCommandHeader(line, ".命令 ", command)) {
+				commands.push_back(std::move(command));
+				currentCommand = &commands.back();
+				continue;
+			}
+			SidecarRawArgument argument;
+			if (currentCommand != nullptr && ParseSidecarArgumentLine(line, argument)) {
+				currentCommand->arguments.push_back(std::move(argument));
+			}
+			continue;
+		}
+		if (section == Section::Types) {
+			SidecarRawType type;
+			if (ParseSidecarTypeHeader(line, type)) {
+				types.push_back(std::move(type));
+				currentType = &types.back();
+				currentMemberCommand = nullptr;
+				continue;
+			}
+			if (currentType == nullptr) continue;
+			SidecarRawElement element;
+			if (ParseSidecarElementLine(line, element)) {
+				currentType->elements.push_back(std::move(element));
+				currentMemberCommand = nullptr;
+				continue;
+			}
+			SidecarRawCommand memberCommand;
+			if (ParseSidecarCommandHeader(line, ".成员命令 ", memberCommand)) {
+				currentType->memberCommands.push_back(std::move(memberCommand));
+				currentMemberCommand = &currentType->memberCommands.back();
+				continue;
+			}
+			SidecarRawArgument argument;
+			if (currentMemberCommand != nullptr && ParseSidecarArgumentLine(line, argument)) {
+				currentMemberCommand->arguments.push_back(std::move(argument));
+			}
+			continue;
+		}
+		if (section == Section::Constants && StartsWith(line, ".常量 ")) {
+			const std::vector<std::string> fields = SplitFields(line.substr(std::string(".常量 ").size()));
+			if (fields.empty()) continue;
+			support_library_public_info::ConstantMetadata constant;
+			constant.name = Trim(fields[0]);
+			constant.type = 1;
+			const std::string typeName = fields.size() >= 2 ? Trim(fields[1]) : std::string();
+			if (typeName.find("文本") != std::string::npos) constant.type = 3;
+			else if (typeName.find("逻辑") != std::string::npos) constant.type = 2;
+			const std::string value = SidecarFieldValue(fields, "值=");
+			if (constant.type == 3) {
+				constant.textValue = DecodeConstantLiteral(value);
+			}
+			else {
+				char* end = nullptr;
+				const double parsed = std::strtod(value.c_str(), &end);
+				if (end != nullptr && end != value.c_str()) constant.numberValue = parsed;
+			}
+			constant.englishName = SidecarFieldValue(fields, "英文名=");
+			constants.push_back(std::move(constant));
+		}
+	}
+
+	if (commands.empty() && types.empty() && constants.empty()) {
+		outError = "support_library_sidecar_empty:" + PathToUtf8(sidecarPath);
+		return false;
+	}
+	std::unordered_map<std::string, std::uint32_t> customTypes;
+	for (std::size_t index = 0; index < types.size(); ++index) {
+		types[index].metadata.index = index;
+		customTypes.emplace(types[index].metadata.name, static_cast<std::uint32_t>(index + 1));
+	}
+	for (auto& command : commands) {
+		bool ignoredArray = false;
+		command.metadata.returnType = SidecarTypeCode(command.returnTypeName, customTypes, ignoredArray);
+		if (ignoredArray) command.metadata.state |= 1u << 6;
+		for (auto& argument : command.arguments) {
+			bool ignoredArgumentArray = false;
+			argument.metadata.dataType = SidecarTypeCode(argument.typeName, customTypes, ignoredArgumentArray);
+		}
+		command.metadata.arguments.reserve(command.arguments.size());
+		for (const auto& argument : command.arguments) command.metadata.arguments.push_back(argument.metadata);
+	}
+	for (auto& type : types) {
+		for (auto& member : type.memberCommands) {
+			bool ignoredArray = false;
+			member.metadata.returnType = SidecarTypeCode(member.returnTypeName, customTypes, ignoredArray);
+			if (ignoredArray) member.metadata.state |= 1u << 6;
+			for (auto& argument : member.arguments) {
+				bool ignoredArgumentArray = false;
+				argument.metadata.dataType = SidecarTypeCode(argument.typeName, customTypes, ignoredArgumentArray);
+			}
+			member.metadata.arguments.reserve(member.arguments.size());
+			for (const auto& argument : member.arguments) member.metadata.arguments.push_back(argument.metadata);
+			int bestScore = -1;
+			std::size_t matched = static_cast<std::size_t>(-1);
+			for (std::size_t index = 0; index < commands.size(); ++index) {
+				const int score = SidecarCommandMatchScore(member, commands[index]);
+				if (score > bestScore) {
+					bestScore = score;
+					matched = index;
+				}
+			}
+			if (matched == static_cast<std::size_t>(-1)) {
+				matched = commands.size();
+				member.metadata.index = matched;
+				commands.push_back(std::move(member));
+			}
+			type.metadata.commandIndexes.push_back(matched);
+		}
+		for (auto& element : type.elements) {
+			bool elementArray = element.metadata.isArray;
+			element.metadata.dataType = SidecarTypeCode(element.typeName, customTypes, elementArray);
+			element.metadata.isArray = elementArray;
+			type.metadata.elements.push_back(std::move(element.metadata));
+		}
+	}
+	outMetadata.filePath = sidecarPath;
+	outMetadata.fileName = dependency.fileName;
+	outMetadata.name = dependency.name;
+	outMetadata.guid = dependency.guid;
+	outMetadata.majorVersion = 0;
+	outMetadata.minorVersion = 0;
+	outMetadata.commands.reserve(commands.size());
+	for (std::size_t index = 0; index < commands.size(); ++index) {
+		commands[index].metadata.index = index;
+		commands[index].metadata.executeSymbol.clear();
+		outMetadata.commands.push_back(std::move(commands[index].metadata));
+	}
+	outMetadata.dataTypes.reserve(types.size());
+	for (auto& type : types) outMetadata.dataTypes.push_back(std::move(type.metadata));
+	outMetadata.constants = std::move(constants);
+	return true;
+}
+
+bool IsMetadataCompatibleWithDependency(
+	const support_library_public_info::LibraryMetadata& metadata,
+	const e2txt::Dependency& dependency)
+{
+	const auto normalize = [](std::string value) {
+		value = Trim(std::move(value));
+		std::transform(value.begin(), value.end(), value.begin(), [](const unsigned char ch) {
+			return static_cast<char>(std::tolower(ch));
+		});
+		return value;
+	};
+	const std::string expectedGuid = normalize(dependency.guid);
+	const std::string actualGuid = normalize(metadata.guid);
+	const std::string expectedName = normalize(dependency.name);
+	const std::string actualName = normalize(metadata.name);
+	if (!expectedName.empty() && !actualName.empty() && expectedName != actualName) {
+		// A source-only `.支持库 foo` declaration is initially represented as
+		// fileName=foo,name=foo.  In that case the file stem is the identity and
+		// the FNE's localized display name may legitimately differ.  An explicit
+		// project dependency with a distinct display name must still fail closed.
+		const std::filesystem::path expectedFile = Utf8PathToPath(dependency.fileName);
+		const std::filesystem::path actualFile = !metadata.fileName.empty()
+			? Utf8PathToPath(metadata.fileName)
+			: metadata.filePath;
+		const bool nameIsFileAlias = !dependency.fileName.empty() &&
+			(expectedName == normalize(dependency.fileName) ||
+				expectedName == normalize(expectedFile.stem().string()));
+		const bool sameFileStem = !expectedFile.stem().empty() &&
+			normalize(expectedFile.stem().string()) == normalize(actualFile.stem().string());
+		if (!nameIsFileAlias || !sameFileStem) return false;
+	}
+	// Architecture-specific rebuilds occasionally carry a regenerated GUID
+	// while retaining the library's stable visible name.  Use the GUID as the
+	// identity check only when no name is available on either side.
+	if (expectedName.empty() && actualName.empty() &&
+		!expectedGuid.empty() && !actualGuid.empty() && expectedGuid != actualGuid) return false;
+	return true;
+}
+
+std::filesystem::path ResolveSupportLibrarySidecarPath(
+	const e2txt::Dependency& dependency,
+	const std::filesystem::path& inputRoot,
+	const std::vector<std::filesystem::path>& searchDirectories)
+{
+	std::vector<std::filesystem::path> candidates;
+	const auto append = [&](std::filesystem::path candidate) {
+		if (candidate.empty()) return;
+		if (candidate.extension() != L".txt") candidate.replace_extension(L".txt");
+		if (candidate.is_relative()) candidate = (inputRoot / candidate).lexically_normal();
+		for (const auto& existing : candidates) {
+			if (existing.lexically_normal() == candidate.lexically_normal()) return;
+		}
+		candidates.push_back(std::move(candidate));
+	};
+	if (!dependency.localWorkspace.empty()) append(Utf8PathToPath(dependency.localWorkspace));
+	if (!dependency.resolvedPath.empty()) append(Utf8PathToPath(dependency.resolvedPath));
+	const std::string libraryName = dependency.fileName.empty() ? dependency.name : dependency.fileName;
+	if (!libraryName.empty()) {
+		std::filesystem::path name = Utf8PathToPath(libraryName);
+		name.replace_extension(L".txt");
+		append(name);
+		append(std::filesystem::path(L"elib") / name.filename());
+		for (const auto& directory : searchDirectories) {
+			if (directory.empty()) continue;
+			std::filesystem::path direct = directory / name.filename();
+			if (direct.extension() != L".txt") direct.replace_extension(L".txt");
+			for (const auto& existing : candidates) {
+				if (existing.lexically_normal() == direct.lexically_normal()) direct.clear();
+			}
+			if (!direct.empty()) candidates.push_back(std::move(direct));
+			candidates.push_back(directory / L"elib" / name.filename());
+		}
+	}
+	for (const auto& candidate : candidates) {
+		if (IsRegularFilePath(candidate)) return AbsolutePathValue(candidate);
+	}
+	return {};
+}
+
+std::string NormalizeMetadataMatchName(std::string value)
+{
+	value = Trim(std::move(value));
+	std::transform(value.begin(), value.end(), value.begin(), [](const unsigned char ch) {
+		return static_cast<char>(std::tolower(ch));
+	});
+	return value;
+}
+
+int MetadataCommandMatchScore(
+	const support_library_public_info::CommandMetadata& target,
+	const support_library_public_info::CommandMetadata& source)
+{
+	if (target.arguments.size() != source.arguments.size()) return -1;
+	const std::string targetEnglish = NormalizeMetadataMatchName(target.englishName);
+	const std::string sourceEnglish = NormalizeMetadataMatchName(source.englishName);
+	const std::string targetName = NormalizeMetadataMatchName(target.name);
+	const std::string sourceName = NormalizeMetadataMatchName(source.name);
+	// Chinese display names disambiguate overloaded English identifiers such
+	// as GetType/SetType across different object types, so prefer them when
+	// both tables provide a name.
+	if (!targetName.empty() && targetName == sourceName) return 100;
+	if (!targetEnglish.empty() && targetEnglish == sourceEnglish) return 90;
+	if (targetEnglish.empty() && sourceEnglish.empty() &&
+		targetName.empty() && sourceName.empty() &&
+		target.state == source.state && target.category == source.category) return 60;
+	return -1;
+}
+
+void MergeArchitectureNeutralMetadata(
+	support_library_public_info::LibraryMetadata& target,
+	const support_library_public_info::LibraryMetadata& source)
+{
+	const auto findTargetTypeIndex = [&](const support_library_public_info::DataTypeMetadata& sourceType) {
+		const std::string sourceEnglish = NormalizeMetadataMatchName(sourceType.englishName);
+		const std::string sourceName = NormalizeMetadataMatchName(sourceType.name);
+		for (std::size_t index = 0; index < target.dataTypes.size(); ++index) {
+			const auto& targetType = target.dataTypes[index];
+			if (!sourceEnglish.empty() && sourceEnglish == NormalizeMetadataMatchName(targetType.englishName)) return index;
+			if (!sourceName.empty() && sourceName == NormalizeMetadataMatchName(targetType.name)) return index;
+		}
+		return static_cast<std::size_t>(-1);
+	};
+	const auto remapTypeCode = [&](const std::uint32_t code) {
+		const std::uint32_t arrayFlag = code & kTypeArrayFlag;
+		const std::uint32_t base = code & ~kTypeArrayFlag;
+		if ((base & 0x80000000u) != 0 || (base & 0x40000000u) != 0 ||
+			base == kTypeNull || base > source.dataTypes.size()) return code;
+		const std::size_t targetIndex = findTargetTypeIndex(source.dataTypes[static_cast<std::size_t>(base - 1)]);
+		return targetIndex == static_cast<std::size_t>(-1)
+			? code
+			: static_cast<std::uint32_t>(targetIndex + 1) | arrayFlag;
+	};
+	// Match commands without assuming that x86 and x64 command tables have the
+	// same index.  The visible/English name plus arity is the stable interface
+	// identity; executeSymbol remains exclusively from the target FNE.
+	std::vector<std::size_t> sourceForTarget(target.commands.size(), static_cast<std::size_t>(-1));
+	std::unordered_set<std::size_t> usedSourceCommands;
+	for (std::size_t targetIndex = 0; targetIndex < target.commands.size(); ++targetIndex) {
+		int bestScore = -1;
+		std::size_t bestSource = static_cast<std::size_t>(-1);
+		for (std::size_t sourceIndex = 0; sourceIndex < source.commands.size(); ++sourceIndex) {
+			if (usedSourceCommands.contains(sourceIndex)) continue;
+			const int score = MetadataCommandMatchScore(target.commands[targetIndex], source.commands[sourceIndex]);
+			if (score > bestScore) {
+				bestScore = score;
+				bestSource = sourceIndex;
+			}
+		}
+		if (bestSource == static_cast<std::size_t>(-1)) continue;
+		sourceForTarget[targetIndex] = bestSource;
+		usedSourceCommands.insert(bestSource);
+		const auto& sourceCommand = source.commands[bestSource];
+		auto& targetCommand = target.commands[targetIndex];
+		if (targetCommand.name.empty()) targetCommand.name = sourceCommand.name;
+		if (targetCommand.englishName.empty()) targetCommand.englishName = sourceCommand.englishName;
+		if (sourceCommand.returnType != kTypeNull || targetCommand.returnType == kTypeNull) {
+			// The sidecar is the architecture-neutral declaration.  A rebuilt
+			// FNE may publish a placeholder (_SDT_ALL) or omit the array bit;
+			// use the declaration's concrete return type when the command identity
+			// matches, while retaining the target execute symbol below.
+			targetCommand.returnType = remapTypeCode(sourceCommand.returnType);
+		}
+		// These flags describe source-level ABI semantics and are safe to merge;
+		// retain any target-only platform flags outside the public command mask.
+		constexpr std::uint16_t kPublicCommandFlags =
+			(1u << 2) | (1u << 3) | (1u << 4) | (1u << 5) | (1u << 6) |
+			(1u << 7) | (1u << 8) | (1u << 9);
+		targetCommand.state = static_cast<std::uint16_t>(
+			(targetCommand.state & ~kPublicCommandFlags) | (sourceCommand.state & kPublicCommandFlags));
+		if (targetCommand.arguments.size() == sourceCommand.arguments.size()) {
+			for (std::size_t argumentIndex = 0; argumentIndex < targetCommand.arguments.size(); ++argumentIndex) {
+				auto& targetArgument = targetCommand.arguments[argumentIndex];
+				const auto& sourceArgument = sourceCommand.arguments[argumentIndex];
+				if (targetArgument.name.empty()) targetArgument.name = sourceArgument.name;
+				if (sourceArgument.dataType != kTypeNull || targetArgument.dataType == kTypeNull) {
+					targetArgument.dataType = remapTypeCode(sourceArgument.dataType);
+				}
+				// Argument flags are the ABI contract for variable/array passing.
+				targetArgument.state |= sourceArgument.state;
+				if (targetArgument.defaultValue == 0) targetArgument.defaultValue = sourceArgument.defaultValue;
+			}
+		}
+	}
+
+	for (const auto& sourceType : source.dataTypes) {
+		std::size_t targetTypeIndex = static_cast<std::size_t>(-1);
+		const std::string sourceEnglish = NormalizeMetadataMatchName(sourceType.englishName);
+		const std::string sourceName = NormalizeMetadataMatchName(sourceType.name);
+		for (std::size_t index = 0; index < target.dataTypes.size(); ++index) {
+			const auto& targetType = target.dataTypes[index];
+			if (!sourceEnglish.empty() && sourceEnglish == NormalizeMetadataMatchName(targetType.englishName)) {
+				targetTypeIndex = index;
+				break;
+			}
+			if (targetTypeIndex == static_cast<std::size_t>(-1) &&
+				!sourceName.empty() && sourceName == NormalizeMetadataMatchName(targetType.name)) {
+				targetTypeIndex = index;
+			}
+		}
+		if (targetTypeIndex == static_cast<std::size_t>(-1)) continue;
+		auto& targetType = target.dataTypes[targetTypeIndex];
+		if (targetType.name.empty()) targetType.name = sourceType.name;
+		if (targetType.englishName.empty()) targetType.englishName = sourceType.englishName;
+		targetType.state |= sourceType.state;
+		if (targetType.elements.size() < sourceType.elements.size()) {
+			targetType.elements = sourceType.elements;
+			for (auto& element : targetType.elements) element.dataType = remapTypeCode(element.dataType);
+		}
+		const std::vector<std::size_t> originalTargetCommandIndexes = targetType.commandIndexes;
+		targetType.commandIndexes.clear();
+		for (const std::size_t sourceCommandIndex : sourceType.commandIndexes) {
+			if (sourceCommandIndex >= source.commands.size()) continue;
+			// Resolve a type's member command in its own context.  A global
+			// greedy map is incorrect for repeated English names such as
+			// GetType/GetDateTime; the visible member name and arity provide a
+			// deterministic match and allow legitimate aliases to be reused.
+			int bestScore = -1;
+			std::size_t targetCommandIndex = static_cast<std::size_t>(-1);
+			const SidecarRawCommand sourceCommand = [&]() {
+				SidecarRawCommand result;
+				result.metadata = source.commands[sourceCommandIndex];
+				return result;
+			}();
+			const auto considerTargetCommand = [&](const std::size_t index) {
+				SidecarRawCommand targetCommand;
+				targetCommand.metadata = target.commands[index];
+				const int score = SidecarCommandMatchScore(sourceCommand, targetCommand);
+				if (score > bestScore) {
+					bestScore = score;
+					targetCommandIndex = index;
+				}
+			};
+			if (!originalTargetCommandIndexes.empty()) {
+				for (const std::size_t index : originalTargetCommandIndexes) {
+					if (index < target.commands.size()) considerTargetCommand(index);
+				}
+			}
+			if (bestScore < 0) {
+				for (std::size_t index = 0; index < target.commands.size(); ++index) considerTargetCommand(index);
+			}
+			if (targetCommandIndex != static_cast<std::size_t>(-1)) targetType.commandIndexes.push_back(targetCommandIndex);
+		}
+	}
+
+	std::unordered_map<std::string, std::size_t> targetConstantIndexes;
+	for (std::size_t index = 0; index < target.constants.size(); ++index) {
+		targetConstantIndexes.emplace(NormalizeMetadataMatchName(target.constants[index].name), index);
+	}
+	for (const auto& constant : source.constants) {
+		const std::string key = NormalizeMetadataMatchName(constant.name);
+		const auto found = targetConstantIndexes.find(key);
+		if (found == targetConstantIndexes.end()) {
+			targetConstantIndexes.emplace(key, target.constants.size());
+			target.constants.push_back(constant);
+		}
+		else {
+			// The neutral declaration carries the correct value/type when a
+			// generated x64 FNE serialized a text constant as numeric zero.
+			target.constants[found->second] = constant;
+		}
+	}
+}
+
+std::size_t SystemTypeSize(const std::uint32_t type, const TargetArchitecture architecture)
 {
 	switch (type) {
 	case kTypeByte: return 1;
 	case kTypeShort: return 2;
 	case kTypeInt:
 	case kTypeFloat:
-	case kTypeBool:
+	case kTypeBool: return 4;
 	case kTypeText:
 	case kTypeBinary:
-	case kTypeSubroutine: return 4;
+	case kTypeSubroutine: return architecture == TargetArchitecture::X64 ? 8u : 4u;
 	case kTypeInt64:
 	case kTypeDouble:
 	case kTypeDateTime: return 8;
@@ -1019,11 +1749,13 @@ std::size_t SystemTypeSize(const std::uint32_t type)
 
 bool LoadLibraries(Program& program, std::string& error)
 {
-#if !defined(_M_IX86)
-	(void)program;
-	error = "independent compiler backend requires Win32 e-packager";
-	return false;
-#else
+	const auto normalizeDependencyName = [](std::string value) {
+		value = Trim(std::move(value));
+		std::transform(value.begin(), value.end(), value.begin(), [](const unsigned char ch) {
+			return static_cast<char>(std::tolower(ch));
+		});
+		return value;
+	};
 	// A source page can retain a .支持库 declaration even when an edited or
 	// reconstructed .e no longer carries that dependency in its binary header.
 	// Recover those declarations before loading metadata so source and bundle
@@ -1121,17 +1853,56 @@ bool LoadLibraries(Program& program, std::string& error)
 		const auto& dependency = program.bundle.dependencies[index];
 		if (dependency.kind != e2txt::DependencyKind::ELib) continue;
 		const std::filesystem::path path = ResolveSupportLibraryPath(
-			dependency, program.inputRoot, program.supportLibrarySearchDirectories);
-		if (path.empty()) {
-			error = "support_library_not_found:" + dependency.fileName + ":" + dependency.name;
-			return false;
-		}
+			dependency, program.inputRoot, program.supportLibrarySearchDirectories,
+			program.targetArchitecture);
 		Library library;
 		library.ordinal = program.libraries.size();
 		library.dependency = dependency;
-		if (!support_library_public_info::LoadSupportLibraryMetadata(path, library.metadata, error)) {
-			error = "support_library_metadata_failed:" + PathToUtf8(path) + ":" + error;
-			return false;
+		if (!path.empty()) {
+			support_library_public_info::LibraryMetadata binaryMetadata;
+			std::string binaryError;
+			const bool binaryLoaded = support_library_public_info::LoadSupportLibraryMetadata(
+				path, binaryMetadata, binaryError);
+			if (!binaryLoaded || !IsMetadataCompatibleWithDependency(binaryMetadata, dependency)) {
+				const std::filesystem::path sidecar = ResolveSupportLibrarySidecarPath(
+					dependency, program.inputRoot, program.supportLibrarySearchDirectories);
+				std::string sidecarError;
+				if (sidecar.empty() || !LoadSupportLibrarySidecarMetadata(
+						sidecar, dependency, library.metadata, sidecarError)) {
+					error = "support_library_metadata_failed:" + PathToUtf8(path) + ":" +
+					(binaryError.empty() ? std::string("library_identity_mismatch") : binaryError);
+					return false;
+				}
+				library.implementationAvailable = false;
+			}
+			else {
+				library.metadata = std::move(binaryMetadata);
+				if (!library.metadata.name.empty() &&
+					normalizeDependencyName(dependency.name) == normalizeDependencyName(dependency.fileName)) {
+					library.dependency.name = library.metadata.name;
+				}
+				const std::filesystem::path sidecar = ResolveSupportLibrarySidecarPath(
+					dependency, program.inputRoot, program.supportLibrarySearchDirectories);
+				if (!sidecar.empty()) {
+					support_library_public_info::LibraryMetadata neutralMetadata;
+					std::string sidecarError;
+					if (LoadSupportLibrarySidecarMetadata(
+						sidecar, dependency, neutralMetadata, sidecarError)) {
+		MergeArchitectureNeutralMetadata(library.metadata, neutralMetadata);
+					}
+				}
+			}
+		}
+		else {
+			const std::filesystem::path sidecar = ResolveSupportLibrarySidecarPath(
+				dependency, program.inputRoot, program.supportLibrarySearchDirectories);
+			std::string sidecarError;
+			if (sidecar.empty() || !LoadSupportLibrarySidecarMetadata(
+					sidecar, dependency, library.metadata, sidecarError)) {
+				error = "support_library_not_found:" + dependency.fileName + ":" + dependency.name;
+				return false;
+			}
+			library.implementationAvailable = false;
 		}
 		program.libraries.push_back(std::move(library));
 	}
@@ -1140,7 +1911,6 @@ bool LoadLibraries(Program& program, std::string& error)
 		return false;
 	}
 	return true;
-#endif
 }
 
 void RegisterSystemTypes(Program& program)
@@ -1182,8 +1952,12 @@ bool RegisterLibraryTypes(Program& program, std::string& error)
 			return true;
 		}
 		if (!active.insert(typeIndex).second) {
-			error = "recursive_support_library_type:" + type.name;
-			return false;
+			// A recursive/opaque library object is represented by a pointer at
+			// the language ABI boundary.  Keep it unresolved until a target
+			// actually needs its inline layout.
+			type.layoutComplete = false;
+			type.size = sizeof(void*);
+			return true;
 		}
 		const auto& source = program.libraries[type.libraryIndex].metadata.dataTypes[type.dataTypeIndex];
 		std::size_t offset = 0;
@@ -1193,16 +1967,24 @@ bool RegisterLibraryTypes(Program& program, std::string& error)
 			element.type = { program.NormalizeLibraryType(type.libraryIndex, sourceElement.dataType), sourceElement.isArray, true };
 			element.offset = offset;
 			element.defaultValue = sourceElement.defaultValue;
-			std::size_t elementSize = sourceElement.isArray ? 4 : SystemTypeSize(element.type.code);
+			std::size_t elementSize = sourceElement.isArray
+				? (program.targetArchitecture == TargetArchitecture::X64 ? 8u : 4u)
+				: SystemTypeSize(element.type.code, program.targetArchitecture);
 			if (elementSize == 0) {
 				const auto nested = program.typeByCode.find(element.type.code);
 				if (nested == program.typeByCode.end()) {
-					error = "unknown_support_library_element_type:" + type.name + "." + element.name;
-					return false;
+					type.layoutComplete = false;
+					elementSize = sizeof(void*);
 				}
-				if (!calculate(nested->second, active)) return false;
+				else {
+					if (!calculate(nested->second, active)) {
+						type.layoutComplete = false;
+					}
+					if (!program.types[nested->second].layoutComplete) type.layoutComplete = false;
+					elementSize = sizeof(void*);
+				}
 				// 复合类型成员在易语言运行时中保存对象数据指针。
-				elementSize = 4;
+				elementSize = program.targetArchitecture == TargetArchitecture::X64 ? 8u : 4u;
 			}
 			offset += elementSize;
 			type.elements.push_back(std::move(element));
@@ -1482,6 +2264,7 @@ bool BuildCompilerModel(
 	const std::filesystem::path& inputRoot,
 	const std::vector<std::filesystem::path>& supportLibrarySearchDirectories,
 	const std::vector<std::string>& conditionMacros,
+	const TargetArchitecture targetArchitecture,
 	Program& outProgram,
 	std::string& outError)
 {
@@ -1489,7 +2272,11 @@ bool BuildCompilerModel(
 	outProgram.bundle = std::move(bundle);
 	outProgram.inputRoot = inputRoot;
 	outProgram.supportLibrarySearchDirectories = supportLibrarySearchDirectories;
-	if (!ExpandEComDependencies(outProgram.bundle, inputRoot, outError)) return false;
+	outProgram.targetArchitecture = targetArchitecture;
+	e2txt::ReadOptions moduleReadOptions;
+	moduleReadOptions.supportLibrarySearchDirectories = supportLibrarySearchDirectories;
+	moduleReadOptions.restrictSupportLibrarySearch = targetArchitecture == TargetArchitecture::X64;
+	if (!ExpandEComDependencies(outProgram.bundle, inputRoot, moduleReadOptions, outError)) return false;
 	for (std::string macro : conditionMacros) {
 		std::transform(macro.begin(), macro.end(), macro.begin(), [](const unsigned char value) {
 			return static_cast<char>(std::toupper(value));

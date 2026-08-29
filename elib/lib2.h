@@ -1226,8 +1226,9 @@ typedef struct
 #define NR_ERR          -1
 
 
-typedef INT(WINAPI* PFN_NOTIFY_LIB) (INT nMsg, DWORD dwParam1, DWORD dwParam2);    // 此函数用作系统通知库有关事件。
-typedef INT(WINAPI* PFN_NOTIFY_SYS) (INT nMsg, DWORD dwParam1, DWORD dwParam2);    // 此函数用作库通知系统有关事件。
+// 通知参数可能携带指针，必须使用与目标位数一致的宽度。
+typedef INT_PTR(WINAPI* PFN_NOTIFY_LIB) (INT nMsg, DWORD_PTR dwParam1, DWORD_PTR dwParam2);    // 此函数用作系统通知库有关事件。
+typedef INT_PTR(WINAPI* PFN_NOTIFY_SYS) (INT nMsg, DWORD_PTR dwParam1, DWORD_PTR dwParam2);    // 此函数用作库通知系统有关事件。
 
 
 

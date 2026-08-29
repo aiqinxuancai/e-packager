@@ -4,13 +4,18 @@
 #include <string>
 #include <vector>
 
+#include "CompilerTarget.h"
+
 namespace ecompiler {
 
-// 独立编译后端类型。
-enum class Backend {
+// 独立源码编译方式。
+enum class CompileMode {
 	NativeCpp,
 	BlackMoon,
 };
+
+// 兼容旧的 C++ 调用方；新代码应使用 CompileMode。
+using Backend = CompileMode;
 
 // 黑月链接入口模式，产物体积通常从小到大为汇编、C/C++、MFC。
 enum class BlackMoonMode {
@@ -19,16 +24,23 @@ enum class BlackMoonMode {
 	Mfc,
 };
 
-// 独立 Win32 编译选项。编译器和链接器均可显式覆盖。
+// 独立源码编译选项。编译器和链接器均可显式覆盖；x64 仅用于黑月核心方式。
 struct Options {
 	std::filesystem::path compilerPath;
 	std::filesystem::path linkerPath;
 	std::filesystem::path libraryPath;
-	Backend backend = Backend::NativeCpp;
+	// x64 库根目录可按优先级叠加：首个根优先提供核心归档，后续根可提供 FNE 与其他支持库。
+	std::vector<std::filesystem::path> blackMoonX64Directories;
+	// 兼容旧的单目录调用方；新调用方应使用 blackMoonX64Directories。
+	std::filesystem::path blackMoonX64Directory;
+	// x64 编译原生 .e 时用于按官方 x86 命令表解码字节码的 Win32 工具。
+	std::filesystem::path x86DecoderPath;
+	TargetArchitecture targetArchitecture = TargetArchitecture::Host;
+	CompileMode compileMode = CompileMode::NativeCpp;
 	BlackMoonMode blackMoonMode = BlackMoonMode::Assembly;
 	// 黑月目录，包含 bin/ 与 lib/；留空时根据 e.exe 自动推导。
 	std::filesystem::path blackMoonDirectory;
-	// 黑月后端用于生成原生易代码 PE 的无头 IDE 工具。
+	// 黑月编译方式用于生成原生易代码 PE 的无头 IDE 工具。
 	std::filesystem::path eIdePath;
 	std::filesystem::path autoLinkerTestPath;
 	unsigned int blackMoonTimeoutSeconds = 120;

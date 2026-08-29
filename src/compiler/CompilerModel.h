@@ -3,6 +3,7 @@
 #include "../SourceExpressionParser.h"
 #include "../SupportLibraryPublicInfo.h"
 #include "../e2txt.h"
+#include "CompilerTarget.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -108,6 +109,9 @@ struct Library {
 	std::size_t ordinal = 0;
 	e2txt::Dependency dependency;
 	support_library_public_info::LibraryMetadata metadata;
+	// 二进制 FNE 可加载时为 true；仅从 elib/*.txt 恢复接口时为 false。
+	// 后者允许未触达的兼容声明参与类型检查，但不能产生可执行调用。
+	bool implementationAvailable = true;
 };
 
 // 项目 DLL 声明页中的外部命令。
@@ -142,6 +146,10 @@ struct TypeInfo {
 	std::size_t dataTypeIndex = static_cast<std::size_t>(-1);
 	std::size_t size = 0;
 	bool isEnum = false;
+	// FNE metadata may describe optional/window types whose dependent type is
+	// absent in a target-architecture build.  Keep the declaration available
+	// for name resolution, but do not emit a layout until it is complete.
+	bool layoutComplete = true;
 	std::vector<TypeElement> elements;
 	std::vector<std::size_t> memberCommandIndexes;
 	std::vector<std::size_t> memberMethodIds;
@@ -149,6 +157,7 @@ struct TypeInfo {
 
 struct Program {
 	bool buildDll = false;
+	TargetArchitecture targetArchitecture = TargetArchitecture::X86;
 	// 当前编译配置启用的条件宏。宏名称按易语言规则不区分大小写。
 	std::unordered_set<std::string> conditionMacros;
 	e2txt::ProjectBundle bundle;
@@ -172,12 +181,13 @@ struct Program {
 	std::uint32_t NormalizeLibraryType(std::size_t libraryIndex, std::uint32_t code) const;
 };
 
-// 从目录包或原生工程生成语义模型，并直接从每个 FNE 读取绑定信息。
+// 从目录包或原生工程生成语义模型，并直接从每个目标架构 FNE 读取绑定信息。
 bool BuildCompilerModel(
 	e2txt::ProjectBundle bundle,
 	const std::filesystem::path& inputRoot,
 	const std::vector<std::filesystem::path>& supportLibrarySearchDirectories,
 	const std::vector<std::string>& conditionMacros,
+	TargetArchitecture targetArchitecture,
 	Program& outProgram,
 	std::string& outError);
 

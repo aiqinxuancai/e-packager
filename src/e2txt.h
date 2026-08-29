@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <exception>
+#include <filesystem>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -407,12 +408,20 @@ struct GenerateOptions {
 	// 编译器读取易模块时保留已嵌入模块二进制的导入函数体。
 	// 普通拆包继续隐藏它们，避免把上游模块实现重复写入工作区。
 	bool includeImportedFunctions = false;
+	// 可选的支持库搜索目录。源码直接编译时由目标架构选择对应的 FNE 目录。
+	std::vector<std::filesystem::path> supportLibrarySearchDirectories;
+	// 置位后只在上面的目录中查找支持库，不回退到注册表/默认安装目录。
+	bool restrictSupportLibrarySearch = false;
 };
 
 // 读取源工程文件时的附加选项。
 struct ReadOptions {
 	// 加密 `.e` / `.ec` 文件的密码；留空表示按未加密文件读取。
 	std::string password;
+	// 可选的支持库搜索目录，传递给原生符号解码器。
+	std::vector<std::filesystem::path> supportLibrarySearchDirectories;
+	// 置位后禁止回退到当前进程或注册表发现的其它位数支持库。
+	bool restrictSupportLibrarySearch = false;
 };
 
 // 写出源工程文件时的附加选项。

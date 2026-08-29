@@ -126,23 +126,94 @@ e-packager compile-check checked.e `
 
 这一步依赖当前机器的易语言版本、支持库、易模块和链接器配置，失败时应先修复环境或源码，再交付 `.e`。
 
-### 编译后端
+### 源码直接编译（试验性）
 
-`compile` 默认使用本项目的源码直编后端。Win32 版还提供黑月链接后端，可选择体积从小到大的汇编、C/C++ 与 MFC 入口：
+> ⚠️ **试验性功能。** 编译结果尚未经过大规模验证，行为和选项可能随版本变化。窗口工程、窗口事件以及少见的支持库暂不保证可用。交付前请继续使用 `compile-check` 或易语言 IDE 确认，不要直接把产物用于生产环境。
 
-```powershell
-bin\Win32\Release\e-packager.exe compile MyApp.e .\out\MyApp.exe `
-  --backend blackmoon --blackmoon-mode asm `
-  --eide "C:\Users\aiqin\OneDrive\e5.6\e5.95.exe" `
-  --autolinker-test "D:\git\AutoLinker\bin\fne_release\AutoLinkerTest.exe" `
-  --blackmoon-dir "C:\Users\aiqin\OneDrive\e5.6\BlackMoon"
+`compile` 把易语言源码直接编译为独立的 EXE 或 DLL，无需在 IDE 中点击编译。输入可以是 `.e` 文件，也可以是 `unpack` 出的工程目录：
+
+```text
+e-packager compile <input.e|input-dir> <output.exe|output.dll> [选项]
 ```
 
-`--blackmoon-mode` 可取 `asm`、`cpp` 或 `mfc`。黑月后端会保留 `<输出名>.blackmoon.ecode.exe/.dll` 和 `<输出名>.blackmoon.obj` 供检查；`--blackmoon-timeout <秒>` 同时限制无头易代码阶段和最终链接阶段。它只支持 Win32，因为黑月的 OBJ、入口桩和静态库均为 x86。
+输出扩展名为 `.dll` 时自动按 DLL 编译，公开子程序即导出函数。
 
-该模式不加载 `BlackMoon.fne`。它通过 AutoLinker 无头生成原生易代码 PE，再调用内置的 BlackMoonNG 易代码转换实现并链接黑月静态库；因此仍要求本机已安装易语言、AutoLinker 和黑月工具链。
+`--compile-mode` 选择编译方式：
 
-黑月核心库和第三方静态库可能在实际使用的归档成员中带有 MFC 依赖。此时 `asm`/`cpp` 会先按请求的入口尝试链接；若链接器明确报告 `nafxcw`/MFC 运行库冲突，后端会自动改用 MFC 入口和完整 CRT 初始化重试，并在结果中同时写出 `mode`（请求模式）与 `effective_mode=mfc`（实际模式）。不需要 MFC 的工程不会触发重试，仍使用原有的最小入口。
+| 编译方式 | 架构 | 额外要求 |
+| --- | --- | --- |
+| `native`（默认） | x86 | 仅需 Visual C++ 工具链 |
+| `blackmoon` | x86 | 已安装易语言、AutoLinker 和黑月工具链 |
+| `blackmoon` | x64 | x64 黑月核心库（见下） |
+
+#### native（默认）
+
+默认方式，不启动易语言 IDE。通常只需给出输入和输出：
+
+```powershell
+e-packager.exe compile MyApp.e .\out\MyApp.exe
+e-packager.exe compile .\MyLib .\out\MyLib.dll
+```
+
+编译器会自动探测本机的 Visual C++ 与 Windows SDK。若探测失败或需要指定特定版本，用 `--linker` 和 `--lib` 指向链接器和库目录：
+
+```powershell
+e-packager.exe compile MyApp.e .\out\MyApp.exe `
+  --linker "C:\path\to\VC2022Linker\bin\link.exe" `
+  --lib "C:\path\to\VC2022Linker\lib"
+```
+
+输出目录中会保留 `<输出名>.generated.cpp` 等中间文件，便于排查问题。
+
+#### blackmoon（x86）
+
+需要链接黑月静态库时使用。`--blackmoon-mode` 选择入口模式并自动启用该编译方式，可取 `asm`、`cpp` 或 `mfc`，产物体积依次递增：
+
+```powershell
+e-packager.exe compile MyApp.e .\out\MyApp.exe `
+  --blackmoon-mode asm `
+  --eide "C:\path\to\e.exe" `
+  --autolinker-test "C:\path\to\AutoLinkerTest.exe" `
+  --blackmoon-dir "C:\path\to\BlackMoon"
+```
+
+若所用的静态库带有 MFC 依赖，`asm`、`cpp` 会在链接失败后自动改用 MFC 入口重试，成功消息中的 `effective_mode` 表示实际生效的入口。不需要 MFC 的工程不受影响。
+
+#### blackmoon（x64）
+
+x64 需要同架构的黑月核心库。原始黑月归档是 x86 的，不能直接链接，须先用仓库脚本从 `BlackMoonKernelStaticLib` 源码构建：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File .\scripts\BuildBlackMoonCoreAdapter.ps1
+```
+
+再把生成的 `adapter` 目录传给编译器：
+
+```powershell
+e-packager.exe compile MyApp.e .\out\MyApp-x64.exe `
+  --arch x64 --compile-mode blackmoon `
+  --blackmoon-x64-dir "D:\git\BlackMoonKernelStaticLib\adapter"
+```
+
+`--blackmoon-x64-dir` 可重复传入，按顺序搜索：首个为上述 `adapter`，其余可补充匹配版本的支持库。`.e` 输入会自动调用 Win32 版 `e-packager` 解码，一般无需干预。
+
+#### 常用选项
+
+| 选项 | 作用 |
+| --- | --- |
+| `--compile-mode native\|blackmoon` | 选择编译方式，默认 `native` |
+| `--arch host\|x86\|x64` | 选择输出架构，默认跟随当前程序；x64 需配合 `blackmoon` |
+| `--blackmoon-mode asm\|cpp\|mfc` | 选择黑月入口模式（仅 x86），并自动启用 `blackmoon` |
+| `--dll` | 按 DLL 编译；输出扩展名为 `.dll` 时可省略 |
+| `--define <宏>` / `-D <宏>` | 添加条件编译宏，可重复传入 |
+| `--linker <link.exe>` / `--lib <目录>` | 指定链接器和库目录 |
+| `--eide <e.exe>` / `--autolinker-test <exe>` | 易语言 IDE 与 AutoLinker 启动器（x86 黑月） |
+| `--blackmoon-dir <目录>` | 黑月工具链根目录（x86 黑月） |
+| `--blackmoon-x64-dir <目录>` | x64 黑月核心库目录，可重复传入 |
+| `--blackmoon-timeout <秒>` | 黑月编译与链接超时，默认 120，范围 1 至 3600 |
+
+如果支持库或静态库中缺少某个命令的实现，请更换匹配版本的支持库，而不是修改源码绕开。实现原理与已验证范围详见 [`docs/independent-compiler-architecture.md`](docs/independent-compiler-architecture.md)。
 
 ### 刷新派生内容
 

@@ -207,7 +207,8 @@
     <ClInclude Include="src\e2txt.h" />
 	<ClInclude Include="src\compiler\BlackMoonEcodeBridge.h" />
 	<ClInclude Include="src\compiler\BlackMoonCompiler.h" />
-    <ClInclude Include="src\compiler\CompilerModel.h" />
+	<ClInclude Include="src\compiler\CompilerModel.h" />
+	<ClInclude Include="src\compiler\CompilerTarget.h" />
 	<ClInclude Include="src\compiler\CppEmitter.h" />
     <ClInclude Include="src\compiler\ECompiler.h" />
 	<ClInclude Include="src\compiler\blackmoon\bm_ecode_to_obj.h" />

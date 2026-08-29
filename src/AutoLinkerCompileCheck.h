@@ -31,7 +31,7 @@ bool Prepare(const Options& options, PreparedOptions& outOptions, std::string& o
 // 调用 AutoLinkerTest 对指定易语言工程执行真实编译。
 Result Run(const std::filesystem::path& sourcePath, const PreparedOptions& options);
 
-// 调用 AutoLinkerTest 并保留指定输出文件，供后续编译后端消费原生 PE。
+// 调用 AutoLinkerTest 并保留指定输出文件，供后续编译方式消费原生 PE。
 Result CompileToOutput(
 	const std::filesystem::path& sourcePath,
 	const std::filesystem::path& outputPath,

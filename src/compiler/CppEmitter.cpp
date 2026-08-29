@@ -113,6 +113,11 @@ bool IsCompilePrimitive(const support_library_public_info::CommandMetadata& comm
 	static constexpr std::string_view names[] = {
 		"MachineCode", "hex", "binary", "GetAppName", "XchgVar", "ForceXchgVar",
 		"GetRuntimeDataType", "IsCondMacroDefined", "this",
+		// These are language/runtime primitives. Their FNE entries describe the
+		// source signature, while the generated Value runtime owns the actual
+		// array state and must perform the mutation consistently across cores.
+		"ReDim", "GetAryElementCount", "CopyAry", "AddElement", "InsElement",
+		"RemoveElement", "RemoveAll", "dir", "not",
 	};
 	return std::find(std::begin(names), std::end(names), command.englishName) != std::end(names);
 }
@@ -150,6 +155,9 @@ const char* kRuntimeSource = R"CPP(
 #include <vector>
 
 namespace ert {
+using EPointer = std::uintptr_t;
+using EIntPtr = std::intptr_t;
+#if !defined(_WIN64)
 // 旧版 FNE 可能直接引用 MSVCRT 的 getenv/_putenv。宿主使用现代 CRT
 // 时它们可能维护独立的 CRT 环境副本，因此统一桥接到进程环境 API，
 // 保证不同编译器运行时之间的环境变量状态一致。
@@ -235,6 +243,7 @@ extern "C" int __cdecl fprintf(FILE* stream,const char* format,...) {
     if(output!=nullptr && output!=INVALID_HANDLE_VALUE && length!=0) WriteFile(output,text,static_cast<DWORD>(length),&written,nullptr);
     va_end(arguments); return static_cast<int>(written);
 }
+#endif
 constexpr std::uint32_t T_NULL=0, T_ALL=0x80000000u, T_BYTE=0x80000101u, T_SHORT=0x80000201u;
 constexpr std::uint32_t T_INT=0x80000301u, T_INT64=0x80000401u, T_FLOAT=0x80000501u;
 constexpr std::uint32_t T_DOUBLE=0x80000601u, T_BOOL=0x80000002u, T_DATE=0x80000003u;
@@ -351,6 +360,153 @@ static double ToNumber(const Value& value) {
     if(value.type==T_TEXT) return value.text.empty()?0:std::strtod(value.text.c_str(),nullptr);
     return (value.type==T_FLOAT||value.type==T_DOUBLE||value.type==T_DATE)?value.number:static_cast<double>(value.integer);
 }
+// Execute the small, position-independent x86 instruction subset commonly
+// used by 易语言 "置入代码" snippets.  x64 builds cannot execute those bytes
+// natively, so they run against a virtual EBP parameter frame instead.  The
+// interpreter deliberately rejects memory operands and opcodes it cannot
+// model; silently guessing would be worse than a deterministic compile/run
+// diagnostic.
+static bool ExecuteX86MachineCode(const unsigned char* code,std::size_t size,std::vector<Value>& parameters,bool combineHighRegister,long long& result) {
+    if(code==nullptr && size!=0) return false;
+    std::vector<unsigned int> stack(parameters.size(),0);
+    for(std::size_t index=0;index<parameters.size();++index) {
+        const Value& value=parameters[index];
+        if(value.declaredArray || value.type==T_TEXT || value.type==T_BIN || FindType(value.type)!=nullptr) return false;
+        stack[index]=static_cast<unsigned int>(ToInteger(value));
+    }
+    unsigned int regs[8]{}; // eax,ecx,edx,ebx,esp,ebp,esi,edi
+    bool zf=false,sf=false,of=false,cf=false,pf=false;
+    bool operand16=false;
+    auto parity=[&](unsigned int value){
+        unsigned int bits=value&0xffu; bits^=bits>>4; bits^=bits>>2; bits^=bits>>1; return (bits&1u)==0;
+    };
+    auto setFlagsLogic=[&](unsigned int value,unsigned int mask){
+        zf=(value&mask)==0; sf=(value&(mask==0xffffu?0x8000u:0x80000000u))!=0; of=false; cf=false; pf=parity(value);
+    };
+    auto stackIndex=[&](int displacement,std::size_t& index){
+        if(displacement<8 || ((displacement-8)&3)!=0) return false;
+        index=static_cast<std::size_t>((displacement-8)/4);
+        return index<stack.size();
+    };
+    auto readReg=[&](unsigned int reg){ return regs[reg&7u]; };
+    auto writeReg=[&](unsigned int reg,unsigned int value){ regs[reg&7u]=value; };
+    auto readReg8=[&](unsigned int reg){
+        const unsigned int index=reg&3u;
+        return static_cast<unsigned char>((reg&4u)?(regs[index]>>8):(regs[index]&0xffu));
+    };
+    auto writeReg8=[&](unsigned int reg,unsigned char value){
+        const unsigned int index=reg&3u;
+        if(reg&4u) regs[index]=(regs[index]&0xffff00ffu)|(static_cast<unsigned int>(value)<<8);
+        else regs[index]=(regs[index]&0xffffff00u)|value;
+    };
+    auto readMemory=[&](int displacement,unsigned int& value){
+        std::size_t index=0; if(!stackIndex(displacement,index)) return false; value=stack[index]; return true;
+    };
+    auto writeMemory=[&](int displacement,unsigned int value){
+        std::size_t index=0; if(!stackIndex(displacement,index)) return false; stack[index]=value; return true;
+    };
+    auto setFlagsAdd=[&](unsigned int left,unsigned int right,unsigned int value){
+        const unsigned int mask=operand16?0xffffu:0xffffffffu;
+        left&=mask; right&=mask; value&=mask;
+        zf=value==0; sf=(value&(operand16?0x8000u:0x80000000u))!=0; pf=parity(value);
+        cf=operand16 ? value < left : value < left;
+        of=(((~(left^right))&(left^value))&(operand16?0x8000u:0x80000000u))!=0;
+    };
+    auto setFlagsSub=[&](unsigned int left,unsigned int right,unsigned int value){
+        const unsigned int mask=operand16?0xffffu:0xffffffffu;
+        left&=mask; right&=mask; value&=mask;
+        zf=value==0; sf=(value&(operand16?0x8000u:0x80000000u))!=0; pf=parity(value);
+        cf=left<right;
+        of=(((left^right)&(left^value))&(operand16?0x8000u:0x80000000u))!=0;
+    };
+    auto condition=[&](unsigned int codeValue){
+        switch(codeValue&0xfu) {
+        case 0x0:return of; case 0x1:return !of; case 0x2:return cf; case 0x3:return !cf;
+        case 0x4:return zf; case 0x5:return !zf; case 0x6:return cf||zf; case 0x7:return !cf&&!zf;
+        case 0x8:return sf; case 0x9:return !sf; case 0xa:return pf; case 0xb:return !pf;
+        case 0xc:return sf!=of; case 0xd:return sf==of; case 0xe:return zf||(sf!=of); case 0xf:return !zf&&(sf==of);
+        default:return false;
+        }
+    };
+    std::size_t ip=0;
+    while(ip<size) {
+        operand16=false;
+        while(ip<size && code[ip]==0x66u){ operand16=!operand16; ++ip; }
+        if(ip>=size) break;
+        const unsigned char opcode=code[ip++];
+        if(opcode==0x90u || opcode==0xF3u) continue;
+        if(opcode>=0xB8u && opcode<=0xBFu) {
+            if(ip+4>size) return false;
+            unsigned int value=static_cast<unsigned int>(code[ip])|
+                (static_cast<unsigned int>(code[ip+1])<<8)|
+                (static_cast<unsigned int>(code[ip+2])<<16)|
+                (static_cast<unsigned int>(code[ip+3])<<24); ip+=4;
+            if(operand16) value&=0xffffu;
+            if(operand16) regs[opcode-0xB8u]=(regs[opcode-0xB8u]&0xffff0000u)|value;
+            else regs[opcode-0xB8u]=value;
+            continue;
+        }
+        if(opcode>=0x40u && opcode<=0x47u){ const unsigned int mask=operand16?0xffffu:0xffffffffu; regs[opcode-0x40u]=(regs[opcode-0x40u]+1u)&mask; setFlagsAdd(regs[opcode-0x40u]-1u,1u,regs[opcode-0x40u]); continue; }
+        if(opcode>=0x48u && opcode<=0x4Fu){ const unsigned int old=regs[opcode-0x48u]; const unsigned int mask=operand16?0xffffu:0xffffffffu; regs[opcode-0x48u]=(old-1u)&mask; setFlagsSub(old,1u,regs[opcode-0x48u]); continue; }
+        if(opcode==0xC9u){ continue; }
+        if(opcode==0xC3u || opcode==0xCBu || opcode==0xC2u || opcode==0xCAu){ break; }
+        if(opcode==0xEBu){ if(ip>=size) return false; const int displacement=static_cast<signed char>(code[ip++]); const std::ptrdiff_t target=static_cast<std::ptrdiff_t>(ip)+displacement; if(target<0||target>static_cast<std::ptrdiff_t>(size)) return false; ip=static_cast<std::size_t>(target); continue; }
+        if(opcode>=0x70u && opcode<=0x7Fu){ if(ip>=size) return false; const int displacement=static_cast<signed char>(code[ip++]); if(condition(opcode)){ const std::ptrdiff_t target=static_cast<std::ptrdiff_t>(ip)+displacement; if(target<0||target>static_cast<std::ptrdiff_t>(size)) return false; ip=static_cast<std::size_t>(target); } continue; }
+        if(opcode==0xE9u){ if(ip+4>size) return false; const int displacement=static_cast<int>(static_cast<unsigned int>(code[ip])|(static_cast<unsigned int>(code[ip+1])<<8)|(static_cast<unsigned int>(code[ip+2])<<16)|(static_cast<unsigned int>(code[ip+3])<<24)); ip+=4; const std::ptrdiff_t target=static_cast<std::ptrdiff_t>(ip)+displacement; if(target<0||target>static_cast<std::ptrdiff_t>(size)) return false; ip=static_cast<std::size_t>(target); continue; }
+        if(opcode==0x0Fu){
+            if(ip>=size) return false; const unsigned char second=code[ip++];
+            if(second<0x80u||second>0x8Fu||ip+4>size) return false;
+            const int displacement=static_cast<int>(static_cast<unsigned int>(code[ip])|(static_cast<unsigned int>(code[ip+1])<<8)|(static_cast<unsigned int>(code[ip+2])<<16)|(static_cast<unsigned int>(code[ip+3])<<24)); ip+=4;
+            if(condition(second)){ const std::ptrdiff_t target=static_cast<std::ptrdiff_t>(ip)+displacement; if(target<0||target>static_cast<std::ptrdiff_t>(size)) return false; ip=static_cast<std::size_t>(target); }
+            continue;
+        }
+        if(opcode==0x05u || opcode==0x2Du){
+            if(ip+4>size) return false; const unsigned int immediate=static_cast<unsigned int>(code[ip])|(static_cast<unsigned int>(code[ip+1])<<8)|(static_cast<unsigned int>(code[ip+2])<<16)|(static_cast<unsigned int>(code[ip+3])<<24); ip+=4;
+            const unsigned int old=regs[0]; const unsigned int value=opcode==0x05u?old+immediate:old-immediate; regs[0]=operand16?((old&0xffff0000u)|(value&0xffffu)):value; if(opcode==0x05u) setFlagsAdd(old,immediate,value); else setFlagsSub(old,immediate,value); continue;
+        }
+        if(opcode==0xA9u){
+            if(ip+4>size) return false; const unsigned int immediate=static_cast<unsigned int>(code[ip])|(static_cast<unsigned int>(code[ip+1])<<8)|(static_cast<unsigned int>(code[ip+2])<<16)|(static_cast<unsigned int>(code[ip+3])<<24); ip+=4; setFlagsLogic(regs[0]&immediate,operand16?0xffffu:0xffffffffu); continue;
+        }
+        if(opcode==0x31u || opcode==0x33u || opcode==0x85u || opcode==0x89u || opcode==0x8Bu || opcode==0x88u || opcode==0x8Au || opcode==0x03u || opcode==0x2Bu || opcode==0x3Bu || opcode==0x39u || opcode==0x3Au){
+            if(ip>=size) return false; const unsigned char modrm=code[ip++]; const unsigned int mod=(modrm>>6)&3u, reg=(modrm>>3)&7u, rm=modrm&7u; int displacement=0;
+            if(mod==0u && rm==5u){ if(ip+4>size)return false; displacement=static_cast<int>(static_cast<unsigned int>(code[ip])|(static_cast<unsigned int>(code[ip+1])<<8)|(static_cast<unsigned int>(code[ip+2])<<16)|(static_cast<unsigned int>(code[ip+3])<<24)); ip+=4; }
+            else if(mod==1u && rm==5u){ if(ip>=size)return false; displacement=static_cast<signed char>(code[ip++]); }
+            else if(mod==2u && rm==5u){ if(ip+4>size)return false; displacement=static_cast<int>(static_cast<unsigned int>(code[ip])|(static_cast<unsigned int>(code[ip+1])<<8)|(static_cast<unsigned int>(code[ip+2])<<16)|(static_cast<unsigned int>(code[ip+3])<<24)); ip+=4; }
+            else if(mod==3u){
+                const unsigned int left=readReg(reg), right=readReg(rm), value=left^right;
+                if(opcode==0x31u||opcode==0x33u){ writeReg(opcode==0x31u?rm:reg,operand16?((readReg(opcode==0x31u?rm:reg)&0xffff0000u)|(value&0xffffu)):value); setFlagsLogic(value,operand16?0xffffu:0xffffffffu); continue; }
+                if(opcode==0x39u||opcode==0x3Au){ const unsigned int a=opcode==0x39u?left:right,b=opcode==0x39u?right:left; setFlagsSub(a,b,a-b); continue; }
+                return false;
+            }
+            else return false;
+            unsigned int memory=0; if(!readMemory(displacement,memory)) return false;
+            const unsigned int mask=operand16?0xffffu:0xffffffffu;
+            if(opcode==0x8Bu){ writeReg(reg,operand16?((readReg(reg)&0xffff0000u)|(memory&0xffffu)):memory); continue; }
+            if(opcode==0x89u){ if(!writeMemory(displacement,operand16?readReg(reg)&0xffffu:readReg(reg))) return false; continue; }
+            if(opcode==0x8Au){ writeReg8(reg,static_cast<unsigned char>(memory&0xffu)); continue; }
+            if(opcode==0x88u){ if(!writeMemory(displacement,(memory&0xffffff00u)|readReg8(reg))) return false; continue; }
+            if(opcode==0x03u){ const unsigned int old=readReg(reg),value=(old+memory)&mask; writeReg(reg,operand16?((old&0xffff0000u)|(value&0xffffu)):value); setFlagsAdd(old,memory,value); continue; }
+            if(opcode==0x2Bu){ const unsigned int old=readReg(reg),value=(old-memory)&mask; writeReg(reg,operand16?((old&0xffff0000u)|(value&0xffffu)):value); setFlagsSub(old,memory,value); continue; }
+            if(opcode==0x3Bu){ const unsigned int old=readReg(reg),value=(old-memory)&mask; setFlagsSub(old,memory,value); continue; }
+            if(opcode==0x85u){ const unsigned int value=readReg(reg)&memory; setFlagsLogic(value,mask); continue; }
+            if(opcode==0x39u||opcode==0x3Au){ const unsigned int a=opcode==0x39u?readReg(reg):memory,b=opcode==0x39u?memory:readReg(reg); setFlagsSub(a,b,a-b); continue; }
+            return false;
+        }
+        if(opcode==0xC1u || opcode==0xD1u || opcode==0xD3u){
+            if(ip>=size) return false; const unsigned char modrm=code[ip++]; const unsigned int mod=(modrm>>6)&3u, sub=(modrm>>3)&7u, rm=modrm&7u; if(mod!=3u) return false; unsigned int count=opcode==0xC1u?(ip<size?code[ip++]:0):1; if(opcode==0xD3u) count=regs[1]&0xffu; count&=operand16?15u:31u; if(count==0u) continue; const unsigned int mask=operand16?0xffffu:0xffffffffu; unsigned int value=readReg(rm)&mask; if(sub==0u){ value=((value<<count)|(value>>(operand16?16-count:32-count)))&mask; } else if(sub==1u){ value=((value>>count)|(value<<(operand16?16-count:32-count)))&mask; } else if(sub==4u||sub==6u){ value=(value<<count)&mask; } else if(sub==5u){ value=(value>>count)&mask; } else if(sub==7u){ value=static_cast<unsigned int>(static_cast<int>(value)>>count)&mask; } else return false; writeReg(rm,operand16?((readReg(rm)&0xffff0000u)|value):value); setFlagsLogic(value,mask); continue;
+        }
+        return false;
+    }
+    for(std::size_t index=0;index<parameters.size()&&index<stack.size();++index){ parameters[index].integer=static_cast<long long>(static_cast<std::int32_t>(stack[index])); parameters[index].number=static_cast<double>(parameters[index].integer); }
+    if(combineHighRegister) {
+        const std::uint64_t combined=(static_cast<std::uint64_t>(regs[2])<<32)|regs[0];
+        result=static_cast<long long>(combined);
+    }
+    else {
+        result=static_cast<long long>(static_cast<std::int32_t>(regs[0]));
+    }
+    return true;
+}
 static bool ToBool(const Value& value) {
     if(value.declaredArray) return !value.elements.empty();
     if(value.type==T_TEXT) return !value.text.empty();
@@ -454,7 +610,7 @@ static Value Not(const Value& a) { return Boolean(!ToBool(a)); }
 
 static Value& Index(Value& value,long long index) {
     if(index<1||static_cast<std::size_t>(index)>value.elements.size()) {
-        OutputDebugStringA("ecompiler: array index out of bounds\r\n"); ExitProcess(87);
+        std::fputs("ecompiler: array index out of bounds\r\n",stderr); OutputDebugStringA("ecompiler: array index out of bounds\r\n"); ExitProcess(87);
     }
     return value.elements[static_cast<std::size_t>(index-1)];
 }
@@ -462,7 +618,7 @@ static Value& IndexPath(Value& value,const std::vector<long long>& indexes) {
     if(indexes.empty()) return value;
     if(value.dimensions.empty() && indexes.size()==1) return Index(value,indexes.front());
     if(indexes.size()!=value.dimensions.size()) {
-        OutputDebugStringA("ecompiler: array dimension mismatch\r\n"); ExitProcess(87);
+        std::fputs("ecompiler: array dimension mismatch\r\n",stderr); OutputDebugStringA("ecompiler: array dimension mismatch\r\n"); ExitProcess(87);
     }
     std::size_t flat=0;
     std::size_t stride=1;
@@ -470,15 +626,15 @@ static Value& IndexPath(Value& value,const std::vector<long long>& indexes) {
         const std::size_t dimensionIndex=indexes.size()-1-reverse;
         const long long index=indexes[dimensionIndex];
         const int dimension=value.dimensions[dimensionIndex];
-        if(index<1 || index>dimension) { OutputDebugStringA("ecompiler: array index out of bounds\r\n"); ExitProcess(87); }
+        if(index<1 || index>dimension) { std::fputs("ecompiler: array index out of bounds\r\n",stderr); OutputDebugStringA("ecompiler: array index out of bounds\r\n"); ExitProcess(87); }
         flat += static_cast<std::size_t>(index-1)*stride;
         stride*=static_cast<std::size_t>(dimension);
     }
-    if(flat>=value.elements.size()) { OutputDebugStringA("ecompiler: array index out of bounds\r\n"); ExitProcess(87); }
+    if(flat>=value.elements.size()) { std::fputs("ecompiler: array index out of bounds\r\n",stderr); OutputDebugStringA("ecompiler: array index out of bounds\r\n"); ExitProcess(87); }
     return value.elements[flat];
 }
 static Value& Field(Value& value,std::size_t index) {
-    if(index>=value.fields.size()) { OutputDebugStringA("ecompiler: compound field out of bounds\r\n"); ExitProcess(87); }
+    if(index>=value.fields.size()) { std::fputs("ecompiler: compound field out of bounds\r\n",stderr); OutputDebugStringA("ecompiler: compound field out of bounds\r\n"); ExitProcess(87); }
     return value.fields[index];
 }
 static void Redim(Value& value,const std::vector<int>& dimensions,bool preserve) {
@@ -520,23 +676,23 @@ static Value FindFile(const Value& pattern) {
     if(search!=INVALID_HANDLE_VALUE) { FindClose(search); search=INVALID_HANDLE_VALUE; }
     return Text("");
 }
-extern "C" int __stdcall BlackMoonFuncForeLibNotifySys(int,unsigned long,unsigned long);
+extern "C" EIntPtr __stdcall BlackMoonFuncForeLibNotifySys(int,EPointer,EPointer);
 static void RuntimeFree(void* pointer) {
-    if(pointer) BlackMoonFuncForeLibNotifySys(ecompiler_nrs_mfree,reinterpret_cast<unsigned long>(pointer),0);
+    if(pointer) BlackMoonFuncForeLibNotifySys(ecompiler_nrs_mfree,reinterpret_cast<EPointer>(pointer),0);
 }
-static void RuntimeFreeArray(std::uint32_t type,void* pointer) { if(pointer) BlackMoonFuncForeLibNotifySys(ecompiler_nrs_free_array,type,reinterpret_cast<unsigned long>(pointer)); }
+static void RuntimeFreeArray(std::uint32_t type,void* pointer) { if(pointer) BlackMoonFuncForeLibNotifySys(ecompiler_nrs_free_array,type,reinterpret_cast<EPointer>(pointer)); }
 static char* RuntimeText(const std::string& text) {
-    auto* result=reinterpret_cast<char*>(BlackMoonFuncForeLibNotifySys(ecompiler_nrs_malloc,static_cast<unsigned long>(text.size()+1),0));
+    auto* result=reinterpret_cast<char*>(BlackMoonFuncForeLibNotifySys(ecompiler_nrs_malloc,static_cast<EPointer>(text.size()+1),0));
     if(result!=nullptr) std::memcpy(result,text.c_str(),text.size()+1); return result;
 }
 static unsigned char* RuntimeBinary(const std::vector<unsigned char>& bytes) {
-    auto* result=reinterpret_cast<unsigned char*>(BlackMoonFuncForeLibNotifySys(ecompiler_nrs_malloc,static_cast<unsigned long>(bytes.size()+8),0));
+    auto* result=reinterpret_cast<unsigned char*>(BlackMoonFuncForeLibNotifySys(ecompiler_nrs_malloc,static_cast<EPointer>(bytes.size()+8),0));
     if(result==nullptr) return nullptr;
     *reinterpret_cast<int*>(result)=1; *reinterpret_cast<int*>(result+4)=static_cast<int>(bytes.size());
     if(!bytes.empty()) std::memcpy(result+8,bytes.data(),bytes.size()); return result;
 }
 static std::size_t ScalarSize(std::uint32_t type) {
-    switch(type&~T_ARRAY) { case T_BYTE:return 1; case T_SHORT:return 2; case T_INT:case T_FLOAT:case T_BOOL:case T_TEXT:case T_BIN:case T_SUB:return 4; case T_INT64:case T_DOUBLE:case T_DATE:return 8; default:return 4; }
+    switch(type&~T_ARRAY) { case T_BYTE:return 1; case T_SHORT:return 2; case T_INT:case T_FLOAT:case T_BOOL:return 4; case T_TEXT:case T_BIN:case T_SUB:return sizeof(void*); case T_INT64:case T_DOUBLE:case T_DATE:return 8; default:return 4; }
 }
 static void ReadObject(Value& value,const void* source);
 static void ReadArray(Value& value,std::uint32_t type,const unsigned char* raw) {
@@ -554,7 +710,7 @@ static void ReadArray(Value& value,std::uint32_t type,const unsigned char* raw) 
     }
     const unsigned char* data=raw+4+dimensions*4;
     const std::uint32_t base=type&~T_ARRAY;
-    const std::size_t itemSize=(base==T_TEXT||base==T_BIN||FindType(base))?4:ScalarSize(base);
+    const std::size_t itemSize=(base==T_TEXT||base==T_BIN||FindType(base))?sizeof(void*):ScalarSize(base);
     for(int index=0;index<count;++index) {
         Value item=MakeVar(base);
         if(const auto* descriptor=FindType(base); descriptor!=nullptr && descriptor->enumeration) {
@@ -566,7 +722,8 @@ static void ReadArray(Value& value,std::uint32_t type,const unsigned char* raw) 
         switch(base) {
         case T_BYTE:item.integer=*data;break;
         case T_SHORT:item.integer=*reinterpret_cast<const short*>(data);break;
-        case T_INT:case T_BOOL:case T_SUB:item.integer=*reinterpret_cast<const int*>(data);break;
+        case T_INT:case T_BOOL:item.integer=*reinterpret_cast<const int*>(data);break;
+        case T_SUB:item.integer=static_cast<long long>(reinterpret_cast<std::uintptr_t>(*reinterpret_cast<void* const*>(data)));break;
         case T_INT64:item.integer=*reinterpret_cast<const long long*>(data);break;
         case T_FLOAT:item.number=*reinterpret_cast<const float*>(data);item.integer=static_cast<long long>(item.number);break;
         case T_DOUBLE:case T_DATE:item.number=*reinterpret_cast<const double*>(data);item.integer=static_cast<long long>(item.number);break;
@@ -640,10 +797,10 @@ struct Arena {
 };
 static void PrepareObjectWithArena(Value& value,Arena& arena);
 static void* RuntimeAlloc(std::size_t size) {
-    return reinterpret_cast<void*>(static_cast<std::uintptr_t>(BlackMoonFuncForeLibNotifySys(ecompiler_nrs_malloc,static_cast<unsigned long>(size),0)));
+    return reinterpret_cast<void*>(static_cast<EPointer>(BlackMoonFuncForeLibNotifySys(ecompiler_nrs_malloc,static_cast<EPointer>(size),0)));
 }
 static void* MarshalArray(Value& value,std::uint32_t type,Arena& arena,bool track=true) {
-    const auto base=type&~T_ARRAY; const std::size_t itemSize=(base==T_TEXT||base==T_BIN||FindType(base))?4:ScalarSize(base);
+    const auto base=type&~T_ARRAY; const std::size_t itemSize=(base==T_TEXT||base==T_BIN||FindType(base))?sizeof(void*):ScalarSize(base);
     const std::vector<int> dimensions=value.dimensions.empty()?std::vector<int>{static_cast<int>(value.elements.size())}:value.dimensions;
     std::size_t dimensionBytes=4+dimensions.size()*4;
     auto* block=static_cast<unsigned char*>(RuntimeAlloc(dimensionBytes+itemSize*value.elements.size()));
@@ -686,6 +843,14 @@ static void PrepareObjectWithArena(Value& value,Arena& arena) {
 }
 static void MarshalValue(Value& value,std::uint32_t expected,MData& out,Arena& arena) {
     std::memset(&out,0,sizeof(out)); if(value.missing) return;
+    // Some historical x86 FNEs describe an address as an integer. Preserve a
+    // real subroutine/native pointer instead of truncating it on x64; support
+    // libraries can then opt into the pointer ABI by inspecting T_SUB.
+    if(expected==T_INT && value.type==T_SUB) {
+        out.type=T_SUB;
+        out.pointerValue=reinterpret_cast<void*>(static_cast<EPointer>(ToInteger(value)));
+        return;
+    }
     std::uint32_t type=expected==T_ALL||expected==T_NULL?value.type:expected;
     if(value.declaredArray) { out.type=type|T_ARRAY; out.pointerValue=MarshalArray(value,type|T_ARRAY,arena); return; }
     out.type=type;
@@ -696,7 +861,9 @@ static void MarshalValue(Value& value,std::uint32_t expected,MData& out,Arena& a
     }
     switch(type) {
     case T_BYTE:out.byteValue=static_cast<unsigned char>(ToInteger(value));break; case T_SHORT:out.shortValue=static_cast<short>(ToInteger(value));break;
-    case T_INT:case T_BOOL:case T_SUB:out.intValue=static_cast<int>(ToInteger(value));break; case T_INT64:out.int64Value=ToInteger(value);break;
+    case T_INT:case T_BOOL:out.intValue=static_cast<int>(ToInteger(value));break;
+    case T_SUB:out.pointerValue=reinterpret_cast<void*>(static_cast<EPointer>(ToInteger(value)));break;
+    case T_INT64:out.int64Value=ToInteger(value);break;
     case T_FLOAT:out.floatValue=static_cast<float>(ToNumber(value));break; case T_DOUBLE:case T_DATE:out.doubleValue=ToNumber(value);break;
     case T_TEXT:out.textValue=value.text.empty()?nullptr:value.text.data();break;
     case T_BIN: { auto* block=static_cast<unsigned char*>(RuntimeAlloc(8+value.bytes.size())); if(block==nullptr)break; *reinterpret_cast<int*>(block)=1; *reinterpret_cast<int*>(block+4)=static_cast<int>(value.bytes.size()); if(!value.bytes.empty())std::memcpy(block+8,value.bytes.data(),value.bytes.size()); out.pointerValue=block; arena.ownedValues.push_back(block); break; }
@@ -737,7 +904,8 @@ static void MarshalByReference(Value& value,std::uint32_t expected,std::uint32_t
     switch(type) {
     case T_BYTE: *reinterpret_cast<unsigned char*>(scalar.data())=static_cast<unsigned char>(ToInteger(value)); out.bytePointer=scalar.data(); break;
     case T_SHORT: *reinterpret_cast<short*>(scalar.data())=static_cast<short>(ToInteger(value)); out.shortPointer=reinterpret_cast<short*>(scalar.data()); break;
-    case T_INT: case T_BOOL: case T_SUB: *reinterpret_cast<int*>(scalar.data())=static_cast<int>(ToInteger(value)); out.intPointer=reinterpret_cast<int*>(scalar.data()); break;
+    case T_INT: case T_BOOL: *reinterpret_cast<int*>(scalar.data())=static_cast<int>(ToInteger(value)); out.intPointer=reinterpret_cast<int*>(scalar.data()); break;
+    case T_SUB: *reinterpret_cast<std::uintptr_t*>(scalar.data())=static_cast<std::uintptr_t>(ToInteger(value)); out.pointerPointer=reinterpret_cast<void**>(scalar.data()); break;
     case T_INT64: *reinterpret_cast<long long*>(scalar.data())=ToInteger(value); out.int64Pointer=reinterpret_cast<long long*>(scalar.data()); break;
     case T_FLOAT: *reinterpret_cast<float*>(scalar.data())=static_cast<float>(ToNumber(value)); out.floatPointer=reinterpret_cast<float*>(scalar.data()); break;
     case T_DOUBLE: case T_DATE: *reinterpret_cast<double*>(scalar.data())=ToNumber(value); out.doublePointer=reinterpret_cast<double*>(scalar.data()); break;
@@ -789,7 +957,7 @@ static void ApplyWritebacks(Arena& arena) {
                     count*=dimension;
                 }
                 unsigned char* source=static_cast<unsigned char*>(raw)+4+dimensions*4;
-                const std::size_t itemSize=(type==T_TEXT||type==T_BIN||FindType(type))?4:ScalarSize(type);
+                const std::size_t itemSize=(type==T_TEXT||type==T_BIN||FindType(type))?sizeof(void*):ScalarSize(type);
                 item.value->elements.clear(); item.value->declaredArray=true;
                 for(int index=0;index<count;++index) {
                     Value element=MakeVar(type);
@@ -834,7 +1002,8 @@ static void ApplyWritebacks(Arena& arena) {
         case T_BIN: if(item.binarySlot && *item.binarySlot){auto* raw=*item.binarySlot;int dimensions=*reinterpret_cast<int*>(raw),count=1;for(int i=0;i<dimensions;++i)count*=*reinterpret_cast<int*>(raw+4+i*4);item.value->bytes.assign(raw+4+dimensions*4,raw+4+dimensions*4+count);RuntimeFree(raw);} break;
         case T_BYTE: item.value->integer=*reinterpret_cast<unsigned char*>(item.scalarSlot); break;
         case T_SHORT: item.value->integer=*reinterpret_cast<short*>(item.scalarSlot); break;
-        case T_INT: case T_BOOL: case T_SUB: item.value->integer=*reinterpret_cast<int*>(item.scalarSlot); break;
+        case T_INT: case T_BOOL: item.value->integer=*reinterpret_cast<int*>(item.scalarSlot); break;
+        case T_SUB: item.value->integer=static_cast<long long>(*reinterpret_cast<std::uintptr_t*>(item.scalarSlot)); break;
         case T_INT64: item.value->integer=*reinterpret_cast<long long*>(item.scalarSlot); break;
         case T_FLOAT: item.value->number=*reinterpret_cast<float*>(item.scalarSlot); item.value->integer=static_cast<long long>(item.value->number); break;
         case T_DOUBLE: case T_DATE: item.value->number=*reinterpret_cast<double*>(item.scalarSlot); item.value->integer=static_cast<long long>(item.value->number); break;
@@ -853,7 +1022,7 @@ static Value CopyReturned(MData& data,std::uint32_t fallback,bool returnsArray) 
         int dimensions=*reinterpret_cast<int*>(raw), count=1;
         result.dimensions.clear();
         for(int i=0;i<dimensions;++i) { const int dimension=*reinterpret_cast<int*>(raw+4+i*4); result.dimensions.push_back(dimension); count*=dimension; }
-        unsigned char* source=raw+4+dimensions*4; const std::size_t itemSize=(type==T_TEXT||type==T_BIN||FindType(type))?4:ScalarSize(type);
+        unsigned char* source=raw+4+dimensions*4; const std::size_t itemSize=(type==T_TEXT||type==T_BIN||FindType(type))?sizeof(void*):ScalarSize(type);
         for(int i=0;i<count;++i) { Value item=MakeVar(type); if(const auto* descriptor=FindType(type); descriptor!=nullptr && descriptor->enumeration) { item.integer=*reinterpret_cast<int*>(source); result.elements.push_back(std::move(item)); source+=itemSize; continue; } switch(type) {
             case T_BYTE:item.integer=*source;break; case T_SHORT:item.integer=*reinterpret_cast<short*>(source);break; case T_INT:case T_BOOL:item.integer=*reinterpret_cast<int*>(source);break;
             case T_INT64:item.integer=*reinterpret_cast<long long*>(source);break; case T_FLOAT:item.number=*reinterpret_cast<float*>(source);break; case T_DOUBLE:case T_DATE:item.number=*reinterpret_cast<double*>(source);break;
@@ -865,7 +1034,8 @@ static Value CopyReturned(MData& data,std::uint32_t fallback,bool returnsArray) 
         RuntimeFreeArray(type,raw); return result;
     }
     Value result=MakeVar(type,false,false); if(const auto* descriptor=FindType(type); descriptor!=nullptr && descriptor->enumeration) { result.integer=data.intValue; return result; } switch(type) {
-    case T_BYTE:result.integer=data.byteValue;break; case T_SHORT:result.integer=data.shortValue;break; case T_INT:case T_BOOL:case T_SUB:result.integer=data.intValue;break;
+    case T_BYTE:result.integer=data.byteValue;break; case T_SHORT:result.integer=data.shortValue;break; case T_INT:case T_BOOL:result.integer=data.intValue;break;
+    case T_SUB:result.integer=static_cast<long long>(reinterpret_cast<std::uintptr_t>(data.pointerValue));break;
     case T_INT64:result.integer=data.int64Value;break; case T_FLOAT:result.number=data.floatValue;break; case T_DOUBLE:case T_DATE:result.number=data.doubleValue;break;
     case T_TEXT:if(data.textValue){result.text=data.textValue;RuntimeFree(data.textValue);}break;
     case T_BIN:if(data.pointerValue){auto* raw=static_cast<unsigned char*>(data.pointerValue);int dimensions=*reinterpret_cast<int*>(raw),count=1;for(int i=0;i<dimensions;++i)count*=*reinterpret_cast<int*>(raw+4+i*4);auto* bytes=raw+4+dimensions*4;result.bytes.assign(bytes,bytes+count);RuntimeFree(raw);}break;
@@ -878,6 +1048,12 @@ __declspec(noinline) static bool InvokeCommand(ExecuteCommand command,MData* res
 }
 static thread_local std::function<Value()> currentStatement;
 static int __cdecl EvaluateStatement() { return currentStatement ? (ToBool(currentStatement()) ? 1 : 0) : 0; }
+#if defined(_WIN64)
+// The legacy statement ABI stores a 32-bit code address and cannot represent
+// an x64 function pointer.  x64 core libraries do not execute these callbacks;
+// keep a normal callable stub so ordinary command marshalling remains valid.
+extern "C" int __cdecl StatementThunk() { return EvaluateStatement(); }
+#else
 extern "C" __declspec(naked) void __cdecl StatementThunk() {
     __asm {
         push ebp
@@ -888,6 +1064,14 @@ extern "C" __declspec(naked) void __cdecl StatementThunk() {
         pop ebp
         ret
     }
+}
+#endif
+static unsigned int StatementAddress() {
+#if defined(_WIN64)
+    return 0;
+#else
+    return reinterpret_cast<unsigned int>(&StatementThunk);
+#endif
 }
 static void ReleaseArena(Arena& arena) {
     for(const auto& item:arena.ownedArrays) {
@@ -1010,7 +1194,7 @@ static Value CallFne(const char* name,ExecuteCommand command,std::uint32_t retur
     for(std::size_t i=0;i<args.size();++i) {
         if(specs[i].type==T_STATEMENT && args[i].statement) {
             statementScope=std::make_unique<StatementScope>(args[i].statement);
-            raw[i].type=T_STATEMENT; raw[i].statement.statementAddress=reinterpret_cast<unsigned int>(&StatementThunk); raw[i].statement.statementEbp=0;
+			raw[i].type=T_STATEMENT; raw[i].statement.statementAddress=StatementAddress(); raw[i].statement.statementEbp=0;
             continue;
         }
 		const bool byReference=(specs[i].state&(1u<<2|1u<<3|1u<<4|1u<<5|1u<<9))!=0 && args[i].reference!=nullptr;
@@ -1050,7 +1234,7 @@ public:
 		for (const Method& method : program_.methods) {
 			if (program_.buildDll && method.isPublic) EmitExportWrapper(method);
 		}
-		EmitTypes();
+		if (!EmitTypes()) return false;
 		EmitDeclarationsAndStartup();
 		result.reachableLibraries = reachableLibraries_;
 		result.exports = exports_;
@@ -1076,7 +1260,7 @@ private:
 	void Write(const std::string& text) { body_ << text; }
 	void Line(const int indent, const std::string& text) { body_ << std::string(static_cast<std::size_t>(indent) * 4, ' ') << text << "\n"; }
 
-	void EmitTypes()
+	bool EmitTypes()
 	{
 		lifecycle_.assign(program_.types.size(), LifecycleBinding {});
 		std::set<std::size_t> usedTypeIndexes;
@@ -1097,6 +1281,9 @@ private:
 		for (std::size_t typeIndex = 0; typeIndex < program_.types.size(); ++typeIndex) {
 			const TypeInfo& type = program_.types[typeIndex];
 			if (!usedTypeIndexes.contains(typeIndex)) continue;
+			if (!type.layoutComplete) {
+				return Fail("incomplete_support_library_type:" + type.name);
+			}
 			if (type.libraryIndex >= program_.libraries.size()) continue;
 			const auto& commands = program_.libraries[type.libraryIndex].metadata.commands;
 			for (const std::size_t commandIndex : type.memberCommandIndexes) {
@@ -1142,6 +1329,7 @@ private:
 		}
 		body_ << "};\nconst TypeDesc* TypeTable(){return type_table;}\n"
 			"std::size_t TypeCount(){return sizeof(type_table)/sizeof(type_table[0]);}\n}\nusing namespace ert;\n";
+		return true;
 	}
 
 	void EmitGlobals()
@@ -1434,7 +1622,11 @@ private:
 		switch (type.code) {
 		case kTypeByte: base = "unsigned char"; break;
 		case kTypeShort: base = "short"; break;
-		case kTypeInt: case kTypeBool: case kTypeSubroutine: case kTypeAll: base = "int"; break;
+		case kTypeInt: case kTypeBool: case kTypeAll: base = "int"; break;
+		// A subroutine value is an address.  It is four bytes in the x86
+		// language ABI and eight bytes in an x64 process; void* keeps the
+		// generated public/import signature pointer-sized on both targets.
+		case kTypeSubroutine: base = "void*"; break;
 		case kTypeInt64: base = "long long"; break;
 		case kTypeFloat: base = "float"; break;
 		case kTypeDouble: case kTypeDateTime: base = "double"; break;
@@ -1455,7 +1647,8 @@ private:
 		switch (type.code) {
 		case kTypeByte: return "unsigned char";
 		case kTypeShort: return "short";
-		case kTypeInt: case kTypeBool: case kTypeSubroutine: return "int";
+		case kTypeInt: case kTypeBool: return "int";
+		case kTypeSubroutine: return "void*";
 		case kTypeInt64: return "long long";
 		case kTypeFloat: return "float";
 		case kTypeDouble: case kTypeDateTime: return "double";
@@ -1469,12 +1662,53 @@ private:
 		return type.code == kTypeNull ? "void" : DllCType(type, false);
 	}
 
+	std::string ImportLinkerSymbol(
+		const std::string& name,
+		const bool isCdecl,
+		const std::size_t stackBytes) const
+	{
+		if (program_.targetArchitecture == TargetArchitecture::X64) return name;
+		return "_" + name + (isCdecl ? std::string() : std::string("@") + std::to_string(stackBytes));
+	}
+
+	std::size_t AbiStackBytes(const TypeRef type, const bool byReference) const
+	{
+		if (program_.targetArchitecture == TargetArchitecture::X64) return 0;
+		if (byReference || type.isArray || type.code == kTypeText ||
+			type.code == kTypeBinary || type.code == kTypeSubroutine ||
+			program_.FindType(type.code) != nullptr) return 4;
+		switch (type.code) {
+		case kTypeInt64:
+		case kTypeDouble:
+		case kTypeDateTime:
+			return 8;
+		default:
+			return 4;
+		}
+	}
+
+	std::size_t AbiParameterBytes(const std::vector<Variable>& parameters) const
+	{
+		std::size_t bytes = 0;
+		for (const Variable& parameter : parameters) bytes += AbiStackBytes(parameter.type, parameter.byReference);
+		return bytes;
+	}
+
+	static std::string LinkerDirectiveName(std::string value)
+	{
+		for (char& character : value) {
+			if (character == '"' || character == '\\' || character == '\r' || character == '\n') character = '_';
+		}
+		return value;
+	}
+
 	std::string DllValueExpression(const TypeRef type, const std::string& valueName) const
 	{
 		if (type.isArray) return valueName + ".missing?nullptr:__dll_array_" + valueName;
 		switch (type.code) {
 		case kTypeText: return valueName + ".missing?nullptr:DllText(" + valueName + ")";
 		case kTypeBinary: return valueName + ".missing?nullptr:DllBinary(" + valueName + ")";
+		case kTypeSubroutine: return "reinterpret_cast<void*>(static_cast<std::uintptr_t>(ToInteger(" + valueName + ")))";
 		default:
 			if (program_.FindType(type.code) != nullptr) return "DllObject(" + valueName + ")";
 			if (type.code == kTypeFloat || type.code == kTypeDouble || type.code == kTypeDateTime)
@@ -1561,20 +1795,13 @@ private:
 			for (std::size_t index = 0; index < callArguments.size(); ++index) { if (index != 0) output << ','; output << callArguments[index]; }
 			return output.str();
 		}();
-		const bool platformImport = IsPlatformImportModule(command.fileName);
-		std::ostringstream platformSignature;
-		if (platformImport) {
-			platformSignature << "reinterpret_cast<" << DllReturnCType(command.returnType) << " (" << (command.usesCdecl ? "__cdecl" : "__stdcall") << "*) (";
-			for (std::size_t index = 0; index < command.parameters.size(); ++index) {
-				if (index != 0) platformSignature << ',';
-				const Variable& parameter = command.parameters[index];
-				const TypeRef type = parameter.type.valid ? parameter.type : TypeRef { kTypeInt, false, true };
-				if (parameter.byReference && program_.FindType(type.code) != nullptr) platformSignature << "void*";
-				else platformSignature << DllCType(type, parameter.byReference);
-			}
-			platformSignature << ")>(" << command.entryName << ")(" << joinedArguments << ")";
-		}
-		const std::string invoked = platformImport ? platformSignature.str() : importSymbol + "(" + joinedArguments + ")";
+		// Every DLL declaration goes through a compiler-generated import alias.
+		// Calling a platform entry by its header name (for example
+		// InterlockedIncrement or abs) is ambiguous in C++ and also bypasses the
+		// PE import-library path.  The alias has the exact declaration assembled
+		// in RegisterDllImport and is mapped to the real import symbol by the
+		// generated linker directive.
+		const std::string invoked = importSymbol + "(" + joinedArguments + ")";
 		if (returnType.code == kTypeNull) {
 			result << invoked << ";";
 		}
@@ -1588,7 +1815,8 @@ private:
 		else if (returnType.code == kTypeBinary) result << "return DllBinaryResult(__dll_result);";
 		else if (returnType.code == kTypeFloat || returnType.code == kTypeDouble || returnType.code == kTypeDateTime) result << "return Number(__dll_result);";
 		else if (returnType.code == kTypeBool) result << "return Boolean(__dll_result!=0);";
-		else if (returnType.code == kTypeByte || returnType.code == kTypeShort || returnType.code == kTypeInt || returnType.code == kTypeInt64 || returnType.code == kTypeSubroutine) result << "return Integer(__dll_result," << Hex(returnType.code) << ");";
+		else if (returnType.code == kTypeSubroutine) result << "return Integer(static_cast<long long>(reinterpret_cast<std::uintptr_t>(__dll_result))," << Hex(returnType.code) << ");";
+		else if (returnType.code == kTypeByte || returnType.code == kTypeShort || returnType.code == kTypeInt || returnType.code == kTypeInt64) result << "return Integer(__dll_result," << Hex(returnType.code) << ");";
 		else result << "Value __dll_value=MakeVar(" << Hex(returnType.code) << ",false,false); if(__dll_result) ReadObject(__dll_value,__dll_result); return __dll_value;";
 		result << "})()";
 		return result.str();
@@ -1598,23 +1826,42 @@ private:
 	{
 		const auto found = dllImportSymbols_.find(commandIndex);
 		if (found != dllImportSymbols_.end()) return found->second;
-		const bool platformImport = IsPlatformImportModule(command.fileName);
-		const std::string symbol = platformImport && IsCppIdentifier(command.entryName) ? command.entryName : "ecompiler_import_" + std::to_string(commandIndex);
-		if (platformImport) {
-			imports_.push_back({commandIndex, command.fileName, command.entryName, symbol, command.usesCdecl, command.parameters.size() * 4});
-			dllImportSymbols_.emplace(commandIndex, symbol);
-			return symbol;
-		}
+		// Keep the local name independent from the DLL entry name.  Besides
+		// avoiding collisions with C/C++ declarations, this makes platform and
+		// third-party DLLs follow one import-table contract.
+		const std::string symbol = "ecompiler_import_" + std::to_string(commandIndex);
 		const std::string returnType = DllReturnCType(command.returnType);
 		declarations_ << "extern \"C\" __declspec(dllimport) " << returnType << ' '
 			<< (command.usesCdecl ? "__cdecl" : "__stdcall") << ' ' << symbol << "(";
 		for (std::size_t index = 0; index < command.parameters.size(); ++index) {
 			if (index != 0) declarations_ << ',';
 			const TypeRef type = command.parameters[index].type.valid ? command.parameters[index].type : TypeRef { kTypeInt, false, true };
-			declarations_ << ((platformImport && command.parameters[index].byReference) ? PlatformImportCType(type) + "*" : DllCType(type, command.parameters[index].byReference));
+			// A by-reference composite passed to a Windows API is a pointer to
+			// the object storage, while an ordinary E DLL uses the pointer slot
+			// described by DllCType.  Keep this distinction in the declaration as
+			// well as in EmitDllCall's argument marshalling.
+			declarations_ << ((IsPlatformImportModule(command.fileName) && command.parameters[index].byReference && program_.FindType(type.code) != nullptr)
+				? "void*"
+				: DllCType(type, command.parameters[index].byReference));
 		}
 		declarations_ << ");\n";
-		imports_.push_back({commandIndex, command.fileName, command.entryName, symbol, command.usesCdecl, command.parameters.size() * 4});
+		const std::string localSymbol = ImportLinkerSymbol(
+			symbol,
+			command.usesCdecl,
+			AbiParameterBytes(command.parameters));
+		const std::string targetSymbol = ImportLinkerSymbol(
+			command.entryName,
+			true,
+			0);
+		const std::string localImportSymbol = LinkerDirectiveName("__imp_" + localSymbol);
+		const std::string targetImportSymbol = LinkerDirectiveName("__imp_" + targetSymbol);
+		declarations_ << "#pragma comment(linker,\"/alternatename:" << localImportSymbol
+			<< "=" << targetImportSymbol << "\")\n";
+		// The non-__imp form is useful when the compiler folds a call into a
+		// direct reference (and is harmless for a normal dllimport thunk).
+		declarations_ << "#pragma comment(linker,\"/alternatename:" << LinkerDirectiveName(localSymbol)
+			<< "=" << LinkerDirectiveName(targetSymbol) << "\")\n";
+		imports_.push_back({commandIndex, command.fileName, command.entryName, symbol, command.usesCdecl, AbiParameterBytes(command.parameters)});
 		dllImportSymbols_.emplace(commandIndex, symbol);
 		return symbol;
 	}
@@ -1622,7 +1869,16 @@ private:
 	std::string EmitFneCall(const Method& method, const CommandBinding& binding, const e2txt::SourceExpressionNode& call, const e2txt::SourceExpressionNode* receiver)
 	{
 		const auto& command = *binding.command;
-		if (IsCompilePrimitive(command) || command.executeSymbol.empty()) return EmitBuiltin(method, binding, call);
+		if (IsCompilePrimitive(command)) return EmitBuiltin(method, binding, call);
+		if (command.executeSymbol.empty()) {
+			const std::string libraryName = binding.libraryIndex < program_.libraries.size()
+				? program_.libraries[binding.libraryIndex].dependency.name
+				: std::string();
+			Fail(method.sourceFile + ":" + std::to_string(method.sourceLine) +
+				": support_library_implementation_unavailable:" +
+				(libraryName.empty() ? std::string("<unknown>") : libraryName) + ":" + command.name);
+			return "Empty()";
+		}
 		if (!IsCppIdentifier(command.executeSymbol)) { Fail("invalid_fne_execute_symbol:" + command.executeSymbol); return "Empty()"; }
 		reachableLibraries_.insert(binding.libraryIndex);
 		reachableSymbols_.insert(command.executeSymbol);
@@ -1690,7 +1946,9 @@ private:
 			}
 			if (const DllCommand* dll = ResolveDllCommand(callee.text, argumentCount)) return EmitDllCall(method, *dll, node);
 			const auto binding = ResolveGlobalCommand(callee.text, argumentCount);
-			if (!binding) { Fail(method.sourceFile + ": unknown_call:" + callee.text + "/" + std::to_string(argumentCount)); return "Empty()"; }
+			if (!binding) {
+				Fail(method.sourceFile + ": unknown_call:" + callee.text + "/" + std::to_string(argumentCount)); return "Empty()";
+			}
 			return EmitFneCall(method, *binding, node, nullptr);
 		}
 		if (callee.kind == Kind::Member && !callee.children.empty()) {
@@ -1851,6 +2109,59 @@ private:
 		return true;
 	}
 
+	bool EmitX64MachineMethod(const Method& method, const Statement& machineStatement)
+	{
+		const auto isIntegerType = [](const TypeRef type) {
+			return !type.isArray && (type.code == kTypeByte || type.code == kTypeShort ||
+				type.code == kTypeInt || type.code == kTypeInt64 || type.code == kTypeBool);
+		};
+		for (const auto& parameter : method.parameters) {
+			if (!isIntegerType(parameter.type)) {
+				return Fail(method.sourceFile + ": x64_machine_code_parameter_type_not_supported:" + parameter.typeName);
+			}
+		}
+		if (method.returnType.code != kTypeNull && !isIntegerType(method.returnType)) {
+			return Fail(method.sourceFile + ": x64_machine_code_return_type_not_supported");
+		}
+		body_ << "\nstatic Value method_" << method.id << "(std::vector<Arg> a,Value* self) {\n";
+		Line(1, "std::vector<Value> p; p.reserve(" + std::to_string(method.parameters.size()) + ");");
+		for (std::size_t index = 0; index < method.parameters.size(); ++index) {
+			const auto& parameter = method.parameters[index];
+			Line(1, "p.push_back(MakeVar(" + Hex(parameter.type.code) + ",false));");
+			Line(1, "if(a.size()>" + std::to_string(index) + ") Assign(p[" + std::to_string(index) + "],a[" + std::to_string(index) + "].Get());");
+		}
+		Line(1, "std::vector<Value> v; v.reserve(" + std::to_string(method.locals.size()) + ");");
+		for (const auto& local : method.locals) {
+			Line(1, "v.push_back(MakeVar(" + Hex(local.type.code) + "," + (local.type.isArray ? "true" : "false") + ")); ");
+		}
+		std::string writeback = "[&](){";
+		for (std::size_t index = 0; index < method.parameters.size(); ++index) {
+			if (method.parameters[index].byReference) {
+				writeback += "if(a.size()>" + std::to_string(index) + " && a[" + std::to_string(index) + "].reference) Assign(*a[" + std::to_string(index) + "].reference,p[" + std::to_string(index) + "]);";
+			}
+		}
+		writeback += "}";
+		Line(1, "MethodValueScope __scope{&p,&v," + writeback + "};");
+		body_ << "    static const unsigned char __machine_code[] = {";
+		for (const std::uint8_t byte : machineStatement.machineCode) {
+			body_ << static_cast<unsigned int>(byte) << ',';
+		}
+		body_ << "};\n";
+		Line(1, "long long __machine_result=0;");
+		Line(1, "if(!ExecuteX86MachineCode(__machine_code,sizeof(__machine_code),p," + std::string(method.returnType.code == kTypeInt64 ? "true" : "false") + ",__machine_result)){std::fputs(\"ecompiler: unsupported x86 machine code for x64\\r\\n\",stderr);OutputDebugStringA(\"ecompiler: unsupported x86 machine code for x64\\r\\n\");ExitProcess(87);}");
+		if (method.returnType.code == kTypeNull) {
+			Line(1, "return Empty();");
+		}
+		else if (method.returnType.code == kTypeInt64) {
+			Line(1, "Value __machine_value=MakeVar(" + Hex(method.returnType.code) + "); __machine_value.integer=__machine_result; __machine_value.number=static_cast<double>(__machine_result); return __machine_value;");
+		}
+		else {
+			Line(1, "return Integer(__machine_result," + Hex(method.returnType.code) + ");");
+		}
+		body_ << "}\n";
+		return true;
+	}
+
 	bool EmitMethod(const Method& method)
 	{
 		const Statement* machineStatement = nullptr;
@@ -1864,6 +2175,9 @@ private:
 			if (machineStatement != nullptr) return Fail(method.sourceFile + ": machine_code_must_be_only_method_statement");
 		}
 		if (machineStatement != nullptr) {
+			if (program_.targetArchitecture == TargetArchitecture::X64) {
+				return EmitX64MachineMethod(method, *machineStatement);
+			}
 			const std::string helper = "ecompiler_machine_" + std::to_string(method.id);
 			const bool hasExplicitReturn = std::any_of(
 				machineStatement->machineCode.begin(),
@@ -1970,7 +2284,8 @@ private:
 		switch (type.code) {
 		case kTypeByte: base = "unsigned char"; break;
 		case kTypeShort: base = "short"; break;
-		case kTypeInt: case kTypeBool: case kTypeSubroutine: base = "int"; break;
+		case kTypeInt: case kTypeBool: base = "int"; break;
+		case kTypeSubroutine: base = "void*"; break;
 		case kTypeInt64: base = "long long"; break;
 		case kTypeFloat: base = "float"; break;
 		case kTypeDouble: case kTypeDateTime: base = "double"; break;
@@ -2024,33 +2339,144 @@ private:
 		else if (method.returnType.code == kTypeBinary) body_ << "    return RuntimeBinary(result.bytes);\n";
 		else if (method.returnType.code == kTypeFloat || method.returnType.code == kTypeDouble || method.returnType.code == kTypeDateTime) body_ << "    return static_cast<" << returnType << ">(result.number);\n";
 		else if (program_.FindType(method.returnType.code) != nullptr) body_ << "    return result.object.empty()?nullptr:result.object.data();\n";
+		else if (method.returnType.code == kTypeSubroutine) body_ << "    return reinterpret_cast<void*>(static_cast<std::uintptr_t>(result.integer));\n";
 		else body_ << "    return static_cast<" << returnType << ">(result.integer);\n";
 		body_ << "}\n";
-		exports_.push_back({ method.exportName.empty() ? method.name : method.exportName, symbol, method.usesCdecl, method.parameters.size() * 4 });
+		exports_.push_back({ method.exportName.empty() ? method.name : method.exportName, symbol, method.usesCdecl, AbiParameterBytes(method.parameters) });
 	}
 
 	void EmitDeclarationsAndStartup()
 	{
 		std::ostringstream prefix;
+		const bool targetX64 = program_.targetArchitecture == TargetArchitecture::X64;
 		prefix << "\n";
-		for (const std::size_t method : pendingMethods_) prefix << "static ert::Value method_" << method << "(std::vector<ert::Arg>,ert::Value* self=nullptr);\n";
-		for (const std::string& symbol : reachableSymbols_) prefix << "extern \"C\" void __cdecl " << symbol << "(ert::MData*,int,ert::MData*);\n";
+		for (const std::size_t method : pendingMethods_) {
+			prefix << "static ert::Value method_" << method
+				<< "(std::vector<ert::Arg>,ert::Value* self=nullptr);\n";
+		}
+		for (const std::string& symbol : reachableSymbols_) {
+			prefix << "extern \"C\" void __cdecl " << symbol
+				<< "(ert::MData*,int,ert::MData*);\n";
+		}
 		for (const std::size_t libraryIndex : reachableLibraries_) {
 			const std::string& notify = program_.libraries[libraryIndex].metadata.notifySymbol;
-			if (!notify.empty() && IsCppIdentifier(notify)) prefix << "extern \"C\" int __stdcall " << notify << "(int,unsigned long,unsigned long);\n";
+			if (!notify.empty() && IsCppIdentifier(notify)) {
+				prefix << "extern \"C\" ert::EIntPtr __stdcall " << notify
+					<< "(int,ert::EPointer,ert::EPointer);\n";
+			}
 		}
 		prefix << declarations_.str() << body_.str();
-		prefix << "\nextern \"C\" unsigned int BlackMoonFuncForeLib=reinterpret_cast<unsigned int>(&ert::BlackMoonFuncForeLibNotifySys);\n";
-		prefix << "namespace ecompiler_runtime_host { static std::unordered_set<void*> files; static char modulePath[MAX_PATH]{}; static const char* ModuleDirectory(){DWORD length=GetModuleFileNameA(nullptr,modulePath,MAX_PATH);if(length==0)return \"\";modulePath[length]=0;char* slash=strrchr(modulePath,'\\\\');if(slash)*slash=0;return modulePath;} static const char* ModuleFileName(){DWORD length=GetModuleFileNameA(nullptr,modulePath,MAX_PATH);if(length==0)return \"\";modulePath[length]=0;const char* slash=strrchr(modulePath,'\\\\');return slash?slash+1:modulePath;} static const char* CommandTail(){const char* text=GetCommandLineA();if(text==nullptr)return \"\";if(*text=='\\\"'){++text;while(*text&&*text!='\\\"')++text;if(*text)++text;}else while(*text&&*text!=' ')++text;while(*text==' ')++text;return text;} static void FreeArray(unsigned long type,void* value){if(value==nullptr)return;unsigned char* raw=static_cast<unsigned char*>(value);int dimensions=*reinterpret_cast<int*>(raw);int count=1;for(int index=0;index<dimensions;++index)count*=*reinterpret_cast<int*>(raw+4+index*4);unsigned char* data=raw+4+dimensions*4;if(type==T_TEXT||type==T_BIN){for(int index=0;index<count;++index){void* item=*reinterpret_cast<void**>(data+index*4);if(item)HeapFree(GetProcessHeap(),0,item);}}HeapFree(GetProcessHeap(),0,raw);} }\n";
-		prefix << "extern \"C\" int __stdcall BlackMoonFuncForeLibNotifySys(int message,unsigned long param1,unsigned long param2){using namespace ecompiler_runtime_host;switch(message){case ecompiler_nrs_get_cmd_line:return reinterpret_cast<int>(CommandTail());case ecompiler_nrs_get_exe_path:return reinterpret_cast<int>(ModuleDirectory());case ecompiler_nrs_get_exe_name:return reinterpret_cast<int>(ModuleFileName());case ecompiler_nrs_convert_num_to_int:{const MData* data=reinterpret_cast<const MData*>(param1);if(data==nullptr)return 0;switch(data->type&~T_ARRAY){case T_BYTE:return static_cast<int>(data->byteValue);case T_SHORT:return static_cast<int>(data->shortValue);case T_INT:case T_BOOL:return data->intValue;case T_INT64:return static_cast<int>(data->int64Value);case T_FLOAT:return static_cast<int>(data->floatValue);case T_DOUBLE:case T_DATE:return static_cast<int>(data->doubleValue);default:return 0;}}case ecompiler_nrs_file_check:return files.contains(reinterpret_cast<void*>(param1))?0:-1;case ecompiler_nrs_file_register:if(param1)files.insert(reinterpret_cast<void*>(param1));return 0;case ecompiler_nrs_file_unregister:return files.erase(reinterpret_cast<void*>(param1))?1:0;case ecompiler_nrs_free_array:FreeArray(param1,reinterpret_cast<void*>(param2));return 0;case ecompiler_nrs_malloc:return reinterpret_cast<int>(HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,param1));case ecompiler_nrs_mfree:if(param1)HeapFree(GetProcessHeap(),0,reinterpret_cast<void*>(param1));return 0;case ecompiler_nrs_mrealloc:return reinterpret_cast<int>(param1?HeapReAlloc(GetProcessHeap(),0,reinterpret_cast<void*>(param1),param2):HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,param2));case ecompiler_nrs_get_program_type:return 3;case ecompiler_nrs_exit_program:ExitProcess(param1);return 0;default:return 0;}}\n";
+		prefix << "\nextern \"C\" ert::EPointer BlackMoonFuncForeLib="
+			<< "reinterpret_cast<ert::EPointer>(&ert::BlackMoonFuncForeLibNotifySys);\n";
+		prefix << R"CPP(
+namespace ecompiler_runtime_host {
+static std::unordered_set<void*> files;
+static char modulePath[MAX_PATH]{};
+static const char* ModuleDirectory() {
+    DWORD length=GetModuleFileNameA(nullptr,modulePath,MAX_PATH);
+    if(length==0)return "";
+    modulePath[length]=0;
+    char* slash=strrchr(modulePath,'\\');
+    if(slash)*slash=0;
+    return modulePath;
+}
+static const char* ModuleFileName() {
+    DWORD length=GetModuleFileNameA(nullptr,modulePath,MAX_PATH);
+    if(length==0)return "";
+    modulePath[length]=0;
+    char* slash=strrchr(modulePath,'\\');
+    return slash?slash+1:modulePath;
+}
+static const char* CommandTail() {
+    const char* text=GetCommandLineA();
+    if(text==nullptr)return "";
+    if(*text=='"'){++text;while(*text&&*text!='"')++text;if(*text)++text;}
+    else while(*text&&*text!=' ')++text;
+    while(*text==' ')++text;
+    return text;
+}
+static void FreeArray(ert::EPointer type,void* value) {
+    if(value==nullptr)return;
+    auto* raw=static_cast<unsigned char*>(value);
+    const int dimensions=*reinterpret_cast<int*>(raw);
+    int count=1;
+    for(int index=0;index<dimensions;++index)
+        count*=*reinterpret_cast<int*>(raw+4+index*4);
+    auto* data=raw+4+dimensions*4;
+    const auto base=type&~ert::T_ARRAY;
+    if(base==ert::T_TEXT||base==ert::T_BIN) {
+        for(int index=0;index<count;++index) {
+            void* item=*reinterpret_cast<void**>(data+index*sizeof(void*));
+            if(item)HeapFree(GetProcessHeap(),0,item);
+        }
+    }
+    HeapFree(GetProcessHeap(),0,raw);
+}
+}
+extern "C" ert::EIntPtr __stdcall BlackMoonFuncForeLibNotifySys(
+    int message,ert::EPointer param1,ert::EPointer param2) {
+    using namespace ecompiler_runtime_host;
+    switch(message) {
+    case ecompiler_nrs_get_cmd_line:
+        return reinterpret_cast<ert::EIntPtr>(CommandTail());
+    case ecompiler_nrs_get_exe_path:
+        return reinterpret_cast<ert::EIntPtr>(ModuleDirectory());
+    case ecompiler_nrs_get_exe_name:
+        return reinterpret_cast<ert::EIntPtr>(ModuleFileName());
+    case ecompiler_nrs_convert_num_to_int: {
+        const ert::MData* data=reinterpret_cast<const ert::MData*>(param1);
+        if(data==nullptr)return 0;
+        switch(data->type&~ert::T_ARRAY) {
+        case ert::T_BYTE:return static_cast<int>(data->byteValue);
+        case ert::T_SHORT:return static_cast<int>(data->shortValue);
+        case ert::T_INT:case ert::T_BOOL:return data->intValue;
+        case ert::T_INT64:return static_cast<int>(data->int64Value);
+        case ert::T_FLOAT:return static_cast<int>(data->floatValue);
+        case ert::T_DOUBLE:case ert::T_DATE:return static_cast<int>(data->doubleValue);
+        default:return 0;
+        }
+    }
+    case ecompiler_nrs_file_check:
+        return files.contains(reinterpret_cast<void*>(param1))?0:-1;
+    case ecompiler_nrs_file_register:
+        if(param1)files.insert(reinterpret_cast<void*>(param1));
+        return 0;
+    case ecompiler_nrs_file_unregister:
+        return files.erase(reinterpret_cast<void*>(param1))?1:0;
+    case ecompiler_nrs_free_array:
+        FreeArray(param1,reinterpret_cast<void*>(param2));
+        return 0;
+    case ecompiler_nrs_malloc:
+        return reinterpret_cast<ert::EIntPtr>(
+            HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,static_cast<SIZE_T>(param1)));
+    case ecompiler_nrs_mfree:
+        if(param1)HeapFree(GetProcessHeap(),0,reinterpret_cast<void*>(param1));
+        return 0;
+    case ecompiler_nrs_mrealloc:
+        return reinterpret_cast<ert::EIntPtr>(
+            param1
+                ? HeapReAlloc(GetProcessHeap(),0,reinterpret_cast<void*>(param1),static_cast<SIZE_T>(param2))
+                : HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,static_cast<SIZE_T>(param2)));
+    case ecompiler_nrs_get_program_type:
+        return 3;
+    case ecompiler_nrs_exit_program:
+        ExitProcess(static_cast<UINT>(param1));
+        return 0;
+    default:
+        return 0;
+    }
+}
+)CPP";
 		prefix << "extern \"C\" void* __cdecl krnl_MMalloc(unsigned int size){return HeapAlloc(GetProcessHeap(),0,size);}\n";
 		prefix << "extern \"C\" void* __cdecl krnl_MMallocNoCheck(unsigned int size){return HeapAlloc(GetProcessHeap(),0,size);}\n";
 		prefix << "extern \"C\" void* __cdecl krnl_MRealloc(void* value,unsigned int size){return value?HeapReAlloc(GetProcessHeap(),0,value,size):HeapAlloc(GetProcessHeap(),0,size);}\n";
 		prefix << "extern \"C\" void __cdecl krnl_MFree(void* value){if(value)HeapFree(GetProcessHeap(),0,value);}\n";
-		prefix << "extern \"C\" unsigned int BlackMoonCalleLibList[]={";
+		prefix << "extern \"C\" ert::EPointer BlackMoonCalleLibList[]={";
 		for (const std::size_t libraryIndex : reachableLibraries_) {
 			const std::string& notify = program_.libraries[libraryIndex].metadata.notifySymbol;
-			if (!notify.empty() && IsCppIdentifier(notify)) prefix << "reinterpret_cast<unsigned int>(&" << notify << "),";
+			if (!notify.empty() && IsCppIdentifier(notify)) {
+				prefix << "reinterpret_cast<ert::EPointer>(&" << notify << "),";
+			}
 		}
 		prefix << "0};\n";
 		prefix << "extern \"C\" void* hBlackMoonHeap=GetProcessHeap();\n";
@@ -2058,7 +2484,7 @@ private:
 		prefix << "extern \"C\" void __cdecl E_Destroy(void(__cdecl* callback)()){if(callback) ecompiler_runtime_host::destroyCallbacks.push_back(callback);}\n";
 		prefix << "extern \"C\" void* __cdecl E_MAlloc(unsigned int size){return HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,size);}\n";
 		prefix << "extern \"C\" void* __cdecl E_MAlloc_Nzero(unsigned int size){return HeapAlloc(GetProcessHeap(),0,size);}\n";
-		prefix << "extern \"C\" void* __cdecl E_MRealloc(void* value,unsigned int size){return value?HeapReAlloc(GetProcessHeap(),0,value,size):HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,size);}\n";
+		prefix << "extern \"C\" void* __cdecl E_Realloc(void* value,unsigned int size){return value?HeapReAlloc(GetProcessHeap(),0,value,size):HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,size);}\n";
 		prefix << "extern \"C\" void __cdecl E_MFree(void* value){if(value)HeapFree(GetProcessHeap(),0,value);}\n";
 		prefix << "extern \"C\" void __cdecl E_ReportError(unsigned int,unsigned int,unsigned int){OutputDebugStringA(\"ecompiler: support library runtime error\\r\\n\");}\n";
 		prefix << "extern \"C\" void __cdecl E_End(unsigned int code){ExitProcess(code);}\n";
@@ -2071,24 +2497,26 @@ private:
 			prefix << "extern \"C\" void __cdecl E_Init(); extern \"C\" void __cdecl E_DestroyRes();\n";
 			prefix << "extern \"C\" BOOL WINAPI DllMain(HINSTANCE module,DWORD reason,LPVOID reserved){(void)reserved;if(reason==DLL_PROCESS_ATTACH){DisableThreadLibraryCalls(module);E_Init();ECodeStart();}else if(reason==DLL_PROCESS_DETACH){E_DestroyRes();}return TRUE;}\n";
 		}
-		// 规范 FNE ABI 在 param1 传入通知函数；部分旧静态库实际从
-		// param2 读取。两个槽位传同一指针，兼容两种历史实现。
-		prefix << "extern \"C\" void __cdecl E_Init(){hBlackMoonHeap=GetProcessHeap();using Notify= int(__stdcall*)(int,unsigned long,unsigned long);for(unsigned int* item=BlackMoonCalleLibList;item!=nullptr&&*item;++item)reinterpret_cast<Notify>(*item)(ecompiler_nl_sys_notify_function,BlackMoonFuncForeLib,BlackMoonFuncForeLib);}\n";
+		prefix << "extern \"C\" void __cdecl E_Init(){hBlackMoonHeap=GetProcessHeap();using Notify=ert::EIntPtr(__stdcall*)(int,ert::EPointer,ert::EPointer);for(ert::EPointer* item=BlackMoonCalleLibList;item!=nullptr&&*item;++item)reinterpret_cast<Notify>(*item)(ecompiler_nl_sys_notify_function,BlackMoonFuncForeLib,BlackMoonFuncForeLib);}\n";
 		prefix << "extern \"C\" void __cdecl E_DestroyRes(){";
 		for (std::size_t index = 0; index < program_.globals.size(); ++index) prefix << "ert::DestroyValue(g_global_" << index << "());";
 		for (std::size_t assemblyIndex = 0; assemblyIndex < program_.assemblies.size(); ++assemblyIndex)
 			for (std::size_t index = 0; index < program_.assemblies[assemblyIndex].variables.size(); ++index)
 				prefix << "ert::DestroyValue(g_" << assemblyIndex << '_' << index << "());";
-		prefix << "for(auto callback:ecompiler_runtime_host::destroyCallbacks)if(callback)callback();using Notify= int(__stdcall*)(int,unsigned long,unsigned long);for(unsigned int* item=BlackMoonCalleLibList;item!=nullptr&&*item;++item)reinterpret_cast<Notify>(*item)(ecompiler_nl_free_library_data,0,0);ecompiler_runtime_host::destroyCallbacks.clear();}\n";
+		prefix << "for(auto callback:ecompiler_runtime_host::destroyCallbacks)if(callback)callback();using Notify=ert::EIntPtr(__stdcall*)(int,ert::EPointer,ert::EPointer);for(ert::EPointer* item=BlackMoonCalleLibList;item!=nullptr&&*item;++item)reinterpret_cast<Notify>(*item)(ecompiler_nl_free_library_data,0,0);ecompiler_runtime_host::destroyCallbacks.clear();}\n";
 		prefix << "static void ecompiler_safe_destroy(){__try{E_DestroyRes();}__except(EXCEPTION_EXECUTE_HANDLER){}}\n";
-		prefix << "int __stdcall AfxWinInit(HINSTANCE,HINSTANCE,LPSTR,int);\n";
+		if (!targetX64) prefix << "int __stdcall AfxWinInit(HINSTANCE,HINSTANCE,LPSTR,int);\n";
 		prefix << "int nBMProtectESP=0;int nBMProtectEBP=0;\n";
 		if (!program_.buildDll) {
-			prefix << "int main(){ert::InitializeLegacyCrtData();if(!AfxWinInit(GetModuleHandleA(nullptr),nullptr,GetCommandLineA(),0))ExitProcess(1);E_Init();if(!EStartup())ExitProcess(1);const int result=ECodeStart();ecompiler_safe_destroy();ExitProcess(static_cast<UINT>(result));}\n";
+			if (targetX64) {
+				prefix << "int main(){E_Init();if(!EStartup())ExitProcess(1);const int result=ECodeStart();ecompiler_safe_destroy();return result;}\n";
+			}
+			else {
+				prefix << "int main(){ert::InitializeLegacyCrtData();if(!AfxWinInit(GetModuleHandleA(nullptr),nullptr,GetCommandLineA(),0))ExitProcess(1);E_Init();if(!EStartup())ExitProcess(1);const int result=ECodeStart();ecompiler_safe_destroy();ExitProcess(static_cast<UINT>(result));}\n";
+			}
 		}
 		result_->text += prefix.str();
 	}
-
 	const Program& program_;
 	GeneratedSource* result_ = nullptr;
 	std::string* error_ = nullptr;

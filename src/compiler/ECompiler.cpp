@@ -6,21 +6,28 @@
 #include "../PathHelper.h"
 #include "../e2txt.h"
 #include "../EFolderCodec.h"
+#include "../../thirdparty/json.hpp"
 
 #include <Windows.h>
 
 #include <algorithm>
 #include <cwctype>
 #include <chrono>
+#include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace ecompiler {
 namespace {
+
+using json = nlohmann::json;
 
 std::filesystem::path DefaultCompilerPath()
 {
@@ -43,6 +50,124 @@ bool IsRegularFile(const std::filesystem::path& path)
 	return std::filesystem::is_regular_file(path, error);
 }
 
+// Static libraries are COFF archives.  Reading the machine field from their
+// object members lets the compiler reject a mismatched x86/x64 archive before
+// generating a large C++ translation unit or invoking the linker.
+std::optional<std::uint16_t> ReadCoffArchiveMachine(const std::filesystem::path& path)
+{
+	std::ifstream input(path, std::ios::binary);
+	if (!input) return std::nullopt;
+	char signature[8]{};
+	input.read(signature, sizeof(signature));
+	if (!input) return std::nullopt;
+	if (std::string(signature, sizeof(signature)) != "!<arch>\n") {
+		input.seekg(0, std::ios::beg);
+		std::uint16_t machine = 0;
+		input.read(reinterpret_cast<char*>(&machine), sizeof(machine));
+		if (!input) return std::nullopt;
+		return machine == 0x014c || machine == 0x8664 ? std::optional(machine) : std::nullopt;
+	}
+
+	bool sawObject = false;
+	std::optional<std::uint16_t> firstMachine;
+	for (;;) {
+		char header[60]{};
+		input.read(header, sizeof(header));
+		if (input.eof()) break;
+		if (!input) return std::nullopt;
+		if (header[58] != '`' || header[59] != '\n') return std::nullopt;
+		std::string sizeText(header + 48, 10);
+		while (!sizeText.empty() && static_cast<unsigned char>(sizeText.back()) <= 0x20) sizeText.pop_back();
+		std::uint64_t memberSize = 0;
+		try {
+			memberSize = sizeText.empty() ? 0 : std::stoull(sizeText);
+		}
+		catch (...) {
+			return std::nullopt;
+		}
+		const std::streampos memberStart = input.tellg();
+		if (memberStart < 0) return std::nullopt;
+		std::uint16_t machine = 0;
+		input.read(reinterpret_cast<char*>(&machine), sizeof(machine));
+		if (!input) return std::nullopt;
+		std::string memberName(header, 16);
+		while (!memberName.empty() && (memberName.back() == ' ' || memberName.back() == '/')) memberName.pop_back();
+		// Object members may use /<offset> names into the archive's long-name
+		// table; only the two special linker/long-name members are non-COFF.
+		const bool linkerMember = memberName.empty() || memberName == "/";
+		if (!linkerMember && (machine == 0x014c || machine == 0x8664)) {
+			sawObject = true;
+			if (!firstMachine.has_value()) firstMachine = machine;
+			else if (*firstMachine != machine) return std::nullopt;
+		}
+		input.seekg(memberStart + static_cast<std::streamoff>(memberSize), std::ios::beg);
+		if (!input) return std::nullopt;
+		if ((memberSize & 1u) != 0) input.seekg(1, std::ios::cur);
+		if (!input) return std::nullopt;
+	}
+	return sawObject ? firstMachine : std::nullopt;
+}
+
+bool IsStaticLibraryCompatible(
+	const std::filesystem::path& path,
+	const TargetArchitecture architecture)
+{
+	const auto machine = ReadCoffArchiveMachine(path);
+	if (!machine.has_value()) return true;
+	return architecture == TargetArchitecture::X64 ? *machine == 0x8664 : *machine == 0x014c;
+}
+
+struct CoreArchiveSelection {
+	std::filesystem::path primaryArchive;
+	std::filesystem::path fallbackArchive;
+	bool adapter = false;
+};
+
+bool ReadBlackMoonAdapterSelection(
+	const std::filesystem::path& directory,
+	const TargetArchitecture architecture,
+	CoreArchiveSelection& selection)
+{
+	selection = {};
+	if (architecture != TargetArchitecture::X64) return false;
+	const std::filesystem::path manifestPath = directory / L"krnln_adapter.json";
+	if (!IsRegularFile(manifestPath)) return false;
+	std::ifstream input(manifestPath, std::ios::binary);
+	if (!input) return false;
+	try {
+		const json manifest = json::parse(input);
+		if (manifest.value("formatVersion", 0) != 1 ||
+			manifest.value("architecture", std::string()) != "x64" ||
+			manifest.value("abi", std::string()) != "ecompiler-fne-execute-v1") {
+			return false;
+		}
+		const std::string primaryName = manifest.value("primaryArchive", std::string());
+		const std::string fallbackName = manifest.value("fallbackArchive", std::string());
+		if (primaryName.empty() || fallbackName.empty()) return false;
+		const std::filesystem::path primary = directory / Utf8PathToPath(primaryName);
+		const std::filesystem::path fallback = directory / Utf8PathToPath(fallbackName);
+		if (!IsRegularFile(primary) || !IsRegularFile(fallback) ||
+			!IsStaticLibraryCompatible(primary, architecture) ||
+			!IsStaticLibraryCompatible(fallback, architecture)) {
+			return false;
+		}
+		selection.primaryArchive = primary;
+		selection.fallbackArchive = fallback;
+		selection.adapter = true;
+		return true;
+	}
+	catch (...) {
+		return false;
+	}
+}
+
+std::filesystem::path AbsolutePath(const std::filesystem::path& path)
+{
+	std::error_code error;
+	const auto absolute = std::filesystem::absolute(path, error);
+	return error ? path : absolute;
+}
+
 std::filesystem::path LatestVersionDirectory(const std::filesystem::path& root)
 {
 	std::error_code error;
@@ -57,6 +182,7 @@ std::filesystem::path LatestVersionDirectory(const std::filesystem::path& root)
 }
 
 bool DiscoverBuildEnvironment(
+	const TargetArchitecture architecture,
 	std::filesystem::path& matchingCompiler,
 	std::vector<std::filesystem::path>& includeDirectories,
 	std::vector<std::filesystem::path>& libraryDirectories,
@@ -90,17 +216,25 @@ bool DiscoverBuildEnvironment(
 		error = "visual_cpp_or_windows_sdk_not_found";
 		return false;
 	}
-	for (const auto& candidate : {
-		vcTools / L"bin" / L"Hostx86" / L"x86" / L"cl.exe",
-		vcTools / L"bin" / L"Hostx64" / L"x86" / L"cl.exe",
-	}) {
+	const std::vector<std::filesystem::path> compilerCandidates = architecture == TargetArchitecture::X64
+		? std::vector<std::filesystem::path> {
+			vcTools / L"bin" / L"Hostx64" / L"x64" / L"cl.exe",
+			vcTools / L"bin" / L"Hostx86" / L"x64" / L"cl.exe",
+		}
+		: std::vector<std::filesystem::path> {
+			vcTools / L"bin" / L"Hostx86" / L"x86" / L"cl.exe",
+			vcTools / L"bin" / L"Hostx64" / L"x86" / L"cl.exe",
+		};
+	for (const auto& candidate : compilerCandidates) {
 		if (IsRegularFile(candidate)) {
 			matchingCompiler = candidate;
 			break;
 		}
 	}
 	if (matchingCompiler.empty()) {
-		error = "matching_x86_compiler_not_found:" + PathToUtf8(vcTools);
+		error = std::string("matching_") +
+			(architecture == TargetArchitecture::X64 ? "x64" : "x86") +
+			"_compiler_not_found:" + PathToUtf8(vcTools);
 		return false;
 	}
 	includeDirectories = {
@@ -112,10 +246,11 @@ bool DiscoverBuildEnvironment(
 	};
 	const std::filesystem::path kitVersion = windowsKit.filename();
 	const std::filesystem::path kitLib = windowsKit.parent_path().parent_path() / L"Lib" / kitVersion;
+	const std::filesystem::path machineDirectory = architecture == TargetArchitecture::X64 ? L"x64" : L"x86";
 	libraryDirectories = {
-		vcTools / L"lib" / L"x86",
-		kitLib / L"ucrt" / L"x86",
-		kitLib / L"um" / L"x86",
+		vcTools / L"lib" / machineDirectory,
+		kitLib / L"ucrt" / machineDirectory,
+		kitLib / L"um" / machineDirectory,
 	};
 	for (const auto& directory : includeDirectories) {
 		if (!std::filesystem::is_directory(directory)) { error = "compiler_include_directory_not_found:" + PathToUtf8(directory); return false; }
@@ -171,13 +306,14 @@ bool WriteDllDefinition(
 	const std::filesystem::path& path,
 	const std::string& libraryName,
 	const std::vector<GeneratedSource::ExportedFunction>& exports,
+	const TargetArchitecture architecture,
 	std::string& error)
 {
 	std::ostringstream text;
 	text << "LIBRARY \"" << DefQuotedName(libraryName) << "\"\r\nEXPORTS\r\n";
 	for (const auto& item : exports) {
 		if (item.name.empty() || item.symbol.empty()) continue;
-		const std::string decorated = item.usesCdecl
+		const std::string decorated = architecture == TargetArchitecture::X64 || item.usesCdecl
 			? item.symbol
 			: ("_" + item.symbol + "@" + std::to_string(item.stackBytes));
 		text << "    " << item.name << "=" << decorated << "\r\n";
@@ -188,30 +324,21 @@ bool WriteDllDefinition(
 bool WriteImportDefinition(
 	const std::filesystem::path& path,
 	const GeneratedSource::ImportedFunction& item,
+	const TargetArchitecture architecture,
 	std::string& error)
 {
 	std::ostringstream text;
 	text << "LIBRARY \"" << DefQuotedName(item.moduleName) << "\"\r\nEXPORTS\r\n";
-	const std::string decoratedAlias = item.usesCdecl
-		? item.symbol
-		: (item.symbol + "@" + std::to_string(item.stackBytes));
-	text << "    " << decoratedAlias << "=" << item.entryName << "\r\n";
+	(void)architecture;
+	(void)item.usesCdecl;
+	(void)item.stackBytes;
+	// LIB.EXE treats the left-hand side of a DEF entry as the name that
+	// Windows stores in the PE import table.  The generated C++ symbol is
+	// intentionally different, so the emitter adds an /alternatename mapping
+	// to the real symbol.  Emitting the local alias here would make the loader
+	// search for ecompiler_import_* in the target DLL.
+	text << "    " << item.entryName << "\r\n";
 	return WriteTextFile(path, text.str(), error);
-}
-
-bool IsPlatformImportModule(const std::string& moduleName)
-{
-	std::filesystem::path modulePath = Utf8PathToPath(moduleName);
-	std::string normalized = modulePath.filename().string();
-	if (normalized.empty()) normalized = moduleName;
-	std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](const unsigned char value) {
-		return static_cast<char>(std::tolower(value));
-	});
-	if (std::filesystem::path(normalized).extension().empty()) normalized += ".dll";
-	return normalized == "kernel32.dll" || normalized == "user32.dll" || normalized == "gdi32.dll" ||
-		normalized == "advapi32.dll" || normalized == "shell32.dll" || normalized == "ole32.dll" ||
-		normalized == "oleaut32.dll" || normalized == "comdlg32.dll" || normalized == "winmm.dll" ||
-		normalized == "odbc32.dll" || normalized == "odbccp32.dll" || normalized == "ws2_32.dll";
 }
 
 bool ReadTextFile(const std::filesystem::path& path, std::string& text)
@@ -281,10 +408,160 @@ bool RunProcess(
 	return true;
 }
 
+bool ReadPeMachine(
+	const std::filesystem::path& path,
+	std::uint16_t& machine)
+{
+	machine = 0;
+	std::ifstream input(path, std::ios::binary);
+	if (!input) return false;
+	std::uint16_t dosMagic = 0;
+	std::int32_t peOffset = 0;
+	input.read(reinterpret_cast<char*>(&dosMagic), sizeof(dosMagic));
+	input.seekg(0x3C, std::ios::beg);
+	input.read(reinterpret_cast<char*>(&peOffset), sizeof(peOffset));
+	if (!input || dosMagic != 0x5A4D || peOffset < 0 || peOffset > 0x1000000) return false;
+	input.seekg(peOffset + 4, std::ios::beg);
+	input.read(reinterpret_cast<char*>(&machine), sizeof(machine));
+	return input.good();
+}
+
+void AppendPathCandidate(
+	std::vector<std::filesystem::path>& candidates,
+	const std::filesystem::path& candidate)
+{
+	if (candidate.empty()) return;
+	const std::filesystem::path normalized = AbsolutePath(candidate).lexically_normal();
+	for (const auto& existing : candidates) {
+		if (existing.lexically_normal() == normalized) return;
+	}
+	candidates.push_back(normalized);
+}
+
+std::filesystem::path ResolveX86DecoderPath(const Options& options)
+{
+	std::vector<std::filesystem::path> candidates;
+	AppendPathCandidate(candidates, options.x86DecoderPath);
+	wchar_t configured[MAX_PATH * 4] {};
+	if (GetEnvironmentVariableW(L"E_PACKAGER_X86_DECODER", configured, std::size(configured)) > 0) {
+		AppendPathCandidate(candidates, std::filesystem::path(configured));
+	}
+
+	const std::filesystem::path executableDirectory = Utf8PathToPath(GetBasePath());
+	const std::filesystem::path binDirectory = executableDirectory.parent_path().parent_path();
+	AppendPathCandidate(candidates, binDirectory / L"Win32" / L"Release" / L"e-packager.exe");
+	AppendPathCandidate(candidates, binDirectory / L"Win32" / L"Debug" / L"e-packager.exe");
+	AppendPathCandidate(candidates, binDirectory / L"Win32" / L"e-packager.exe");
+	const std::filesystem::path currentDirectory = std::filesystem::current_path();
+	AppendPathCandidate(candidates, currentDirectory / L"bin" / L"Win32" / L"Release" / L"e-packager.exe");
+	AppendPathCandidate(candidates, currentDirectory / L"e-packager.exe");
+
+	for (const auto& candidate : candidates) {
+		if (!IsRegularFile(candidate)) continue;
+		std::uint16_t machine = 0;
+		if (ReadPeMachine(candidate, machine) && machine == 0x014C) return candidate;
+	}
+	return {};
+}
+
+bool CreateTemporaryDirectory(
+	std::filesystem::path& outDirectory,
+	std::string& error)
+{
+	outDirectory.clear();
+	wchar_t temporaryPath[MAX_PATH * 4] {};
+	const DWORD length = GetTempPathW(static_cast<DWORD>(std::size(temporaryPath)), temporaryPath);
+	if (length == 0 || length >= std::size(temporaryPath)) {
+		error = "x64_source_decode_temp_path_failed:" + std::to_string(GetLastError());
+		return false;
+	}
+	const std::filesystem::path root(temporaryPath);
+	const std::wstring prefix = L"e-packager-x86-decode-" +
+		std::to_wstring(GetCurrentProcessId()) + L"-" +
+		std::to_wstring(GetTickCount64());
+	for (unsigned int attempt = 0; attempt < 100; ++attempt) {
+		const std::filesystem::path candidate = root / (prefix + L"-" + std::to_wstring(attempt));
+		std::error_code ec;
+		if (std::filesystem::create_directory(candidate, ec)) {
+			outDirectory = candidate;
+			return true;
+		}
+		if (ec && ec != std::errc::file_exists) {
+			error = "x64_source_decode_temp_directory_failed:" + ec.message();
+			return false;
+		}
+	}
+	error = "x64_source_decode_temp_directory_collision";
+	return false;
+}
+
+class TemporaryDirectoryGuard {
+public:
+	TemporaryDirectoryGuard() = default;
+	explicit TemporaryDirectoryGuard(std::filesystem::path path) : path_(std::move(path)) {}
+	TemporaryDirectoryGuard(const TemporaryDirectoryGuard&) = delete;
+	TemporaryDirectoryGuard& operator=(const TemporaryDirectoryGuard&) = delete;
+	TemporaryDirectoryGuard(TemporaryDirectoryGuard&& other) noexcept : path_(std::move(other.path_)) {}
+	TemporaryDirectoryGuard& operator=(TemporaryDirectoryGuard&& other) noexcept {
+		if (this != &other) {
+			Reset();
+			path_ = std::move(other.path_);
+		}
+		return *this;
+	}
+	~TemporaryDirectoryGuard() { Reset(); }
+
+	const std::filesystem::path& path() const { return path_; }
+	void Reset() {
+		if (!path_.empty()) {
+			std::error_code ignored;
+			std::filesystem::remove_all(path_, ignored);
+			path_.clear();
+		}
+	}
+
+private:
+	std::filesystem::path path_;
+};
+
+bool DecodeSourceWithX86Helper(
+	const std::filesystem::path& inputPath,
+	const Options& options,
+	TemporaryDirectoryGuard& outDirectory,
+	std::string& error)
+{
+	const std::filesystem::path decoder = ResolveX86DecoderPath(options);
+	if (decoder.empty()) {
+		error = "x64_source_decoder_not_found:provide --x86-decoder or E_PACKAGER_X86_DECODER";
+		return false;
+	}
+	std::filesystem::path directory;
+	if (!CreateTemporaryDirectory(directory, error)) return false;
+	outDirectory = TemporaryDirectoryGuard(directory);
+	std::string processOutput;
+	if (!RunProcess(
+		decoder,
+		{L"unpack", Quote(AbsolutePath(inputPath)), Quote(directory)},
+		decoder.parent_path(),
+		directory / L"decode.log",
+		processOutput,
+		error)) {
+		error = "x64_source_decode_failed:" + error;
+		return false;
+	}
+	if (!IsRegularFile(directory / L"project" / L"_meta.json") ||
+		!IsRegularFile(directory / L"project" / L".module.json")) {
+		error = "x64_source_decode_output_invalid:" + PathToUtf8(directory);
+		return false;
+	}
+	return true;
+}
+
 bool ReadInputBundle(
 	const std::filesystem::path& inputPath,
 	e2txt::ProjectBundle& bundle,
 	std::filesystem::path& inputRoot,
+	const e2txt::ReadOptions& readOptions,
 	std::string& error)
 {
 	std::error_code filesystemError;
@@ -307,7 +584,7 @@ bool ReadInputBundle(
 		return false;
 	}
 	e2txt::Generator generator;
-	if (!generator.GenerateBundle(PathToUtf8(inputPath), bundle, &error)) {
+	if (!generator.GenerateBundle(PathToUtf8(inputPath), bundle, &error, readOptions)) {
 		error = "read_e_project_failed:" + error;
 		return false;
 	}
@@ -324,10 +601,16 @@ std::filesystem::path ProductRootFromCompiler(const std::filesystem::path& compi
 
 std::filesystem::path FindStaticLibrary(
 	const std::filesystem::path& directory,
-	const Library& library)
+	const Library& library,
+	const TargetArchitecture architecture)
 {
+	if (directory.empty()) return {};
 	std::vector<std::wstring> candidateNames;
-	if (library.dependency.fileName == "krnln") candidateNames.push_back(L"krnln_static.lib");
+	if (library.dependency.fileName == "krnln") {
+		candidateNames.push_back(L"krnln_static.lib");
+		candidateNames.push_back(L"krnln.lib");
+		candidateNames.push_back(L"krnln_test.lib");
+	}
 	const std::filesystem::path metadataStem = library.metadata.filePath.stem();
 	if (!metadataStem.empty()) {
 		candidateNames.push_back(metadataStem.wstring() + L"_static.lib");
@@ -343,7 +626,7 @@ std::filesystem::path FindStaticLibrary(
 	}
 	for (const std::wstring& name : candidateNames) {
 		const std::filesystem::path candidate = directory / name;
-		if (IsRegularFile(candidate)) return candidate;
+		if (IsRegularFile(candidate) && IsStaticLibraryCompatible(candidate, architecture)) return candidate;
 	}
 	std::error_code error;
 	for (const auto& entry : std::filesystem::directory_iterator(directory, error)) {
@@ -352,7 +635,7 @@ std::filesystem::path FindStaticLibrary(
 		std::transform(fileName.begin(), fileName.end(), fileName.begin(), towlower);
 		for (std::wstring expected : candidateNames) {
 			std::transform(expected.begin(), expected.end(), expected.begin(), towlower);
-			if (fileName == expected) return entry.path();
+			if (fileName == expected && IsStaticLibraryCompatible(entry.path(), architecture)) return entry.path();
 		}
 	}
 	return {};
@@ -401,28 +684,205 @@ void AppendUniquePath(std::vector<std::filesystem::path>& paths, const std::file
 	paths.push_back(path);
 }
 
+std::filesystem::path FindStaticLibraryInDirectories(
+	const std::vector<std::filesystem::path>& directories,
+	const Library& library,
+	const TargetArchitecture architecture)
+{
+	for (const auto& directory : directories) {
+		const std::filesystem::path archive = FindStaticLibrary(directory, library, architecture);
+		if (!archive.empty()) return archive;
+	}
+	return {};
+}
+
+struct X64LibraryRoots {
+	std::filesystem::path staticLibraryDirectory;
+	std::filesystem::path metadataDirectory;
+	CoreArchiveSelection coreArchive;
+	std::vector<std::filesystem::path> searchDirectories;
+};
+
+void AddRootCandidates(
+	std::vector<std::filesystem::path>& roots,
+	const std::filesystem::path& root)
+{
+	if (root.empty()) return;
+	if (IsRegularFile(root)) {
+		AppendUniquePath(roots, root.parent_path());
+		return;
+	}
+	// Accept either a product root or a directly supplied lib\x64/
+	// static_lib\x64 directory.  Walking only two parents keeps discovery
+	// deterministic while covering the layouts used by the E toolchain.
+	std::filesystem::path base = root;
+	for (unsigned int depth = 0; depth < 3 && !base.empty(); ++depth) {
+		AppendUniquePath(roots, base);
+		AppendUniquePath(roots, base / L"static_lib" / L"x64");
+		AppendUniquePath(roots, base / L"lib" / L"x64");
+		AppendUniquePath(roots, base / L"static_lib");
+		AppendUniquePath(roots, base / L"lib");
+		AppendUniquePath(roots, base / L"x64");
+		const std::filesystem::path parent = base.parent_path();
+		if (parent == base) break;
+		base = parent;
+	}
+}
+
+std::filesystem::path FindCoreStaticArchive(
+	const std::filesystem::path& directory,
+	const TargetArchitecture architecture)
+{
+	std::error_code directoryError;
+	if (directory.empty() || !std::filesystem::is_directory(directory, directoryError)) return {};
+	static constexpr const wchar_t* names[] = {
+		L"krnln_static.lib", L"krnln.lib", L"krnln_test.lib",
+	};
+	for (const wchar_t* name : names) {
+		const std::filesystem::path candidate = directory / name;
+		if (IsRegularFile(candidate) && IsStaticLibraryCompatible(candidate, architecture)) return candidate;
+	}
+	return {};
+}
+
+X64LibraryRoots ResolveX64LibraryRoots(
+	const Options& options,
+	const std::filesystem::path& compiler,
+	const std::filesystem::path& productRoot)
+{
+	std::vector<std::filesystem::path> roots;
+	if (!options.blackMoonX64Directories.empty()) {
+		for (const auto& directory : options.blackMoonX64Directories) {
+			AddRootCandidates(roots, AbsolutePath(directory));
+		}
+	}
+	else if (!options.blackMoonX64Directory.empty()) {
+		AddRootCandidates(roots, AbsolutePath(options.blackMoonX64Directory));
+	}
+	else {
+		wchar_t configured[MAX_PATH * 4]{};
+		if (GetEnvironmentVariableW(L"E_PACKAGER_BLACKMOON_X64_DIR", configured, std::size(configured)) > 0) {
+			AddRootCandidates(roots, AbsolutePath(std::filesystem::path(configured)));
+		}
+	}
+	if (!options.blackMoonDirectory.empty()) AddRootCandidates(roots, AbsolutePath(options.blackMoonDirectory));
+	if (!options.libraryPath.empty()) AddRootCandidates(roots, AbsolutePath(options.libraryPath));
+	if (!options.eIdePath.empty()) AddRootCandidates(roots, AbsolutePath(options.eIdePath).parent_path());
+	AddRootCandidates(roots, productRoot);
+	AddRootCandidates(roots, compiler.parent_path());
+	AddRootCandidates(roots, Utf8PathToPath(GetBasePath()));
+
+	X64LibraryRoots result;
+	for (const auto& root : roots) {
+		if (result.staticLibraryDirectory.empty()) {
+			CoreArchiveSelection adapterArchive;
+			if (ReadBlackMoonAdapterSelection(root, TargetArchitecture::X64, adapterArchive)) {
+				result.staticLibraryDirectory = adapterArchive.primaryArchive.parent_path();
+				result.coreArchive = std::move(adapterArchive);
+			}
+			else {
+				const auto coreArchive = FindCoreStaticArchive(root, TargetArchitecture::X64);
+				if (!coreArchive.empty()) result.staticLibraryDirectory = coreArchive.parent_path();
+			}
+		}
+		if (result.metadataDirectory.empty() && IsRegularFile(root / L"krnln.fne")) {
+			result.metadataDirectory = root;
+		}
+	}
+	for (const auto& root : roots) {
+		CoreArchiveSelection adapterArchive;
+		if (ReadBlackMoonAdapterSelection(root, TargetArchitecture::X64, adapterArchive)) {
+			AppendUniquePath(result.searchDirectories, root);
+		}
+		if (!FindCoreStaticArchive(root, TargetArchitecture::X64).empty()) AppendUniquePath(result.searchDirectories, root);
+		if (IsRegularFile(root / L"krnln.fne")) AppendUniquePath(result.searchDirectories, root);
+	}
+	return result;
+}
+
+std::filesystem::path FindLibraryManager(
+	const TargetArchitecture architecture,
+	const std::filesystem::path& compiler,
+	const std::filesystem::path& productRoot)
+{
+	const std::vector<std::filesystem::path> candidates = architecture == TargetArchitecture::X64
+		? std::vector<std::filesystem::path> {
+			compiler.parent_path() / L"lib.exe",
+			compiler.parent_path().parent_path() / L"lib.exe",
+			productRoot / L"linker" / L"VC6linker" / L"Bin" / L"LIB.EXE",
+		}
+		: std::vector<std::filesystem::path> {
+			productRoot / L"linker" / L"VC6linker" / L"Bin" / L"LIB.EXE",
+			compiler.parent_path() / L"lib.exe",
+		};
+	for (const auto& candidate : candidates) if (IsRegularFile(candidate)) return candidate;
+	return {};
+}
+
+TargetArchitecture HostTargetArchitecture()
+{
+#if defined(_M_X64)
+	return TargetArchitecture::X64;
+#else
+	return TargetArchitecture::X86;
+#endif
+}
+
 bool ResolveToolchain(
 	const Options& options,
+	const TargetArchitecture architecture,
 	std::filesystem::path& compiler,
 	std::filesystem::path& linker,
 	std::filesystem::path& vcLibrary,
 	std::filesystem::path& productRoot,
+	std::vector<std::filesystem::path>* outIncludeDirectories,
+	std::vector<std::filesystem::path>* outSystemLibraryDirectories,
 	std::string& error)
 {
-#if !defined(_M_IX86)
-	(void)options; (void)compiler; (void)linker; (void)vcLibrary; (void)productRoot;
-	error = "independent compiler backend requires Win32 e-packager";
-	return false;
-#else
-	compiler = options.compilerPath.empty() ? DefaultCompilerPath() : options.compilerPath;
+	if (outIncludeDirectories != nullptr) outIncludeDirectories->clear();
+	if (outSystemLibraryDirectories != nullptr) outSystemLibraryDirectories->clear();
+	if (architecture == TargetArchitecture::X64 && options.compilerPath.empty()) {
+		std::vector<std::filesystem::path> includeDirectories;
+		std::vector<std::filesystem::path> systemLibraryDirectories;
+		if (!DiscoverBuildEnvironment(
+				architecture, compiler, includeDirectories, systemLibraryDirectories, error)) {
+			return false;
+		}
+		if (outIncludeDirectories != nullptr) *outIncludeDirectories = includeDirectories;
+		if (outSystemLibraryDirectories != nullptr) *outSystemLibraryDirectories = systemLibraryDirectories;
+	}
+	else {
+		compiler = options.compilerPath.empty() ? DefaultCompilerPath() : options.compilerPath;
+	}
 	linker = options.linkerPath.empty() ? compiler.parent_path() / L"link.exe" : options.linkerPath;
-	vcLibrary = options.libraryPath.empty() ? compiler.parent_path().parent_path() / L"lib" : options.libraryPath;
 	productRoot = ProductRootFromCompiler(compiler);
+	if (options.libraryPath.empty()) {
+		vcLibrary = compiler.parent_path().parent_path() / L"lib";
+		if (architecture == TargetArchitecture::X64 &&
+			outSystemLibraryDirectories != nullptr && !outSystemLibraryDirectories->empty()) {
+			vcLibrary = outSystemLibraryDirectories->front();
+		}
+		if (architecture == TargetArchitecture::X64 &&
+			(outSystemLibraryDirectories == nullptr || outSystemLibraryDirectories->empty())) {
+			std::vector<std::filesystem::path> includeDirectories;
+			std::vector<std::filesystem::path> systemLibraryDirectories;
+			std::filesystem::path discoveredCompiler;
+			if (!DiscoverBuildEnvironment(
+					architecture, discoveredCompiler, includeDirectories, systemLibraryDirectories, error)) {
+				return false;
+			}
+			if (outIncludeDirectories != nullptr) *outIncludeDirectories = includeDirectories;
+			if (outSystemLibraryDirectories != nullptr) *outSystemLibraryDirectories = systemLibraryDirectories;
+			vcLibrary = systemLibraryDirectories.empty() ? vcLibrary : systemLibraryDirectories.front();
+		}
+	}
+	else {
+		vcLibrary = options.libraryPath;
+	}
 	if (!IsRegularFile(compiler)) { error = "compiler_not_found:" + PathToUtf8(compiler); return false; }
 	if (!IsRegularFile(linker)) { error = "linker_not_found:" + PathToUtf8(linker); return false; }
 	if (!std::filesystem::is_directory(vcLibrary)) { error = "linker_library_directory_not_found:" + PathToUtf8(vcLibrary); return false; }
 	return true;
-#endif
 }
 
 }  // namespace
@@ -433,8 +893,17 @@ bool Compile(
 	const Options& options,
 	Result& result)
 {
-	if (options.backend == Backend::BlackMoon) {
-		return blackmoon_backend::Compile(inputPath, outputPath, options, result);
+	const TargetArchitecture targetArchitecture = options.targetArchitecture == TargetArchitecture::Host
+		? HostTargetArchitecture() : options.targetArchitecture;
+	const bool targetX64 = targetArchitecture == TargetArchitecture::X64;
+	if (options.compileMode == CompileMode::BlackMoon && targetArchitecture == TargetArchitecture::X86) {
+		return blackmoon_compiler::Compile(inputPath, outputPath, options, result);
+	}
+	if (options.compileMode == CompileMode::NativeCpp && targetArchitecture == TargetArchitecture::X64) {
+		result = {};
+		result.outputPath = outputPath;
+		result.message = "native_compile_mode_x64_not_supported";
+		return false;
 	}
 	result = {};
 	result.outputPath = outputPath;
@@ -443,13 +912,51 @@ bool Compile(
 	std::filesystem::path linker;
 	std::filesystem::path vcLibrary;
 	std::filesystem::path productRoot;
-	if (!ResolveToolchain(options, compiler, linker, vcLibrary, productRoot, error)) {
+	std::vector<std::filesystem::path> includeDirectories;
+	std::vector<std::filesystem::path> systemLibraryDirectories;
+	if (!ResolveToolchain(
+		options, targetArchitecture, compiler, linker, vcLibrary, productRoot,
+		&includeDirectories, &systemLibraryDirectories, error)) {
 		result.message = error;
 		return false;
 	}
+	X64LibraryRoots x64Roots;
+	std::vector<std::filesystem::path> supportLibrarySearchDirectories;
+	if (targetArchitecture == TargetArchitecture::X64) {
+		x64Roots = ResolveX64LibraryRoots(options, compiler, productRoot);
+		supportLibrarySearchDirectories = x64Roots.searchDirectories;
+		if (!x64Roots.staticLibraryDirectory.empty()) {
+			AppendUniquePath(supportLibrarySearchDirectories, x64Roots.staticLibraryDirectory);
+		}
+		if (!x64Roots.metadataDirectory.empty()) {
+			AppendUniquePath(supportLibrarySearchDirectories, x64Roots.metadataDirectory);
+		}
+		if (x64Roots.staticLibraryDirectory.empty()) {
+			result.message = "x64_blackmoon_core_library_not_found:provide --blackmoon-x64-dir";
+			return false;
+		}
+	}
+	else {
+		supportLibrarySearchDirectories.push_back(productRoot / L"lib");
+	}
+	std::filesystem::path bundleInput = inputPath;
+	TemporaryDirectoryGuard sourceDecoderDirectory;
+	std::error_code inputTypeError;
+	if (targetArchitecture == TargetArchitecture::X64 &&
+		std::filesystem::is_regular_file(inputPath, inputTypeError) &&
+		inputPath.extension() == L".e") {
+		if (!DecodeSourceWithX86Helper(inputPath, options, sourceDecoderDirectory, error)) {
+			result.message = error;
+			return false;
+		}
+		bundleInput = sourceDecoderDirectory.path();
+	}
 	e2txt::ProjectBundle bundle;
 	std::filesystem::path inputRoot;
-	if (!ReadInputBundle(inputPath, bundle, inputRoot, error)) {
+	e2txt::ReadOptions readOptions;
+	readOptions.supportLibrarySearchDirectories = supportLibrarySearchDirectories;
+	readOptions.restrictSupportLibrarySearch = targetArchitecture == TargetArchitecture::X64;
+	if (!ReadInputBundle(bundleInput, bundle, inputRoot, readOptions, error)) {
 		result.message = error;
 		return false;
 	}
@@ -458,7 +965,9 @@ bool Compile(
 		return false;
 	}
 	Program program;
-	if (!BuildCompilerModel(std::move(bundle), inputRoot, { productRoot / L"lib" }, options.conditionMacros, program, error)) {
+	if (!BuildCompilerModel(
+		std::move(bundle), inputRoot, supportLibrarySearchDirectories, options.conditionMacros,
+		targetArchitecture, program, error)) {
 		result.message = "compiler_model_failed:" + error;
 		return false;
 	}
@@ -485,24 +994,23 @@ bool Compile(
 	}
 	const std::filesystem::path logPath = outputDirectory / (outputPath.stem().wstring() + L".compile.log");
 	std::string processOutput;
-	std::vector<std::filesystem::path> includeDirectories;
-	std::vector<std::filesystem::path> systemLibraryDirectories;
 	std::filesystem::path matchingCompiler;
-	if (!DiscoverBuildEnvironment(matchingCompiler, includeDirectories, systemLibraryDirectories, error)) {
-		result.message = error;
-		return false;
+	if (includeDirectories.empty() || systemLibraryDirectories.empty()) {
+		if (!DiscoverBuildEnvironment(targetArchitecture, matchingCompiler, includeDirectories, systemLibraryDirectories, error)) {
+			result.message = error;
+			return false;
+		}
 	}
-	if (options.compilerPath.empty()) compiler = matchingCompiler;
+	if (options.compilerPath.empty() && !matchingCompiler.empty()) compiler = matchingCompiler;
 	std::vector<std::filesystem::path> generatedImportLibraries;
-	const std::filesystem::path libraryManager = productRoot / L"linker" / L"VC6linker" / L"Bin" / L"LIB.EXE";
+	const std::filesystem::path libraryManager = FindLibraryManager(targetArchitecture, compiler, productRoot);
 	for (const auto& import : generated.imports) {
 		if (import.moduleName.empty() || import.entryName.empty()) continue;
-		if (IsPlatformImportModule(import.moduleName)) continue;
 		const std::filesystem::path importDef = outputDirectory /
 			(outputPath.stem().wstring() + L".import." + std::to_wstring(import.commandIndex) + L".def");
 		const std::filesystem::path importLib = outputDirectory /
 			(outputPath.stem().wstring() + L".import." + std::to_wstring(import.commandIndex) + L".lib");
-		if (!WriteImportDefinition(importDef, import, error)) {
+		if (!WriteImportDefinition(importDef, import, targetArchitecture, error)) {
 			result.message = error;
 			return false;
 		}
@@ -511,7 +1019,7 @@ bool Compile(
 			(outputPath.stem().wstring() + L".import." + std::to_wstring(import.commandIndex) + L".log");
 		std::string importOutput;
 		if (!IsRegularFile(libraryManager) || !RunProcess(libraryManager,
-			{L"/NOLOGO", L"/MACHINE:I386", L"/DEF:" + Quote(importDef), L"/OUT:" + Quote(importLib)},
+			{L"/NOLOGO", targetX64 ? L"/MACHINE:X64" : L"/MACHINE:I386", L"/DEF:" + Quote(importDef), L"/OUT:" + Quote(importLib)},
 			outputDirectory, importLog, importOutput, error)) {
 			result.message = "generate_import_library_failed:" + import.moduleName + ":" + error;
 			return false;
@@ -528,54 +1036,72 @@ bool Compile(
 		}
 	}
 	std::vector<std::wstring> compilerArguments = {
-		L"/nologo", L"/c", L"/O2", L"/Gy", L"/Zl", L"/GS-", L"/GR-", L"/EHsc", L"/arch:IA32", L"/MT", L"/std:c++20",
+		L"/nologo", L"/c", L"/O2", L"/Gy", L"/Zl", L"/GS-", L"/GR-", L"/EHsc", L"/MT", L"/std:c++20",
 		L"/source-charset:utf-8", L"/execution-charset:.936", L"/Fo" + Quote(result.objectPath), Quote(result.sourcePath),
 	};
+	if (!targetX64) compilerArguments.insert(compilerArguments.begin() + 8, L"/arch:IA32");
 	for (const auto& directory : includeDirectories) compilerArguments.push_back(L"/I" + Quote(directory));
 	if (!RunProcess(compiler, compilerArguments, outputDirectory, logPath, processOutput, error)) {
 		result.message = error;
 		return false;
 	}
-	const std::filesystem::path staticLibrary = productRoot / L"static_lib";
+	const std::filesystem::path staticLibrary = targetX64
+		? x64Roots.staticLibraryDirectory : productRoot / L"static_lib";
 	const std::filesystem::path vc6RuntimeLibrary = productRoot / L"linker" / L"VC6linker" / L"Lib" / L"MSVCRT.LIB";
 	const std::filesystem::path mfcLibrary = vcLibrary / L"NAFXCW.LIB";
-	for (const std::filesystem::path& required : { mfcLibrary }) {
-		if (!IsRegularFile(required)) {
-			result.message = "mfc_runtime_file_not_found:" + PathToUtf8(required);
+	if (!targetX64) {
+		for (const std::filesystem::path& required : { mfcLibrary }) {
+			if (!IsRegularFile(required)) {
+				result.message = "mfc_runtime_file_not_found:" + PathToUtf8(required);
+				return false;
+			}
+		}
+		if (!IsRegularFile(vc6RuntimeLibrary)) {
+			result.message = "vc6_runtime_library_not_found:" + PathToUtf8(vc6RuntimeLibrary);
 			return false;
 		}
 	}
-	if (!IsRegularFile(vc6RuntimeLibrary)) {
-		result.message = "vc6_runtime_library_not_found:" + PathToUtf8(vc6RuntimeLibrary);
-		return false;
-	}
 	std::vector<std::filesystem::path> supportLibraries;
 	std::vector<std::filesystem::path> dependencyDirectories = {
-		staticLibrary, vcLibrary, program.inputRoot,
+		staticLibrary, vcLibrary, program.inputRoot, program.inputRoot / L"elib",
 	};
+	for (const auto& directory : supportLibrarySearchDirectories) dependencyDirectories.push_back(directory);
 	for (const auto& library : program.libraries) {
 		if (!library.metadata.filePath.empty()) dependencyDirectories.push_back(library.metadata.filePath.parent_path());
 	}
 	bool usesCoreLibrary = false;
+	bool usesBlackMoonCoreAdapter = false;
 	for (const auto& library : program.libraries) {
 		if (library.dependency.fileName != "krnln") continue;
 		usesCoreLibrary = true;
-		std::filesystem::path path = FindStaticLibrary(staticLibrary, library);
-		if (path.empty()) path = FindStaticLibrary(library.metadata.filePath.parent_path(), library);
-		if (path.empty()) path = FindStaticLibrary(program.inputRoot, library);
+		std::filesystem::path path;
+		if (targetX64 && x64Roots.coreArchive.adapter) {
+			path = x64Roots.coreArchive.primaryArchive;
+			usesBlackMoonCoreAdapter = true;
+		}
+		else {
+			path = FindStaticLibraryInDirectories(dependencyDirectories, library, targetArchitecture);
+		}
 		if (path.empty()) {
 			result.message = "core_static_archive_not_found:" + PathToUtf8(staticLibrary);
 			return false;
 		}
 		AppendUniquePath(supportLibraries, path);
+		if (usesBlackMoonCoreAdapter) {
+			AppendUniquePath(supportLibraries, x64Roots.coreArchive.fallbackArchive);
+		}
 		break;
 	}
 	for (const std::size_t libraryIndex : generated.reachableLibraries) {
 		if (libraryIndex >= program.libraries.size()) continue;
 		if (program.libraries[libraryIndex].dependency.fileName == "krnln") continue;
-		std::filesystem::path path = FindStaticLibrary(staticLibrary, program.libraries[libraryIndex]);
-		if (path.empty()) path = FindStaticLibrary(program.libraries[libraryIndex].metadata.filePath.parent_path(), program.libraries[libraryIndex]);
-		if (path.empty()) path = FindStaticLibrary(program.inputRoot, program.libraries[libraryIndex]);
+		if (!program.libraries[libraryIndex].implementationAvailable) {
+			result.message = "support_library_target_implementation_not_available:" +
+				program.libraries[libraryIndex].dependency.fileName;
+			return false;
+		}
+		std::filesystem::path path = FindStaticLibraryInDirectories(
+			dependencyDirectories, program.libraries[libraryIndex], targetArchitecture);
 		if (path.empty()) {
 			result.message = "support_library_static_archive_not_found:" + program.libraries[libraryIndex].dependency.fileName + ":" + PathToUtf8(staticLibrary);
 			return false;
@@ -584,7 +1110,7 @@ bool Compile(
 	}
 	// FNEs expose their link-time dependencies through NL_GET_DEPENDENT_LIBS.
 	// Resolve those names from the product static-lib tree (or the VC library
-	// directory) so adding a new support library does not require backend code
+	// directory) so adding a new support library does not require compile-mode code
 	// changes.  Standard platform imports are supplied below in the same way.
 	for (const std::size_t libraryIndex : generated.reachableLibraries) {
 		if (libraryIndex >= program.libraries.size()) continue;
@@ -593,7 +1119,7 @@ bool Compile(
 			if (!artifact.empty()) AppendUniquePath(supportLibraries, artifact);
 		}
 	}
-	if (usesCoreLibrary) {
+	if (usesCoreLibrary && !targetX64) {
 		// The stock core archive contains its database/media bridge entry points
 		// but does not publish those two transitive archives through the FNE
 		// notification table.  They are archive-level dependencies, independent
@@ -607,16 +1133,25 @@ bool Compile(
 			AppendUniquePath(supportLibraries, dependency);
 		}
 	}
-	std::vector<std::wstring> linkerArguments = {
-		L"/NOLOGO", L"/FORCE:MULTIPLE", L"/SUBSYSTEM:CONSOLE", L"/MACHINE:I386", L"/INCREMENTAL:NO", L"/OPT:REF",
-		L"/NODEFAULTLIB:LIBCMT", L"/INCLUDE:_LegacyVc6Swprintf", L"/ALTERNATENAME:_swprintf=_LegacyVc6Swprintf", L"/ALTERNATENAME:__swprintf=_LegacyVc6Swprintf", L"/ALTERNATENAME:___eapp_info=_eapp_info_data", L"/LIBPATH:" + Quote(vcLibrary), L"/OUT:" + Quote(outputPath),
-		Quote(result.objectPath), Quote(mfcLibrary),
-	};
+	std::vector<std::wstring> linkerArguments;
+	if (targetX64) {
+		linkerArguments = {
+			L"/NOLOGO", L"/SUBSYSTEM:CONSOLE", L"/MACHINE:X64", L"/INCREMENTAL:NO", L"/OPT:REF",
+			L"/LIBPATH:" + Quote(vcLibrary), L"/OUT:" + Quote(outputPath), Quote(result.objectPath),
+		};
+	}
+	else {
+		linkerArguments = {
+			L"/NOLOGO", L"/FORCE:MULTIPLE", L"/SUBSYSTEM:CONSOLE", L"/MACHINE:I386", L"/INCREMENTAL:NO", L"/OPT:REF",
+			L"/NODEFAULTLIB:LIBCMT", L"/INCLUDE:_LegacyVc6Swprintf", L"/ALTERNATENAME:_swprintf=_LegacyVc6Swprintf", L"/ALTERNATENAME:__swprintf=_LegacyVc6Swprintf", L"/ALTERNATENAME:___eapp_info=_eapp_info_data", L"/LIBPATH:" + Quote(vcLibrary), L"/OUT:" + Quote(outputPath),
+			Quote(result.objectPath), Quote(mfcLibrary),
+		};
+	}
 	if (program.buildDll) {
 		linkerArguments.push_back(L"/DLL");
 		linkerArguments.push_back(L"/SUBSYSTEM:WINDOWS");
 		const std::filesystem::path definitionPath = outputDirectory / (outputPath.stem().wstring() + L".def");
-		if (!WriteDllDefinition(definitionPath, outputPath.stem().string(), generated.exports, error)) {
+		if (!WriteDllDefinition(definitionPath, outputPath.stem().string(), generated.exports, targetArchitecture, error)) {
 			result.message = error;
 			return false;
 		}
@@ -628,7 +1163,7 @@ bool Compile(
 	}
 	for (const auto& library : supportLibraries) linkerArguments.push_back(Quote(library));
 	for (const auto& library : generatedImportLibraries) linkerArguments.push_back(Quote(library));
-	linkerArguments.push_back(Quote(vc6RuntimeLibrary));
+	if (!targetX64) linkerArguments.push_back(Quote(vc6RuntimeLibrary));
 	// The VC6/MFC compatibility archive is intentionally linked for the same
 	// ABI used by classic FNEs.  Its old object files do not consistently carry
 	// all of their import-library directives, so provide the platform imports
@@ -638,7 +1173,11 @@ bool Compile(
 		L"comdlg32.lib", L"advapi32.lib", L"shell32.lib", L"ole32.lib",
 		L"oleaut32.lib", L"olepro32.lib", L"uuid.lib", L"odbc32.lib",
 		L"odbccp32.lib", L"wininet.lib", L"winmm.lib", L"comctl32.lib"
-	}) linkerArguments.push_back(importLibrary);
+	}) {
+		const std::filesystem::path artifact = FindLibraryArtifact(
+			systemLibraryDirectories, PathToUtf8(std::filesystem::path(importLibrary)));
+		if (!artifact.empty()) linkerArguments.push_back(Quote(artifact));
+	}
 	if (!RunProcess(linker, linkerArguments, outputDirectory, logPath, processOutput, error)) {
 		result.message = error;
 		return false;
@@ -660,9 +1199,12 @@ bool Compile(
 	result.ok = true;
 	result.message =
 		"compiled:" + PathToUtf8(outputPath) +
+		";compile_mode=" + (targetX64 ? std::string("blackmoon") : std::string("native")) +
+		";arch=" + (targetX64 ? std::string("x64") : std::string("x86")) +
 		";methods=" + std::to_string(generated.reachableMethodCount) +
 		";commands=" + std::to_string(generated.reachableCommandCount) +
 		";libraries=" + std::to_string(generated.reachableLibraries.size()) +
+		(usesBlackMoonCoreAdapter ? ";core_archive=blackmoon_kernel_adapter" : std::string()) +
 		";source=" + PathToUtf8(result.sourcePath) +
 		";object=" + PathToUtf8(result.objectPath);
 	return true;

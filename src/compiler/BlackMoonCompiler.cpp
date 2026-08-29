@@ -1,4 +1,4 @@
-﻿// 黑月源码后端：无黑月 FNE 注入地调用易代码转换器及其三种链接入口。
+﻿// 黑月源码编译方式：无黑月 FNE 注入地调用易代码转换器及其三种链接入口。
 #include "BlackMoonCompiler.h"
 
 #include "BlackMoonEcodeBridge.h"
@@ -22,7 +22,7 @@
 #include <utility>
 #include <vector>
 
-namespace ecompiler::blackmoon_backend {
+namespace ecompiler::blackmoon_compiler {
 namespace {
 
 std::filesystem::path AbsolutePath(const std::filesystem::path& path)
@@ -353,7 +353,7 @@ bool Compile(
 	(void)options;
 	result = {};
 	result.outputPath = outputPath;
-	result.message = "blackmoon_backend_requires_win32_e_packager";
+	result.message = "blackmoon_compile_mode_requires_win32_e_packager";
 	return false;
 #else
 	result = {};
@@ -653,7 +653,7 @@ bool Compile(
 	}
 	result.ok = true;
 	result.message = "compiled:" + PathToUtf8(effectiveOutput) +
-		";backend=blackmoon;mode=" + ModeName(options.blackMoonMode) +
+		";compile_mode=blackmoon;mode=" + ModeName(options.blackMoonMode) +
 		";effective_mode=" + ModeName(effectiveMode) +
 		(usedMfcFallback ? ";runtime_fallback=mfc" : "") +
 		";artifact_bytes=" + std::to_string(outputBytes) +
@@ -663,4 +663,4 @@ bool Compile(
 #endif
 }
 
-}  // namespace ecompiler::blackmoon_backend
+}  // namespace ecompiler::blackmoon_compiler

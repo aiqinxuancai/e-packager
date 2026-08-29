@@ -1507,15 +1507,33 @@ std::string ToLowerAscii(std::string value)
 	return value;
 }
 
-bool ParseCompilerBackend(const std::string& text, ecompiler::Backend& outBackend)
+bool ParseCompileMode(const std::string& text, ecompiler::CompileMode& outMode)
 {
 	const std::string normalized = ToLowerAscii(text);
 	if (normalized == "native" || normalized == "cpp") {
-		outBackend = ecompiler::Backend::NativeCpp;
+		outMode = ecompiler::CompileMode::NativeCpp;
 		return true;
 	}
 	if (normalized == "blackmoon" || normalized == "bm") {
-		outBackend = ecompiler::Backend::BlackMoon;
+		outMode = ecompiler::CompileMode::BlackMoon;
+		return true;
+	}
+	return false;
+}
+
+bool ParseTargetArchitecture(const std::string& text, ecompiler::TargetArchitecture& outArchitecture)
+{
+	const std::string normalized = ToLowerAscii(text);
+	if (normalized == "host" || normalized == "auto") {
+		outArchitecture = ecompiler::TargetArchitecture::Host;
+		return true;
+	}
+	if (normalized == "x86" || normalized == "win32" || normalized == "i386") {
+		outArchitecture = ecompiler::TargetArchitecture::X86;
+		return true;
+	}
+	if (normalized == "x64" || normalized == "amd64") {
+		outArchitecture = ecompiler::TargetArchitecture::X64;
 		return true;
 	}
 	return false;
@@ -2389,7 +2407,7 @@ void PrintUsage()
 	std::cout << Utf8Literal(u8"  e-packager pack <input-dir> <output.e|output.ec> [--password <text>] [--compile-check ...]  # 封包，可选 AutoLinker 无头编译确认") << std::endl;
 	std::cout << Utf8Literal(u8"       --compile-check [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--compile-target auto|win_exe|win_console_exe|win_dll|ecom] [--compile-static] [--compile-timeout <seconds>]") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager validate <input-dir>        # 快速检查声明、基础语法和可确定的类型错误") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager compile <input.e|input-dir> <output.exe|output.dll> [--backend native|blackmoon] [--blackmoon-mode asm|cpp|mfc] [--dll] [--define <macro>]... [--linker <link.exe>] [--lib <lib-dir>] [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--blackmoon-dir <dir>] [--blackmoon-timeout <seconds>]  # 默认直接 C++ 后端；黑月后端转换原生易代码并按模式链接") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager compile <input.e|input-dir> <output.exe|output.dll> [--compile-mode native|blackmoon] [--arch host|x86|x64] [--blackmoon-mode asm|cpp|mfc] [--dll] [--define <macro>]... [--linker <link.exe>] [--lib <lib-dir>] [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--blackmoon-dir <dir>] [--blackmoon-x64-dir <dir>] [--x86-decoder <e-packager.exe>] [--blackmoon-timeout <seconds>]  # 默认源码直编；x64 需 blackmoon 与 x64 核心库（--backend 为兼容别名）") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager compile-check <input.e|input.ec> [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--compile-target ...] [--compile-static] [--compile-timeout <seconds>]  # 直接执行权威无头编译") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager update <input-dir> [--add-ecom <file.ec>]... [--add-elib <name|file.fne>]... [--add-image <file|name=file>]... [--add-audio <file|name=file>]...   # 刷新派生内容并新增资源") << std::endl;
 #if defined(_M_X64)
@@ -2478,6 +2496,11 @@ int RunCommand(int argc, char* argv[])
 		}
 		CompileCommandOptions commandOptions;
 		ecompiler::Options& options = commandOptions.compilerOptions;
+		const auto appendBlackMoonX64Directory = [&options](const std::filesystem::path& directory) {
+			const std::filesystem::path resolved = ResolveAbsolutePath(directory);
+			if (options.blackMoonX64Directory.empty()) options.blackMoonX64Directory = resolved;
+			options.blackMoonX64Directories.push_back(resolved);
+		};
 		for (int index = 4; index < argc; ++index) {
 			const std::string option = argv[index];
 			if (option == "--dll") {
@@ -2485,18 +2508,33 @@ int RunCommand(int argc, char* argv[])
 				continue;
 			}
 			if (option == "--blackmoon") {
-				options.backend = ecompiler::Backend::BlackMoon;
+				options.compileMode = ecompiler::CompileMode::BlackMoon;
 				continue;
 			}
-			if (option == "--backend" && index + 1 < argc) {
-				if (!ParseCompilerBackend(argv[++index], options.backend)) {
+			if (option == "--arch" && index + 1 < argc) {
+				if (!ParseTargetArchitecture(argv[++index], options.targetArchitecture)) {
 					PrintUsage();
 					return EXIT_FAILURE;
 				}
 				continue;
 			}
-			if (option.rfind("--backend=", 0) == 0) {
-				if (!ParseCompilerBackend(option.substr(std::string("--backend=").size()), options.backend)) {
+			if (option.rfind("--arch=", 0) == 0) {
+				if (!ParseTargetArchitecture(option.substr(std::string("--arch=").size()), options.targetArchitecture)) {
+					PrintUsage();
+					return EXIT_FAILURE;
+				}
+				continue;
+			}
+			if ((option == "--compile-mode" || option == "--backend") && index + 1 < argc) {
+				if (!ParseCompileMode(argv[++index], options.compileMode)) {
+					PrintUsage();
+					return EXIT_FAILURE;
+				}
+				continue;
+			}
+			if (option.rfind("--compile-mode=", 0) == 0 || option.rfind("--backend=", 0) == 0) {
+				const std::string prefix = option.rfind("--compile-mode=", 0) == 0 ? "--compile-mode=" : "--backend=";
+				if (!ParseCompileMode(option.substr(prefix.size()), options.compileMode)) {
 					PrintUsage();
 					return EXIT_FAILURE;
 				}
@@ -2507,7 +2545,7 @@ int RunCommand(int argc, char* argv[])
 					PrintUsage();
 					return EXIT_FAILURE;
 				}
-				options.backend = ecompiler::Backend::BlackMoon;
+				options.compileMode = ecompiler::CompileMode::BlackMoon;
 				continue;
 			}
 			if (option.rfind("--blackmoon-mode=", 0) == 0) {
@@ -2515,7 +2553,7 @@ int RunCommand(int argc, char* argv[])
 					PrintUsage();
 					return EXIT_FAILURE;
 				}
-				options.backend = ecompiler::Backend::BlackMoon;
+				options.compileMode = ecompiler::CompileMode::BlackMoon;
 				continue;
 			}
 			if ((option == "--linker" || option == "--lib") && index + 1 < argc) {
@@ -2537,6 +2575,22 @@ int RunCommand(int argc, char* argv[])
 			}
 			if (option == "--blackmoon-dir" && index + 1 < argc) {
 				options.blackMoonDirectory = ResolveAbsolutePath(std::filesystem::path(argv[++index]));
+				continue;
+			}
+			if (option == "--blackmoon-x64-dir" && index + 1 < argc) {
+				appendBlackMoonX64Directory(std::filesystem::path(argv[++index]));
+				continue;
+			}
+			if (option.rfind("--blackmoon-x64-dir=", 0) == 0) {
+				appendBlackMoonX64Directory(std::filesystem::path(option.substr(std::string("--blackmoon-x64-dir=").size())));
+				continue;
+			}
+			if (option == "--x86-decoder" && index + 1 < argc) {
+				options.x86DecoderPath = ResolveAbsolutePath(std::filesystem::path(argv[++index]));
+				continue;
+			}
+			if (option.rfind("--x86-decoder=", 0) == 0) {
+				options.x86DecoderPath = ResolveAbsolutePath(std::filesystem::path(option.substr(std::string("--x86-decoder=").size())));
 				continue;
 			}
 			if (option == "--blackmoon-timeout" && index + 1 < argc) {
