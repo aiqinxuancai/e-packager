@@ -128,34 +128,35 @@ e-packager compile-check checked.e `
 
 ### 源码直接编译（试验性）
 
-> ⚠️ **试验性功能。** 编译结果尚未经过大规模验证，行为和选项可能随版本变化。窗口工程、窗口事件以及少见的支持库暂不保证可用。交付前请继续使用 `compile-check` 或易语言 IDE 确认，不要直接把产物用于生产环境。
+> ⚠️ **试验性功能。** 编译结果尚未经过大规模验证，行为和选项可能随版本变化。窗口工程、窗口事件以及少见的支持库暂不保证可用。交付前请继续用 `compile-check` 或易语言 IDE 确认，不要直接把产物用于生产环境。
 
-`compile` 把易语言源码直接编译为独立的 EXE 或 DLL，无需在 IDE 中点击编译。输入可以是 `.e` 文件，也可以是 `unpack` 出的工程目录：
+`compile` 把易语言源码直接编译成独立的 EXE 或 DLL，不需要打开易语言 IDE：
 
 ```text
 e-packager compile <input.e|input-dir> <output.exe|output.dll> [选项]
 ```
 
-输出扩展名为 `.dll` 时自动按 DLL 编译，公开子程序即导出函数。
+输入可以是 `.e` 文件，也可以是 `unpack` 出的工程目录；输出扩展名写 `.dll` 时自动按 DLL 编译，工程里的公开子程序会成为 DLL 导出函数。
 
-`--compile-mode` 选择编译方式：
+**两种编译方式：**
 
-| 编译方式 | 架构 | 额外要求 |
+| `--compile-mode` | 架构 | 需要什么 |
 | --- | --- | --- |
-| `semantic`（默认） | x86/x64 | Visual C++ 工具链；推荐同架构 BlackMoonKernelStaticLib adapter |
-| `legacy-blackmoon` | x86 | 已安装易语言、AutoLinker、黑月工具链及匹配的传统核心归档 |
-| `blackmoon` | x86/x64 | 兼容别名：x86 分派传统路线，x64 分派 semantic |
+| `semantic`（默认，推荐） | x86 / x64 | 一套 Visual C++ 工具链；调用核心库命令时还需同架构的 BlackMoonKernelStaticLib adapter |
+| `legacy-blackmoon` | 仅 x86 | 已安装的易语言、AutoLinker、黑月工具链，以及匹配的传统核心归档 |
 
-#### semantic（默认）
+`blackmoon` 是兼容旧脚本的别名：x86 下等同于 `legacy-blackmoon`，x64 下等同于 `semantic`。没有特殊需求时用默认的 `semantic` 即可；只有依赖传统黑月工具链、或需要和旧编译产物保持完全一致时才需要 `legacy-blackmoon`。
 
-默认方式，不启动易语言 IDE。通常只需给出输入和输出：
+#### semantic：默认方式
+
+只需给出输入和输出：
 
 ```powershell
 e-packager.exe compile MyApp.e .\out\MyApp.exe
 e-packager.exe compile .\MyLib .\out\MyLib.dll
 ```
 
-编译器会自动按目标架构探测本机的 Visual C++ 与 Windows SDK。若探测失败或需要指定特定版本，可用 `--compiler`、`--linker` 和 `--lib` 显式指定：
+编译器会自动探测本机的 Visual C++ 与 Windows SDK，并在输出目录生成 `<输出名>.generated.cpp` 等中间文件，方便排查问题，可随时删除。探测失败，或想固定用某个版本时，用 `--compiler`、`--linker`、`--lib` 显式指定：
 
 ```powershell
 e-packager.exe compile MyApp.e .\out\MyApp.exe `
@@ -164,20 +165,31 @@ e-packager.exe compile MyApp.e .\out\MyApp.exe `
   --lib "C:\path\to\VC2022Linker\lib"
 ```
 
-输出目录中会保留 `<输出名>.generated.cpp` 等中间文件，便于排查问题。
+x86、x64 都可以用 `--arch x86` / `--arch x64` 指定，默认跟随当前程序架构。
 
-#### semantic（源码语义编译）
+#### 需要核心库命令时：下载 adapter
 
-`semantic` 是默认编译路线，直接读取 `.e` 或拆包目录，构建语义模型并生成 C++。x86、x64 均使用现代 MSVC；如果提供 `BlackMoonKernelStaticLib` adapter，则核心库命令通过统一的 `ecompiler-fne-execute-v1` ABI 链接。
+工程如果用到了易语言核心库（黑月核心）里的命令，需要额外下载一份匹配架构的 [BlackMoonKernelStaticLib](https://github.com/aiqinxuancai/BlackMoonKernelStaticLib) adapter。前往 [Releases](https://github.com/aiqinxuancai/BlackMoonKernelStaticLib/releases) 下载对应架构的资产（不要用 GitHub 自动生成的 Source code 压缩包）；带 `beta`/`pre`/`rc` 标记的是预发布版，生产环境请选稳定版：
+
+| 发布资产 | 用途 |
+| --- | --- |
+| `BlackMoonKernelStaticLib-v<版本>-x64.zip` | x64 编译，通常只需下载此文件 |
+| `BlackMoonKernelStaticLib-v<版本>-x86.zip` | x86 编译 |
+| `BlackMoonKernelStaticLib-v<版本>.zip` | 同时包含 x86 与 x64 |
+
+解压后得到 `adapter` 目录，直接传给编译器即可：
 
 ```powershell
+Expand-Archive "C:\Users\<用户名>\Downloads\BlackMoonKernelStaticLib-v<版本>-x64.zip" "D:\deps\BlackMoonKernelStaticLib" -Force
+
 e-packager.exe compile MyApp.e .\out\MyApp-x86.exe `
-  --arch x86 --compile-mode semantic `
-  --blackmoon-x86-dir "D:\deps\BlackMoonKernelStaticLib\adapter"
+  --arch x86 --blackmoon-x86-dir "D:\deps\BlackMoonKernelStaticLib\adapter"
+
+e-packager.exe compile MyApp.e .\out\MyApp-x64.exe `
+  --arch x64 --blackmoon-x64-dir "D:\deps\BlackMoonKernelStaticLib\adapter"
 ```
 
-`--blackmoon-core-dir` 是通用写法，也可用 `--blackmoon-x86-dir` 或
-`--blackmoon-x64-dir`。目录中的 FNE、主归档、后备归档和 adapter 清单必须来自同一 Release。
+`--blackmoon-x86-dir` / `--blackmoon-x64-dir` 均可重复传入，用于补充同架构的其他支持库；但核心 adapter 里的 FNE、主归档、后备归档和清单文件必须来自**同一个** Release，不要混用不同版本。`.e` 输入会自动调用 Win32 版 `e-packager` 做权威解码，一般无需干预。
 
 #### legacy-blackmoon（传统 x86 黑月）
 
@@ -198,35 +210,6 @@ e-packager.exe compile MyApp.e .\out\MyApp.exe `
 `BlackMoonKernelStaticLib` 的 [Release](https://github.com/aiqinxuancai/BlackMoonKernelStaticLib/releases) 同时提供现代语义 adapter 与传统归档。传统黑月归档位于 `legacy_static_lib\x86\krnln.lib`，不能覆盖到现代语义 adapter，也不能与现代 adapter 混用。传统路线仍需完整的 `BlackMoon\bin\LINK.EXE`、`BlackMoonExe.obj`、`EyInit.obj` 等文件。
 
 不要把不同版本的核心 `.fne` 和 `krnln.lib` 混用；x86 黑月转换会读取易语言安装目录下的 `lib\krnln.fne`。除非已验证与当前 IDE/黑月工具链匹配，不要用发布包内的 x86 FNE 直接覆盖 IDE 的核心 FNE。
-
-#### semantic（x64）
-
-原始黑月归档是 x86 的，不能直接链接到 x64 程序。x64 所需的 FNE 元数据、主归档、后备归档和适配清单由 [BlackMoonKernelStaticLib](https://github.com/aiqinxuancai/BlackMoonKernelStaticLib) 的 [Release 工作流](https://github.com/aiqinxuancai/BlackMoonKernelStaticLib/actions/workflows/release.yml) 针对每个 `v*` tag 构建并上传到 [Releases](https://github.com/aiqinxuancai/BlackMoonKernelStaticLib/releases)。请下载 Release 资产，而不是 GitHub 自动生成的 Source code 压缩包：
-
-| 发布资产 | 用途 |
-| --- | --- |
-| `BlackMoonKernelStaticLib-v<版本>-x64.zip` | x64 编译所需包，通常只需下载此文件 |
-| `BlackMoonKernelStaticLib-v<版本>-x86.zip` | 为已有 x86 黑月工具链更新核心归档 |
-| `BlackMoonKernelStaticLib-v<版本>.zip` | 同时包含 x86 与 x64 的合并包 |
-
-带 `beta`、`pre`、`rc` 等预发行标志的 tag 会显示为 Pre-release；生产使用应选择与项目验证过的稳定版本。x64 包解压后应保留以下目录结构：
-
-```powershell
-Expand-Archive `
-  "C:\Users\<用户名>\Downloads\BlackMoonKernelStaticLib-v<版本>-x64.zip" `
-  "D:\deps\BlackMoonKernelStaticLib" `
-  -Force
-```
-
-其中 `adapter\lib\x64\krnln.fne`、`adapter\static_lib\x64\krnln_static.lib`、`krnln_fallback.lib` 和 `krnln_adapter.json` 必须来自同一个 Release。无需把这些文件复制到 e-packager 安装目录；直接将解压后的 `adapter` 目录传给编译器：
-
-```powershell
-bin\x64\Release\e-packager.exe compile MyApp.e .\out\MyApp-x64.exe `
-  --arch x64 --compile-mode semantic `
-  --blackmoon-x64-dir "D:\deps\BlackMoonKernelStaticLib\adapter"
-```
-
-`--blackmoon-x64-dir` 可重复传入，按顺序搜索；优先传入同一 Release 解压得到的 `adapter`，其余目录仅用于补充同架构、同 ABI 的其他支持库。`.e` 输入会自动调用 Win32 版 `e-packager` 解码，一般无需干预；x86 semantic 也会先使用该权威解码器，避免目标 FNE 版本变化导致旧 E-code 命令索引错译。
 
 #### 常用选项
 
