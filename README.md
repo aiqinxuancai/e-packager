@@ -142,11 +142,11 @@ e-packager compile <input.e|input-dir> <output.exe|output.dll> [选项]
 
 | 编译方式 | 架构 | 额外要求 |
 | --- | --- | --- |
-| `native`（默认） | x86 | 仅需 Visual C++ 工具链 |
-| `blackmoon` | x86 | 已安装易语言、AutoLinker 和黑月工具链 |
-| `blackmoon` | x64 | x64 黑月核心库（见下） |
+| `semantic`（默认） | x86/x64 | Visual C++ 工具链；推荐同架构 BlackMoonKernelStaticLib adapter |
+| `legacy-blackmoon` | x86 | 已安装易语言、AutoLinker、黑月工具链及匹配的传统核心归档 |
+| `blackmoon` | x86/x64 | 兼容别名：x86 分派传统路线，x64 分派 semantic |
 
-#### native（默认）
+#### semantic（默认）
 
 默认方式，不启动易语言 IDE。通常只需给出输入和输出：
 
@@ -155,62 +155,93 @@ e-packager.exe compile MyApp.e .\out\MyApp.exe
 e-packager.exe compile .\MyLib .\out\MyLib.dll
 ```
 
-编译器会自动探测本机的 Visual C++ 与 Windows SDK。若探测失败或需要指定特定版本，用 `--linker` 和 `--lib` 指向链接器和库目录：
+编译器会自动按目标架构探测本机的 Visual C++ 与 Windows SDK。若探测失败或需要指定特定版本，可用 `--compiler`、`--linker` 和 `--lib` 显式指定：
 
 ```powershell
 e-packager.exe compile MyApp.e .\out\MyApp.exe `
+  --compiler "C:\path\to\VC2022\bin\Hostx64\x86\cl.exe" `
   --linker "C:\path\to\VC2022Linker\bin\link.exe" `
   --lib "C:\path\to\VC2022Linker\lib"
 ```
 
 输出目录中会保留 `<输出名>.generated.cpp` 等中间文件，便于排查问题。
 
-#### blackmoon（x86）
+#### semantic（源码语义编译）
 
-需要链接黑月静态库时使用。`--blackmoon-mode` 选择入口模式并自动启用该编译方式，可取 `asm`、`cpp` 或 `mfc`，产物体积依次递增：
+`semantic` 是默认编译路线，直接读取 `.e` 或拆包目录，构建语义模型并生成 C++。x86、x64 均使用现代 MSVC；如果提供 `BlackMoonKernelStaticLib` adapter，则核心库命令通过统一的 `ecompiler-fne-execute-v1` ABI 链接。
+
+```powershell
+e-packager.exe compile MyApp.e .\out\MyApp-x86.exe `
+  --arch x86 --compile-mode semantic `
+  --blackmoon-x86-dir "D:\deps\BlackMoonKernelStaticLib\adapter"
+```
+
+`--blackmoon-core-dir` 是通用写法，也可用 `--blackmoon-x86-dir` 或
+`--blackmoon-x64-dir`。目录中的 FNE、主归档、后备归档和 adapter 清单必须来自同一 Release。
+
+#### legacy-blackmoon（传统 x86 黑月）
+
+该路线保留 IDE 编译 E-code -> `BlackMoon.obj` -> 传统黑月入口对象的行为。
+使用 `--compile-mode legacy-blackmoon`（旧的 `--blackmoon`/`blackmoon` 兼容别名仍可用）。`--legacy-blackmoon-mode` 选择入口模式，可取 `asm`、`cpp` 或 `mfc`：
 
 ```powershell
 e-packager.exe compile MyApp.e .\out\MyApp.exe `
-  --blackmoon-mode asm `
+  --compile-mode legacy-blackmoon `
+  --legacy-blackmoon-mode asm `
   --eide "C:\path\to\e.exe" `
   --autolinker-test "C:\path\to\AutoLinkerTest.exe" `
-  --blackmoon-dir "C:\path\to\BlackMoon"
+  --legacy-blackmoon-dir "C:\path\to\BlackMoon"
 ```
 
 若所用的静态库带有 MFC 依赖，`asm`、`cpp` 会在链接失败后自动改用 MFC 入口重试，成功消息中的 `effective_mode` 表示实际生效的入口。不需要 MFC 的工程不受影响。
 
-#### blackmoon（x64）
+`BlackMoonKernelStaticLib` 的 [Release](https://github.com/aiqinxuancai/BlackMoonKernelStaticLib/releases) 同时提供现代语义 adapter 与传统归档。传统黑月归档位于 `legacy_static_lib\x86\krnln.lib`，不能覆盖到现代语义 adapter，也不能与现代 adapter 混用。传统路线仍需完整的 `BlackMoon\bin\LINK.EXE`、`BlackMoonExe.obj`、`EyInit.obj` 等文件。
 
-x64 需要同架构的黑月核心库。原始黑月归档是 x86 的，不能直接链接，须先用仓库脚本从 `BlackMoonKernelStaticLib` 源码构建：
+不要把不同版本的核心 `.fne` 和 `krnln.lib` 混用；x86 黑月转换会读取易语言安装目录下的 `lib\krnln.fne`。除非已验证与当前 IDE/黑月工具链匹配，不要用发布包内的 x86 FNE 直接覆盖 IDE 的核心 FNE。
+
+#### semantic（x64）
+
+原始黑月归档是 x86 的，不能直接链接到 x64 程序。x64 所需的 FNE 元数据、主归档、后备归档和适配清单由 [BlackMoonKernelStaticLib](https://github.com/aiqinxuancai/BlackMoonKernelStaticLib) 的 [Release 工作流](https://github.com/aiqinxuancai/BlackMoonKernelStaticLib/actions/workflows/release.yml) 针对每个 `v*` tag 构建并上传到 [Releases](https://github.com/aiqinxuancai/BlackMoonKernelStaticLib/releases)。请下载 Release 资产，而不是 GitHub 自动生成的 Source code 压缩包：
+
+| 发布资产 | 用途 |
+| --- | --- |
+| `BlackMoonKernelStaticLib-v<版本>-x64.zip` | x64 编译所需包，通常只需下载此文件 |
+| `BlackMoonKernelStaticLib-v<版本>-x86.zip` | 为已有 x86 黑月工具链更新核心归档 |
+| `BlackMoonKernelStaticLib-v<版本>.zip` | 同时包含 x86 与 x64 的合并包 |
+
+带 `beta`、`pre`、`rc` 等预发行标志的 tag 会显示为 Pre-release；生产使用应选择与项目验证过的稳定版本。x64 包解压后应保留以下目录结构：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass `
-  -File .\scripts\BuildBlackMoonCoreAdapter.ps1
+Expand-Archive `
+  "C:\Users\<用户名>\Downloads\BlackMoonKernelStaticLib-v<版本>-x64.zip" `
+  "D:\deps\BlackMoonKernelStaticLib" `
+  -Force
 ```
 
-再把生成的 `adapter` 目录传给编译器：
+其中 `adapter\lib\x64\krnln.fne`、`adapter\static_lib\x64\krnln_static.lib`、`krnln_fallback.lib` 和 `krnln_adapter.json` 必须来自同一个 Release。无需把这些文件复制到 e-packager 安装目录；直接将解压后的 `adapter` 目录传给编译器：
 
 ```powershell
-e-packager.exe compile MyApp.e .\out\MyApp-x64.exe `
-  --arch x64 --compile-mode blackmoon `
-  --blackmoon-x64-dir "D:\git\BlackMoonKernelStaticLib\adapter"
+bin\x64\Release\e-packager.exe compile MyApp.e .\out\MyApp-x64.exe `
+  --arch x64 --compile-mode semantic `
+  --blackmoon-x64-dir "D:\deps\BlackMoonKernelStaticLib\adapter"
 ```
 
-`--blackmoon-x64-dir` 可重复传入，按顺序搜索：首个为上述 `adapter`，其余可补充匹配版本的支持库。`.e` 输入会自动调用 Win32 版 `e-packager` 解码，一般无需干预。
+`--blackmoon-x64-dir` 可重复传入，按顺序搜索；优先传入同一 Release 解压得到的 `adapter`，其余目录仅用于补充同架构、同 ABI 的其他支持库。`.e` 输入会自动调用 Win32 版 `e-packager` 解码，一般无需干预；x86 semantic 也会先使用该权威解码器，避免目标 FNE 版本变化导致旧 E-code 命令索引错译。
 
 #### 常用选项
 
 | 选项 | 作用 |
 | --- | --- |
-| `--compile-mode native\|blackmoon` | 选择编译方式，默认 `native` |
-| `--arch host\|x86\|x64` | 选择输出架构，默认跟随当前程序；x64 需配合 `blackmoon` |
-| `--blackmoon-mode asm\|cpp\|mfc` | 选择黑月入口模式（仅 x86），并自动启用 `blackmoon` |
+| `--compile-mode semantic\|legacy-blackmoon\|blackmoon` | 选择源码语义或传统黑月路线；默认 `semantic`，`blackmoon` 为兼容别名 |
+| `--arch host\|x86\|x64` | 选择输出架构，默认跟随当前程序；semantic 两种架构均可用 |
+| `--legacy-blackmoon-mode asm\|cpp\|mfc` | 选择传统黑月入口模式（仅 x86） |
 | `--dll` | 按 DLL 编译；输出扩展名为 `.dll` 时可省略 |
 | `--define <宏>` / `-D <宏>` | 添加条件编译宏，可重复传入 |
-| `--linker <link.exe>` / `--lib <目录>` | 指定链接器和库目录 |
+| `--compiler <cl.exe>` / `--linker <link.exe>` / `--lib <目录>` | 指定 C++ 编译器、链接器和库目录；未指定编译器时按目标架构自动探测 |
 | `--eide <e.exe>` / `--autolinker-test <exe>` | 易语言 IDE 与 AutoLinker 启动器（x86 黑月） |
-| `--blackmoon-dir <目录>` | 黑月工具链根目录（x86 黑月） |
-| `--blackmoon-x64-dir <目录>` | x64 黑月核心库目录，可重复传入 |
+| `--legacy-blackmoon-dir <目录>` | 传统黑月工具链根目录（`--blackmoon-dir` 为兼容别名） |
+| `--blackmoon-core-dir <目录>` | semantic 核心 adapter 根目录，可重复传入 |
+| `--blackmoon-x86-dir <目录>` / `--blackmoon-x64-dir <目录>` | semantic 指定架构核心 adapter 根目录 |
 | `--blackmoon-timeout <秒>` | 黑月编译与链接超时，默认 120，范围 1 至 3600 |
 
 如果支持库或静态库中缺少某个命令的实现，请更换匹配版本的支持库，而不是修改源码绕开。实现原理与已验证范围详见 [`docs/independent-compiler-architecture.md`](docs/independent-compiler-architecture.md)。

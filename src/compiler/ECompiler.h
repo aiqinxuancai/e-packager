@@ -8,10 +8,17 @@
 
 namespace ecompiler {
 
-// 独立源码编译方式。
+// 编译路线：语义模型直接编译，或保留的传统黑月易代码转换。
 enum class CompileMode {
-	NativeCpp,
-	BlackMoon,
+	// `.e`/目录 -> 语义模型 -> C++ -> 现代 MSVC。
+	Semantic,
+	// IDE -> 易代码 PE -> BlackMoon.obj -> 传统入口对象（仅 Win32）。
+	LegacyBlackMoon,
+	// 旧命令行 `blackmoon` 的兼容分派：Win32 走传统路线，x64 走语义路线。
+	BlackMoonCompatibility,
+	// 保留旧 C++ 调用方的枚举名。
+	NativeCpp = Semantic,
+	BlackMoon = BlackMoonCompatibility,
 };
 
 // 兼容旧的 C++ 调用方；新代码应使用 CompileMode。
@@ -24,19 +31,23 @@ enum class BlackMoonMode {
 	Mfc,
 };
 
-// 独立源码编译选项。编译器和链接器均可显式覆盖；x64 仅用于黑月核心方式。
+// 独立源码编译选项。编译器和链接器均可显式覆盖；semantic 支持 x86/x64。
 struct Options {
 	std::filesystem::path compilerPath;
 	std::filesystem::path linkerPath;
 	std::filesystem::path libraryPath;
-	// x64 库根目录可按优先级叠加：首个根优先提供核心归档，后续根可提供 FNE 与其他支持库。
+	// 语义编译核心库根目录可按优先级叠加。目录中可包含 x86/x64 adapter 清单。
+	std::vector<std::filesystem::path> blackMoonCoreDirectories;
+	// 兼容旧的单目录调用方；新调用方应使用 blackMoonCoreDirectories。
+	std::filesystem::path blackMoonCoreDirectory;
+	// x64 旧选项的兼容字段；新调用方应使用 blackMoonCoreDirectories。
 	std::vector<std::filesystem::path> blackMoonX64Directories;
 	// 兼容旧的单目录调用方；新调用方应使用 blackMoonX64Directories。
 	std::filesystem::path blackMoonX64Directory;
-	// x64 编译原生 .e 时用于按官方 x86 命令表解码字节码的 Win32 工具。
+	// 编译原生 .e 时用于按官方 x86 命令表解码字节码的 Win32 工具。
 	std::filesystem::path x86DecoderPath;
 	TargetArchitecture targetArchitecture = TargetArchitecture::Host;
-	CompileMode compileMode = CompileMode::NativeCpp;
+	CompileMode compileMode = CompileMode::Semantic;
 	BlackMoonMode blackMoonMode = BlackMoonMode::Assembly;
 	// 黑月目录，包含 bin/ 与 lib/；留空时根据 e.exe 自动推导。
 	std::filesystem::path blackMoonDirectory;
@@ -58,7 +69,7 @@ struct Result {
 	std::string message;
 };
 
-// 将原生 .e 或拆包目录编译为 Win32 控制台 EXE，不启动易语言 IDE。
+// 将原生 .e 或拆包目录编译为目标架构的控制台 EXE 或 DLL，不启动易语言 IDE。
 bool Compile(
 	const std::filesystem::path& inputPath,
 	const std::filesystem::path& outputPath,

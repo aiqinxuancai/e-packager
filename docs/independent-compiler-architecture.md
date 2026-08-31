@@ -8,9 +8,10 @@
 
 ### 目标
 
-- 支持 Win32 控制台 EXE 的无 IDE 编译。
+- 支持 Win32 控制台 EXE 的无 IDE 编译；默认 `semantic` 路线直接从源码语义模型生成 C++。
 - 支持 Win32 DLL 的生成，并把易语言公开子程序导出为 DLL 导出函数。
-- 使用 x64 黑月核心静态库时，支持 x64 控制台 EXE 和 DLL；x64 目标使用 x64 FNE 元数据与 x64 C++/链接工具链。
+- 使用匹配的现代核心 adapter 时，支持 x86/x64 控制台 EXE 和 DLL；两种架构都使用目标 FNE 元数据与现代 C++/链接工具链。
+- 保留 `legacy-blackmoon` 路线，继续执行 IDE E-code -> `BlackMoon.obj` -> 传统黑月入口对象，仅用于 Win32 兼容场景。
 - 从工程依赖的 FNE 中读取公开接口和 ABI 元数据，建立通用命令绑定。
 - 链接已有支持库静态实现，而不是重新实现每个支持库函数。
 - 把 `.DLL声明.txt` 中的外部 DLL 命令转换为真正的 PE 导入表项。
@@ -20,10 +21,10 @@
 
 - 当前不编译窗口工程。检测到窗体文件或窗口绑定时，会返回
   `window_project_not_supported_by_independent_compiler`。
-- `native` 普通源码直编目前只支持 x86/Win32，因为官方核心库源码和对应静态实现只有 x86。x64 必须选择 `blackmoon` 编译方式并提供 x64 核心静态库；x64 进程不会加载 x86 FNE。
+- `semantic` 需要目标架构匹配的核心 FNE 和静态 adapter。缺少 adapter 时，Win32 仍可使用历史兼容静态库，但不应把它与现代 adapter 混用；x64 必须提供 x64 adapter。
 - 当前不是易语言 IDE 的逐字节代码生成器。完整语法、窗口事件、所有隐式转换、COM/Variant 边界、线程语义以及每一个支持库的特殊 ABI 仍需要逐步补齐和验证。
 
-因此，准确的表述是：已经形成一条可运行的、元数据驱动的 x86/Win32 与 x64（黑月核心）独立编译链，并覆盖控制台程序、DLL、支持库调用和外部 DLL 导入等核心路径；不是“任意易语言项目都已经与 IDE 完全等价”。
+因此，准确的表述是：已经形成一条可运行的、元数据驱动的 x86/x64 `semantic` 独立编译链，并保留一条独立的 x86 传统黑月兼容链；两条链都覆盖控制台程序、DLL、支持库调用和外部 DLL 导入等核心路径，但不是“任意易语言项目都已经与 IDE 完全等价”。
 
 ## 2. 端到端流水线
 
@@ -78,7 +79,7 @@
 编译入口为：
 
 ```text
-e-packager compile <input.e|input-dir> <output.exe|output.dll> [--dll] [--linker <link.exe>] [--lib <lib-dir>]
+e-packager compile <input.e|input-dir> <output.exe|output.dll> [--dll] [--compiler <cl.exe>] [--linker <link.exe>] [--lib <lib-dir>]
 ```
 
 ### 原生 `.e`
@@ -216,7 +217,7 @@ FNE 中没有运行时执行符号的编译期命令由统一的英文元数据�
 3. 每个可达 FNE 的 `NL_GET_DEPENDENT_LIBS` 返回值会继续解析到产品 `static_lib`、VC 库目录或工程目录。
 4. 最终把支持库 `.lib`、VC6 CRT/MFC、现代 CRT 和 Windows SDK 导入库一并交给链接器。
 
-当前产品目录的默认根为 `C:\Users\aiqin\OneDrive\e5.6\linker`。默认 C++ 编译器为其下的 `VC2022Linker\bin\cl.exe`，链接器为同目录 `link.exe`；也可以通过 `--linker` 和 `--lib` 覆盖。编译器会自动探测 Visual C++ 和 Windows SDK 的 Win32 include/lib 目录。
+编译器会按目标架构自动探测本机 Visual C++ 和 Windows SDK 的 include/lib 目录，并选择对应的 `cl.exe` 与 `link.exe`。需要固定工具链版本时，可通过 `--compiler`、`--linker` 和 `--lib` 显式覆盖；环境变量 `VCToolsInstallDir` 也会作为探测入口。
 
 为了兼容现有核心静态归档，当前还保留核心库级别的 `odbcdb_static.lib`、`mp3_static.lib` 依赖补充。这是归档级兼容项，不按某个源代码函数分支；长期方向是让这些依赖也完全由 FNE/静态库元数据发布，消除产品树约定。
 
@@ -286,7 +287,7 @@ EXPORTS
 /source-charset:utf-8 /execution-charset:.936
 ```
 
-链接阶段按目标架构选择 x86 或 x64，并加入对应 CRT、Windows SDK 导入库及可达支持库。x86 黑月入口额外使用 VC6/MFC 兼容库；x64 使用现代 `link.exe` 和 x64 核心静态归档。默认会保留以下调试/审计产物：
+语义链接阶段按目标架构选择 x86 或 x64，并加入对应 CRT、Windows SDK 导入库及可达支持库。使用现代 adapter 时，x86/x64 都只链接现代 CRT 与目标架构核心归档；传统 `legacy-blackmoon` 才额外使用 VC6/MFC 入口对象。默认会保留以下调试/审计产物：
 
 - `<output>.generated.cpp`：生成的 C++ 翻译单元；
 - `<output>.obj`：`cl.exe` 产生的 COFF 对象；
@@ -297,7 +298,7 @@ EXPORTS
 `Result.message` 会报告输出路径以及方法、命令、库数量，例如：
 
 ```text
-compiled:<output>;compile_mode=native;methods=...;commands=...;libraries=...;source=...;object=...
+compiled:<output>;compile_mode=semantic;arch=x86|x64;methods=...;commands=...;libraries=...;source=...;object=...
 ```
 
 ## 12. 使用示例
@@ -320,6 +321,7 @@ dumpbin /exports temp\e-win32-dll-new-proj.dll
 
 ```powershell
 bin\Win32\Release\e-packager.exe compile <input.e> <output.exe> `
+  --compiler C:\Users\aiqin\OneDrive\e5.6\linker\VC2022Linker\bin\cl.exe `
   --linker C:\Users\aiqin\OneDrive\e5.6\linker\VC2022Linker\bin\link.exe `
   --lib C:\Users\aiqin\OneDrive\e5.6\linker\VC2022Linker\lib
 ```
@@ -331,7 +333,7 @@ bin\Win32\Release\e-packager.exe compile <input.e> <output.exe> `
 ### 构建
 
 - Release Win32 `e-packager`：已成功构建。
-- Release x64 `e-packager`：已成功构建；`blackmoon --arch x64` 已用 `e-console-exe-new-proj.e` 和 `e-win32-dll-new-proj.e` 验证控制台 EXE、DLL、公开导出及外部调用，`native --arch x64` 会明确拒绝。
+- Release x64 `e-packager`：已成功构建；`semantic --arch x64` 已用控制台和 DLL 工程验证核心调用、公开导出及外部调用。
 
 ### 控制台回归
 
@@ -361,7 +363,7 @@ bin\Win32\Release\e-packager.exe compile <input.e> <output.exe> `
 增减时间 ... #小时
 ```
 
-原始 `eproj\\e-console-exe-full-test.e` 已分别通过 Win32 native 和 x64 BlackMoon 编译运行，均退出码 `0`；x64 运行输出包含 `取时间小时=15`、`取小时=15` 和正确的减少一小时结果。该修复只改变元数据编码判定，不修改 `.e` 原始字节，也不针对某个命令名称添加替换分支。
+原始 `eproj\\e-console-exe-full-test.e` 已分别通过 Win32 semantic、x86 semantic adapter 和 x64 semantic adapter 编译运行，均退出码 `0`；该修复只改变元数据编码判定，不修改 `.e` 原始字节，也不针对某个命令名称添加替换分支。
 
 ### DLL 回归
 
@@ -429,16 +431,20 @@ TestPub1
 4. 设计窗口项目的独立运行时边界，再实现窗口资源和事件，而不是把窗口源码硬塞进控制台入口。
 5. 扩展 x64 支持库的 ABI 测试覆盖，并把仍未发布的归档级依赖迁移到支持库元数据。
 
-## 16. 黑月源码编译方式
+## 16. 编译路线与黑月兼容
 
-除默认的 `native` C++ 编译方式外，`compile` 还支持 `blackmoon` 编译方式：
+`compile` 有两条明确路线。默认 `semantic` 是源码语义编译；`legacy-blackmoon`
+保留旧黑月的 E-code 转 OBJ 兼容流程。旧参数 `blackmoon` 在 x86 仍分派到传统路线，
+在 x64 分派到 semantic，供旧脚本平滑迁移。
+
+### 16.1 legacy-blackmoon（传统 x86）
 
 ```powershell
 bin\Win32\Release\e-packager.exe compile <input.e|input-dir> <output.exe|output.dll> `
-  --compile-mode blackmoon --blackmoon-mode asm `
+  --compile-mode legacy-blackmoon --legacy-blackmoon-mode asm `
   --eide C:\Users\aiqin\OneDrive\e5.6\e5.95.exe `
   --autolinker-test D:\git\AutoLinker\bin\fne_release\AutoLinkerTest.exe `
-  --blackmoon-dir C:\Users\aiqin\OneDrive\e5.6\BlackMoon
+  --legacy-blackmoon-dir C:\Users\aiqin\OneDrive\e5.6\BlackMoon
 ```
 
 该编译方式不加载、不注入、也不调用 `BlackMoon.fne`。它采用 BlackMoonNG 的易代码到 COFF 转换实现：
@@ -459,16 +465,16 @@ bin\Win32\Release\e-packager.exe compile <input.e|input-dir> <output.exe|output.
 
 | 参数 | 首选黑月入口 | 实测最小工程尺寸 |
 | --- | --- | --- |
-| `--blackmoon-mode asm` | `BlackMoonExe.obj` + `EyInit.obj`，自定义 `BMEntrypoint` | 3,584 B |
-| `--blackmoon-mode cpp` | `BlackMoonExe.obj` + `EyInit.obj` | 36,864 B |
-| `--blackmoon-mode mfc` | `MFCBlackMoonCon.obj` / `MFCBlackMoon.obj` | 114,688 B |
+| `--legacy-blackmoon-mode asm` | `BlackMoonExe.obj` + `EyInit.obj`，自定义 `BMEntrypoint` | 3,584 B |
+| `--legacy-blackmoon-mode cpp` | `BlackMoonExe.obj` + `EyInit.obj` | 36,864 B |
+| `--legacy-blackmoon-mode mfc` | `MFCBlackMoonCon.obj` / `MFCBlackMoon.obj` | 114,688 B |
 
 上述实测均来自 `e-console-exe-new-proj.e`，三个产物均可运行并以 `0` 退出。DLL 会选择相应 `BlackMoonDll*.obj` 或 `BlackMoonMFCdll*.obj` 并生成导出 `.def`；`e-win32-dll-new-proj.e` 的汇编模式产物为 20,480 B，导出 `TestPub1`。
 
 入口选择是能力驱动的，而不是按函数名写死。当核心归档的实际链接成员带入 `nafxcw`/MFC 运行库时，非 MFC 请求模式的第一次链接会被拒绝；编译器随后改用对应的 `MFCBlackMoon*.obj`、`EyInit.obj`/`EyMFCComInit.obj` 和 CRT 初始化路径重试。结果消息使用 `compile_mode` 标识所选编译方式，并保留 `mode` 与 `effective_mode` 说明黑月入口，例如：
 
 ```text
-compile_mode=blackmoon;mode=asm;effective_mode=mfc;runtime_fallback=mfc
+compile_mode=legacy-blackmoon;mode=asm;effective_mode=mfc;runtime_fallback=mfc
 ```
 
 这不是忽略 `LNK2005` 的 `/FORCE` 方案。它避免混用 `MSVCRT`、`LIBCMT` 与 MFC 的对象，确保全局构造、浮点环境和 MFC 状态先完成初始化。当前 `e-console-exe-full-test.e` 含有核心拼音命令，所用 `PY.OBJ` 需要 MFC；重新测试时 `asm`、`cpp`、`mfc` 三种请求均以退出码 `0` 运行完成，输出均为 345 行并到达结束标记，前两种的 `effective_mode` 为 `mfc`。
@@ -483,9 +489,12 @@ compile_mode=blackmoon;mode=asm;effective_mode=mfc;runtime_fallback=mfc
 
 这是归档能力差异，不是针对项目或函数名写入的特殊分支。当前完整测试源码已移除该不兼容调用；如果更换为包含对应符号的新版黑月核心归档，无需修改编译器逻辑即可恢复该命令。
 
-### 16.1 x64 黑月核心方式
+### 16.2 semantic 核心 adapter（x86/x64）
 
-x64 不使用上面的 x86 易代码到 OBJ 转换器。核心实现优先来自 `BlackMoonKernelStaticLib`，而非以函数名为单位在编译器中补写替代逻辑。由于该仓库的原始对象和源码遵循 Win32/x86 ABI，适配构建会从源码重新编译为 x64，统一将执行入口接到 FNE 所描述的 `ecompiler-fne-execute-v1` 参数布局。
+semantic 不使用上面的 x86 易代码到 OBJ 转换器。核心实现优先来自
+`BlackMoonKernelStaticLib`，而非以函数名为单位在编译器中补写替代逻辑。适配构建会
+按目标架构重新编译源码，统一将执行入口接到 FNE 所描述的
+`ecompiler-fne-execute-v1` 参数布局；x86 与 x64 使用同一清单格式和发现逻辑。
 
 构建适配归档：
 
@@ -498,35 +507,42 @@ powershell -NoProfile -ExecutionPolicy Bypass `
 
 ```text
 adapter\
-  lib\x64\krnln.fne
-  static_lib\x64\krnln_static.lib       # 黑月源码适配后的主归档
-  static_lib\x64\krnln_fallback.lib     # 仅含暂时无法安全适配的旧实现
-  static_lib\x64\krnln_adapter.json     # ABI、架构和归档清单
+  lib\x86\krnln.fne / lib\x64\krnln.fne
+  static_lib\x86\krnln_static.lib       # x86 适配主归档
+  static_lib\x86\krnln_fallback.lib     # x86 兼容后备归档
+  static_lib\x86\krnln_adapter.json     # x86 ABI、架构和归档清单
+  static_lib\x64\krnln_static.lib       # x64 适配主归档
+  static_lib\x64\krnln_fallback.lib     # x64 兼容后备归档
+  static_lib\x64\krnln_adapter.json     # x64 ABI、架构和归档清单
+  legacy_static_lib\x86\krnln.lib      # 传统 VC6/BlackMoon.obj 归档
 ```
 
-适配脚本从 COFF 符号表确认每个 FNE 执行入口，再根据源码签名、所属数据类型、指针宽度和内联汇编使用情况筛选可迁移实现。它不会按测试用例写函数名分支：旧英文标识通过源码说明块中的正式中文命令名与 FNE 元数据做唯一匹配；重复的成员命令则由数据类型成员表确定所有者。`PY.OBJ` 的拼音表仅作为 COFF 数据来源提取，x64 不链接其中的 x86 代码。主归档始终先链接；后备归档只在主归档不提供符号时生效，完整控制台回归的 138 个调用均没有落入后备归档。
+适配脚本从 COFF 符号表确认每个 FNE 执行入口，再根据源码签名、所属数据类型、指针宽度和内联汇编使用情况筛选可迁移实现。它不会按测试用例写函数名分支：旧英文标识通过源码说明块中的正式中文命令名与 FNE 元数据做唯一匹配；重复的成员命令则由数据类型成员表确定所有者。`PY.OBJ` 的拼音表仅作为 COFF 数据来源提取。主归档始终先链接；后备归档只在主归档不提供符号时生效。
 
-随后编译器先用 Win32 `e-packager` 解码原生 `.e`，再在 x64 进程中从目标目录读取 x64 FNE 的命令、类型、参数和执行符号，生成 x64 C++ 调用包装，最后链接上述归档及其他同架构静态库：
+随后编译器先用 Win32 `e-packager` 解码原生 `.e`，再在目标进程中从目标目录读取对应架构 FNE 的命令、类型、参数和执行符号，生成 C++ 调用包装，最后链接上述归档及其他同架构静态库：
 
 ```text
 原生 .e
   -> Win32 e-packager 解码为 ProjectBundle
-  -> x64 FNE 元数据与 .DLL声明.txt 建模
-  -> x64 C++ / cl.exe
-  -> x64 核心静态库与支持库
-  -> x64 link.exe
+  -> 目标架构 FNE 元数据与 .DLL声明.txt 建模
+  -> x86/x64 C++ / cl.exe
+  -> 对应架构核心静态库与支持库
+  -> 对应架构 link.exe
   -> output.exe / output.dll
 ```
 
 ```powershell
 bin\x64\Release\e-packager.exe compile eproj\e-console-exe-new-proj.e temp\console-x64.exe `
-  --arch x64 --compile-mode blackmoon --blackmoon-x64-dir D:\git\BlackMoonKernelStaticLib\adapter
+  --arch x64 --compile-mode semantic --blackmoon-x64-dir D:\git\BlackMoonKernelStaticLib\adapter
+
+bin\Win32\Release\e-packager.exe compile eproj\e-console-exe-full-test.e temp\console-x86.exe `
+  --arch x86 --compile-mode semantic --blackmoon-x86-dir D:\git\BlackMoonKernelStaticLib\adapter
 
 bin\x64\Release\e-packager.exe compile eproj\e-win32-dll-new-proj.e temp\dll-x64.dll `
-  --arch x64 --compile-mode blackmoon --dll --blackmoon-x64-dir D:\git\BlackMoonKernelStaticLib\adapter
+  --arch x64 --compile-mode semantic --dll --blackmoon-x64-dir D:\git\BlackMoonKernelStaticLib\adapter
 ```
 
-`--blackmoon-x64-dir` 可重复传入，会依次搜索自身、`x64`、`lib\x64`、`static_lib\x64` 等目录，并校验静态归档的 COFF machine 字段和适配清单。原生 `.e` 输入需要 Win32 解码器；可以用 `--x86-decoder` 指定，或由 `E_PACKAGER_X86_DECODER` 提供。x64 DLL 的公开子程序仍通过 `.def` 导出，外部 DLL 声明使用真实导入名和 import library 进入 PE Import Directory。
+`--blackmoon-core-dir`、`--blackmoon-x86-dir` 和 `--blackmoon-x64-dir` 可重复传入，会按架构搜索自身、`lib/<arch>`、`static_lib/<arch>` 等目录，并校验静态归档的 COFF machine 字段和适配清单。原生 `.e` 输入需要 Win32 解码器；可以用 `--x86-decoder` 指定，或由 `E_PACKAGER_X86_DECODER` 提供。DLL 的公开子程序仍通过 `.def` 导出，外部 DLL 声明使用真实导入名和 import library 进入 PE Import Directory。
 
 转换器代码位于 `src/compiler/blackmoon/`，来源为 BlackMoonNG，并在同目录保留其 MIT 许可证；黑月核心静态库遵循其仓库附带的 BSD 3-Clause 许可证。
 

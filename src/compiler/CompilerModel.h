@@ -157,6 +157,8 @@ struct TypeInfo {
 
 struct Program {
 	bool buildDll = false;
+	// 仅传统 x86 静态库需要 VC6/MFC 运行时桥接；现代 adapter 不应引入它。
+	bool useLegacyX86RuntimeBridge = false;
 	TargetArchitecture targetArchitecture = TargetArchitecture::X86;
 	// 当前编译配置启用的条件宏。宏名称按易语言规则不区分大小写。
 	std::unordered_set<std::string> conditionMacros;
@@ -188,6 +190,7 @@ bool BuildCompilerModel(
 	const std::vector<std::filesystem::path>& supportLibrarySearchDirectories,
 	const std::vector<std::string>& conditionMacros,
 	TargetArchitecture targetArchitecture,
+	bool restrictSupportLibrarySearch,
 	Program& outProgram,
 	std::string& outError);
 

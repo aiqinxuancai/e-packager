@@ -424,6 +424,31 @@ bool IsValidUtf8(const std::string& text)
 	return true;
 }
 
+thread_local bool g_supportLibraryStringsAreUtf8 = false;
+
+bool HasNonAsciiBytes(const std::string& text)
+{
+	return std::any_of(text.begin(), text.end(), [](const unsigned char value) {
+		return value >= 0x80;
+	});
+}
+
+bool IsUtf8MetadataField(const char* text)
+{
+	const size_t length = GetSafeCStringLength(text, kMaxSupportLibraryStringLength);
+	if (length == static_cast<size_t>(-1) || length == 0) return false;
+	const std::string raw(text, length);
+	return HasNonAsciiBytes(raw) && IsValidUtf8(raw);
+}
+
+bool DetectUtf8MetadataStrings(const LIB_INFO* libInfo)
+{
+	if (libInfo == nullptr) return false;
+	return IsUtf8MetadataField(libInfo->m_szName) ||
+		IsUtf8MetadataField(libInfo->m_szExplain) ||
+		IsUtf8MetadataField(libInfo->m_szAuthor);
+}
+
 std::string ReadAnsiText(const char* text)
 {
 	const size_t length = GetSafeCStringLength(text, kMaxSupportLibraryStringLength);
@@ -432,14 +457,18 @@ std::string ReadAnsiText(const char* text)
 	}
 	if (text == nullptr || length == 0) return std::string();
 	const std::string raw(text, length);
-	// Classic Win32 FNEs store GBK/CP_ACP strings. Newer x64 FNEs store UTF-8.
-	// Do not decide from byte validity: GBK text can form a valid UTF-8 byte
-	// sequence by coincidence (for example D0 A1 CA B1 for "小时").
+	// Classic Win32 FNEs store GBK/CP_ACP strings. Newer builds can store UTF-8
+	// on either architecture. The per-load flag is detected from several
+	// identity fields, so an isolated valid-looking GBK field cannot switch the
+	// whole library's decoding mode by accident.
 #if defined(_WIN64) || defined(_M_X64)
 	return IsValidUtf8(raw)
 		? ConvertCodePage(raw, CP_UTF8, CP_ACP, MB_ERR_INVALID_CHARS)
 		: raw;
 #else
+	if (g_supportLibraryStringsAreUtf8 && IsValidUtf8(raw)) {
+		return ConvertCodePage(raw, CP_UTF8, CP_ACP, MB_ERR_INVALID_CHARS);
+	}
 	return raw;
 #endif
 }
@@ -586,6 +615,17 @@ bool HasReadableDataTypes(const LIB_INFO* libInfo)
 			sizeof(LIB_DATA_TYPE_INFO) * static_cast<size_t>(libInfo->m_nDataTypeCount));
 }
 
+bool HasReadableCommands(const LIB_INFO* libInfo)
+{
+	return libInfo != nullptr &&
+		libInfo->m_nCmdCount > 0 &&
+		libInfo->m_nCmdCount <= kMaxSupportLibraryArrayCount &&
+		libInfo->m_pBeginCmdInfo != nullptr &&
+		IsReadableMemoryRange(
+			libInfo->m_pBeginCmdInfo,
+			sizeof(CMD_INFO) * static_cast<size_t>(libInfo->m_nCmdCount));
+}
+
 int CountNamedDataTypes(const LIB_INFO* libInfo)
 {
 	if (!HasReadableDataTypes(libInfo)) {
@@ -603,7 +643,28 @@ int CountNamedDataTypes(const LIB_INFO* libInfo)
 
 bool ShouldRetrySupportLibraryWithDllInitialization(const LIB_INFO* libInfo)
 {
-	if (libInfo == nullptr || libInfo->m_nDataTypeCount <= 1) {
+	if (libInfo == nullptr) {
+		return false;
+	}
+	// A number of modern libraries publish pointers to their metadata arrays
+	// from static storage, but initialize the associated counts during DLL
+	// startup.  The lightweight loader sees non-null table addresses together
+	// with zero counts.  That combination is not a valid empty declaration and
+	// is a generic signal that the initialized load is required.
+	if ((libInfo->m_nCmdCount == 0 && libInfo->m_pBeginCmdInfo != nullptr) ||
+		(libInfo->m_nDataTypeCount == 0 && libInfo->m_pDataType != nullptr) ||
+		(libInfo->m_nLibConstCount == 0 && libInfo->m_pLibConst != nullptr)) {
+		return true;
+	}
+	// Modern FNEs can keep type metadata in directly mapped static data while
+	// their command table contains relocated function pointers.  A no-resolve
+	// load then looks partially valid, so inspecting only the type table loses
+	// every executable command.  Require a readable command table whenever the
+	// library declares commands before accepting the lightweight load.
+	if (libInfo->m_nCmdCount > 0 && !HasReadableCommands(libInfo)) {
+		return true;
+	}
+	if (libInfo->m_nDataTypeCount <= 1) {
 		return false;
 	}
 	if (!HasReadableDataTypes(libInfo)) {
@@ -1364,6 +1425,11 @@ bool TryLoadSupportLibraryDump(
 	if (outMetadata != nullptr) {
 		*outMetadata = {};
 	}
+	const bool previousStringEncoding = g_supportLibraryStringsAreUtf8;
+	struct RestoreStringEncoding {
+		bool previous;
+		~RestoreStringEncoding() { g_supportLibraryStringsAreUtf8 = previous; }
+	} restoreStringEncoding { previousStringEncoding };
 
 	HMODULE module = nullptr;
 	const LIB_INFO* libInfo = nullptr;
@@ -1439,6 +1505,7 @@ bool TryLoadSupportLibraryDump(
 		outError = attemptError;
 		return false;
 	}
+	g_supportLibraryStringsAreUtf8 = DetectUtf8MetadataStrings(libInfo);
 
 	outDump.filePath = PathToUtf8(filePath);
 	outDump.fileName = PathToUtf8(filePath.filename());

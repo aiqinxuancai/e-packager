@@ -157,7 +157,7 @@ const char* kRuntimeSource = R"CPP(
 namespace ert {
 using EPointer = std::uintptr_t;
 using EIntPtr = std::intptr_t;
-#if !defined(_WIN64)
+#if !defined(_WIN64) && defined(ECOMPILER_LEGACY_X86_RUNTIME)
 // 旧版 FNE 可能直接引用 MSVCRT 的 getenv/_putenv。宿主使用现代 CRT
 // 时它们可能维护独立的 CRT 环境副本，因此统一桥接到进程环境 API，
 // 保证不同编译器运行时之间的环境变量状态一致。
@@ -1219,7 +1219,10 @@ public:
 		error_ = &error;
 		result_ = &result;
 		result = {};
-		result.text = kRuntimeSource;
+		if (program_.useLegacyX86RuntimeBridge) {
+			result.text = "#define ECOMPILER_LEGACY_X86_RUNTIME 1\n";
+		}
+		result.text += kRuntimeSource;
 		body_ << "\nusing namespace ert;\n";
 		EmitGlobals();
 		const auto startup = program_.methodByName.find("_启动子程序");
@@ -1947,7 +1950,8 @@ private:
 			if (const DllCommand* dll = ResolveDllCommand(callee.text, argumentCount)) return EmitDllCall(method, *dll, node);
 			const auto binding = ResolveGlobalCommand(callee.text, argumentCount);
 			if (!binding) {
-				Fail(method.sourceFile + ": unknown_call:" + callee.text + "/" + std::to_string(argumentCount)); return "Empty()";
+				Fail(method.sourceFile + ": unknown_call:" + callee.text + "/" + std::to_string(argumentCount));
+				return "Empty()";
 			}
 			return EmitFneCall(method, *binding, node, nullptr);
 		}
@@ -2505,14 +2509,19 @@ extern "C" ert::EIntPtr __stdcall BlackMoonFuncForeLibNotifySys(
 				prefix << "ert::DestroyValue(g_" << assemblyIndex << '_' << index << "());";
 		prefix << "for(auto callback:ecompiler_runtime_host::destroyCallbacks)if(callback)callback();using Notify=ert::EIntPtr(__stdcall*)(int,ert::EPointer,ert::EPointer);for(ert::EPointer* item=BlackMoonCalleLibList;item!=nullptr&&*item;++item)reinterpret_cast<Notify>(*item)(ecompiler_nl_free_library_data,0,0);ecompiler_runtime_host::destroyCallbacks.clear();}\n";
 		prefix << "static void ecompiler_safe_destroy(){__try{E_DestroyRes();}__except(EXCEPTION_EXECUTE_HANDLER){}}\n";
-		if (!targetX64) prefix << "int __stdcall AfxWinInit(HINSTANCE,HINSTANCE,LPSTR,int);\n";
+		if (!targetX64 && program_.useLegacyX86RuntimeBridge) {
+			prefix << "int __stdcall AfxWinInit(HINSTANCE,HINSTANCE,LPSTR,int);\n";
+		}
 		prefix << "int nBMProtectESP=0;int nBMProtectEBP=0;\n";
 		if (!program_.buildDll) {
 			if (targetX64) {
 				prefix << "int main(){E_Init();if(!EStartup())ExitProcess(1);const int result=ECodeStart();ecompiler_safe_destroy();return result;}\n";
 			}
-			else {
+			else if (program_.useLegacyX86RuntimeBridge) {
 				prefix << "int main(){ert::InitializeLegacyCrtData();if(!AfxWinInit(GetModuleHandleA(nullptr),nullptr,GetCommandLineA(),0))ExitProcess(1);E_Init();if(!EStartup())ExitProcess(1);const int result=ECodeStart();ecompiler_safe_destroy();ExitProcess(static_cast<UINT>(result));}\n";
+			}
+			else {
+				prefix << "int main(){E_Init();if(!EStartup())ExitProcess(1);const int result=ECodeStart();ecompiler_safe_destroy();return result;}\n";
 			}
 		}
 		result_->text += prefix.str();

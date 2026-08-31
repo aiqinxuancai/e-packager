@@ -29,11 +29,6 @@ namespace {
 
 using json = nlohmann::json;
 
-std::filesystem::path DefaultCompilerPath()
-{
-	return L"C:\\Users\\aiqin\\OneDrive\\e5.6\\linker\\VC2022Linker\\bin\\cl.exe";
-}
-
 std::wstring Quote(const std::filesystem::path& path)
 {
 	return L"\"" + path.wstring() + L"\"";
@@ -129,15 +124,15 @@ bool ReadBlackMoonAdapterSelection(
 	CoreArchiveSelection& selection)
 {
 	selection = {};
-	if (architecture != TargetArchitecture::X64) return false;
 	const std::filesystem::path manifestPath = directory / L"krnln_adapter.json";
 	if (!IsRegularFile(manifestPath)) return false;
+	const std::string architectureName = architecture == TargetArchitecture::X64 ? "x64" : "x86";
 	std::ifstream input(manifestPath, std::ios::binary);
 	if (!input) return false;
 	try {
 		const json manifest = json::parse(input);
 		if (manifest.value("formatVersion", 0) != 1 ||
-			manifest.value("architecture", std::string()) != "x64" ||
+			manifest.value("architecture", std::string()) != architectureName ||
 			manifest.value("abi", std::string()) != "ecompiler-fne-execute-v1") {
 			return false;
 		}
@@ -195,15 +190,19 @@ bool DiscoverBuildEnvironment(
 	wchar_t configured[MAX_PATH] {};
 	if (GetEnvironmentVariableW(L"VCToolsInstallDir", configured, MAX_PATH) > 0) vcTools = configured;
 	if (vcTools.empty() || !std::filesystem::is_directory(vcTools)) {
-		const std::filesystem::path visualStudioRoot = L"C:\\Program Files\\Microsoft Visual Studio";
 		std::error_code filesystemError;
 		std::vector<std::filesystem::path> candidates;
-		for (const auto& version : std::filesystem::directory_iterator(visualStudioRoot, filesystemError)) {
-			if (!version.is_directory(filesystemError)) continue;
-			for (const auto& edition : std::filesystem::directory_iterator(version.path(), filesystemError)) {
-				if (!edition.is_directory(filesystemError)) continue;
-				const auto candidate = LatestVersionDirectory(edition.path() / L"VC" / L"Tools" / L"MSVC");
-				if (!candidate.empty() && IsRegularFile(candidate / L"include" / L"vector")) candidates.push_back(candidate);
+		for (const auto& visualStudioRoot : {
+			std::filesystem::path(L"C:\\Program Files\\Microsoft Visual Studio"),
+			std::filesystem::path(L"C:\\Program Files (x86)\\Microsoft Visual Studio")
+		}) {
+			for (const auto& version : std::filesystem::directory_iterator(visualStudioRoot, filesystemError)) {
+				if (!version.is_directory(filesystemError)) continue;
+				for (const auto& edition : std::filesystem::directory_iterator(version.path(), filesystemError)) {
+					if (!edition.is_directory(filesystemError)) continue;
+					const auto candidate = LatestVersionDirectory(edition.path() / L"VC" / L"Tools" / L"MSVC");
+					if (!candidate.empty() && IsRegularFile(candidate / L"include" / L"vector")) candidates.push_back(candidate);
+				}
 			}
 		}
 		if (!candidates.empty()) {
@@ -211,7 +210,23 @@ bool DiscoverBuildEnvironment(
 			vcTools = candidates.front();
 		}
 	}
-	const std::filesystem::path windowsKit = LatestVersionDirectory(L"C:\\Program Files (x86)\\Windows Kits\\10\\Include");
+	std::filesystem::path windowsKitRoot;
+	wchar_t sdkDirectory[MAX_PATH * 4]{};
+	if (GetEnvironmentVariableW(L"WindowsSdkDir", sdkDirectory, std::size(sdkDirectory)) > 0) {
+		windowsKitRoot = std::filesystem::path(sdkDirectory) / L"Include";
+	}
+	if (windowsKitRoot.empty() || !std::filesystem::is_directory(windowsKitRoot)) {
+		for (const auto& candidate : {
+			std::filesystem::path(L"C:\\Program Files (x86)\\Windows Kits\\10\\Include"),
+			std::filesystem::path(L"C:\\Program Files\\Windows Kits\\10\\Include")
+		}) {
+			if (std::filesystem::is_directory(candidate)) {
+				windowsKitRoot = candidate;
+				break;
+			}
+		}
+	}
+	const std::filesystem::path windowsKit = LatestVersionDirectory(windowsKitRoot);
 	if (vcTools.empty() || windowsKit.empty()) {
 		error = "visual_cpp_or_windows_sdk_not_found";
 		return false;
@@ -532,7 +547,7 @@ bool DecodeSourceWithX86Helper(
 {
 	const std::filesystem::path decoder = ResolveX86DecoderPath(options);
 	if (decoder.empty()) {
-		error = "x64_source_decoder_not_found:provide --x86-decoder or E_PACKAGER_X86_DECODER";
+		error = "semantic_source_decoder_not_found:provide --x86-decoder or E_PACKAGER_X86_DECODER";
 		return false;
 	}
 	std::filesystem::path directory;
@@ -546,12 +561,12 @@ bool DecodeSourceWithX86Helper(
 		directory / L"decode.log",
 		processOutput,
 		error)) {
-		error = "x64_source_decode_failed:" + error;
+		error = "semantic_source_decode_failed:" + error;
 		return false;
 	}
 	if (!IsRegularFile(directory / L"project" / L"_meta.json") ||
 		!IsRegularFile(directory / L"project" / L".module.json")) {
-		error = "x64_source_decode_output_invalid:" + PathToUtf8(directory);
+		error = "semantic_source_decode_output_invalid:" + PathToUtf8(directory);
 		return false;
 	}
 	return true;
@@ -696,7 +711,7 @@ std::filesystem::path FindStaticLibraryInDirectories(
 	return {};
 }
 
-struct X64LibraryRoots {
+struct CoreLibraryRoots {
 	std::filesystem::path staticLibraryDirectory;
 	std::filesystem::path metadataDirectory;
 	CoreArchiveSelection coreArchive;
@@ -705,24 +720,27 @@ struct X64LibraryRoots {
 
 void AddRootCandidates(
 	std::vector<std::filesystem::path>& roots,
-	const std::filesystem::path& root)
+	const std::filesystem::path& root,
+	const TargetArchitecture architecture)
 {
 	if (root.empty()) return;
 	if (IsRegularFile(root)) {
 		AppendUniquePath(roots, root.parent_path());
 		return;
 	}
-	// Accept either a product root or a directly supplied lib\x64/
-	// static_lib\x64 directory.  Walking only two parents keeps discovery
-	// deterministic while covering the layouts used by the E toolchain.
+	const std::filesystem::path architectureDirectory =
+		architecture == TargetArchitecture::X64 ? L"x64" : L"x86";
+	// Accept either a product root or a directly supplied lib/<arch>/
+	// static_lib/<arch> directory. Walking a few parents keeps discovery
+	// deterministic while covering release, product, and bin/<arch>/ layouts.
 	std::filesystem::path base = root;
-	for (unsigned int depth = 0; depth < 3 && !base.empty(); ++depth) {
+	for (unsigned int depth = 0; depth < 5 && !base.empty(); ++depth) {
 		AppendUniquePath(roots, base);
-		AppendUniquePath(roots, base / L"static_lib" / L"x64");
-		AppendUniquePath(roots, base / L"lib" / L"x64");
+		AppendUniquePath(roots, base / L"static_lib" / architectureDirectory);
+		AppendUniquePath(roots, base / L"lib" / architectureDirectory);
 		AppendUniquePath(roots, base / L"static_lib");
 		AppendUniquePath(roots, base / L"lib");
-		AppendUniquePath(roots, base / L"x64");
+		AppendUniquePath(roots, base / architectureDirectory);
 		const std::filesystem::path parent = base.parent_path();
 		if (parent == base) break;
 		base = parent;
@@ -745,43 +763,55 @@ std::filesystem::path FindCoreStaticArchive(
 	return {};
 }
 
-X64LibraryRoots ResolveX64LibraryRoots(
+CoreLibraryRoots ResolveCoreLibraryRoots(
 	const Options& options,
+	const TargetArchitecture architecture,
 	const std::filesystem::path& compiler,
 	const std::filesystem::path& productRoot)
 {
 	std::vector<std::filesystem::path> roots;
-	if (!options.blackMoonX64Directories.empty()) {
+	if (!options.blackMoonCoreDirectories.empty()) {
+		for (const auto& directory : options.blackMoonCoreDirectories) {
+			AddRootCandidates(roots, AbsolutePath(directory), architecture);
+		}
+	}
+	else if (!options.blackMoonCoreDirectory.empty()) {
+		AddRootCandidates(roots, AbsolutePath(options.blackMoonCoreDirectory), architecture);
+	}
+	if (architecture == TargetArchitecture::X64) {
 		for (const auto& directory : options.blackMoonX64Directories) {
-			AddRootCandidates(roots, AbsolutePath(directory));
+			AddRootCandidates(roots, AbsolutePath(directory), architecture);
+		}
+		if (!options.blackMoonX64Directory.empty()) {
+			AddRootCandidates(roots, AbsolutePath(options.blackMoonX64Directory), architecture);
 		}
 	}
-	else if (!options.blackMoonX64Directory.empty()) {
-		AddRootCandidates(roots, AbsolutePath(options.blackMoonX64Directory));
+	wchar_t configured[MAX_PATH * 4]{};
+	if (GetEnvironmentVariableW(L"E_PACKAGER_BLACKMOON_CORE_DIR", configured, std::size(configured)) > 0) {
+		AddRootCandidates(roots, AbsolutePath(std::filesystem::path(configured)), architecture);
 	}
-	else {
-		wchar_t configured[MAX_PATH * 4]{};
-		if (GetEnvironmentVariableW(L"E_PACKAGER_BLACKMOON_X64_DIR", configured, std::size(configured)) > 0) {
-			AddRootCandidates(roots, AbsolutePath(std::filesystem::path(configured)));
-		}
+	const wchar_t* architectureEnvironment = architecture == TargetArchitecture::X64
+		? L"E_PACKAGER_BLACKMOON_X64_DIR" : L"E_PACKAGER_BLACKMOON_X86_DIR";
+	if (GetEnvironmentVariableW(architectureEnvironment, configured, std::size(configured)) > 0) {
+		AddRootCandidates(roots, AbsolutePath(std::filesystem::path(configured)), architecture);
 	}
-	if (!options.blackMoonDirectory.empty()) AddRootCandidates(roots, AbsolutePath(options.blackMoonDirectory));
-	if (!options.libraryPath.empty()) AddRootCandidates(roots, AbsolutePath(options.libraryPath));
-	if (!options.eIdePath.empty()) AddRootCandidates(roots, AbsolutePath(options.eIdePath).parent_path());
-	AddRootCandidates(roots, productRoot);
-	AddRootCandidates(roots, compiler.parent_path());
-	AddRootCandidates(roots, Utf8PathToPath(GetBasePath()));
+	if (!options.blackMoonDirectory.empty()) AddRootCandidates(roots, AbsolutePath(options.blackMoonDirectory), architecture);
+	if (!options.libraryPath.empty()) AddRootCandidates(roots, AbsolutePath(options.libraryPath), architecture);
+	if (!options.eIdePath.empty()) AddRootCandidates(roots, AbsolutePath(options.eIdePath).parent_path(), architecture);
+	AddRootCandidates(roots, productRoot, architecture);
+	AddRootCandidates(roots, compiler.parent_path(), architecture);
+	AddRootCandidates(roots, Utf8PathToPath(GetBasePath()), architecture);
 
-	X64LibraryRoots result;
+	CoreLibraryRoots result;
 	for (const auto& root : roots) {
 		if (result.staticLibraryDirectory.empty()) {
 			CoreArchiveSelection adapterArchive;
-			if (ReadBlackMoonAdapterSelection(root, TargetArchitecture::X64, adapterArchive)) {
+			if (ReadBlackMoonAdapterSelection(root, architecture, adapterArchive)) {
 				result.staticLibraryDirectory = adapterArchive.primaryArchive.parent_path();
 				result.coreArchive = std::move(adapterArchive);
 			}
 			else {
-				const auto coreArchive = FindCoreStaticArchive(root, TargetArchitecture::X64);
+				const auto coreArchive = FindCoreStaticArchive(root, architecture);
 				if (!coreArchive.empty()) result.staticLibraryDirectory = coreArchive.parent_path();
 			}
 		}
@@ -791,10 +821,10 @@ X64LibraryRoots ResolveX64LibraryRoots(
 	}
 	for (const auto& root : roots) {
 		CoreArchiveSelection adapterArchive;
-		if (ReadBlackMoonAdapterSelection(root, TargetArchitecture::X64, adapterArchive)) {
+		if (ReadBlackMoonAdapterSelection(root, architecture, adapterArchive)) {
 			AppendUniquePath(result.searchDirectories, root);
 		}
-		if (!FindCoreStaticArchive(root, TargetArchitecture::X64).empty()) AppendUniquePath(result.searchDirectories, root);
+		if (!FindCoreStaticArchive(root, architecture).empty()) AppendUniquePath(result.searchDirectories, root);
 		if (IsRegularFile(root / L"krnln.fne")) AppendUniquePath(result.searchDirectories, root);
 	}
 	return result;
@@ -841,7 +871,7 @@ bool ResolveToolchain(
 {
 	if (outIncludeDirectories != nullptr) outIncludeDirectories->clear();
 	if (outSystemLibraryDirectories != nullptr) outSystemLibraryDirectories->clear();
-	if (architecture == TargetArchitecture::X64 && options.compilerPath.empty()) {
+	if (options.compilerPath.empty()) {
 		std::vector<std::filesystem::path> includeDirectories;
 		std::vector<std::filesystem::path> systemLibraryDirectories;
 		if (!DiscoverBuildEnvironment(
@@ -852,18 +882,18 @@ bool ResolveToolchain(
 		if (outSystemLibraryDirectories != nullptr) *outSystemLibraryDirectories = systemLibraryDirectories;
 	}
 	else {
-		compiler = options.compilerPath.empty() ? DefaultCompilerPath() : options.compilerPath;
+		compiler = options.compilerPath;
 	}
 	linker = options.linkerPath.empty() ? compiler.parent_path() / L"link.exe" : options.linkerPath;
 	productRoot = ProductRootFromCompiler(compiler);
 	if (options.libraryPath.empty()) {
-		vcLibrary = compiler.parent_path().parent_path() / L"lib";
-		if (architecture == TargetArchitecture::X64 &&
-			outSystemLibraryDirectories != nullptr && !outSystemLibraryDirectories->empty()) {
+		if (outSystemLibraryDirectories != nullptr && !outSystemLibraryDirectories->empty()) {
 			vcLibrary = outSystemLibraryDirectories->front();
 		}
-		if (architecture == TargetArchitecture::X64 &&
-			(outSystemLibraryDirectories == nullptr || outSystemLibraryDirectories->empty())) {
+		else {
+			vcLibrary = compiler.parent_path().parent_path() / L"lib";
+		}
+		if (outSystemLibraryDirectories == nullptr || outSystemLibraryDirectories->empty()) {
 			std::vector<std::filesystem::path> includeDirectories;
 			std::vector<std::filesystem::path> systemLibraryDirectories;
 			std::filesystem::path discoveredCompiler;
@@ -896,14 +926,19 @@ bool Compile(
 	const TargetArchitecture targetArchitecture = options.targetArchitecture == TargetArchitecture::Host
 		? HostTargetArchitecture() : options.targetArchitecture;
 	const bool targetX64 = targetArchitecture == TargetArchitecture::X64;
-	if (options.compileMode == CompileMode::BlackMoon && targetArchitecture == TargetArchitecture::X86) {
-		return blackmoon_compiler::Compile(inputPath, outputPath, options, result);
+	CompileMode effectiveCompileMode = options.compileMode;
+	if (effectiveCompileMode == CompileMode::BlackMoonCompatibility) {
+		effectiveCompileMode = targetArchitecture == TargetArchitecture::X86
+			? CompileMode::LegacyBlackMoon : CompileMode::Semantic;
 	}
-	if (options.compileMode == CompileMode::NativeCpp && targetArchitecture == TargetArchitecture::X64) {
-		result = {};
-		result.outputPath = outputPath;
-		result.message = "native_compile_mode_x64_not_supported";
-		return false;
+	if (effectiveCompileMode == CompileMode::LegacyBlackMoon) {
+		if (targetArchitecture != TargetArchitecture::X86) {
+			result = {};
+			result.outputPath = outputPath;
+			result.message = "legacy_blackmoon_requires_x86";
+			return false;
+		}
+		return blackmoon_compiler::Compile(inputPath, outputPath, options, result);
 	}
 	result = {};
 	result.outputPath = outputPath;
@@ -920,30 +955,26 @@ bool Compile(
 		result.message = error;
 		return false;
 	}
-	X64LibraryRoots x64Roots;
+	CoreLibraryRoots coreRoots = ResolveCoreLibraryRoots(
+		options, targetArchitecture, compiler, productRoot);
+	const bool usesModernCoreAdapter = coreRoots.coreArchive.adapter;
 	std::vector<std::filesystem::path> supportLibrarySearchDirectories;
-	if (targetArchitecture == TargetArchitecture::X64) {
-		x64Roots = ResolveX64LibraryRoots(options, compiler, productRoot);
-		supportLibrarySearchDirectories = x64Roots.searchDirectories;
-		if (!x64Roots.staticLibraryDirectory.empty()) {
-			AppendUniquePath(supportLibrarySearchDirectories, x64Roots.staticLibraryDirectory);
-		}
-		if (!x64Roots.metadataDirectory.empty()) {
-			AppendUniquePath(supportLibrarySearchDirectories, x64Roots.metadataDirectory);
-		}
-		if (x64Roots.staticLibraryDirectory.empty()) {
-			result.message = "x64_blackmoon_core_library_not_found:provide --blackmoon-x64-dir";
-			return false;
-		}
+	supportLibrarySearchDirectories = coreRoots.searchDirectories;
+	if (!coreRoots.staticLibraryDirectory.empty()) {
+		AppendUniquePath(supportLibrarySearchDirectories, coreRoots.staticLibraryDirectory);
 	}
-	else {
-		supportLibrarySearchDirectories.push_back(productRoot / L"lib");
+	if (!coreRoots.metadataDirectory.empty()) {
+		AppendUniquePath(supportLibrarySearchDirectories, coreRoots.metadataDirectory);
 	}
+	if (targetArchitecture == TargetArchitecture::X64 && coreRoots.staticLibraryDirectory.empty()) {
+		result.message = "semantic_core_library_not_found:provide --blackmoon-core-dir";
+		return false;
+	}
+	AppendUniquePath(supportLibrarySearchDirectories, productRoot / L"lib");
 	std::filesystem::path bundleInput = inputPath;
 	TemporaryDirectoryGuard sourceDecoderDirectory;
 	std::error_code inputTypeError;
-	if (targetArchitecture == TargetArchitecture::X64 &&
-		std::filesystem::is_regular_file(inputPath, inputTypeError) &&
+	if (std::filesystem::is_regular_file(inputPath, inputTypeError) &&
 		inputPath.extension() == L".e") {
 		if (!DecodeSourceWithX86Helper(inputPath, options, sourceDecoderDirectory, error)) {
 			result.message = error;
@@ -955,7 +986,7 @@ bool Compile(
 	std::filesystem::path inputRoot;
 	e2txt::ReadOptions readOptions;
 	readOptions.supportLibrarySearchDirectories = supportLibrarySearchDirectories;
-	readOptions.restrictSupportLibrarySearch = targetArchitecture == TargetArchitecture::X64;
+	readOptions.restrictSupportLibrarySearch = targetArchitecture == TargetArchitecture::X64 || usesModernCoreAdapter;
 	if (!ReadInputBundle(bundleInput, bundle, inputRoot, readOptions, error)) {
 		result.message = error;
 		return false;
@@ -967,11 +998,12 @@ bool Compile(
 	Program program;
 	if (!BuildCompilerModel(
 		std::move(bundle), inputRoot, supportLibrarySearchDirectories, options.conditionMacros,
-		targetArchitecture, program, error)) {
+		targetArchitecture, readOptions.restrictSupportLibrarySearch, program, error)) {
 		result.message = "compiler_model_failed:" + error;
 		return false;
 	}
 	program.buildDll = options.buildDll || outputPath.extension() == L".dll";
+	program.useLegacyX86RuntimeBridge = !targetX64 && !usesModernCoreAdapter;
 	GeneratedSource generated;
 	if (!EmitCppSource(program, generated, error)) {
 		result.message = "source_generation_failed:" + error;
@@ -1045,11 +1077,12 @@ bool Compile(
 		result.message = error;
 		return false;
 	}
-	const std::filesystem::path staticLibrary = targetX64
-		? x64Roots.staticLibraryDirectory : productRoot / L"static_lib";
+	const std::filesystem::path staticLibrary = coreRoots.staticLibraryDirectory.empty()
+		? productRoot / L"static_lib" : coreRoots.staticLibraryDirectory;
 	const std::filesystem::path vc6RuntimeLibrary = productRoot / L"linker" / L"VC6linker" / L"Lib" / L"MSVCRT.LIB";
 	const std::filesystem::path mfcLibrary = vcLibrary / L"NAFXCW.LIB";
-	if (!targetX64) {
+	const bool useLegacyX86Runtime = !targetX64 && !usesModernCoreAdapter;
+	if (useLegacyX86Runtime) {
 		for (const std::filesystem::path& required : { mfcLibrary }) {
 			if (!IsRegularFile(required)) {
 				result.message = "mfc_runtime_file_not_found:" + PathToUtf8(required);
@@ -1075,8 +1108,8 @@ bool Compile(
 		if (library.dependency.fileName != "krnln") continue;
 		usesCoreLibrary = true;
 		std::filesystem::path path;
-		if (targetX64 && x64Roots.coreArchive.adapter) {
-			path = x64Roots.coreArchive.primaryArchive;
+		if (coreRoots.coreArchive.adapter) {
+			path = coreRoots.coreArchive.primaryArchive;
 			usesBlackMoonCoreAdapter = true;
 		}
 		else {
@@ -1088,7 +1121,7 @@ bool Compile(
 		}
 		AppendUniquePath(supportLibraries, path);
 		if (usesBlackMoonCoreAdapter) {
-			AppendUniquePath(supportLibraries, x64Roots.coreArchive.fallbackArchive);
+			AppendUniquePath(supportLibraries, coreRoots.coreArchive.fallbackArchive);
 		}
 		break;
 	}
@@ -1119,7 +1152,7 @@ bool Compile(
 			if (!artifact.empty()) AppendUniquePath(supportLibraries, artifact);
 		}
 	}
-	if (usesCoreLibrary && !targetX64) {
+	if (usesCoreLibrary && useLegacyX86Runtime) {
 		// The stock core archive contains its database/media bridge entry points
 		// but does not publish those two transitive archives through the FNE
 		// notification table.  They are archive-level dependencies, independent
@@ -1134,9 +1167,9 @@ bool Compile(
 		}
 	}
 	std::vector<std::wstring> linkerArguments;
-	if (targetX64) {
+	if (targetX64 || usesModernCoreAdapter) {
 		linkerArguments = {
-			L"/NOLOGO", L"/SUBSYSTEM:CONSOLE", L"/MACHINE:X64", L"/INCREMENTAL:NO", L"/OPT:REF",
+			L"/NOLOGO", L"/SUBSYSTEM:CONSOLE", targetX64 ? L"/MACHINE:X64" : L"/MACHINE:I386", L"/INCREMENTAL:NO", L"/OPT:REF",
 			L"/LIBPATH:" + Quote(vcLibrary), L"/OUT:" + Quote(outputPath), Quote(result.objectPath),
 		};
 	}
@@ -1163,7 +1196,7 @@ bool Compile(
 	}
 	for (const auto& library : supportLibraries) linkerArguments.push_back(Quote(library));
 	for (const auto& library : generatedImportLibraries) linkerArguments.push_back(Quote(library));
-	if (!targetX64) linkerArguments.push_back(Quote(vc6RuntimeLibrary));
+	if (useLegacyX86Runtime) linkerArguments.push_back(Quote(vc6RuntimeLibrary));
 	// The VC6/MFC compatibility archive is intentionally linked for the same
 	// ABI used by classic FNEs.  Its old object files do not consistently carry
 	// all of their import-library directives, so provide the platform imports
@@ -1199,7 +1232,7 @@ bool Compile(
 	result.ok = true;
 	result.message =
 		"compiled:" + PathToUtf8(outputPath) +
-		";compile_mode=" + (targetX64 ? std::string("blackmoon") : std::string("native")) +
+		";compile_mode=semantic" +
 		";arch=" + (targetX64 ? std::string("x64") : std::string("x86")) +
 		";methods=" + std::to_string(generated.reachableMethodCount) +
 		";commands=" + std::to_string(generated.reachableCommandCount) +

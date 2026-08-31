@@ -1,6 +1,7 @@
 ﻿#include "CompilerModel.h"
 
 #include "../PathHelper.h"
+#include "../EFolderCodec.h"
 
 #include <Windows.h>
 
@@ -122,35 +123,76 @@ bool ExpandEComDependencies(
 		const std::string identity = dependency.resolvedPath.empty() ? dependency.path : dependency.resolvedPath;
 		if (!knownECom.insert(identity).second) continue;
 		std::error_code ec;
-		std::filesystem::path path = dependency.resolvedPath.empty() ? Utf8PathToPath(dependency.path) : Utf8PathToPath(dependency.resolvedPath);
-		if (!path.is_absolute()) {
-			if (!dependency.localWorkspace.empty()) path = inputRoot / Utf8PathToPath(dependency.localWorkspace);
-			else path = inputRoot / path;
+		e2txt::ProjectBundle module;
+		std::string moduleError;
+		std::filesystem::path workspacePath;
+		std::filesystem::path moduleFilePath;
+		if (!dependency.localWorkspace.empty()) {
+			workspacePath = Utf8PathToPath(dependency.localWorkspace);
+			if (workspacePath.is_relative()) workspacePath = inputRoot / workspacePath;
 		}
-		if (!path.is_absolute() || !std::filesystem::exists(path)) {
-			const auto candidates = BuildModuleFileLookupCandidates(inputRoot, dependency.path);
-			for (const auto& candidate : candidates) {
-				if (std::filesystem::is_regular_file(candidate, ec)) {
-					path = candidate;
+		bool moduleLoaded = false;
+		// Native `.e` decoding already materializes each embedded `.ec` under
+		// ecom/<name>. Prefer that semantic workspace: it was decoded by the
+		// authoritative x86 helper and therefore retains the module's original
+		// support-library command indices. Re-decoding the old `.ec` with a
+		// target-architecture FNE can silently rename calls when command tables
+		// evolved between core releases.
+		bool workspaceHasUnresolvedImportedTypes = false;
+		if (!workspacePath.empty() && std::filesystem::is_directory(workspacePath, ec)) {
+			// Ordinary unpacking omits imported module pages. Such a workspace
+			// retains generated `_Cls_0x...` type references without their class
+			// declarations; use the compiler-bundle reader below in that case.
+			std::error_code iteratorError;
+			for (const auto& entry : std::filesystem::recursive_directory_iterator(workspacePath, iteratorError)) {
+				if (!entry.is_regular_file(iteratorError) || entry.path().extension() != L".txt") continue;
+				std::ifstream sourceInput(entry.path(), std::ios::binary);
+				std::ostringstream sourceBuffer;
+				sourceBuffer << sourceInput.rdbuf();
+				if (sourceBuffer.str().find("_Cls_0x") != std::string::npos) {
+					workspaceHasUnresolvedImportedTypes = true;
 					break;
 				}
 			}
 		}
-		if (!std::filesystem::is_regular_file(path, ec)) {
-			error = "ecom_module_not_found:" + PathToUtf8(path);
-			return false;
+		if (!workspacePath.empty() && !workspaceHasUnresolvedImportedTypes &&
+			std::filesystem::is_directory(workspacePath, ec)) {
+			e2txt::BundleDirectoryCodec codec;
+			moduleLoaded = codec.ReadBundle(PathToUtf8(workspacePath), module, &moduleError);
+			if (!moduleLoaded) {
+				error = "ecom_module_workspace_read_failed:" + PathToUtf8(workspacePath) + ":" + moduleError;
+				return false;
+			}
 		}
-		e2txt::Generator generator;
-		e2txt::ProjectBundle module;
-		std::string moduleError;
-		// `.ec` 内部已经保存了上游模块的导入实现。编译模式必须读取
-		// 这些隐藏函数和声明，不能把模块再次降级为外部源码依赖。
-		if (!generator.GenerateCompilerBundle(PathToUtf8(path), module, &moduleError, readOptions)) {
-			error = "ecom_module_read_failed:" + PathToUtf8(path) + ":" + moduleError;
-			return false;
+		if (!moduleLoaded) {
+			std::filesystem::path path = dependency.resolvedPath.empty() ? Utf8PathToPath(dependency.path) : Utf8PathToPath(dependency.resolvedPath);
+			if (!path.is_absolute()) path = inputRoot / path;
+			if (!std::filesystem::is_regular_file(path, ec)) {
+				const auto candidates = BuildModuleFileLookupCandidates(inputRoot, dependency.path);
+				for (const auto& candidate : candidates) {
+					if (std::filesystem::is_regular_file(candidate, ec)) {
+						path = candidate;
+						break;
+					}
+				}
+			}
+			moduleFilePath = path;
+			if (!std::filesystem::is_regular_file(path, ec)) {
+				error = "ecom_module_not_found:" + PathToUtf8(path);
+				return false;
+			}
+			// `.ec` 内部已经保存了上游模块的导入实现。编译模式必须读取
+			// 这些隐藏函数和声明，不能把模块再次降级为外部源码依赖。
+			e2txt::Generator generator;
+			if (!generator.GenerateCompilerBundle(PathToUtf8(path), module, &moduleError, readOptions)) {
+				error = "ecom_module_read_failed:" + PathToUtf8(path) + ":" + moduleError;
+				return false;
+			}
 		}
 		const std::string moduleSourcePrefix = "ecom/" +
-			(!module.projectName.empty() ? module.projectName : PathToUtf8(path.stem()));
+			(!module.projectName.empty()
+				? module.projectName
+				: (!moduleFilePath.empty() ? PathToUtf8(moduleFilePath.stem()) : workspacePath.filename().string()));
 		for (auto source : module.sourceFiles) {
 			const std::string sourcePath = source.relativePath.empty() ? source.logicalName : source.relativePath;
 			source.relativePath = moduleSourcePrefix + "/" + sourcePath;
@@ -2265,6 +2307,7 @@ bool BuildCompilerModel(
 	const std::vector<std::filesystem::path>& supportLibrarySearchDirectories,
 	const std::vector<std::string>& conditionMacros,
 	const TargetArchitecture targetArchitecture,
+	const bool restrictSupportLibrarySearch,
 	Program& outProgram,
 	std::string& outError)
 {
@@ -2275,7 +2318,7 @@ bool BuildCompilerModel(
 	outProgram.targetArchitecture = targetArchitecture;
 	e2txt::ReadOptions moduleReadOptions;
 	moduleReadOptions.supportLibrarySearchDirectories = supportLibrarySearchDirectories;
-	moduleReadOptions.restrictSupportLibrarySearch = targetArchitecture == TargetArchitecture::X64;
+	moduleReadOptions.restrictSupportLibrarySearch = restrictSupportLibrarySearch;
 	if (!ExpandEComDependencies(outProgram.bundle, inputRoot, moduleReadOptions, outError)) return false;
 	for (std::string macro : conditionMacros) {
 		std::transform(macro.begin(), macro.end(), macro.begin(), [](const unsigned char value) {

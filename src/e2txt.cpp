@@ -2966,6 +2966,49 @@ const LIB_INFO* CallGetLibInfoSafely(const PFN_GET_LIB_INFO getInfoProc)
 #endif
 }
 
+thread_local bool g_supportLibraryStringsAreUtf8 = false;
+
+bool IsUtf8SupportLibraryField(const char* text)
+{
+	const size_t length = GetSafeCStringLength(text, kMaxSupportLibraryStringLength);
+	if (length == static_cast<size_t>(-1) || length == 0) return false;
+	const std::string raw(text, length);
+	const bool hasNonAscii = std::any_of(raw.begin(), raw.end(), [](const unsigned char value) {
+		return value >= 0x80;
+	});
+	if (!hasNonAscii) return false;
+	return MultiByteToWideChar(
+		CP_UTF8, MB_ERR_INVALID_CHARS, raw.data(), static_cast<int>(raw.size()), nullptr, 0) > 0;
+}
+
+bool DetectUtf8SupportLibraryStrings(const LIB_INFO* libInfo)
+{
+	if (libInfo == nullptr) return false;
+	unsigned int utf8FieldCount = 0;
+	for (const char* field : { libInfo->m_szName, libInfo->m_szExplain, libInfo->m_szAuthor }) {
+		if (IsUtf8SupportLibraryField(field)) ++utf8FieldCount;
+	}
+	// A legacy GBK byte sequence can occasionally pass a UTF-8 validity test.
+	// Requiring agreement across independent identity fields avoids changing a
+	// classic FNE's encoding because of one accidental byte sequence.
+	return utf8FieldCount >= 2;
+}
+
+class SupportLibraryStringEncodingScope {
+public:
+	explicit SupportLibraryStringEncodingScope(const bool utf8)
+		: previous_(g_supportLibraryStringsAreUtf8)
+	{
+		g_supportLibraryStringsAreUtf8 = utf8;
+	}
+	~SupportLibraryStringEncodingScope()
+	{
+		g_supportLibraryStringsAreUtf8 = previous_;
+	}
+private:
+	bool previous_ = false;
+};
+
 std::string ReadSupportLibraryName(const char* text)
 {
 	const size_t length = GetSafeCStringLength(text, kMaxSupportLibraryStringLength);
@@ -3029,6 +3072,31 @@ std::string ReadSupportLibraryName(const char* text)
 	}
 	return local;
 #else
+	if (g_supportLibraryStringsAreUtf8) {
+		const int wideLength = MultiByteToWideChar(
+			CP_UTF8,
+			MB_ERR_INVALID_CHARS,
+			raw.data(),
+			static_cast<int>(raw.size()),
+			nullptr,
+			0);
+		if (wideLength > 0) {
+			std::wstring wide(static_cast<size_t>(wideLength), L'\0');
+			if (MultiByteToWideChar(
+				CP_UTF8, MB_ERR_INVALID_CHARS, raw.data(), static_cast<int>(raw.size()),
+				wide.data(), wideLength) > 0) {
+				const int localLength = WideCharToMultiByte(
+					CP_ACP, 0, wide.data(), wideLength, nullptr, 0, nullptr, nullptr);
+				if (localLength > 0) {
+					std::string local(static_cast<size_t>(localLength), '\0');
+					if (WideCharToMultiByte(
+						CP_ACP, 0, wide.data(), wideLength, local.data(), localLength, nullptr, nullptr) > 0) {
+						return local;
+					}
+				}
+			}
+		}
+	}
 	return raw;
 #endif
 }
@@ -3815,6 +3883,8 @@ private:
 			if (getInfoProc != nullptr) {
 				const LIB_INFO* libInfo = CallGetLibInfoSafely(getInfoProc);
 				if (libInfo != nullptr && IsReadableMemoryRange(libInfo, sizeof(LIB_INFO))) {
+					SupportLibraryStringEncodingScope stringEncoding(
+						DetectUtf8SupportLibraryStrings(libInfo));
 					if (libInfo->m_nCmdCount > 0 &&
 						libInfo->m_nCmdCount <= kMaxSupportLibraryArrayCount &&
 						libInfo->m_pBeginCmdInfo != nullptr &&

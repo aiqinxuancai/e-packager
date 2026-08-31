@@ -653,7 +653,7 @@ bool Compile(
 	}
 	result.ok = true;
 	result.message = "compiled:" + PathToUtf8(effectiveOutput) +
-		";compile_mode=blackmoon;mode=" + ModeName(options.blackMoonMode) +
+		";compile_mode=legacy-blackmoon;mode=" + ModeName(options.blackMoonMode) +
 		";effective_mode=" + ModeName(effectiveMode) +
 		(usedMfcFallback ? ";runtime_fallback=mfc" : "") +
 		";artifact_bytes=" + std::to_string(outputBytes) +

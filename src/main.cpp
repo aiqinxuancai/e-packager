@@ -1510,12 +1510,19 @@ std::string ToLowerAscii(std::string value)
 bool ParseCompileMode(const std::string& text, ecompiler::CompileMode& outMode)
 {
 	const std::string normalized = ToLowerAscii(text);
-	if (normalized == "native" || normalized == "cpp") {
-		outMode = ecompiler::CompileMode::NativeCpp;
+	if (normalized == "semantic" || normalized == "direct" || normalized == "native" || normalized == "cpp") {
+		outMode = ecompiler::CompileMode::Semantic;
 		return true;
 	}
+	if (normalized == "legacy-blackmoon" || normalized == "legacy_bm" ||
+		normalized == "legacy" || normalized == "ecode") {
+		outMode = ecompiler::CompileMode::LegacyBlackMoon;
+		return true;
+	}
+	// Keep existing scripts working: the historical `blackmoon` name selected
+	// the E-code bridge on x86 and the direct compiler on x64.
 	if (normalized == "blackmoon" || normalized == "bm") {
-		outMode = ecompiler::CompileMode::BlackMoon;
+		outMode = ecompiler::CompileMode::BlackMoonCompatibility;
 		return true;
 	}
 	return false;
@@ -2407,7 +2414,7 @@ void PrintUsage()
 	std::cout << Utf8Literal(u8"  e-packager pack <input-dir> <output.e|output.ec> [--password <text>] [--compile-check ...]  # 封包，可选 AutoLinker 无头编译确认") << std::endl;
 	std::cout << Utf8Literal(u8"       --compile-check [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--compile-target auto|win_exe|win_console_exe|win_dll|ecom] [--compile-static] [--compile-timeout <seconds>]") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager validate <input-dir>        # 快速检查声明、基础语法和可确定的类型错误") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager compile <input.e|input-dir> <output.exe|output.dll> [--compile-mode native|blackmoon] [--arch host|x86|x64] [--blackmoon-mode asm|cpp|mfc] [--dll] [--define <macro>]... [--linker <link.exe>] [--lib <lib-dir>] [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--blackmoon-dir <dir>] [--blackmoon-x64-dir <dir>] [--x86-decoder <e-packager.exe>] [--blackmoon-timeout <seconds>]  # 默认源码直编；x64 需 blackmoon 与 x64 核心库（--backend 为兼容别名）") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager compile <input.e|input-dir> <output.exe|output.dll> [--compile-mode semantic|legacy-blackmoon|blackmoon] [--arch host|x86|x64] [--legacy-blackmoon-mode asm|cpp|mfc] [--dll] [--define <macro>]... [--compiler <cl.exe>] [--linker <link.exe>] [--lib <lib-dir>] [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--legacy-blackmoon-dir <dir>] [--blackmoon-core-dir <dir>] [--blackmoon-x86-dir <dir>] [--blackmoon-x64-dir <dir>] [--x86-decoder <e-packager.exe>] [--blackmoon-timeout <seconds>]  # 默认 semantic；blackmoon 为旧命令兼容别名（--backend 为兼容别名）") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager compile-check <input.e|input.ec> [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--compile-target ...] [--compile-static] [--compile-timeout <seconds>]  # 直接执行权威无头编译") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager update <input-dir> [--add-ecom <file.ec>]... [--add-elib <name|file.fne>]... [--add-image <file|name=file>]... [--add-audio <file|name=file>]...   # 刷新派生内容并新增资源") << std::endl;
 #if defined(_M_X64)
@@ -2496,10 +2503,17 @@ int RunCommand(int argc, char* argv[])
 		}
 		CompileCommandOptions commandOptions;
 		ecompiler::Options& options = commandOptions.compilerOptions;
+		const auto appendBlackMoonCoreDirectory = [&options](const std::filesystem::path& directory) {
+			const std::filesystem::path resolved = ResolveAbsolutePath(directory);
+			if (options.blackMoonCoreDirectory.empty()) options.blackMoonCoreDirectory = resolved;
+			options.blackMoonCoreDirectories.push_back(resolved);
+		};
 		const auto appendBlackMoonX64Directory = [&options](const std::filesystem::path& directory) {
 			const std::filesystem::path resolved = ResolveAbsolutePath(directory);
 			if (options.blackMoonX64Directory.empty()) options.blackMoonX64Directory = resolved;
 			options.blackMoonX64Directories.push_back(resolved);
+			if (options.blackMoonCoreDirectory.empty()) options.blackMoonCoreDirectory = resolved;
+			options.blackMoonCoreDirectories.push_back(resolved);
 		};
 		for (int index = 4; index < argc; ++index) {
 			const std::string option = argv[index];
@@ -2508,7 +2522,11 @@ int RunCommand(int argc, char* argv[])
 				continue;
 			}
 			if (option == "--blackmoon") {
-				options.compileMode = ecompiler::CompileMode::BlackMoon;
+				options.compileMode = ecompiler::CompileMode::BlackMoonCompatibility;
+				continue;
+			}
+			if (option == "--legacy-blackmoon") {
+				options.compileMode = ecompiler::CompileMode::LegacyBlackMoon;
 				continue;
 			}
 			if (option == "--arch" && index + 1 < argc) {
@@ -2540,25 +2558,40 @@ int RunCommand(int argc, char* argv[])
 				}
 				continue;
 			}
-			if (option == "--blackmoon-mode" && index + 1 < argc) {
+			if ((option == "--blackmoon-mode" || option == "--legacy-blackmoon-mode") && index + 1 < argc) {
 				if (!ParseBlackMoonMode(argv[++index], options.blackMoonMode)) {
 					PrintUsage();
 					return EXIT_FAILURE;
 				}
-				options.compileMode = ecompiler::CompileMode::BlackMoon;
+				options.compileMode = ecompiler::CompileMode::LegacyBlackMoon;
 				continue;
 			}
-			if (option.rfind("--blackmoon-mode=", 0) == 0) {
-				if (!ParseBlackMoonMode(option.substr(std::string("--blackmoon-mode=").size()), options.blackMoonMode)) {
+			if (option.rfind("--blackmoon-mode=", 0) == 0 || option.rfind("--legacy-blackmoon-mode=", 0) == 0) {
+				const std::string prefix = option.rfind("--legacy-blackmoon-mode=", 0) == 0
+					? "--legacy-blackmoon-mode=" : "--blackmoon-mode=";
+				if (!ParseBlackMoonMode(option.substr(prefix.size()), options.blackMoonMode)) {
 					PrintUsage();
 					return EXIT_FAILURE;
 				}
-				options.compileMode = ecompiler::CompileMode::BlackMoon;
+				options.compileMode = ecompiler::CompileMode::LegacyBlackMoon;
 				continue;
 			}
-			if ((option == "--linker" || option == "--lib") && index + 1 < argc) {
-				if (option == "--linker") options.linkerPath = ResolveAbsolutePath(std::filesystem::path(argv[++index]));
+			if ((option == "--compiler" || option == "--linker" || option == "--lib") && index + 1 < argc) {
+				if (option == "--compiler") options.compilerPath = ResolveAbsolutePath(std::filesystem::path(argv[++index]));
+				else if (option == "--linker") options.linkerPath = ResolveAbsolutePath(std::filesystem::path(argv[++index]));
 				else options.libraryPath = ResolveAbsolutePath(std::filesystem::path(argv[++index]));
+				continue;
+			}
+			if (option.rfind("--compiler=", 0) == 0) {
+				options.compilerPath = ResolveAbsolutePath(std::filesystem::path(option.substr(std::string("--compiler=").size())));
+				continue;
+			}
+			if (option.rfind("--linker=", 0) == 0) {
+				options.linkerPath = ResolveAbsolutePath(std::filesystem::path(option.substr(std::string("--linker=").size())));
+				continue;
+			}
+			if (option.rfind("--lib=", 0) == 0) {
+				options.libraryPath = ResolveAbsolutePath(std::filesystem::path(option.substr(std::string("--lib=").size())));
 				continue;
 			}
 			if ((option == "--define" || option == "-D") && index + 1 < argc) {
@@ -2573,8 +2606,18 @@ int RunCommand(int argc, char* argv[])
 				options.autoLinkerTestPath = ResolveAbsolutePath(std::filesystem::path(argv[++index]));
 				continue;
 			}
-			if (option == "--blackmoon-dir" && index + 1 < argc) {
+			if ((option == "--blackmoon-dir" || option == "--legacy-blackmoon-dir") && index + 1 < argc) {
 				options.blackMoonDirectory = ResolveAbsolutePath(std::filesystem::path(argv[++index]));
+				continue;
+			}
+			if ((option == "--blackmoon-core-dir" || option == "--blackmoon-x86-dir") && index + 1 < argc) {
+				appendBlackMoonCoreDirectory(std::filesystem::path(argv[++index]));
+				continue;
+			}
+			if (option.rfind("--blackmoon-core-dir=", 0) == 0 || option.rfind("--blackmoon-x86-dir=", 0) == 0) {
+				const std::string prefix = option.rfind("--blackmoon-x86-dir=", 0) == 0
+					? "--blackmoon-x86-dir=" : "--blackmoon-core-dir=";
+				appendBlackMoonCoreDirectory(std::filesystem::path(option.substr(prefix.size())));
 				continue;
 			}
 			if (option == "--blackmoon-x64-dir" && index + 1 < argc) {
