@@ -142,7 +142,7 @@ e-packager compile <input.e|input-dir> <output.exe|output.dll> [选项]
 
 | `--compile-mode` | 架构 | 需要什么 |
 | --- | --- | --- |
-| `semantic`（默认，推荐） | x86 / x64 | 一套 Visual C++ 工具链；调用核心库命令时还需同架构的 BlackMoonKernelStaticLib adapter |
+| `semantic`（默认，推荐） | x86 / x64 | 一套 Visual C++ 工具链；调用核心库命令时还需同架构的 BlackMoonModernCore adapter |
 | `legacy-blackmoon` | 仅 x86 | 已安装的易语言、AutoLinker、黑月工具链，以及匹配的传统核心归档 |
 
 `blackmoon` 是兼容旧脚本的别名：x86 下等同于 `legacy-blackmoon`，x64 下等同于 `semantic`。没有特殊需求时用默认的 `semantic` 即可；只有依赖传统黑月工具链、或需要和旧编译产物保持完全一致时才需要 `legacy-blackmoon`。
@@ -180,27 +180,28 @@ e-packager.exe compile MyApp.e .\out\MyApp-console.exe --subsystem console
 
 `--dll` 或 `.dll` 输出始终使用 DLL/Windows 子系统，并由公开子程序生成导出表；它不会被 `--subsystem console` 改成控制台程序。仍包含窗体 XML 或窗口绑定的工程会继续报告 `window_project_not_supported_by_independent_compiler`，因为控件布局和事件生成尚未纳入语义编译器。
 
-#### 需要核心库命令时：下载 adapter
+#### 需要核心库命令时：下载 BlackMoonModernCore adapter
 
-工程如果用到了易语言核心库（黑月核心）里的命令，需要额外下载一份匹配架构的 [BlackMoonKernelStaticLib](https://github.com/aiqinxuancai/BlackMoonKernelStaticLib) adapter。前往 [Releases](https://github.com/aiqinxuancai/BlackMoonKernelStaticLib/releases) 下载对应架构的资产（不要用 GitHub 自动生成的 Source code 压缩包）；带 `beta`/`pre`/`rc` 标记的是预发布版，生产环境请选稳定版：
+工程如果用到了易语言核心库（黑月核心）里的命令，需要额外下载一份匹配架构的 [BlackMoonModernCore](https://github.com/aiqinxuancai/BlackMoonModernCore) adapter。前往 [Releases](https://github.com/aiqinxuancai/BlackMoonModernCore/releases) 下载对应架构的资产（不要用 GitHub 自动生成的 Source code 压缩包）；带 `beta`/`pre`/`rc` 标记的是预发布版，生产环境请选稳定版。
+
+当前 Release 压缩包为了兼容既有脚本，文件名仍使用 `BlackMoonKernelStaticLib-v<版本>...` 前缀；它们属于 **BlackMoonModernCore** 发布物，不需要安装或下载旧的 `BlackMoonKernelStaticLib` 项目：
 
 | 发布资产 | 用途 |
 | --- | --- |
 | `BlackMoonKernelStaticLib-v<版本>-x64.zip` | x64 编译，通常只需下载此文件 |
-| `BlackMoonKernelStaticLib-v<版本>-x86.zip` | x86 编译 |
+| `BlackMoonKernelStaticLib-v<版本>-x86.zip` | x86 编译；同时包含传统黑月链路所需的 `legacy_static_lib\x86\krnln.lib` |
 | `BlackMoonKernelStaticLib-v<版本>.zip` | 同时包含 x86 与 x64 |
-| `BlackMoonKernelStaticLib-v<版本>-vc6.zip` | 仅传统 x86 黑月链路的 VC6 `krnln.lib` |
 
 解压后得到 `adapter` 目录，直接传给编译器即可：
 
 ```powershell
-Expand-Archive "C:\Users\<用户名>\Downloads\BlackMoonKernelStaticLib-v<版本>-x64.zip" "D:\deps\BlackMoonKernelStaticLib" -Force
+Expand-Archive "C:\Users\<用户名>\Downloads\BlackMoonKernelStaticLib-v<版本>-x64.zip" "D:\deps\BlackMoonModernCore" -Force
 
 e-packager.exe compile MyApp.e .\out\MyApp-x86.exe `
-  --arch x86 --blackmoon-x86-dir "D:\deps\BlackMoonKernelStaticLib\adapter"
+  --arch x86 --blackmoon-x86-dir "D:\deps\BlackMoonModernCore\adapter"
 
 e-packager.exe compile MyApp.e .\out\MyApp-x64.exe `
-  --arch x64 --blackmoon-x64-dir "D:\deps\BlackMoonKernelStaticLib\adapter"
+  --arch x64 --blackmoon-x64-dir "D:\deps\BlackMoonModernCore\adapter"
 ```
 
 `--blackmoon-x86-dir` / `--blackmoon-x64-dir` 均可重复传入，用于补充同架构的其他支持库；但核心 adapter 里的 FNE、主归档、后备归档和清单文件必须来自**同一个** Release，不要混用不同版本。`.e` 输入会自动调用 Win32 版 `e-packager` 做权威解码，一般无需干预。
@@ -229,7 +230,7 @@ JSON 诊断始终包含 `phase`、`code`、`file`、`line`、`column`、`message
 源码启用，编译已拆包目录不会暗中修改依赖搜索路径。第三方支持库只有在其发布包或本地配置提供可识别下载源时才能自动取得，
 否则命令会明确报告缺少下载提供方，不会用其他库或函数替代。
 
-`-vc6.zip` 不是 semantic adapter：它只有由 Visual C++ 6.0 生成的传统 x86 `krnln.lib`，没有 `krnln.fne`、`krnln_adapter.json` 或现代包装层。需要使用它时，将压缩包中的 `krnln.lib` 放入传统黑月工具链的库搜索目录（或通过 `--lib` 指定），并按下面的 `legacy-blackmoon` 方式提供完整的 `BlackMoon\bin`、入口对象和 VC6/MFC 运行库；不能把该目录作为 `--blackmoon-x86-dir` 来替代现代 x86 adapter，也不能用于 x64。
+传统 x86 黑月链路所需的 VC6 `krnln.lib` 位于 `BlackMoonModernCore` x86 Release 包的 `legacy_static_lib\x86\krnln.lib`。它不是 semantic adapter，不能替代包含 `krnln.fne`、`krnln_adapter.json` 和现代包装层的 `adapter` 目录；使用时将该归档放入传统黑月工具链的库搜索目录（或通过 `--lib` 指定），并按下面的 `legacy-blackmoon` 方式提供完整的 `BlackMoon\bin`、入口对象和 VC6/MFC 运行库，也不能用于 x64。
 
 #### legacy-blackmoon（传统 x86 黑月）
 
@@ -247,7 +248,7 @@ e-packager.exe compile MyApp.e .\out\MyApp.exe `
 
 若所用的静态库带有 MFC 依赖，`asm`、`cpp` 会在链接失败后自动改用 MFC 入口重试，成功消息中的 `effective_mode` 表示实际生效的入口。不需要 MFC 的工程不受影响。
 
-`BlackMoonKernelStaticLib` 的 [Release](https://github.com/aiqinxuancai/BlackMoonKernelStaticLib/releases) 同时提供现代语义 adapter 与传统归档。传统黑月归档位于 `legacy_static_lib\x86\krnln.lib`，不能覆盖到现代语义 adapter，也不能与现代 adapter 混用。传统路线仍需完整的 `BlackMoon\bin\LINK.EXE`、`BlackMoonExe.obj`、`EyInit.obj` 等文件。
+`BlackMoonModernCore` 的 [Release](https://github.com/aiqinxuancai/BlackMoonModernCore/releases) 同时提供现代语义 adapter 与传统归档。传统黑月归档位于 `legacy_static_lib\x86\krnln.lib`，不能覆盖到现代语义 adapter，也不能与现代 adapter 混用。传统路线仍需完整的 `BlackMoon\bin\LINK.EXE`、`BlackMoonExe.obj`、`EyInit.obj` 等文件。
 
 不要把不同版本的核心 `.fne` 和 `krnln.lib` 混用；x86 黑月转换会读取易语言安装目录下的 `lib\krnln.fne`。除非已验证与当前 IDE/黑月工具链匹配，不要用发布包内的 x86 FNE 直接覆盖 IDE 的核心 FNE。
 
