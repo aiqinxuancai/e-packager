@@ -1283,6 +1283,27 @@ private:
 
 	void Write(const std::string& text) { body_ << text; }
 	void Line(const int indent, const std::string& text) { body_ << std::string(static_cast<std::size_t>(indent) * 4, ' ') << text << "\n"; }
+	void SourceLine(const std::string& file, const std::size_t line)
+	{
+		if (line == 0) return;
+		std::string normalized = file;
+		const int utf8Length = MultiByteToWideChar(
+			CP_UTF8, MB_ERR_INVALID_CHARS, normalized.data(), static_cast<int>(normalized.size()), nullptr, 0);
+		if (utf8Length <= 0) {
+			const int localLength = MultiByteToWideChar(
+				CP_ACP, 0, normalized.data(), static_cast<int>(normalized.size()), nullptr, 0);
+			if (localLength > 0) {
+				std::wstring wide(static_cast<std::size_t>(localLength), L'\0');
+				if (MultiByteToWideChar(
+						CP_ACP, 0, normalized.data(), static_cast<int>(normalized.size()), wide.data(), localLength) > 0) {
+					normalized = WideToUtf8Text(wide);
+				}
+			}
+		}
+		std::replace(normalized.begin(), normalized.end(), '\\', '/');
+		normalized.erase(std::remove(normalized.begin(), normalized.end(), '"'), normalized.end());
+		body_ << "#line " << line << " \"" << normalized << "\"\n";
+	}
 
 	bool EmitTypes()
 	{
@@ -2119,6 +2140,7 @@ private:
 	bool EmitStatements(const Method& method, const std::vector<Statement>& statements, const int indent)
 	{
 		for (const Statement& statement : statements) {
+			SourceLine(method.sourceFile, statement.sourceLine);
 			switch (statement.kind) {
 			case StatementKind::Expression: Line(indent, "(void)" + EmitExpression(method, *statement.expression) + ";"); break;
 			case StatementKind::Assignment: Line(indent, "Assign(" + EmitLvalue(method, *statement.target) + ',' + EmitExpression(method, *statement.expression) + ");"); break;
@@ -2216,6 +2238,7 @@ private:
 
 	bool EmitMethod(const Method& method)
 	{
+		SourceLine(method.sourceFile, method.sourceLine);
 		const Statement* machineStatement = nullptr;
 		for (const Statement& statement : method.body) {
 			if (statement.kind == StatementKind::MachineCode) {
@@ -2562,7 +2585,18 @@ extern "C" ert::EIntPtr __stdcall BlackMoonFuncForeLibNotifySys(
 		}
 		prefix << "int nBMProtectESP=0;int nBMProtectEBP=0;\n";
 		if (!program_.buildDll) {
-			if (targetX64) {
+			if (program_.windowsGui) {
+				if (targetX64) {
+					prefix << "int WINAPI WinMain(HINSTANCE,HINSTANCE,LPSTR,int){E_Init();if(!EStartup())ExitProcess(1);const int result=ECodeStart();ecompiler_safe_destroy();return result;}\n";
+				}
+				else if (program_.useLegacyX86RuntimeBridge) {
+					prefix << "int WINAPI WinMain(HINSTANCE,HINSTANCE,LPSTR,int){ert::InitializeLegacyCrtData();E_Init();if(!EStartup())ExitProcess(1);const int result=ECodeStart();ecompiler_safe_destroy();ExitProcess(static_cast<UINT>(result));}\n";
+				}
+				else {
+					prefix << "int WINAPI WinMain(HINSTANCE,HINSTANCE,LPSTR,int){ert::InitializeLegacyTimezoneData();E_Init();if(!EStartup())ExitProcess(1);const int result=ECodeStart();ecompiler_safe_destroy();return result;}\n";
+				}
+			}
+			else if (targetX64) {
 				prefix << "int main(){E_Init();if(!EStartup())ExitProcess(1);const int result=ECodeStart();ecompiler_safe_destroy();return result;}\n";
 			}
 			else if (program_.useLegacyX86RuntimeBridge) {

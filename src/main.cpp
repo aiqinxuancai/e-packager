@@ -12,6 +12,7 @@
 #include <future>
 #include <iostream>
 #include <map>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -20,6 +21,7 @@
 
 #include "..\thirdparty\json.hpp"
 #include "AutoLinkerCompileCheck.h"
+#include "DependencyDownloader.h"
 #include "compiler/ECompiler.h"
 #include "EFolderCodec.h"
 #include "PathHelper.h"
@@ -163,6 +165,28 @@ struct PackCommandOptions {
 struct CompileCommandOptions {
 	ecompiler::Options compilerOptions;
 };
+
+enum class DiagnosticOutputFormat {
+	Text,
+	Json,
+};
+
+bool ParseDiagnosticOutputFormat(const std::string& value, DiagnosticOutputFormat& outFormat)
+{
+	std::string normalized = value;
+	std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](const unsigned char character) {
+		return static_cast<char>(std::tolower(character));
+	});
+	if (normalized == "text" || normalized == "plain") {
+		outFormat = DiagnosticOutputFormat::Text;
+		return true;
+	}
+	if (normalized == "json") {
+		outFormat = DiagnosticOutputFormat::Json;
+		return true;
+	}
+	return false;
+}
 
 struct DependencyModuleAnnotation {
 	size_t dependencyIndex = 0;
@@ -1546,6 +1570,24 @@ bool ParseTargetArchitecture(const std::string& text, ecompiler::TargetArchitect
 	return false;
 }
 
+bool ParseExecutableSubsystem(const std::string& text, ecompiler::ExecutableSubsystem& outSubsystem)
+{
+	const std::string normalized = ToLowerAscii(text);
+	if (normalized == "auto") {
+		outSubsystem = ecompiler::ExecutableSubsystem::Auto;
+		return true;
+	}
+	if (normalized == "console" || normalized == "cui") {
+		outSubsystem = ecompiler::ExecutableSubsystem::Console;
+		return true;
+	}
+	if (normalized == "windows" || normalized == "windowsgui" || normalized == "gui") {
+		outSubsystem = ecompiler::ExecutableSubsystem::WindowsGui;
+		return true;
+	}
+	return false;
+}
+
 bool ParseBlackMoonMode(const std::string& text, ecompiler::BlackMoonMode& outMode)
 {
 	const std::string normalized = ToLowerAscii(text);
@@ -1883,36 +1925,356 @@ int RunCompileCheck(
 		result.ok ? result.summary.c_str() : result.error.c_str());
 }
 
-int RunValidate(const char* inputDir)
+struct ParsedCompileDiagnostic {
+	std::string phase = "compile";
+	std::string file;
+	std::size_t line = 0;
+	std::size_t column = 0;
+	std::string code = "compile_failed";
+	std::string message;
+	std::string rawOutput;
+};
+
+std::string NormalizeDiagnosticUtf8(const std::string& value)
+{
+	if (value.empty()) return {};
+	const int utf8Length = MultiByteToWideChar(
+		CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), nullptr, 0);
+	if (utf8Length > 0) return value;
+	const int localLength = MultiByteToWideChar(
+		CP_ACP, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
+	if (localLength <= 0) return value;
+	std::wstring wide(static_cast<std::size_t>(localLength), L'\0');
+	if (MultiByteToWideChar(
+		CP_ACP, 0, value.data(), static_cast<int>(value.size()), wide.data(), localLength) <= 0) {
+		return value;
+	}
+	return WideToUtf8Text(wide);
+}
+
+bool TryParseSourceLocation(
+	const std::string& value,
+	std::string& outFile,
+	std::size_t& outLine,
+	std::string& outDetail)
+{
+	static const std::regex pattern(R"(^(.+):([0-9]+): (.*)$)");
+	std::smatch match;
+	if (!std::regex_match(value, match, pattern) || match.size() != 4) return false;
+	try {
+		outLine = static_cast<std::size_t>(std::stoull(match[2].str()));
+	}
+	catch (...) {
+		return false;
+	}
+	outFile = match[1].str();
+	outDetail = match[3].str();
+	return true;
+}
+
+std::string DiagnosticCodeFromDetail(const std::string& detail)
+{
+	const std::size_t separator = detail.find(':');
+	const std::string code = detail.substr(0, separator);
+	return code.empty() ? "compile_failed" : code;
+}
+
+ParsedCompileDiagnostic ParseCompileDiagnostic(const std::string& message)
+{
+	ParsedCompileDiagnostic diagnostic;
+	const std::string normalizedMessage = NormalizeDiagnosticUtf8(message);
+	diagnostic.message = normalizedMessage;
+	diagnostic.rawOutput = normalizedMessage;
+	std::string detail = normalizedMessage;
+	for (;;) {
+		const std::size_t separator = detail.find(':');
+		if (separator == std::string::npos) break;
+		const std::string prefix = detail.substr(0, separator);
+		if (prefix == "compiler_model_failed") {
+			diagnostic.phase = "parse";
+			detail = detail.substr(separator + 1);
+			continue;
+		}
+		if (prefix == "source_generation_failed") {
+			diagnostic.phase = "generate";
+			detail = detail.substr(separator + 1);
+			continue;
+		}
+		if (prefix == "semantic_core_library_not_found" || prefix == "core_static_archive_not_found" ||
+			prefix == "mfc_runtime_file_not_found" || prefix == "vc6_runtime_library_not_found" ||
+			prefix == "core_runtime_dependency_not_found" || prefix == "support_library_static_archive_not_found") {
+			diagnostic.phase = "dependency";
+			diagnostic.code = prefix;
+			break;
+		}
+		if (prefix == "process_failed" || prefix == "start_process_failed") {
+			diagnostic.phase = "cpp_compile";
+			diagnostic.code = prefix;
+			break;
+		}
+		break;
+	}
+	std::string sourceFile;
+	std::size_t sourceLine = 0;
+	std::string sourceDetail;
+	if (TryParseSourceLocation(detail, sourceFile, sourceLine, sourceDetail)) {
+		diagnostic.file = sourceFile;
+		diagnostic.line = sourceLine;
+		diagnostic.message = sourceDetail;
+		diagnostic.code = DiagnosticCodeFromDetail(sourceDetail);
+		if (diagnostic.phase == "parse" && diagnostic.code.rfind("unknown_", 0) == 0) {
+			diagnostic.phase = "semantic";
+		}
+	}
+	else {
+		diagnostic.message = detail;
+		if (diagnostic.code == "compile_failed") diagnostic.code = DiagnosticCodeFromDetail(detail);
+	}
+	return diagnostic;
+}
+
+std::string ReadDiagnosticSourceLine(
+	const std::filesystem::path& inputPath,
+	const ParsedCompileDiagnostic& diagnostic)
+{
+	if (diagnostic.file.empty() || diagnostic.line == 0 || !std::filesystem::is_directory(inputPath)) return {};
+	std::string relative = diagnostic.file;
+	std::replace(relative.begin(), relative.end(), '\\', '/');
+	if (relative.rfind("src/", 0) == 0) relative.erase(0, 4);
+	const std::filesystem::path sourcePath = inputPath / "src" / Utf8PathToPath(relative);
+	std::ifstream input(sourcePath, std::ios::binary);
+	if (!input) return {};
+	std::ostringstream buffer;
+	buffer << input.rdbuf();
+	const std::string content = buffer.str();
+	size_t currentLine = 1;
+	size_t start = 0;
+	for (size_t index = 0; index <= content.size(); ++index) {
+		if (index != content.size() && content[index] != '\r' && content[index] != '\n') continue;
+		if (currentLine == diagnostic.line) return NormalizeDiagnosticUtf8(content.substr(start, index - start));
+		if (index < content.size() && content[index] == '\r' && index + 1 < content.size() && content[index + 1] == '\n') ++index;
+		start = index + 1;
+		++currentLine;
+	}
+	return {};
+}
+
+std::string FormatCompileResultJson(
+	const bool ok,
+	const std::string& message,
+	const std::filesystem::path& inputPath)
+{
+	const std::string normalizedMessage = NormalizeDiagnosticUtf8(message);
+	json output;
+	output["ok"] = ok;
+	output["command"] = "compile";
+	output["diagnostics"] = json::array();
+	if (!normalizedMessage.empty()) {
+		if (ok) {
+			output["diagnostics"].push_back({
+				{ "severity", "info" }, { "phase", "compile" }, { "file", "" }, { "line", 0 },
+				{ "column", 0 }, { "code", "compile_succeeded" }, { "message", normalizedMessage },
+				{ "sourceLine", "" }, { "suggestion", "" }, { "rawOutput", "" },
+			});
+		}
+		else {
+			std::istringstream lines(normalizedMessage);
+			std::string line;
+			while (std::getline(lines, line)) {
+				if (!line.empty() && line.back() == '\r') line.pop_back();
+				if (line.empty()) continue;
+				const ParsedCompileDiagnostic diagnostic = ParseCompileDiagnostic(line);
+				const std::string sourceLine = ReadDiagnosticSourceLine(inputPath, diagnostic);
+				output["diagnostics"].push_back({
+					{ "severity", "error" }, { "phase", diagnostic.phase }, { "file", diagnostic.file },
+					{ "line", diagnostic.line }, { "column", diagnostic.column }, { "code", diagnostic.code },
+					{ "message", diagnostic.message }, { "sourceLine", sourceLine }, { "suggestion", "" },
+					{ "rawOutput", diagnostic.rawOutput },
+				});
+			}
+		}
+	}
+	return output.dump();
+}
+
+int PrintCompileResult(
+	const bool ok,
+	const std::string& message,
+	const std::filesystem::path& inputPath,
+	const DiagnosticOutputFormat format)
+{
+	if (format == DiagnosticOutputFormat::Json) {
+		const std::string output = FormatCompileResultJson(ok, message, inputPath);
+		std::cout << output << std::endl;
+		return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+	}
+	const std::string normalizedMessage = NormalizeDiagnosticUtf8(message);
+	return PrintStringResult("compile", ok ? 0 : -1, normalizedMessage.c_str());
+}
+
+int RunValidate(const char* inputDir, const DiagnosticOutputFormat format = DiagnosticOutputFormat::Text)
 {
 	const std::filesystem::path effectiveInputDir = ResolveAbsolutePath(std::filesystem::path(inputDir));
 	std::string error;
 	if (!workspace_support::ValidateInfoJsonVersion(effectiveInputDir, error)) {
+		if (format == DiagnosticOutputFormat::Json) {
+			json output = {
+				{ "ok", false }, { "command", "validate" }, { "diagnostics", json::array({
+					{{ "severity", "error" }, { "phase", "preflight" }, { "file", "" }, { "line", 0 },
+					 { "column", 0 }, { "code", "workspace_metadata_invalid" }, { "message", error },
+					 { "sourceLine", "" }, { "suggestion", "" }, { "rawOutput", error }}
+				}) }
+			};
+			std::cout << output.dump() << std::endl;
+			return EXIT_FAILURE;
+		}
 		return PrintStringResult("validate", -1, error.c_str());
 	}
 
 	e2txt::BundleDirectoryCodec codec;
 	e2txt::ProjectBundle bundle;
 	if (!codec.ReadBundle(PathToUtf8(effectiveInputDir), bundle, &error)) {
+		if (format == DiagnosticOutputFormat::Json) {
+			json output = {
+				{ "ok", false }, { "command", "validate" }, { "diagnostics", json::array({
+					{{ "severity", "error" }, { "phase", "preflight" }, { "file", "" }, { "line", 0 },
+					 { "column", 0 }, { "code", "read_project_failed" }, { "message", error },
+					 { "sourceLine", "" }, { "suggestion", "" }, { "rawOutput", error }}
+				}) }
+			};
+			std::cout << output.dump() << std::endl;
+			return EXIT_FAILURE;
+		}
 		return PrintStringResult("validate", -1, error.c_str());
 	}
 
 	const e2txt::SourcePreflightReport report = e2txt::ValidateProjectBundleSource(bundle);
+	if (format == DiagnosticOutputFormat::Json) {
+		std::cout << e2txt::FormatSourcePreflightReportJson(report, &bundle) << std::endl;
+		return report.IsValid() ? EXIT_SUCCESS : EXIT_FAILURE;
+	}
 	const std::string summary = e2txt::FormatSourcePreflightReport(report);
 	return PrintStringResult("validate", report.IsValid() ? 0 : -1, summary.c_str());
 }
 
-int RunCompile(const char* inputPath, const char* outputPath, ecompiler::Options options = {})
+bool IsDirectECompileInput(const std::filesystem::path& inputPath)
 {
-	ecompiler::Result result;
-	if (!ecompiler::Compile(
-		ResolveAbsolutePath(std::filesystem::path(inputPath)),
-		ResolveAbsolutePath(std::filesystem::path(outputPath)),
-		options,
-		result)) {
-		return PrintStringResult("compile", -1, result.message.c_str());
+	std::string extension = inputPath.extension().string();
+	std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch) {
+		return static_cast<char>(std::tolower(ch));
+	});
+	return extension == ".e" && std::filesystem::is_regular_file(inputPath);
+}
+
+bool ParseMissingCompileDependency(
+	const std::string& message,
+	std::string& outDependency)
+{
+	outDependency.clear();
+	const auto after = [&message](const std::string& prefix) -> std::string {
+		if (message.rfind(prefix, 0) != 0) return {};
+		return message.substr(prefix.size());
+	};
+	if (message.rfind("semantic_core_library_not_found:", 0) == 0 ||
+		message.rfind("core_static_archive_not_found:", 0) == 0 ||
+		message.rfind("mfc_runtime_file_not_found:", 0) == 0 ||
+		message.rfind("vc6_runtime_library_not_found:", 0) == 0 ||
+		message.rfind("core_runtime_dependency_not_found:", 0) == 0) {
+		outDependency = "krnln";
+		return true;
 	}
-	return PrintStringResult("compile", 0, result.message.c_str());
+	if (message.rfind("support_library_static_archive_not_found:", 0) == 0) {
+		const std::string value = after("support_library_static_archive_not_found:");
+		const std::size_t separator = value.find(':');
+		outDependency = separator == std::string::npos ? value : value.substr(0, separator);
+		return !outDependency.empty();
+	}
+	if (message.rfind("support_library_target_implementation_not_available:", 0) == 0) {
+		outDependency = after("support_library_target_implementation_not_available:");
+		return !outDependency.empty();
+	}
+	return false;
+}
+
+ecompiler::TargetArchitecture HostCompileArchitecture()
+{
+#if defined(_M_X64)
+	return ecompiler::TargetArchitecture::X64;
+#else
+	return ecompiler::TargetArchitecture::X86;
+#endif
+}
+
+bool AskToDownloadDependency(const std::string& dependency, const ecompiler::TargetArchitecture architecture)
+{
+	const char* architectureName = architecture == ecompiler::TargetArchitecture::X64 ? "x64" : "x86";
+	std::cerr << Utf8Literal(u8"缺少直接编译依赖：") << dependency
+		<< " (" << architectureName << ")\n"
+		<< Utf8Literal(u8"是否自动下载并重试？ [Y/n] ") << std::flush;
+	std::string answer;
+	if (!std::getline(std::cin, answer)) {
+		std::cerr << Utf8Literal(u8"\n未读取到确认，已取消自动下载。") << std::endl;
+		return false;
+	}
+	std::cerr << std::endl;
+	answer = TrimAsciiCopy(std::move(answer));
+	return answer.empty() || answer[0] == 'y' || answer[0] == 'Y';
+}
+
+void AppendDownloadedDependencyRoot(
+	ecompiler::Options& options,
+	const ecompiler::TargetArchitecture architecture,
+	const std::filesystem::path& root)
+{
+	if (architecture == ecompiler::TargetArchitecture::X64) {
+		if (options.blackMoonX64Directory.empty()) options.blackMoonX64Directory = root;
+		options.blackMoonX64Directories.push_back(root);
+	}
+	else {
+		if (options.blackMoonCoreDirectory.empty()) options.blackMoonCoreDirectory = root;
+		options.blackMoonCoreDirectories.push_back(root);
+	}
+}
+
+int RunCompile(
+	const char* inputPath,
+	const char* outputPath,
+	ecompiler::Options options = {},
+	const DiagnosticOutputFormat format = DiagnosticOutputFormat::Text)
+{
+	const std::filesystem::path effectiveInputPath = ResolveAbsolutePath(std::filesystem::path(inputPath));
+	const std::filesystem::path effectiveOutputPath = ResolveAbsolutePath(std::filesystem::path(outputPath));
+	ecompiler::Result result;
+	if (ecompiler::Compile(effectiveInputPath, effectiveOutputPath, options, result)) {
+		return PrintCompileResult(true, result.message, effectiveInputPath, format);
+	}
+
+	std::string missingDependency;
+	const bool canOfferDownload = IsDirectECompileInput(effectiveInputPath) &&
+		ParseMissingCompileDependency(result.message, missingDependency);
+	if (!canOfferDownload) {
+		return PrintCompileResult(false, result.message, effectiveInputPath, format);
+	}
+	const ecompiler::TargetArchitecture architecture = options.targetArchitecture == ecompiler::TargetArchitecture::Host
+		? HostCompileArchitecture() : options.targetArchitecture;
+	if (!AskToDownloadDependency(missingDependency, architecture)) {
+		const std::string message = result.message + "\nauto_download_declined:" + missingDependency;
+		return PrintCompileResult(false, message, effectiveInputPath, format);
+	}
+	std::filesystem::path downloadedRoot;
+	std::string downloadError;
+	if (!dependency_download::EnsureDependency(
+			missingDependency, architecture, downloadedRoot, downloadError)) {
+		const std::string message = result.message + "\nauto_download_failed:" + downloadError;
+		return PrintCompileResult(false, message, effectiveInputPath, format);
+	}
+	AppendDownloadedDependencyRoot(options, architecture, downloadedRoot);
+	result = {};
+	if (!ecompiler::Compile(effectiveInputPath, effectiveOutputPath, options, result)) {
+		const std::string message = result.message + "\nauto_download_retry_failed:" + PathToUtf8(downloadedRoot);
+		return PrintCompileResult(false, message, effectiveInputPath, format);
+	}
+	return PrintCompileResult(true, result.message, effectiveInputPath, format);
 }
 
 int RunDefaultPack()
@@ -2413,8 +2775,8 @@ void PrintUsage()
 	std::cout << Utf8Literal(u8"  e-packager decrypt-fne <input.fne> [output.txt]      # 导出支持库公开接口单文件（仅 Win32 版可用）") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager pack <input-dir> <output.e|output.ec> [--password <text>] [--compile-check ...]  # 封包，可选 AutoLinker 无头编译确认") << std::endl;
 	std::cout << Utf8Literal(u8"       --compile-check [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--compile-target auto|win_exe|win_console_exe|win_dll|ecom] [--compile-static] [--compile-timeout <seconds>]") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager validate <input-dir>        # 快速检查声明、基础语法和可确定的类型错误") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager compile <input.e|input-dir> <output.exe|output.dll> [--compile-mode semantic|legacy-blackmoon|blackmoon] [--arch host|x86|x64] [--legacy-blackmoon-mode asm|cpp|mfc] [--dll] [--define <macro>]... [--compiler <cl.exe>] [--linker <link.exe>] [--lib <lib-dir>] [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--legacy-blackmoon-dir <dir>] [--blackmoon-core-dir <dir>] [--blackmoon-x86-dir <dir>] [--blackmoon-x64-dir <dir>] [--x86-decoder <e-packager.exe>] [--blackmoon-timeout <seconds>]  # 默认 semantic；blackmoon 为旧命令兼容别名（--backend 为兼容别名）") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager validate <input-dir> [--diagnostics text|json]  # 快速检查声明、基础语法和可确定的类型错误") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager compile <input.e|input-dir> <output.exe|output.dll> [--diagnostics text|json] [--compile-mode semantic|legacy-blackmoon|blackmoon] [--arch host|x86|x64] [--subsystem auto|console|windows] [--legacy-blackmoon-mode asm|cpp|mfc] [--dll] [--define <macro>]... [--compiler <cl.exe>] [--linker <link.exe>] [--lib <lib-dir>] [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--legacy-blackmoon-dir <dir>] [--blackmoon-core-dir <dir>] [--blackmoon-x86-dir <dir>] [--blackmoon-x64-dir <dir>] [--x86-decoder <e-packager.exe>] [--blackmoon-timeout <seconds>]  # 默认 semantic；窗口工程自动使用 Windows 子系统") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager compile-check <input.e|input.ec> [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--compile-target ...] [--compile-static] [--compile-timeout <seconds>]  # 直接执行权威无头编译") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager update <input-dir> [--add-ecom <file.ec>]... [--add-elib <name|file.fne>]... [--add-image <file|name=file>]... [--add-audio <file|name=file>]...   # 刷新派生内容并新增资源") << std::endl;
 #if defined(_M_X64)
@@ -2490,11 +2852,31 @@ int RunCommand(int argc, char* argv[])
 		return RunPack(argv[2], argv[3], packOptions);
 	}
 	if (command == "validate") {
-		if (argc != 3) {
+		if (argc < 3) {
 			PrintUsage();
 			return EXIT_FAILURE;
 		}
-		return RunValidate(argv[2]);
+		DiagnosticOutputFormat format = DiagnosticOutputFormat::Text;
+		for (int index = 3; index < argc; ++index) {
+			const std::string option = argv[index];
+			if (option == "--diagnostics" && index + 1 < argc) {
+				if (!ParseDiagnosticOutputFormat(argv[++index], format)) {
+					PrintUsage();
+					return EXIT_FAILURE;
+				}
+				continue;
+			}
+			if (option.rfind("--diagnostics=", 0) == 0) {
+				if (!ParseDiagnosticOutputFormat(option.substr(std::string("--diagnostics=").size()), format)) {
+					PrintUsage();
+					return EXIT_FAILURE;
+				}
+				continue;
+			}
+			PrintUsage();
+			return EXIT_FAILURE;
+		}
+		return RunValidate(argv[2], format);
 	}
 	if (command == "compile") {
 		if (argc < 4) {
@@ -2503,6 +2885,7 @@ int RunCommand(int argc, char* argv[])
 		}
 		CompileCommandOptions commandOptions;
 		ecompiler::Options& options = commandOptions.compilerOptions;
+		DiagnosticOutputFormat diagnosticFormat = DiagnosticOutputFormat::Text;
 		const auto appendBlackMoonCoreDirectory = [&options](const std::filesystem::path& directory) {
 			const std::filesystem::path resolved = ResolveAbsolutePath(directory);
 			if (options.blackMoonCoreDirectory.empty()) options.blackMoonCoreDirectory = resolved;
@@ -2517,8 +2900,36 @@ int RunCommand(int argc, char* argv[])
 		};
 		for (int index = 4; index < argc; ++index) {
 			const std::string option = argv[index];
+			if (option == "--diagnostics" && index + 1 < argc) {
+				if (!ParseDiagnosticOutputFormat(argv[++index], diagnosticFormat)) {
+					PrintUsage();
+					return EXIT_FAILURE;
+				}
+				continue;
+			}
+			if (option.rfind("--diagnostics=", 0) == 0) {
+				if (!ParseDiagnosticOutputFormat(option.substr(std::string("--diagnostics=").size()), diagnosticFormat)) {
+					PrintUsage();
+					return EXIT_FAILURE;
+				}
+				continue;
+			}
 			if (option == "--dll") {
 				options.buildDll = true;
+				continue;
+			}
+			if (option == "--subsystem" && index + 1 < argc) {
+				if (!ParseExecutableSubsystem(argv[++index], options.subsystem)) {
+					PrintUsage();
+					return EXIT_FAILURE;
+				}
+				continue;
+			}
+			if (option.rfind("--subsystem=", 0) == 0) {
+				if (!ParseExecutableSubsystem(option.substr(std::string("--subsystem=").size()), options.subsystem)) {
+					PrintUsage();
+					return EXIT_FAILURE;
+				}
 				continue;
 			}
 			if (option == "--blackmoon") {
@@ -2646,7 +3057,7 @@ int RunCommand(int argc, char* argv[])
 			PrintUsage();
 			return EXIT_FAILURE;
 		}
-		return RunCompile(argv[2], argv[3], std::move(options));
+		return RunCompile(argv[2], argv[3], std::move(options), diagnosticFormat);
 	}
 	if (command == "compile-check") {
 		if (argc < 3) {

@@ -167,6 +167,7 @@
   <ItemGroup>
     <ClCompile Include="src\AutoLinkerCompileCheck.cpp" />
     <ClCompile Include="src\BundlePathUtils.cpp" />
+    <ClCompile Include="src\DependencyDownloader.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\EFolderCodec.cpp">
       <ObjectFileName>$(IntDir)EFolderCodecCore.obj</ObjectFileName>
@@ -195,6 +196,7 @@
   <ItemGroup>
     <ClInclude Include="src\AutoLinkerCompileCheck.h" />
     <ClInclude Include="src\BundlePathUtils.h" />
+    <ClInclude Include="src\DependencyDownloader.h" />
     <ClInclude Include="src\EFolderCodec.h" />
     <ClInclude Include="src\SelfUpdater.h" />
     <ClInclude Include="src\SimpleXmlDocument.h" />

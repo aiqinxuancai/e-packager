@@ -21,6 +21,12 @@ enum class CompileMode {
 	BlackMoon = BlackMoonCompatibility,
 };
 
+enum class ExecutableSubsystem {
+	Auto,
+	Console,
+	WindowsGui,
+};
+
 // 兼容旧的 C++ 调用方；新代码应使用 CompileMode。
 using Backend = CompileMode;
 
@@ -57,6 +63,7 @@ struct Options {
 	unsigned int blackMoonTimeoutSeconds = 120;
 	bool keepObject = true;
 	bool buildDll = false;
+	ExecutableSubsystem subsystem = ExecutableSubsystem::Auto;
 	std::vector<std::string> conditionMacros;
 };
 
@@ -69,7 +76,7 @@ struct Result {
 	std::string message;
 };
 
-// 将原生 .e 或拆包目录编译为目标架构的控制台 EXE 或 DLL，不启动易语言 IDE。
+// 将原生 .e 或拆包目录编译为目标架构的 EXE（控制台或 Windows GUI）或 DLL，不启动易语言 IDE。
 bool Compile(
 	const std::filesystem::path& inputPath,
 	const std::filesystem::path& outputPath,

@@ -1345,6 +1345,7 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 	json metaJson;
 	metaJson["formatVersion"] = kBundleDirectoryFormatVersion;
 	metaJson["sourceFileKind"] = SourceFileKindToText(bundle.sourceFileKind);
+	metaJson["projectSubsystem"] = ProjectSubsystemToText(bundle.projectSubsystem);
 	metaJson["projectNameStored"] = bundle.projectNameStored;
 	metaJson["sourceFiles"] = json::array();
 	metaJson["formFiles"] = json::array();
@@ -1362,6 +1363,7 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 	persistedBundle.projectName = bundle.projectName;
 	persistedBundle.projectNameStored = bundle.projectNameStored;
 	persistedBundle.versionText = bundle.versionText;
+	persistedBundle.projectSubsystem = bundle.projectSubsystem;
 	persistedBundle.bundleFormatVersion = kBundleDirectoryFormatVersion;
 	persistedBundle.dependencies = bundle.dependencies;
 	persistedBundle.dataTypeText = NormalizeCrLf(bundle.dataTypeText);
@@ -1585,6 +1587,12 @@ bool BundleDirectoryCodec::ReadBundle(const std::string& inputDir, ProjectBundle
 	bundle.sourceFileKind = ResolveBundleSourceFileKind(metaJson, moduleJson.value("sourcePath", std::string()));
 	bundle.bundleFormatVersion = metaJson.value("formatVersion", 0);
 	bundle.projectNameStored = metaJson.value("projectNameStored", true);
+	if (const auto it = metaJson.find("projectSubsystem"); it != metaJson.end() && it->is_string()) {
+		bundle.projectSubsystem = ProjectSubsystemFromText(it->get<std::string>());
+	}
+	if (bundle.projectSubsystem == ProjectSubsystem::Unknown && !bundle.formFiles.empty()) {
+		bundle.projectSubsystem = ProjectSubsystem::WindowsGui;
+	}
 	if (const auto it = moduleJson.find("dependencies"); it != moduleJson.end() && it->is_array()) {
 		for (const auto& dependencyItem : *it) {
 			Dependency dependency = DependencyFromJson(dependencyItem);

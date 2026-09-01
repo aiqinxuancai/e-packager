@@ -7343,6 +7343,12 @@ bool BuildBundleFromSections(
 	bundle.projectName = document.projectName;
 	bundle.projectNameStored = sections.hasUserInfo && !TrimAsciiCopy(sections.userInfo.programName).empty();
 	bundle.versionText = document.versionText;
+	if (sections.hasSystemInfo) {
+		// 易语言系统信息段的 compileType=0 表示窗口子系统，1 表示控制台子系统。
+		// 未知值保留为 Unknown，编译器不会臆测为窗口程序。
+		if (sections.systemInfo.compileType == 0) bundle.projectSubsystem = ProjectSubsystem::WindowsGui;
+		else if (sections.systemInfo.compileType == 1) bundle.projectSubsystem = ProjectSubsystem::Console;
+	}
 	bundle.dependencies = document.dependencies;
 	bundle.nativeProgramHeader = BundleNativeProgramHeaderSnapshot{
 		sections.program.header.versionFlag1,
@@ -8170,6 +8176,7 @@ std::string ComputeBundleDigestInternal(const ProjectBundle& bundle, const bool 
 	BundleDigestWriter writer;
 	writer.WriteString(bundle.projectName);
 	writer.WriteString(bundle.versionText);
+	writer.WriteI32(static_cast<std::int32_t>(bundle.projectSubsystem));
 
 	writer.WriteU64(static_cast<std::uint64_t>(bundle.dependencies.size()));
 	for (const auto& item : bundle.dependencies) {

@@ -128,7 +128,7 @@ e-packager compile-check checked.e `
 
 ### 源码直接编译（试验性）
 
-> ⚠️ **试验性功能。** 编译结果尚未经过大规模验证，行为和选项可能随版本变化。窗口工程、窗口事件以及少见的支持库暂不保证可用。交付前请继续用 `compile-check` 或易语言 IDE 确认，不要直接把产物用于生产环境。
+> ⚠️ **试验性功能。** 编译结果尚未经过大规模验证，行为和选项可能随版本变化。窗口控件/窗口事件以及少见的支持库暂不保证可用。删除全部窗体后仅保留纯代码的窗口工程可以生成不弹出控制台的 Win32 GUI EXE。交付前请继续用 `compile-check` 或易语言 IDE 确认，不要直接把产物用于生产环境。
 
 `compile` 把易语言源码直接编译成独立的 EXE 或 DLL，不需要打开易语言 IDE：
 
@@ -167,6 +167,19 @@ e-packager.exe compile MyApp.e .\out\MyApp.exe `
 
 x86、x64 都可以用 `--arch x86` / `--arch x64` 指定，默认跟随当前程序架构。
 
+#### 控制台与 Win32 GUI 子系统
+
+`compile` 默认使用 `--subsystem auto`：控制台工程沿用 `CONSOLE`，易语言系统信息段标记为窗口工程的项目使用 `WINDOWS`，即使目录中已经删除全部窗体文件也会保留该类型。GUI EXE 由生成器提供 `WinMain` 入口，因此运行时不会自动创建控制台窗口，适合黑月界面类等纯代码 Win32 UI。
+
+需要覆盖工程元数据时可显式指定：
+
+```powershell
+e-packager.exe compile MyApp.e .\out\MyApp-gui.exe --subsystem windows
+e-packager.exe compile MyApp.e .\out\MyApp-console.exe --subsystem console
+```
+
+`--dll` 或 `.dll` 输出始终使用 DLL/Windows 子系统，并由公开子程序生成导出表；它不会被 `--subsystem console` 改成控制台程序。仍包含窗体 XML 或窗口绑定的工程会继续报告 `window_project_not_supported_by_independent_compiler`，因为控件布局和事件生成尚未纳入语义编译器。
+
 #### 需要核心库命令时：下载 adapter
 
 工程如果用到了易语言核心库（黑月核心）里的命令，需要额外下载一份匹配架构的 [BlackMoonKernelStaticLib](https://github.com/aiqinxuancai/BlackMoonKernelStaticLib) adapter。前往 [Releases](https://github.com/aiqinxuancai/BlackMoonKernelStaticLib/releases) 下载对应架构的资产（不要用 GitHub 自动生成的 Source code 压缩包）；带 `beta`/`pre`/`rc` 标记的是预发布版，生产环境请选稳定版：
@@ -191,6 +204,30 @@ e-packager.exe compile MyApp.e .\out\MyApp-x64.exe `
 ```
 
 `--blackmoon-x86-dir` / `--blackmoon-x64-dir` 均可重复传入，用于补充同架构的其他支持库；但核心 adapter 里的 FNE、主归档、后备归档和清单文件必须来自**同一个** Release，不要混用不同版本。`.e` 输入会自动调用 Win32 版 `e-packager` 做权威解码，一般无需干预。
+
+#### 诊断输出
+
+预检和直接编译默认输出人类可读的错误详情，包含阶段、源码文件、行号、错误码和错误内容。需要供 IDE 或脚本解析时，添加
+`--diagnostics json`；默认的 `text` 格式也可显式指定：
+
+```powershell
+e-packager.exe validate .\MyApp --diagnostics json
+e-packager.exe compile MyApp.e .\out\MyApp.exe --diagnostics json
+```
+
+JSON 诊断始终包含 `phase`、`code`、`file`、`line`、`column`、`message`、`sourceLine` 和 `rawOutput` 字段。解析/语义错误优先定位到易语言源码；C++ 编译错误通过生成代码中的源位置映射回源码，无法映射的链接器错误会保留后端文件、行号和原始输出。文本输出默认最多显示 40 条预检诊断，省略部分会以 `diagnostics_omitted` 标明。
+
+如果直接编译 `.e` 源码时没有找到核心编译依赖，命令行会显示：
+
+```text
+缺少直接编译依赖：krnln (x86|x64)
+是否自动下载并重试？ [Y/n]
+```
+
+按回车或输入 `Y` 会从 `BlackMoonModernCore` 的最新稳定版 Release 下载匹配架构的 adapter，缓存到当前用户的
+`%LOCALAPPDATA%\e-packager\dependencies` 后自动重试一次；输入 `N` 则保留原始错误并退出。此询问只对直接传入的 `.e`
+源码启用，编译已拆包目录不会暗中修改依赖搜索路径。第三方支持库只有在其发布包或本地配置提供可识别下载源时才能自动取得，
+否则命令会明确报告缺少下载提供方，不会用其他库或函数替代。
 
 `-vc6.zip` 不是 semantic adapter：它只有由 Visual C++ 6.0 生成的传统 x86 `krnln.lib`，没有 `krnln.fne`、`krnln_adapter.json` 或现代包装层。需要使用它时，将压缩包中的 `krnln.lib` 放入传统黑月工具链的库搜索目录（或通过 `--lib` 指定），并按下面的 `legacy-blackmoon` 方式提供完整的 `BlackMoon\bin`、入口对象和 VC6/MFC 运行库；不能把该目录作为 `--blackmoon-x86-dir` 来替代现代 x86 adapter，也不能用于 x64。
 

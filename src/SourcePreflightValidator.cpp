@@ -20,6 +20,7 @@
 #include "SourceExpressionParser.h"
 #include "SourceSemanticValidator.h"
 #include "e2txt.h"
+#include "../thirdparty/json.hpp"
 
 namespace e2txt {
 namespace {
@@ -1401,6 +1402,68 @@ std::string FormatSourcePreflightReport(const SourcePreflightReport& report)
 		result.pop_back();
 	}
 	return result;
+}
+
+std::string FormatSourcePreflightReportJson(
+	const SourcePreflightReport& report,
+	const ProjectBundle* bundle)
+{
+	nlohmann::json output;
+	output["ok"] = report.IsValid();
+	output["files"] = report.checkedFiles;
+	output["lines"] = report.checkedLines;
+	output["errors"] = report.errors.size();
+	output["warnings"] = report.warnings.size();
+	output["diagnostics"] = nlohmann::json::array();
+	const auto sourceText = [&](const SourcePreflightDiagnostic& diagnostic) {
+		if (bundle == nullptr || diagnostic.line == 0) return std::string();
+		std::string content;
+		const auto normalize = [](std::string value) {
+			std::replace(value.begin(), value.end(), '\\', '/');
+			return value;
+		};
+		const std::string path = normalize(diagnostic.filePath);
+		if (path == normalize(DiagnosticPathToUtf8("src/.全局变量.txt"))) content = bundle->globalText;
+		else if (path == normalize(DiagnosticPathToUtf8("src/.数据类型.txt"))) content = bundle->dataTypeText;
+		else if (path == normalize(DiagnosticPathToUtf8("src/.DLL声明.txt"))) content = bundle->dllDeclareText;
+		else if (path == normalize(DiagnosticPathToUtf8("src/.常量.txt"))) content = bundle->constantText;
+		else {
+			for (const auto& file : bundle->sourceFiles) {
+				const std::string relative = normalize(DiagnosticPathToUtf8(file.relativePath.empty() ? file.logicalName : file.relativePath));
+				if (normalize("src/" + relative) == path || relative == path) {
+					content = file.content;
+					break;
+				}
+			}
+		}
+		if (content.empty()) return std::string();
+		size_t currentLine = 1;
+		size_t start = 0;
+		for (size_t index = 0; index <= content.size(); ++index) {
+			if (index != content.size() && content[index] != '\r' && content[index] != '\n') continue;
+			if (currentLine == diagnostic.line) return LocalTextToUtf8(content.substr(start, index - start));
+			if (index < content.size() && content[index] == '\r' && index + 1 < content.size() && content[index + 1] == '\n') ++index;
+			start = index + 1;
+			++currentLine;
+		}
+		return std::string();
+	};
+	const auto append = [&](const SourcePreflightDiagnostic& diagnostic, const char* severity) {
+		output["diagnostics"].push_back({
+			{ "severity", severity },
+			{ "phase", "preflight" },
+			{ "file", diagnostic.filePath },
+			{ "line", diagnostic.line },
+			{ "column", 0 },
+			{ "code", diagnostic.code },
+			{ "message", diagnostic.message },
+			{ "sourceLine", sourceText(diagnostic) },
+			{ "suggestion", "" },
+		});
+	};
+	for (const auto& diagnostic : report.errors) append(diagnostic, "error");
+	for (const auto& diagnostic : report.warnings) append(diagnostic, "warning");
+	return output.dump();
 }
 
 }  // namespace e2txt

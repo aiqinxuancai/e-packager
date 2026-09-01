@@ -1003,6 +1003,18 @@ bool Compile(
 		return false;
 	}
 	program.buildDll = options.buildDll || outputPath.extension() == L".dll";
+	if (program.buildDll) {
+		program.windowsGui = true;
+	}
+	else if (options.subsystem == ExecutableSubsystem::WindowsGui) {
+		program.windowsGui = true;
+	}
+	else if (options.subsystem == ExecutableSubsystem::Console) {
+		program.windowsGui = false;
+	}
+	else {
+		program.windowsGui = program.bundle.projectSubsystem == e2txt::ProjectSubsystem::WindowsGui;
+	}
 	program.useLegacyX86RuntimeBridge = !targetX64 && !usesModernCoreAdapter;
 	GeneratedSource generated;
 	if (!EmitCppSource(program, generated, error)) {
@@ -1169,7 +1181,7 @@ bool Compile(
 	std::vector<std::wstring> linkerArguments;
 	if (targetX64 || usesModernCoreAdapter) {
 		linkerArguments = {
-			L"/NOLOGO", L"/SUBSYSTEM:CONSOLE", targetX64 ? L"/MACHINE:X64" : L"/MACHINE:I386", L"/INCREMENTAL:NO", L"/OPT:REF",
+			L"/NOLOGO", program.windowsGui ? L"/SUBSYSTEM:WINDOWS" : L"/SUBSYSTEM:CONSOLE", targetX64 ? L"/MACHINE:X64" : L"/MACHINE:I386", L"/INCREMENTAL:NO", L"/OPT:REF",
 			L"/LIBPATH:" + Quote(vcLibrary), L"/OUT:" + Quote(outputPath), Quote(result.objectPath),
 		};
 		// Some third-party E support libraries are still distributed as VC6
@@ -1184,7 +1196,7 @@ bool Compile(
 	}
 	else {
 		linkerArguments = {
-			L"/NOLOGO", L"/FORCE:MULTIPLE", L"/SUBSYSTEM:CONSOLE", L"/MACHINE:I386", L"/INCREMENTAL:NO", L"/OPT:REF",
+			L"/NOLOGO", L"/FORCE:MULTIPLE", program.windowsGui ? L"/SUBSYSTEM:WINDOWS" : L"/SUBSYSTEM:CONSOLE", L"/MACHINE:I386", L"/INCREMENTAL:NO", L"/OPT:REF",
 			L"/NODEFAULTLIB:LIBCMT", L"/INCLUDE:_LegacyVc6Swprintf", L"/ALTERNATENAME:_swprintf=_LegacyVc6Swprintf", L"/ALTERNATENAME:__swprintf=_LegacyVc6Swprintf", L"/ALTERNATENAME:___eapp_info=_eapp_info_data", L"/LIBPATH:" + Quote(vcLibrary), L"/OUT:" + Quote(outputPath),
 			Quote(result.objectPath), Quote(mfcLibrary),
 		};

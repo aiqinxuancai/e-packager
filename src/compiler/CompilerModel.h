@@ -157,6 +157,7 @@ struct TypeInfo {
 
 struct Program {
 	bool buildDll = false;
+	bool windowsGui = false;
 	// 仅传统 x86 静态库需要 VC6/MFC 运行时桥接；现代 adapter 不应引入它。
 	bool useLegacyX86RuntimeBridge = false;
 	TargetArchitecture targetArchitecture = TargetArchitecture::X86;

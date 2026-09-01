@@ -233,6 +233,7 @@ struct RestoreDocumentModel {
 	std::string sourcePath;
 	std::string projectName;
 	std::string versionText;
+	ProjectSubsystem projectSubsystem = ProjectSubsystem::Unknown;
 	std::vector<RestoreDependencyInfo> dependencies;
 	std::vector<RestoreClass> classes;
 	std::vector<RestoreMethod> methods;
@@ -8863,6 +8864,15 @@ bool CanReuseNativeBytesForSemanticEquivalentSources(
 	if (HasPersistedEComPathOverride(bundle)) {
 		return false;
 	}
+	if (bundle.projectSubsystem != originalBundle.projectSubsystem) {
+		return false;
+	}
+	// GUI projects may intentionally remove every form while retaining the
+	// Windows subsystem. Their native snapshot cannot be reused as a complete
+	// replacement because it may still carry the original form-oriented header.
+	if (bundle.projectSubsystem == ProjectSubsystem::WindowsGui) {
+		return false;
+	}
 	if (ComputeBundleDigestWithoutSourceFiles(bundle) !=
 		ComputeBundleDigestWithoutSourceFiles(originalBundle)) {
 		return false;
@@ -9008,6 +9018,9 @@ bool BuildRestoreModel(
 		model.projectName = bundle->projectName;
 	}
 	model.versionText = document.versionText.empty() ? "1.0" : document.versionText;
+	if (bundle != nullptr) {
+		model.projectSubsystem = bundle->projectSubsystem;
+	}
 	for (const auto& dependency : document.dependencies) {
 		RestoreDependencyInfo item;
 		item.name = dependency.name;
@@ -11215,6 +11228,12 @@ bool CanReuseNativeBundleSnapshot(const ProjectBundle& bundle)
 	if (bundle.nativeSourceBytes.empty() || bundle.nativeBundleDigest.empty()) {
 		return false;
 	}
+	// A form-less GUI workspace is a deliberate project-type conversion. The
+	// original snapshot may still describe a console entry and must be rebuilt
+	// from the semantic model so the subsystem marker is emitted consistently.
+	if (bundle.projectSubsystem == ProjectSubsystem::WindowsGui && bundle.formFiles.empty()) {
+		return false;
+	}
 	return ComputeBundleDigest(bundle) == bundle.nativeBundleDigest;
 }
 
@@ -11995,7 +12014,7 @@ std::int32_t ComputeAllocatedIdNum(const RestoreDocumentModel& model)
 	return maxId;
 }
 
-std::vector<std::uint8_t> BuildSystemInfoSection(const RestoreDocumentModel&)
+std::vector<std::uint8_t> BuildSystemInfoSection(const RestoreDocumentModel& model)
 {
 	ByteWriter writer;
 	writer.WriteI16(5);
@@ -12006,7 +12025,7 @@ std::vector<std::uint8_t> BuildSystemInfoSection(const RestoreDocumentModel&)
 	writer.WriteI16(7);
 	writer.WriteI32(1);
 	writer.WriteI32(0);
-	writer.WriteI32(0);
+	writer.WriteI32(model.projectSubsystem == ProjectSubsystem::WindowsGui ? 0 : 1);
 	for (int i = 0; i < 8; ++i) {
 		writer.WriteI32(0);
 	}
