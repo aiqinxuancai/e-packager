@@ -176,6 +176,7 @@ x86、x64 都可以用 `--arch x86` / `--arch x64` 指定，默认跟随当前�
 | `BlackMoonKernelStaticLib-v<版本>-x64.zip` | x64 编译，通常只需下载此文件 |
 | `BlackMoonKernelStaticLib-v<版本>-x86.zip` | x86 编译 |
 | `BlackMoonKernelStaticLib-v<版本>.zip` | 同时包含 x86 与 x64 |
+| `BlackMoonKernelStaticLib-v<版本>-vc6.zip` | 仅传统 x86 黑月链路的 VC6 `krnln.lib` |
 
 解压后得到 `adapter` 目录，直接传给编译器即可：
 
@@ -190,6 +191,8 @@ e-packager.exe compile MyApp.e .\out\MyApp-x64.exe `
 ```
 
 `--blackmoon-x86-dir` / `--blackmoon-x64-dir` 均可重复传入，用于补充同架构的其他支持库；但核心 adapter 里的 FNE、主归档、后备归档和清单文件必须来自**同一个** Release，不要混用不同版本。`.e` 输入会自动调用 Win32 版 `e-packager` 做权威解码，一般无需干预。
+
+`-vc6.zip` 不是 semantic adapter：它只有由 Visual C++ 6.0 生成的传统 x86 `krnln.lib`，没有 `krnln.fne`、`krnln_adapter.json` 或现代包装层。需要使用它时，将压缩包中的 `krnln.lib` 放入传统黑月工具链的库搜索目录（或通过 `--lib` 指定），并按下面的 `legacy-blackmoon` 方式提供完整的 `BlackMoon\bin`、入口对象和 VC6/MFC 运行库；不能把该目录作为 `--blackmoon-x86-dir` 来替代现代 x86 adapter，也不能用于 x64。
 
 #### legacy-blackmoon（传统 x86 黑月）
 

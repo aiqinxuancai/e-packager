@@ -430,15 +430,18 @@ bool Compile(
 		return false;
 	}
 
-	std::vector<std::filesystem::path> libraryDirectories = {
+	std::vector<std::filesystem::path> libraryDirectories;
+	// 显式指定的库目录应覆盖随黑月工具链安装的同名归档，例如 Release
+	// 中单独下载的 VC6 核心库。其余目录仍保持确定的自动搜索顺序。
+	if (!options.libraryPath.empty()) libraryDirectories.push_back(AbsolutePath(options.libraryPath));
+	libraryDirectories.insert(libraryDirectories.end(), {
 		blackMoonLibraryDirectory,
 		blackMoonDirectory,
 		eideDirectory / L"static_lib",
 		outputDirectory,
 		sourcePath.parent_path(),
 		projectRoot,
-	};
-	if (!options.libraryPath.empty()) libraryDirectories.push_back(AbsolutePath(options.libraryPath));
+	});
 	const std::filesystem::path objectPath = workingDirectory / L"BlackMoon.obj";
 	blackmoon::ConversionResult conversion;
 	if (!blackmoon::ConvertEcodePeToObject(

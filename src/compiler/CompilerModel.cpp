@@ -1677,6 +1677,13 @@ void MergeArchitectureNeutralMetadata(
 			(1u << 7) | (1u << 8) | (1u << 9);
 		targetCommand.state = static_cast<std::uint16_t>(
 			(targetCommand.state & ~kPublicCommandFlags) | (sourceCommand.state & kPublicCommandFlags));
+		if (sourceCommand.arguments.size() > targetCommand.arguments.size()) {
+			// Some rebuilt FNEs omit leading/default arguments from the exported
+			// table even though the command ABI and source syntax still expose
+			// them. The sidecar is the architecture-neutral declaration, so use
+			// its longer argument list and keep the target FNE execute symbol.
+			targetCommand.arguments = sourceCommand.arguments;
+		}
 		if (targetCommand.arguments.size() == sourceCommand.arguments.size()) {
 			for (std::size_t argumentIndex = 0; argumentIndex < targetCommand.arguments.size(); ++argumentIndex) {
 				auto& targetArgument = targetCommand.arguments[argumentIndex];

@@ -1172,6 +1172,15 @@ bool Compile(
 			L"/NOLOGO", L"/SUBSYSTEM:CONSOLE", targetX64 ? L"/MACHINE:X64" : L"/MACHINE:I386", L"/INCREMENTAL:NO", L"/OPT:REF",
 			L"/LIBPATH:" + Quote(vcLibrary), L"/OUT:" + Quote(outputPath), Quote(result.objectPath),
 		};
+		// Some third-party E support libraries are still distributed as VC6
+		// archives and carry a /DEFAULTLIB:LIBC directive.  Modern semantic
+		// builds use the discovered /MT CRT; allowing the obsolete LIBC archive
+		// into the link would either fail with LNK1104 or duplicate UCRT symbols.
+		// Suppress only that legacy default-library directive; explicit support
+		// archives and the modern CRT remain linked normally.
+		if (!targetX64 && usesModernCoreAdapter) {
+			linkerArguments.insert(linkerArguments.begin() + 5, L"/NODEFAULTLIB:LIBC");
+		}
 	}
 	else {
 		linkerArguments = {

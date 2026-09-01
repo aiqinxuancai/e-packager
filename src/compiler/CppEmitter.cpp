@@ -208,13 +208,19 @@ extern "C" unsigned char _iob[96]{};
 #ifdef _timezone
 #undef _timezone
 #endif
-extern "C" long ecompiler_timezone=0;
+extern "C" volatile long ecompiler_timezone=0;
+#if defined(_M_IX86)
+#pragma comment(linker,"/include:_ecompiler_timezone")
+#else
+#pragma comment(linker,"/include:ecompiler_timezone")
+#endif
 #pragma comment(linker,"/alternatename:_timezone=_ecompiler_timezone")
 #pragma comment(linker,"/alternatename:__timezone=_ecompiler_timezone")
 extern "C" int* __cdecl __p___argc();
 extern "C" char*** __cdecl __p___argv();
 extern "C" unsigned char* __cdecl __p__mbctype();
 static void InitializeLegacyCrtData() {
+    ecompiler_timezone = ecompiler_timezone;
     if(int* value=__p___argc())__argc=*value;
     if(char*** value=__p___argv())__argv=*value;
     if(unsigned char* value=__p__mbctype())for(std::size_t index=0;index<257;++index)_mbctype[index]=value[index];
@@ -242,6 +248,21 @@ extern "C" int __cdecl fprintf(FILE* stream,const char* format,...) {
     DWORD written=0; HANDLE output=GetStdHandle(STD_OUTPUT_HANDLE);
     if(output!=nullptr && output!=INVALID_HANDLE_VALUE && length!=0) WriteFile(output,text,static_cast<DWORD>(length),&written,nullptr);
     va_end(arguments); return static_cast<int>(written);
+}
+#endif
+#if !defined(_WIN64) && !defined(ECOMPILER_LEGACY_X86_RUNTIME)
+// VC6-era third-party archives may reference the process-wide timezone data
+// symbol.  Keep a small x86-only compatibility object without enabling the
+// broader legacy CRT bridge used by old FNEs.
+#ifdef _timezone
+#undef _timezone
+#endif
+extern "C" volatile long ecompiler_timezone_modern=0;
+#pragma comment(linker,"/include:_ecompiler_timezone_modern")
+#pragma comment(linker,"/alternatename:_timezone=_ecompiler_timezone_modern")
+#pragma comment(linker,"/alternatename:__timezone=_ecompiler_timezone_modern")
+static void InitializeLegacyTimezoneData() {
+    ecompiler_timezone_modern = ecompiler_timezone_modern;
 }
 #endif
 constexpr std::uint32_t T_NULL=0, T_ALL=0x80000000u, T_BYTE=0x80000101u, T_SHORT=0x80000201u;
@@ -1402,10 +1423,22 @@ private:
 	std::optional<CommandBinding> ResolveGlobalCommand(const std::string& name, const std::size_t argumentCount) const
 	{
 		const auto found = program_.globalCommands.find(name);
-		if (found == program_.globalCommands.end()) return std::nullopt;
-		for (const auto [libraryIndex, commandIndex] : found->second) {
-			const auto& command = program_.libraries[libraryIndex].metadata.commands[commandIndex];
-			if (CommandArityMatches(command, argumentCount)) return CommandBinding { libraryIndex, commandIndex, &command, false };
+		if (found != program_.globalCommands.end()) {
+			for (const auto [libraryIndex, commandIndex] : found->second) {
+				const auto& command = program_.libraries[libraryIndex].metadata.commands[commandIndex];
+				if (CommandArityMatches(command, argumentCount)) return CommandBinding { libraryIndex, commandIndex, &command, false };
+			}
+		}
+		// Keep command resolution independent from the order and representation
+		// used to build the name index. This matters for FNEs reconstructed from
+		// different metadata encodings where the canonical map can miss a name.
+		for (std::size_t libraryIndex = 0; libraryIndex < program_.libraries.size(); ++libraryIndex) {
+			const auto& commands = program_.libraries[libraryIndex].metadata.commands;
+			for (std::size_t commandIndex = 0; commandIndex < commands.size(); ++commandIndex) {
+				const auto& command = commands[commandIndex];
+				if (command.name == name && CommandArityMatches(command, argumentCount))
+					return CommandBinding { libraryIndex, commandIndex, &command, false };
+			}
 		}
 		return std::nullopt;
 	}
@@ -1439,6 +1472,22 @@ private:
 	const Method* ResolveOwnedMethod(const Method& owner, const std::string& name, const std::size_t argumentCount) const
 	{
 		return owner.ownerType.valid ? ResolveMemberMethod(owner.ownerType, name, argumentCount) : nullptr;
+	}
+
+	const Method* ResolveUnqualifiedMethod(const std::string& name, const std::size_t argumentCount) const
+	{
+		if (const auto indexed = program_.methodByName.find(name); indexed != program_.methodByName.end() &&
+			indexed->second < program_.methods.size()) {
+			const Method& method = program_.methods[indexed->second];
+			if (!method.ownerType.valid && argumentCount <= method.parameters.size()) return &method;
+		}
+		// Reconstructed bundles can contain methods whose qualified-name index was
+		// built before all source pages were loaded. Resolve ordinary assembly
+		// methods from the canonical method vector as a deterministic fallback.
+		for (const Method& method : program_.methods) {
+			if (!method.ownerType.valid && method.name == name && argumentCount <= method.parameters.size()) return &method;
+		}
+		return nullptr;
 	}
 
 	const DllCommand* ResolveDllCommand(const std::string& name, const std::size_t argumentCount) const
@@ -1500,7 +1549,7 @@ private:
 			const auto& callee = *node.children.front(); const std::size_t count = node.children.size() - 1;
 			if (callee.kind == Kind::Name) {
 				if (const Method* owned = ResolveOwnedMethod(method, callee.text, count)) return owned->returnType;
-				if (const auto methodFound = program_.methodByName.find(callee.text); methodFound != program_.methodByName.end()) return program_.methods[methodFound->second].returnType;
+				if (const Method* targetMethod = ResolveUnqualifiedMethod(callee.text, count)) return targetMethod->returnType;
 				if (const DllCommand* dll = ResolveDllCommand(callee.text, count)) return dll->returnType;
 				if (const auto command = ResolveGlobalCommand(callee.text, count)) {
 					return { program_.NormalizeLibraryType(command->libraryIndex, command->command->returnType), (command->command->state & kCommandReturnsArray) != 0, true };
@@ -1934,18 +1983,17 @@ private:
 				}
 				arguments += '}'; return "method_" + std::to_string(owned->id) + '(' + arguments + ',' + (method.ownerType.valid ? "self" : "nullptr") + ')';
 			}
-			if (const auto target = program_.methodByName.find(callee.text); target != program_.methodByName.end()) {
-				const Method& targetMethod = program_.methods[target->second];
-				if (argumentCount > targetMethod.parameters.size()) { Fail("too_many_method_arguments:" + callee.text); return "Empty()"; }
-				QueueMethod(target->second); std::string arguments = "{";
+			if (const Method* targetMethod = ResolveUnqualifiedMethod(callee.text, argumentCount)) {
+				if (argumentCount > targetMethod->parameters.size()) { Fail("too_many_method_arguments:" + callee.text); return "Empty()"; }
+				QueueMethod(targetMethod->id); std::string arguments = "{";
 				for (std::size_t index = 1; index < node.children.size(); ++index) {
 					const std::size_t parameterIndex = index - 1;
-					const bool byReference = parameterIndex < targetMethod.parameters.size() && targetMethod.parameters[parameterIndex].byReference;
+					const bool byReference = parameterIndex < targetMethod->parameters.size() && targetMethod->parameters[parameterIndex].byReference;
 					const bool referenceable = IsLvalue(*node.children[index]) && !(node.children[index]->kind == Kind::Name && !FindVariable(method, node.children[index]->text));
 					if (byReference && !referenceable) { Fail(method.sourceFile + ": reference_parameter_requires_variable:" + callee.text); return "Empty()"; }
 					arguments += EmitArg(method, *node.children[index], byReference) + ',';
 				}
-				arguments += '}'; return "method_" + std::to_string(target->second) + '(' + arguments + ",nullptr)";
+				arguments += '}'; return "method_" + std::to_string(targetMethod->id) + '(' + arguments + ",nullptr)";
 			}
 			if (const DllCommand* dll = ResolveDllCommand(callee.text, argumentCount)) return EmitDllCall(method, *dll, node);
 			const auto binding = ResolveGlobalCommand(callee.text, argumentCount);
@@ -2521,7 +2569,7 @@ extern "C" ert::EIntPtr __stdcall BlackMoonFuncForeLibNotifySys(
 				prefix << "int main(){ert::InitializeLegacyCrtData();if(!AfxWinInit(GetModuleHandleA(nullptr),nullptr,GetCommandLineA(),0))ExitProcess(1);E_Init();if(!EStartup())ExitProcess(1);const int result=ECodeStart();ecompiler_safe_destroy();ExitProcess(static_cast<UINT>(result));}\n";
 			}
 			else {
-				prefix << "int main(){E_Init();if(!EStartup())ExitProcess(1);const int result=ECodeStart();ecompiler_safe_destroy();return result;}\n";
+				prefix << "int main(){ert::InitializeLegacyTimezoneData();E_Init();if(!EStartup())ExitProcess(1);const int result=ECodeStart();ecompiler_safe_destroy();return result;}\n";
 			}
 		}
 		result_->text += prefix.str();
