@@ -132,6 +132,8 @@ e-packager compile-check checked.e `
 
 `compile` 把易语言源码直接编译成独立的 EXE 或 DLL，不需要打开易语言 IDE：
 
+> 🚀 想要从零开始的完整上手教程（含实测编译尺寸、GUI 子系统、DLL 导出与失败排查），见 [`docs/compile-from-source-guide.md`](docs/compile-from-source-guide.md)。
+
 ```text
 e-packager compile <input.e|input-dir> <output.exe|output.dll> [选项]
 ```
@@ -268,7 +270,7 @@ e-packager.exe compile MyApp.e .\out\MyApp.exe `
 | `--blackmoon-x86-dir <目录>` / `--blackmoon-x64-dir <目录>` | semantic 指定架构核心 adapter 根目录 |
 | `--blackmoon-timeout <秒>` | 黑月编译与链接超时，默认 120，范围 1 至 3600 |
 
-如果支持库或静态库中缺少某个命令的实现，请更换匹配版本的支持库，而不是修改源码绕开。实现原理与已验证范围详见 [`docs/independent-compiler-architecture.md`](docs/independent-compiler-architecture.md)。
+如果支持库或静态库中缺少某个命令的实现，请更换匹配版本的支持库，而不是修改源码绕开。从零开始的完整上手流程、实测编译尺寸与失败排查详见 [`docs/compile-from-source-guide.md`](docs/compile-from-source-guide.md)；实现原理与已验证范围详见 [`docs/independent-compiler-architecture.md`](docs/independent-compiler-architecture.md)。
 
 ### 刷新派生内容
 
