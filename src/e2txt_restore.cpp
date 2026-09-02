@@ -26,6 +26,7 @@
 #include "..\thirdparty\json.hpp"
 
 #include "EFolderCodec.h"
+#include "FormControlPropertyCodec.h"
 #include "PathHelper.h"
 #include "SimpleXmlDocument.h"
 #include "SourcePreflightValidator.h"
@@ -1234,13 +1235,26 @@ std::vector<std::filesystem::path> BuildSupportLibraryCandidatePaths(
 		return candidates;
 	}
 
-	std::filesystem::path filePath = std::filesystem::path(libraryFileName);
-	if (!filePath.has_extension()) {
-		filePath += ".fne";
+	const std::filesystem::path filePath = std::filesystem::path(libraryFileName);
+	std::vector<std::filesystem::path> fileVariants;
+	if (filePath.has_extension()) {
+		fileVariants.push_back(filePath);
+		if (filePath.extension() == ".fne") {
+			fileVariants.push_back(filePath.string() + ".dll");
+		}
+	}
+	else {
+		fileVariants.push_back(filePath.string() + ".fne");
+		fileVariants.push_back(filePath.string() + ".fne.dll");
+		fileVariants.push_back(filePath.string() + ".fnr");
+		fileVariants.push_back(filePath.string() + ".dll");
+		fileVariants.push_back(filePath);
 	}
 
 	if (filePath.is_absolute()) {
-		PushUniqueCandidate(candidates, filePath);
+		for (const auto& variant : fileVariants) {
+			PushUniqueCandidate(candidates, variant);
+		}
 		return candidates;
 	}
 
@@ -1248,16 +1262,18 @@ std::vector<std::filesystem::path> BuildSupportLibraryCandidatePaths(
 		if (baseDir.empty()) {
 			return;
 		}
-		PushUniqueCandidate(candidates, baseDir / filePath);
-		PushUniqueCandidate(candidates, baseDir / "lib" / filePath);
+		for (const auto& variant : fileVariants) {
+			PushUniqueCandidate(candidates, baseDir / variant);
+			PushUniqueCandidate(candidates, baseDir / "lib" / variant);
 
-		std::filesystem::path current = baseDir;
-		while (!current.empty()) {
-			PushUniqueCandidate(candidates, current / "lib" / filePath);
-			if (current == current.root_path()) {
-				break;
+			std::filesystem::path current = baseDir;
+			while (!current.empty()) {
+				PushUniqueCandidate(candidates, current / "lib" / variant);
+				if (current == current.root_path()) {
+					break;
+				}
+				current = current.parent_path();
 			}
-			current = current.parent_path();
 		}
 	};
 
@@ -2253,7 +2269,13 @@ private:
 	{
 		constexpr int kMaxSupportLibraryArrayCount = 16384;
 		const bool isCoreSupportLibrary = IsCoreSupportLibraryFileName(dependency.fileName);
-		const auto candidates = BuildSupportLibraryCandidatePaths(m_sourcePath, dependency.fileName);
+		std::vector<std::filesystem::path> candidates;
+		if (!dependency.resolvedPath.empty()) {
+			PushUniqueCandidate(candidates, Utf8PathToPath(dependency.resolvedPath));
+		}
+		for (const auto& candidate : BuildSupportLibraryCandidatePaths(m_sourcePath, dependency.fileName)) {
+			PushUniqueCandidate(candidates, candidate);
+		}
 		const auto tryTextWorkspaceFallback = [&]() {
 			return LoadSupportLibraryTextWorkspace(dependency, supportIndex);
 		};
@@ -8338,6 +8360,38 @@ std::string GetXmlAttribute(const SimpleXmlNode& node, const std::string& key)
 	return std::string();
 }
 
+FormControlPropertyXmlNode ConvertFormControlPropertyXmlNode(const SimpleXmlNode& node)
+{
+	FormControlPropertyXmlNode converted;
+	converted.name = node.name;
+	converted.attributes.reserve(node.attributes.size());
+	for (const auto& attribute : node.attributes) {
+		converted.attributes.push_back(attribute);
+	}
+	converted.children.reserve(node.children.size());
+	for (const auto& child : node.children) {
+		converted.children.push_back(ConvertFormControlPropertyXmlNode(child));
+	}
+	return converted;
+}
+
+std::size_t CountFormControlTabHeaders(const SimpleXmlNode& node)
+{
+	for (const auto& child : node.children) {
+		if (child.name != node.name + ".子夹管理") {
+			continue;
+		}
+		std::size_t count = 0;
+		for (const auto& tab : child.children) {
+			if (tab.name == "子夹") {
+				++count;
+			}
+		}
+		return count;
+	}
+	return 0;
+}
+
 std::int32_t GetXmlIntAttribute(const SimpleXmlNode& node, const std::string& key, const std::int32_t defaultValue)
 {
 	std::int32_t value = 0;
@@ -8504,15 +8558,18 @@ std::int32_t ResolveFormElementTypeId(const std::string& tagName, TypeResolver& 
 	return resolver.ResolveTypeId(normalized);
 }
 
-void BuildFormControlTree(
+bool BuildFormControlTree(
 	const SimpleXmlNode& node,
+	const std::uint32_t formId,
 	const std::int32_t parentId,
 	const std::int32_t preferredOwnerClassId,
 	const RestoreDocumentModel& model,
 	TypeResolver& resolver,
 	IdAllocator& allocator,
+	FormControlPropertyCodec& propertyCodec,
 	std::vector<RestoreFormElement>& outElements,
-	std::vector<std::int32_t>& outChildren)
+	std::vector<std::int32_t>& outChildren,
+	std::string* outError)
 {
 	RestoreFormElement element;
 	element.id = allocator.Alloc(epl_system_id::kTypeFormControl);
@@ -8530,17 +8587,46 @@ void BuildFormControlTree(
 	element.cursor = DecodeBase64(GetXmlAttribute(node, "鼠标指针"));
 	element.tabStop = GetXmlBoolAttribute(node, "可停留焦点", true);
 	element.tabIndex = GetXmlIntAttribute(node, "停留顺序", 0);
+	element.locked = GetXmlBoolAttribute(node, "锁定", false);
 	element.extensionData = DecodeBase64(GetXmlAttribute(node, "扩展属性数据"));
+	std::vector<std::pair<std::string, std::string>> xmlAttributes;
+	xmlAttributes.reserve(node.attributes.size());
+	for (const auto& attribute : node.attributes) {
+		xmlAttributes.push_back(attribute);
+	}
+	std::vector<FormControlPropertyXmlNode> xmlChildren;
+	xmlChildren.reserve(node.children.size());
+	for (const auto& child : node.children) {
+		xmlChildren.push_back(ConvertFormControlPropertyXmlNode(child));
+	}
+	std::vector<std::uint8_t> updatedPropertyData;
+	if (!propertyCodec.Apply(
+				element.dataType,
+				element.extensionData,
+				formId,
+				static_cast<std::uint32_t>(element.id),
+				xmlAttributes,
+				updatedPropertyData,
+				outError,
+				xmlChildren)) {
+		if (outError != nullptr && !outError->empty()) {
+			*outError = "window_control[" + node.name + "]: " + *outError;
+		}
+		return false;
+	}
+	element.extensionData = std::move(updatedPropertyData);
 	element.events = ReadFormControlEventsFromXml(node, node.name + ".事件", preferredOwnerClassId, model);
 
 	std::vector<std::int32_t> childIds;
 	const bool isTabControl = resolver.IsTabControlType(element.dataType);
 	if (isTabControl) {
 		bool firstTab = true;
+		std::size_t tabGroupCount = 0;
 		for (const auto& child : node.children) {
 			if (child.name != node.name + ".子夹") {
 				continue;
 			}
+			++tabGroupCount;
 			if (!firstTab) {
 				childIds.push_back(0);
 			}
@@ -8549,7 +8635,29 @@ void BuildFormControlTree(
 				if (StartsWith(tabChild.name, node.name + ".")) {
 					continue;
 				}
-				BuildFormControlTree(tabChild, element.id, preferredOwnerClassId, model, resolver, allocator, outElements, childIds);
+				if (!BuildFormControlTree(
+						tabChild,
+						formId,
+						element.id,
+						preferredOwnerClassId,
+						model,
+						resolver,
+						allocator,
+						propertyCodec,
+						outElements,
+						childIds,
+						outError)) {
+					return false;
+				}
+			}
+		}
+		const std::size_t tabHeaderCount = CountFormControlTabHeaders(node);
+		if (tabHeaderCount > tabGroupCount) {
+			const std::size_t missingGroupCount = tabGroupCount == 0
+				? tabHeaderCount - 1
+				: tabHeaderCount - tabGroupCount;
+			for (std::size_t index = 0; index < missingGroupCount; ++index) {
+				childIds.push_back(0);
 			}
 		}
 	}
@@ -8558,12 +8666,26 @@ void BuildFormControlTree(
 			if (StartsWith(child.name, node.name + ".")) {
 				continue;
 			}
-			BuildFormControlTree(child, element.id, preferredOwnerClassId, model, resolver, allocator, outElements, childIds);
+			if (!BuildFormControlTree(
+					child,
+					formId,
+					element.id,
+					preferredOwnerClassId,
+					model,
+					resolver,
+					allocator,
+					propertyCodec,
+					outElements,
+					childIds,
+					outError)) {
+				return false;
+			}
 		}
 	}
 	element.children = std::move(childIds);
 	outChildren.push_back(element.id);
 	outElements.push_back(std::move(element));
+	return true;
 }
 
 void BuildFormMenus(
@@ -8606,6 +8728,17 @@ bool BuildFormsFromXml(
 	std::string* outError)
 {
 	outForms.clear();
+	std::vector<FormControlSupportLibrary> supportLibraries;
+	for (const auto& dependency : model.dependencies) {
+		if (!dependency.isSupportLibrary) {
+			continue;
+		}
+		supportLibraries.push_back(FormControlSupportLibrary {
+			.fileName = dependency.fileName,
+			.resolvedPath = dependency.resolvedPath,
+		});
+	}
+	FormControlPropertyCodec propertyCodec(model.sourcePath, supportLibraries);
 	for (const auto& formDef : parsedForms) {
 		RestoreForm form;
 		const std::string normalizedFormName = TypeResolver::NormalizeTypeName(formDef.name);
@@ -8663,7 +8796,34 @@ bool BuildFormsFromXml(
 			selfElement.cursor = DecodeBase64(GetXmlAttribute(root, "鼠标指针"));
 			selfElement.tabStop = GetXmlBoolAttribute(root, "可停留焦点", true);
 			selfElement.tabIndex = GetXmlIntAttribute(root, "停留顺序", 0);
+			selfElement.locked = GetXmlBoolAttribute(root, "锁定", false);
 			selfElement.extensionData = DecodeBase64(GetXmlAttribute(root, "扩展属性数据"));
+			std::vector<std::pair<std::string, std::string>> rootAttributes;
+			rootAttributes.reserve(root.attributes.size());
+			for (const auto& attribute : root.attributes) {
+				rootAttributes.push_back(attribute);
+			}
+			std::vector<FormControlPropertyXmlNode> rootPropertyChildren;
+			rootPropertyChildren.reserve(root.children.size());
+			for (const auto& child : root.children) {
+				rootPropertyChildren.push_back(ConvertFormControlPropertyXmlNode(child));
+			}
+			std::vector<std::uint8_t> updatedRootPropertyData;
+			if (!propertyCodec.Apply(
+						selfElement.dataType,
+						selfElement.extensionData,
+						static_cast<std::uint32_t>(form.id),
+						static_cast<std::uint32_t>(selfElement.id),
+						rootAttributes,
+						updatedRootPropertyData,
+						outError,
+						rootPropertyChildren)) {
+				if (outError != nullptr && !outError->empty()) {
+					*outError = "window_control[窗口]: " + *outError;
+				}
+				return false;
+			}
+			selfElement.extensionData = std::move(updatedRootPropertyData);
 			selfElement.events = ReadFormControlEventsFromXml(root, "窗口.事件", form.classId, model);
 
 			form.elements.push_back(selfElement);
@@ -8677,7 +8837,20 @@ bool BuildFormsFromXml(
 				if (child.name == "窗口.菜单" || StartsWith(child.name, root.name + ".")) {
 					continue;
 				}
-				BuildFormControlTree(child, 0, form.classId, model, resolver, allocator, form.elements, rootChildren);
+				if (!BuildFormControlTree(
+						child,
+						static_cast<std::uint32_t>(form.id),
+						0,
+						form.classId,
+						model,
+						resolver,
+						allocator,
+						propertyCodec,
+						form.elements,
+						rootChildren,
+						outError)) {
+					return false;
+				}
 			}
 		}
 		else {

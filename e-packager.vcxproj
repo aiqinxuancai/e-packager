@@ -172,6 +172,7 @@
     <ClCompile Include="src\EFolderCodec.cpp">
       <ObjectFileName>$(IntDir)EFolderCodecCore.obj</ObjectFileName>
     </ClCompile>
+    <ClCompile Include="src\FormControlPropertyCodec.cpp" />
     <ClCompile Include="src\SelfUpdater.cpp" />
     <ClCompile Include="src\SimpleXmlDocument.cpp" />
     <ClCompile Include="src\SourceExpressionParser.cpp" />
@@ -198,6 +199,7 @@
     <ClInclude Include="src\BundlePathUtils.h" />
     <ClInclude Include="src\DependencyDownloader.h" />
     <ClInclude Include="src\EFolderCodec.h" />
+    <ClInclude Include="src\FormControlPropertyCodec.h" />
     <ClInclude Include="src\SelfUpdater.h" />
     <ClInclude Include="src\SimpleXmlDocument.h" />
     <ClInclude Include="src\SourceExpressionParser.h" />

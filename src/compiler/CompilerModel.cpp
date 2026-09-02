@@ -1057,9 +1057,13 @@ std::filesystem::path ResolveSupportLibraryPath(
 		std::vector<std::filesystem::path> variants;
 		if (configuredName.has_extension()) {
 			variants.push_back(configuredName);
+			if (configuredName.extension() == L".fne") {
+				variants.push_back(configuredName.wstring() + L".dll");
+			}
 		}
 		else {
 			variants.push_back(configuredName.wstring() + L".fne");
+			variants.push_back(configuredName.wstring() + L".fne.dll");
 			variants.push_back(configuredName.wstring() + L".fnr");
 			variants.push_back(configuredName);
 		}

@@ -216,10 +216,14 @@ std::vector<std::filesystem::path> BuildLibraryFileVariants(const std::string& l
 
 	if (filePath.has_extension()) {
 		variants.push_back(filePath);
+		if (filePath.extension() == ".fne") {
+			variants.push_back(filePath.string() + ".dll");
+		}
 		return variants;
 	}
 
 	variants.push_back(filePath.string() + ".fne");
+	variants.push_back(filePath.string() + ".fne.dll");
 	variants.push_back(filePath.string() + ".fnr");
 	variants.push_back(filePath.string() + ".dll");
 	variants.push_back(filePath);

@@ -28,6 +28,7 @@
 #include <lib2.h>
 
 #include "BundlePathUtils.h"
+#include "FormControlPropertyCodec.h"
 #include "PathHelper.h"
 
 namespace e2txt {
@@ -3187,9 +3188,20 @@ std::vector<std::filesystem::path> BuildSupportLibraryCandidatePaths(
 		return candidates;
 	}
 
-	std::filesystem::path filePath = std::filesystem::path(libraryFileName);
-	if (!filePath.has_extension()) {
-		filePath += ".fne";
+	const std::filesystem::path filePath = std::filesystem::path(libraryFileName);
+	std::vector<std::filesystem::path> fileVariants;
+	if (filePath.has_extension()) {
+		fileVariants.push_back(filePath);
+		if (filePath.extension() == ".fne") {
+			fileVariants.push_back(filePath.string() + ".dll");
+		}
+	}
+	else {
+		fileVariants.push_back(filePath.string() + ".fne");
+		fileVariants.push_back(filePath.string() + ".fne.dll");
+		fileVariants.push_back(filePath.string() + ".fnr");
+		fileVariants.push_back(filePath.string() + ".dll");
+		fileVariants.push_back(filePath);
 	}
 
 	if (filePath.is_absolute()) {
@@ -3197,7 +3209,9 @@ std::vector<std::filesystem::path> BuildSupportLibraryCandidatePaths(
 		// installation.  Architecture-aware callers get a chance to resolve
 		// the same library name from their configured directory first.
 		if (configuredDirectories == nullptr || configuredDirectories->empty()) {
-			PushUniqueCandidate(candidates, filePath);
+			for (const auto& variant : fileVariants) {
+				PushUniqueCandidate(candidates, variant);
+			}
 			return candidates;
 		}
 	}
@@ -3207,13 +3221,15 @@ std::vector<std::filesystem::path> BuildSupportLibraryCandidatePaths(
 			if (directory.empty()) {
 				continue;
 			}
-			if (filePath.is_absolute()) {
-				PushUniqueCandidate(candidates, directory / filePath.filename());
+			for (const auto& variant : fileVariants) {
+				if (filePath.is_absolute()) {
+					PushUniqueCandidate(candidates, directory / variant.filename());
+				}
+				else {
+					PushUniqueCandidate(candidates, directory / variant);
+				}
+				PushUniqueCandidate(candidates, directory / "lib" / variant.filename());
 			}
-			else {
-				PushUniqueCandidate(candidates, directory / filePath);
-			}
-			PushUniqueCandidate(candidates, directory / "lib" / filePath.filename());
 		}
 		if (restrictToConfiguredDirectories) {
 			return candidates;
@@ -3221,7 +3237,9 @@ std::vector<std::filesystem::path> BuildSupportLibraryCandidatePaths(
 	}
 
 	if (filePath.is_absolute()) {
-		PushUniqueCandidate(candidates, filePath);
+		for (const auto& variant : fileVariants) {
+			PushUniqueCandidate(candidates, variant);
+		}
 		return candidates;
 	}
 
@@ -3229,16 +3247,18 @@ std::vector<std::filesystem::path> BuildSupportLibraryCandidatePaths(
 		if (baseDir.empty()) {
 			return;
 		}
-		PushUniqueCandidate(candidates, baseDir / filePath);
-		PushUniqueCandidate(candidates, baseDir / "lib" / filePath);
+		for (const auto& variant : fileVariants) {
+			PushUniqueCandidate(candidates, baseDir / variant);
+			PushUniqueCandidate(candidates, baseDir / "lib" / variant);
 
-		std::filesystem::path current = baseDir;
-		while (!current.empty()) {
-			PushUniqueCandidate(candidates, current / "lib" / filePath);
-			if (current == current.root_path()) {
-				break;
+			std::filesystem::path current = baseDir;
+			while (!current.empty()) {
+				PushUniqueCandidate(candidates, current / "lib" / variant);
+				if (current == current.root_path()) {
+					break;
+				}
+				current = current.parent_path();
 			}
-			current = current.parent_path();
 		}
 	};
 
@@ -6310,6 +6330,9 @@ std::vector<std::pair<std::string, std::string>> BuildFormControlXmlAttributes(
 	if (item.tabIndex != 0) {
 		attributes.emplace_back("停留顺序", std::to_string(item.tabIndex));
 	}
+	if (item.locked) {
+		attributes.emplace_back("锁定", BoolToEText(true));
+	}
 	attributes.emplace_back("扩展属性数据", EncodeBase64(item.extensionData));
 	return attributes;
 }
@@ -6332,6 +6355,137 @@ std::vector<std::pair<std::string, std::string>> BuildFormMenuXmlAttributes(cons
 		attributes.emplace_back("快捷键", std::to_string(item.hotKey));
 	}
 	return attributes;
+}
+
+void AppendFormControlPropertyXmlAttributes(
+	std::vector<std::pair<std::string, std::string>>& attributes,
+	FormControlPropertyCodec& codec,
+	const FormInfo::ElementInfo& item,
+	const std::uint32_t formId,
+	FormControlPropertySemanticData* outSemantic)
+{
+	if (outSemantic != nullptr) {
+		*outSemantic = {};
+	}
+	std::vector<FormControlPropertyValue> values;
+	std::string error;
+	if (!codec.Decode(
+			item.dataType,
+			item.extensionData,
+			formId,
+			static_cast<std::uint32_t>(item.id),
+			values,
+			&error,
+			outSemantic)) {
+		return;
+	}
+	for (const auto& value : values) {
+		if (value.definition.xmlName.empty()) {
+			continue;
+		}
+		const bool semanticAvailable =
+			outSemantic != nullptr &&
+			((value.definition.name == "列表项目" && outSemantic->hasListItems) ||
+				(value.definition.name == "项目数值" && outSemantic->hasItemValues) ||
+				(value.definition.name == "子夹管理" && outSemantic->hasTabItems));
+		if (value.definition.dataType == UD_CUSTOMIZE && semanticAvailable) {
+			continue;
+		}
+		attributes.emplace_back(
+			value.definition.xmlName,
+			FormControlPropertyCodec::ValueToXmlText(value));
+	}
+}
+
+bool AppendFormControlPropertyXmlChildren(
+	FormXml& formXml,
+	const std::string& tagName,
+	const int indent,
+	const FormControlPropertySemanticData& semantic)
+{
+	bool appended = false;
+	if (semantic.hasListItems) {
+		const std::string containerName = tagName + ".列表项目";
+		if (semantic.listItems.empty()) {
+			AppendXmlLine(formXml, indent, BuildXmlOpenTag(containerName, {}, true));
+		}
+		else {
+			AppendXmlLine(formXml, indent, BuildXmlOpenTag(containerName, {}, false));
+			for (std::size_t index = 0; index < semantic.listItems.size(); ++index) {
+				AppendXmlLine(
+					formXml,
+					indent + 1,
+					BuildXmlOpenTag(
+						"项目",
+						{
+							{ "索引", std::to_string(index) },
+							{ "文本", semantic.listItems[index] },
+						},
+						true));
+			}
+			AppendXmlLine(formXml, indent, "</" + containerName + ">");
+		}
+		appended = true;
+	}
+	if (semantic.hasItemValues) {
+		const std::string containerName = tagName + ".项目数值";
+		if (semantic.itemValues.empty()) {
+			AppendXmlLine(formXml, indent, BuildXmlOpenTag(containerName, {}, true));
+		}
+		else {
+			AppendXmlLine(formXml, indent, BuildXmlOpenTag(containerName, {}, false));
+			for (std::size_t index = 0; index < semantic.itemValues.size(); ++index) {
+				AppendXmlLine(
+					formXml,
+					indent + 1,
+					BuildXmlOpenTag(
+						"项目",
+						{
+							{ "索引", std::to_string(index) },
+							{ "数值", std::to_string(semantic.itemValues[index]) },
+						},
+						true));
+			}
+			AppendXmlLine(formXml, indent, "</" + containerName + ">");
+		}
+		appended = true;
+	}
+	if (semantic.hasTabItems) {
+		const std::string containerName = tagName + ".子夹管理";
+		if (semantic.tabItems.empty()) {
+			AppendXmlLine(formXml, indent, BuildXmlOpenTag(containerName, {}, true));
+		}
+		else {
+			AppendXmlLine(formXml, indent, BuildXmlOpenTag(containerName, {}, false));
+			for (std::size_t index = 0; index < semantic.tabItems.size(); ++index) {
+				AppendXmlLine(
+					formXml,
+					indent + 1,
+					BuildXmlOpenTag(
+						"子夹",
+						{
+							{ "索引", std::to_string(index) },
+							{ "标题", semantic.tabItems[index] },
+						},
+						true));
+			}
+			AppendXmlLine(formXml, indent, "</" + containerName + ">");
+		}
+		appended = true;
+	}
+	return appended;
+}
+
+std::vector<FormControlSupportLibrary> BuildFormControlSupportLibraries(const ProgramSection& program)
+{
+	std::vector<FormControlSupportLibrary> libraries;
+	libraries.reserve(program.header.supportLibraryInfo.size());
+	for (const auto& rawInfo : program.header.supportLibraryInfo) {
+		FormControlSupportLibrary library;
+		library.fileName = GetFirstSupportLibraryToken(rawInfo);
+		libraries.push_back(std::move(library));
+	}
+	return libraries;
 }
 
 std::string BuildQualifiedMethodName(SymbolResolver& resolver, const std::int32_t methodId)
@@ -6402,20 +6556,35 @@ void BuildFormXmlEntries(
 		&sections.losable.removedDefinedItems,
 		&options.supportLibrarySearchDirectories,
 		options.restrictSupportLibrarySearch);
+	FormControlPropertyCodec propertyCodec(
+		outDocument.sourcePath,
+		BuildFormControlSupportLibraries(sections.program),
+		options.supportLibrarySearchDirectories,
+		options.restrictSupportLibrarySearch);
 	for (const auto& form : sections.resources.forms) {
 		FormXml formXml;
 		formXml.name = TrimAsciiCopy(form.name);
 		formXml.lines.push_back("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
 
 		const FormInfo::ElementInfo* formSelf = FindFormSelfElement(form);
+		FormControlPropertySemanticData rootSemantic;
 		auto rootAttributes = formSelf != nullptr
 			? BuildFormControlXmlAttributes(*formSelf, false)
 			: std::vector<std::pair<std::string, std::string>>();
+		if (formSelf != nullptr) {
+			AppendFormControlPropertyXmlAttributes(
+				rootAttributes,
+				propertyCodec,
+				*formSelf,
+				static_cast<std::uint32_t>(form.header.dwId),
+				&rootSemantic);
+		}
 		rootAttributes.insert(rootAttributes.begin(), std::make_pair("名称", formXml.name));
 		if (!TrimAsciiCopy(form.comment).empty()) {
 			rootAttributes.insert(rootAttributes.begin() + 1, std::make_pair("备注", TrimAsciiCopy(form.comment)));
 		}
 		AppendXmlLine(formXml, 0, BuildXmlOpenTag("窗口", rootAttributes, false));
+		AppendFormControlPropertyXmlChildren(formXml, "窗口", 1, rootSemantic);
 		if (formSelf != nullptr) {
 			AppendFormControlEventXmlLines(formXml, *formSelf, "窗口", 1, resolver);
 		}
@@ -6511,16 +6680,26 @@ void BuildFormXmlEntries(
 
 		std::function<void(const FormInfo::ElementInfo&, int)> renderControl = [&](const FormInfo::ElementInfo& item, int indent) {
 			const std::string tagName = ResolveFormElementXmlName(item, resolver);
-			const auto attributes = BuildFormControlXmlAttributes(item, true);
+			FormControlPropertySemanticData semantic;
+			auto attributes = BuildFormControlXmlAttributes(item, true);
+			AppendFormControlPropertyXmlAttributes(
+				attributes,
+				propertyCodec,
+				item,
+				static_cast<std::uint32_t>(form.header.dwId),
+				&semantic);
 			const bool isTabControl = resolver.IsTabControlDataType(item.dataType);
 			const bool hasChildren = !item.children.empty();
 			const bool hasEventBindings = !item.events.empty();
-			if (!hasChildren && !hasEventBindings) {
+			const bool hasSemanticProperties =
+				semantic.hasListItems || semantic.hasItemValues || semantic.hasTabItems;
+			if (!hasChildren && !hasEventBindings && !hasSemanticProperties) {
 				AppendXmlLine(formXml, indent, BuildXmlOpenTag(tagName, attributes, true));
 				return;
 			}
 
 			AppendXmlLine(formXml, indent, BuildXmlOpenTag(tagName, attributes, false));
+			AppendFormControlPropertyXmlChildren(formXml, tagName, indent + 1, semantic);
 			AppendFormControlEventXmlLines(formXml, item, tagName, indent + 1, resolver);
 			if (isTabControl) {
 				std::vector<const FormInfo::ElementInfo*> currentGroup;
