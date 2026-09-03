@@ -109,7 +109,7 @@ e-packager validate <input-dir>
 ```powershell
 tool\e-packager.exe pack . .\pack\checked.e `
   --compile-check `
-  --eide "C:\path\to\e.exe" `
+  --eide "C:\path\to\IDE.exe" `
   --autolinker-test "D:\git\AutoLinker\bin\fne_release\AutoLinkerTest.exe" `
   --compile-static --compile-timeout 120
 ```
@@ -118,7 +118,7 @@ tool\e-packager.exe pack . .\pack\checked.e `
 
 ```powershell
 e-packager compile-check checked.e `
-  --eide "C:\path\to\e.exe" `
+  --eide "C:\path\to\IDE.exe" `
   --autolinker-test "D:\git\AutoLinker\bin\fne_release\AutoLinkerTest.exe"
 ```
 
@@ -128,7 +128,7 @@ e-packager compile-check checked.e `
 
 ### 源码直接编译（试验性）
 
-> ⚠️ **试验性功能。** 编译结果尚未经过大规模验证，行为和选项可能随版本变化。窗口控件/窗口事件以及少见的支持库暂不保证可用。删除全部窗体后仅保留纯代码的窗口工程可以生成不弹出控制台的 Win32 GUI EXE。交付前请继续用 `compile-check` 或易语言 IDE 确认，不要直接把产物用于生产环境。
+> ⚠️ **试验性功能。** 语义编译已覆盖当前样例中的常用 Win32 控件、嵌套控件、常见属性和事件，但不是易语言 IDE 的完整替代品。第三方窗口组件仍需要自己的原生运行时适配；交付前请继续用 `compile-check` 或易语言 IDE 复核。
 
 `compile` 把易语言源码直接编译成独立的 EXE 或 DLL，不需要打开易语言 IDE：
 
@@ -144,10 +144,25 @@ e-packager compile <input.e|input-dir> <output.exe|output.dll> [选项]
 
 | `--compile-mode` | 架构 | 需要什么 |
 | --- | --- | --- |
-| `semantic`（默认，推荐） | x86 / x64 | 一套 Visual C++ 工具链；调用核心库命令时还需同架构的 BlackMoonModernCore adapter |
-| `legacy-blackmoon` | 仅 x86 | 已安装的易语言、AutoLinker、黑月工具链，以及匹配的传统核心归档 |
+| `semantic`（默认，推荐） | x86 / x64 | Visual Studio C++ 工具链、Windows SDK；调用核心库命令时还需同架构的 BlackMoonModernCore adapter，以及第三方支持库的 FNE 和静态库 |
+| `legacy-blackmoon` | 仅 x86 | Win32 e-packager、易语言 IDE、已启用的 AutoLinker.fne、BlackMoon 工具链和匹配的传统核心归档 |
 
 `blackmoon` 是兼容旧脚本的别名：x86 下等同于 `legacy-blackmoon`，x64 下等同于 `semantic`。没有特殊需求时用默认的 `semantic` 即可；只有依赖传统黑月工具链、或需要和旧编译产物保持完全一致时才需要 `legacy-blackmoon`。
+
+#### 先安装 Visual Studio C++ 工具链
+
+`semantic` 不是只调用一个 `link.exe`。它会编译生成的 C++ 源码，并使用 Windows SDK 的 `windows.h`、`rc.exe` 和导入库。因此请在 Visual Studio Installer 中勾选 **使用 C++ 的桌面开发**，并确认包含 MSVC 编译工具、Windows 10/11 SDK 和 Windows 通用 C 运行库。
+
+安装后应能在 VS 开发者 PowerShell 中找到 `cl.exe`、`link.exe`、`rc.exe`，并在对应 SDK Include 目录中找到 `windows.h`。e-packager 会自动探测 VS；也可以显式指定 VS 自带的同架构工具：
+
+```powershell
+e-packager.exe compile MyApp.e .\out\MyApp-x86.exe `
+  --arch x86 `
+  --compiler "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Tools\MSVC\<版本>\bin\Hostx64\x86\cl.exe" `
+  --linker "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Tools\MSVC\<版本>\bin\Hostx64\x86\link.exe"
+```
+
+不要把 `C:\Users\<用户名>\OneDrive\e5.6\linker` 下易语言打包的链接器当作 semantic 的 C++ 工具链。它不提供完整的 VS 头文件、CRT、Windows SDK 导入库和 `rc.exe`，也不能替代 Visual Studio 安装。`--lib` 用于搜索支持库静态实现，不是用来拼出 VS SDK 的；VS 的系统库由 `cl.exe` 所属的 VS 安装自动确定。
 
 #### semantic：默认方式
 
@@ -162,9 +177,9 @@ e-packager.exe compile .\MyLib .\out\MyLib.dll
 
 ```powershell
 e-packager.exe compile MyApp.e .\out\MyApp.exe `
-  --compiler "C:\path\to\VC2022\bin\Hostx64\x86\cl.exe" `
-  --linker "C:\path\to\VC2022Linker\bin\link.exe" `
-  --lib "C:\path\to\VC2022Linker\lib"
+  --compiler "C:\path\to\VC\Tools\MSVC\<版本>\bin\Hostx64\x86\cl.exe" `
+  --linker "C:\path\to\VC\Tools\MSVC\<版本>\bin\Hostx64\x86\link.exe" `
+  --lib "D:\deps\support-libraries"
 ```
 
 x86、x64 都可以用 `--arch x86` / `--arch x64` 指定，默认跟随当前程序架构。
@@ -180,7 +195,7 @@ e-packager.exe compile MyApp.e .\out\MyApp-gui.exe --subsystem windows
 e-packager.exe compile MyApp.e .\out\MyApp-console.exe --subsystem console
 ```
 
-`--dll` 或 `.dll` 输出始终使用 DLL/Windows 子系统，并由公开子程序生成导出表；它不会被 `--subsystem console` 改成控制台程序。仍包含窗体 XML 或窗口绑定的工程会继续报告 `window_project_not_supported_by_independent_compiler`，因为控件布局和事件生成尚未纳入语义编译器。
+`--dll` 或 `.dll` 输出始终使用 DLL/Windows 子系统，并由公开子程序生成导出表；它不会被 `--subsystem console` 改成控制台程序。窗口工程会使用独立 Win32 宿主，当前覆盖常用核心控件及其嵌套层级、列表/分页数据、常见属性和事件；第三方自绘控件仍需额外适配。
 
 #### 需要核心库命令时：下载 BlackMoonModernCore adapter
 
@@ -206,7 +221,7 @@ e-packager.exe compile MyApp.e .\out\MyApp-x64.exe `
   --arch x64 --blackmoon-x64-dir "D:\deps\BlackMoonModernCore\adapter"
 ```
 
-`--blackmoon-x86-dir` / `--blackmoon-x64-dir` 均可重复传入，用于补充同架构的其他支持库；但核心 adapter 里的 FNE、主归档、后备归档和清单文件必须来自**同一个** Release，不要混用不同版本。`.e` 输入会自动调用 Win32 版 `e-packager` 做权威解码，一般无需干预。
+`--blackmoon-x86-dir` / `--blackmoon-x64-dir` 均可重复传入，用于补充同架构的其他支持库；但核心 adapter 里的 FNE、主归档、后备归档和清单文件必须来自**同一个** Release，不要混用不同版本。`.e` 输入会自动调用 Win32 版 `e-packager` 做权威解码，一般无需干预。第三方支持库还必须在搜索目录中同时提供匹配架构的 `<支持库文件名>_static.lib`（或等价 `.lib`）和公开接口 FNE/`elib/*.txt`；只有接口文本而没有实现时，编译器会明确报告缺少静态实现。
 
 #### 诊断输出
 
@@ -243,10 +258,11 @@ JSON 诊断始终包含 `phase`、`code`、`file`、`line`、`column`、`message
 e-packager.exe compile MyApp.e .\out\MyApp.exe `
   --compile-mode legacy-blackmoon `
   --legacy-blackmoon-mode asm `
-  --eide "C:\path\to\e.exe" `
-  --autolinker-test "C:\path\to\AutoLinkerTest.exe" `
+  --eide "C:\path\to\IDE.exe" `
   --legacy-blackmoon-dir "C:\path\to\BlackMoon"
 ```
+
+legacy-blackmoon 会直接启动用户指定版本的易语言 IDE，向 IDE 传递 `--autolinker-headless-compile` 参数并取得中间易代码 PE；不再需要 `AutoLinkerTest.exe` 或 `AutoLinkerText.exe`。`--eide` 应指向实际的 IDE 文件，例如 `C:\path\to\IDE.exe`，不能依赖某个固定版本或固定文件名。易语言 `lib` 目录中仍需安装并启用与该 IDE 匹配的 `AutoLinker.fne`，否则 IDE 不会识别这些无头参数。最终的 `BlackMoon\bin\LINK.EXE`、入口 OBJ 和传统 `krnln.lib` 仍来自 BlackMoon/传统归档，不要改用 `e5.6\linker` 中的 VC 打包链接器。
 
 若所用的静态库带有 MFC 依赖，`asm`、`cpp` 会在链接失败后自动改用 MFC 入口重试，成功消息中的 `effective_mode` 表示实际生效的入口。不需要 MFC 的工程不受影响。
 
@@ -264,13 +280,14 @@ e-packager.exe compile MyApp.e .\out\MyApp.exe `
 | `--dll` | 按 DLL 编译；输出扩展名为 `.dll` 时可省略 |
 | `--define <宏>` / `-D <宏>` | 添加条件编译宏，可重复传入 |
 | `--compiler <cl.exe>` / `--linker <link.exe>` / `--lib <目录>` | 指定 C++ 编译器、链接器和库目录；未指定编译器时按目标架构自动探测 |
-| `--eide <e.exe>` / `--autolinker-test <exe>` | 易语言 IDE 与 AutoLinker 启动器（x86 黑月） |
+| `--eide <IDE.exe>` | legacy-blackmoon 直启的版本化易语言 IDE；省略时从 `E_PACKAGER_EIDE` 或注册表查找 |
+| `--autolinker-test <exe>` | 仅 `compile-check`/`pack --compile-check` 使用的旧式无头启动器，semantic 和 legacy-blackmoon 不需要 |
 | `--legacy-blackmoon-dir <目录>` | 传统黑月工具链根目录（`--blackmoon-dir` 为兼容别名） |
 | `--blackmoon-core-dir <目录>` | semantic 核心 adapter 根目录，可重复传入 |
 | `--blackmoon-x86-dir <目录>` / `--blackmoon-x64-dir <目录>` | semantic 指定架构核心 adapter 根目录 |
 | `--blackmoon-timeout <秒>` | 黑月编译与链接超时，默认 120，范围 1 至 3600 |
 
-如果支持库或静态库中缺少某个命令的实现，请更换匹配版本的支持库，而不是修改源码绕开。从零开始的完整上手流程、实测编译尺寸与失败排查详见 [`docs/compile-from-source-guide.md`](docs/compile-from-source-guide.md)；实现原理与已验证范围详见 [`docs/independent-compiler-architecture.md`](docs/independent-compiler-architecture.md)。
+如果支持库或静态库中缺少某个命令的实现，请更换匹配版本的支持库，而不是修改源码绕开。从零开始的完整上手流程、Visual Studio 组件检查和失败排查详见 [`docs/compile-from-source-guide.md`](docs/compile-from-source-guide.md)；实现原理与已验证范围详见 [`docs/independent-compiler-architecture.md`](docs/independent-compiler-architecture.md)。
 
 ### 刷新派生内容
 

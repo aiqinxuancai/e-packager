@@ -36,6 +36,7 @@ constexpr std::uint32_t kArgumentReceivesVariableOrArray = 1u << 4;
 constexpr std::uint32_t kArgumentReceivesArrayData = 1u << 5;
 constexpr std::uint32_t kArgumentReceivesVariableOrOther = 1u << 9;
 constexpr std::uint32_t kTypeStatement = 0x80000008u;
+constexpr std::uint32_t T_WINDOW_UNIT=0x70000001u;
 
 std::string EscapeCppString(const std::string& value)
 {
@@ -51,7 +52,7 @@ std::string EscapeCppString(const std::string& value)
 		case 0: output << "\\000"; break;
 		default:
 			if (ch < 0x20 || ch >= 0x7f) {
-				output << '\\' << std::oct << std::setw(3) << std::setfill('0') << static_cast<int>(ch) << std::dec;
+				output << '\\' << std::oct << std::setw(3) << std::setfill('0') << static_cast<unsigned int>(ch) << std::dec;
 			}
 			else output << static_cast<char>(ch);
 			break;
@@ -137,14 +138,24 @@ bool IsPlatformImportModule(const std::string& moduleName)
 		normalized == "odbc32.dll" || normalized == "odbccp32.dll" || normalized == "ws2_32.dll";
 }
 
+// The runtime template is stored in this UTF-8 source file and is appended to
+// another UTF-8 source file.  Keep its bytes unchanged so the generated
+// compiler applies its normal source-to-execution charset conversion once.
+std::string RuntimeSourceUtf8(const char* source)
+{
+	return source == nullptr ? std::string() : std::string(source);
+}
+
 const char* kRuntimeSource = R"CPP(
 #include <Windows.h>
 #include <algorithm>
+#include <commctrl.h>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <cwchar>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -380,6 +391,24 @@ static long long ToInteger(const Value& value) {
 static double ToNumber(const Value& value) {
     if(value.type==T_TEXT) return value.text.empty()?0:std::strtod(value.text.c_str(),nullptr);
     return (value.type==T_FLOAT||value.type==T_DOUBLE||value.type==T_DATE)?value.number:static_cast<double>(value.integer);
+}
+static std::string ToText(const Value& value);
+static std::wstring RuntimeWide(const std::string& text) {
+    if(text.empty())return {};
+    const int length=MultiByteToWideChar(CP_ACP,0,text.c_str(),-1,nullptr,0);
+    if(length<=1)return {};
+    std::wstring result(static_cast<std::size_t>(length),L'\0');
+    MultiByteToWideChar(CP_ACP,0,text.c_str(),-1,result.data(),length);
+    result.resize(static_cast<std::size_t>(length-1));
+    return result;
+}
+static Value NativeMsgBox(const Value& message,const Value& buttons,const Value& title,const Value& parent) {
+    const std::string messageText=message.missing?std::string():ToText(message);
+    const std::wstring wideMessage=RuntimeWide(messageText);
+    const std::wstring wideTitle=title.missing?RuntimeWide("\320\305\317\242\243\272"):RuntimeWide(ToText(title));
+    HWND parentWindow=parent.missing?nullptr:reinterpret_cast<HWND>(static_cast<EPointer>(ToInteger(parent)));
+    const int result=MessageBoxW(parentWindow,wideMessage.c_str(),wideTitle.c_str(),static_cast<UINT>(ToInteger(buttons)));
+    return Integer(result>0?result-1:result);
 }
 // Execute the small, position-independent x86 instruction subset commonly
 // used by 易语言 "置入代码" snippets.  x64 builds cannot execute those bytes
@@ -1243,12 +1272,16 @@ public:
 		if (program_.useLegacyX86RuntimeBridge) {
 			result.text = "#define ECOMPILER_LEGACY_X86_RUNTIME 1\n";
 		}
-		result.text += kRuntimeSource;
+		result.text += RuntimeSourceUtf8(kRuntimeSource);
 		body_ << "\nusing namespace ert;\n";
 		EmitGlobals();
 		const auto startup = program_.methodByName.find("_启动子程序");
 		if (startup == program_.methodByName.end()) return Fail("startup_method_not_found:_启动子程序");
 		QueueMethod(startup->second);
+		for (const auto& form : program_.windows) {
+			for (const auto& event : form.events) QueueMethod(event.methodId);
+			for (const auto& control : form.controls) for (const auto& event : control.events) QueueMethod(event.methodId);
+		}
 		if (program_.buildDll) {
 			for (const Method& method : program_.methods) if (method.isPublic) QueueMethod(method.id);
 		}
@@ -1408,6 +1441,58 @@ private:
 		}
 	}
 
+	const WindowForm* WindowForMethod(const Method& method) const
+	{
+		for (const auto& form : program_.windows) {
+			if (form.assemblyIndex == method.assemblyIndex) return &form;
+		}
+		return nullptr;
+	}
+
+	const WindowControl* WindowControlByName(const Method& method, const std::string& name) const
+	{
+		const WindowForm* form = WindowForMethod(method);
+		if (form == nullptr) return nullptr;
+		for (const auto& control : form->controls) if (control.name == name) return &control;
+		return nullptr;
+	}
+
+	bool IsWindowRootProperty(const Method& method, const std::string& name) const
+	{
+		return name == "标题" && WindowForMethod(method) != nullptr && !FindVariable(method, name).has_value();
+	}
+
+	const WindowControl* WindowPropertyTarget(
+		const Method& method,
+		const e2txt::SourceExpressionNode& node,
+		std::string& property) const
+	{
+		if (node.kind != e2txt::SourceExpressionKind::Member || node.children.empty() ||
+			node.children.front()->kind != e2txt::SourceExpressionKind::Name) return nullptr;
+		const auto* control = WindowControlByName(method, node.children.front()->text);
+		if (control == nullptr) return nullptr;
+		property = node.text;
+		return control;
+	}
+
+	bool IsWindowPropertyTarget(
+		const Method& method,
+		const e2txt::SourceExpressionNode& node,
+		std::uint32_t& unitId,
+		std::string& property) const
+	{
+		if (node.kind == e2txt::SourceExpressionKind::Name && IsWindowRootProperty(method, node.text)) {
+			unitId = WindowForMethod(method)->id;
+			property = node.text;
+			return true;
+		}
+		if (const auto* control = WindowPropertyTarget(method, node, property)) {
+			unitId = control->id;
+			return true;
+		}
+		return false;
+	}
+
 	void QueueMethod(const std::size_t id)
 	{
 		if (emittedMethods_.insert(id).second) pendingMethods_.push_back(id);
@@ -1428,6 +1513,11 @@ private:
 			if (assembly.variables[index].name == name) return std::pair { "g_" + std::to_string(method.assemblyIndex) + '_' + std::to_string(index) + "()", assembly.variables[index].type };
 		for (std::size_t index = 0; index < program_.globals.size(); ++index)
 			if (program_.globals[index].name == name) return std::pair { "g_global_" + std::to_string(index) + "()", program_.globals[index].type };
+		if (const auto* control = WindowControlByName(method, name)) {
+			return std::pair {
+				"Integer(static_cast<long long>(" + std::to_string(control->id) + "),T_WINDOW_UNIT)",
+				TypeRef { kTypeWindowUnit, false, true } };
+		}
 		return std::nullopt;
 	}
 
@@ -1495,8 +1585,15 @@ private:
 		return owner.ownerType.valid ? ResolveMemberMethod(owner.ownerType, name, argumentCount) : nullptr;
 	}
 
-	const Method* ResolveUnqualifiedMethod(const std::string& name, const std::size_t argumentCount) const
+	const Method* ResolveUnqualifiedMethod(const Method& owner, const std::string& name, const std::size_t argumentCount) const
 	{
+		// Unqualified calls in an ordinary assembly first bind to that
+		// assembly, matching the IDE's namespace rules.
+		for (const Method& candidate : program_.methods) {
+			if (candidate.assemblyIndex != owner.assemblyIndex || candidate.ownerType.valid ||
+				candidate.name != name || argumentCount > candidate.parameters.size()) continue;
+			return &candidate;
+		}
 		if (const auto indexed = program_.methodByName.find(name); indexed != program_.methodByName.end() &&
 			indexed->second < program_.methods.size()) {
 			const Method& method = program_.methods[indexed->second];
@@ -1543,6 +1640,13 @@ private:
 		}
 		case Kind::Member: {
 			if (node.children.empty()) return {};
+			std::string property;
+			if (const auto* control = WindowPropertyTarget(method, node, property)) {
+				(void)control;
+				return property == "选中" || property == "可视" || property == "禁止"
+					? TypeRef { kTypeBool, false, true }
+					: TypeRef { kTypeText, false, true };
+			}
 			if (node.children.front()->kind == Kind::Name && !node.children.front()->text.empty() && node.children.front()->text.front() == '#') {
 				const auto constant = program_.constants.find(node.children.front()->text + "." + node.text);
 				if (constant != program_.constants.end()) return { constant->second.type, false, true };
@@ -1570,7 +1674,7 @@ private:
 			const auto& callee = *node.children.front(); const std::size_t count = node.children.size() - 1;
 			if (callee.kind == Kind::Name) {
 				if (const Method* owned = ResolveOwnedMethod(method, callee.text, count)) return owned->returnType;
-				if (const Method* targetMethod = ResolveUnqualifiedMethod(callee.text, count)) return targetMethod->returnType;
+				if (const Method* targetMethod = ResolveUnqualifiedMethod(method, callee.text, count)) return targetMethod->returnType;
 				if (const DllCommand* dll = ResolveDllCommand(callee.text, count)) return dll->returnType;
 				if (const auto command = ResolveGlobalCommand(callee.text, count)) {
 					return { program_.NormalizeLibraryType(command->libraryIndex, command->command->returnType), (command->command->state & kCommandReturnsArray) != 0, true };
@@ -1600,6 +1704,9 @@ private:
 		using Kind = e2txt::SourceExpressionKind;
 		if (node.kind == Kind::Name) {
 			if (const auto variable = FindVariable(method, node.text)) return variable->first;
+			if (IsWindowRootProperty(method, node.text)) {
+				return "WindowGetProperty(" + std::to_string(WindowForMethod(method)->id) + "," + EscapeCppString(node.text) + ")";
+			}
 			Fail(method.sourceFile + ":" + std::to_string(method.sourceLine) + ": unknown_variable:" + node.text); return "*static_cast<Value*>(nullptr)";
 		}
 		if (node.kind == Kind::Index && node.children.size() >= 2) {
@@ -1610,6 +1717,10 @@ private:
 			return "IndexPath(" + EmitLvalue(method, *node.children.front()) + "," + indexes + ")";
 		}
 		if (node.kind == Kind::Member && !node.children.empty()) {
+			std::string property;
+			if (const auto* control = WindowPropertyTarget(method, node, property)) {
+				return "WindowGetProperty(" + std::to_string(control->id) + "," + EscapeCppString(property) + ")";
+			}
 			const TypeRef base = Infer(method, *node.children.front()); const TypeInfo* type = program_.FindType(base.code);
 			if (type != nullptr) {
 				for (std::size_t index = 0; index < type->elements.size(); ++index)
@@ -1623,6 +1734,9 @@ private:
 	std::string EmitArg(const Method& method, const e2txt::SourceExpressionNode& node, const bool byReference)
 	{
 		bool referenceable = IsLvalue(node);
+		std::uint32_t ignoredUnitId = 0;
+		std::string ignoredProperty;
+		if (IsWindowPropertyTarget(method, node, ignoredUnitId, ignoredProperty)) referenceable = false;
 		// A named constant is an expression, not a mutable variable.  This is
 		// important for generic all-type parameters such as console output.
 		if (node.kind == e2txt::SourceExpressionKind::Name && !FindVariable(method, node.text)) referenceable = false;
@@ -1943,6 +2057,17 @@ private:
 	{
 		const auto& command = *binding.command;
 		if (IsCompilePrimitive(command)) return EmitBuiltin(method, binding, call);
+		const bool isMsgBox = receiver == nullptr &&
+			(command.englishName == "MsgBox" || command.name == "信息框");
+		if (program_.targetArchitecture == TargetArchitecture::X64 && isMsgBox) {
+			const auto argument = [&](const std::size_t index, const char* fallback) {
+				return index < call.children.size() && call.children[index]->kind != e2txt::SourceExpressionKind::Missing
+					? EmitExpression(method, *call.children[index])
+					: std::string(fallback);
+			};
+			return "NativeMsgBox(" + argument(1, "Text(\"\")") + "," + argument(2, "Integer(0)") + "," +
+				argument(3, "Missing()") + "," + argument(4, "Missing()") + ")";
+		}
 		if (command.executeSymbol.empty()) {
 			const std::string libraryName = binding.libraryIndex < program_.libraries.size()
 				? program_.libraries[binding.libraryIndex].dependency.name
@@ -1964,7 +2089,15 @@ private:
 			const TypeRef type = Infer(method, *receiver); specs += "{" + Hex(type.code) + ",0},";
 			usedTypes_.insert(type.code);
 		}
-		for (std::size_t index = 1; index < call.children.size(); ++index) {
+		// The legacy MsgBox ABI gives the title a default value inside the core.
+		// The modern adapter's default is UTF-8 while this FNE text ABI is CP936,
+		// so materialize the omitted title in the generated call.  Emit the
+		// preceding omitted button argument as well when a call has only one arg.
+		const std::size_t sourceArgumentCount = call.children.size() - 1;
+		const std::size_t emittedArgumentCount = isMsgBox
+			? (std::max)(sourceArgumentCount, std::size_t(3))
+			: sourceArgumentCount;
+		for (std::size_t index = 1; index <= emittedArgumentCount; ++index) {
 			const std::size_t metadataIndex = (std::min)(index - 1, command.arguments.empty() ? std::size_t(0) : command.arguments.size() - 1);
 			std::uint32_t argumentState = 0;
 			std::uint32_t argumentType = kTypeAll;
@@ -1977,13 +2110,30 @@ private:
 				specs += "{" + Hex(argumentType) + ',' + Hex(metadata.state) + "},";
 			}
 			if (argumentType == kTypeStatement) {
-				arguments += "Arg::Statement([&](){return " + EmitExpression(method, *call.children[index]) + ";}),";
+				if (index >= call.children.size()) {
+					arguments += "Arg::Temp(Missing()),";
+				}
+				else {
+					arguments += "Arg::Statement([&](){return " + EmitExpression(method, *call.children[index]) + ";}),";
+				}
 				continue;
 			}
 			const bool byReference = (argumentState & (kArgumentReceivesVariable | kArgumentReceivesVariableArray |
 				kArgumentReceivesVariableOrArray | kArgumentReceivesArrayData |
 				kArgumentReceivesVariableOrOther)) != 0;
-			arguments += EmitArg(method, *call.children[index], byReference) + ',';
+			const bool missingTitle = isMsgBox && index == 3 &&
+				(index >= call.children.size() ||
+				 call.children[index]->kind == e2txt::SourceExpressionKind::Missing);
+			if (missingTitle) {
+				// CP936 bytes for the IDE/core default title "信息：".
+				arguments += "Arg::Temp(Text(\"\\320\\305\\317\\242\\243\\272\")),";
+			}
+			else if (index >= call.children.size()) {
+				arguments += "Arg::Temp(Missing()),";
+			}
+			else {
+				arguments += EmitArg(method, *call.children[index], byReference) + ',';
+			}
 		}
 		arguments += '}'; specs += '}';
 		return "CallFne(\"" + command.executeSymbol + "\",&" + command.executeSymbol + ',' + Hex(returnType) + ',' + ((command.state & kCommandReturnsArray) != 0 ? "true" : "false") + ',' + arguments + ',' + specs + ')';
@@ -2004,7 +2154,7 @@ private:
 				}
 				arguments += '}'; return "method_" + std::to_string(owned->id) + '(' + arguments + ',' + (method.ownerType.valid ? "self" : "nullptr") + ')';
 			}
-			if (const Method* targetMethod = ResolveUnqualifiedMethod(callee.text, argumentCount)) {
+			if (const Method* targetMethod = ResolveUnqualifiedMethod(method, callee.text, argumentCount)) {
 				if (argumentCount > targetMethod->parameters.size()) { Fail("too_many_method_arguments:" + callee.text); return "Empty()"; }
 				QueueMethod(targetMethod->id); std::string arguments = "{";
 				for (std::size_t index = 1; index < node.children.size(); ++index) {
@@ -2095,11 +2245,20 @@ private:
 			std::string result = "Bytes({"; for (const auto& child : node.children) result += "static_cast<unsigned char>(ToInteger(" + EmitExpression(method, *child) + ")),"; return result + "})";
 		}
 		case Kind::Name:
+			if (IsWindowRootProperty(method, node.text)) {
+				return "WindowGetProperty(" + std::to_string(WindowForMethod(method)->id) + "," + EscapeCppString(node.text) + ")";
+			}
 			if (const auto variable = FindVariable(method, node.text)) return variable->first;
 			if (const auto constant = program_.constants.find(node.text); constant != program_.constants.end()) return EmitConstant(constant->second);
 			Fail(method.sourceFile + ": unknown_name:" + node.text); return "Empty()";
 		case Kind::Call: return EmitCall(method, node);
 		case Kind::Member:
+			{
+				std::string property;
+				if (const auto* control = WindowPropertyTarget(method, node, property)) {
+					return "WindowGetProperty(" + std::to_string(control->id) + "," + EscapeCppString(property) + ")";
+				}
+			}
 			if (!node.children.empty() && node.children.front()->kind == Kind::Name && !node.children.front()->text.empty() && node.children.front()->text.front() == '#') {
 				const std::string qualified = node.children.front()->text + "." + node.text;
 				if (const auto constant = program_.constants.find(qualified); constant != program_.constants.end()) return EmitConstant(constant->second);
@@ -2143,7 +2302,17 @@ private:
 			SourceLine(method.sourceFile, statement.sourceLine);
 			switch (statement.kind) {
 			case StatementKind::Expression: Line(indent, "(void)" + EmitExpression(method, *statement.expression) + ";"); break;
-			case StatementKind::Assignment: Line(indent, "Assign(" + EmitLvalue(method, *statement.target) + ',' + EmitExpression(method, *statement.expression) + ");"); break;
+			case StatementKind::Assignment: {
+				std::uint32_t unitId = 0;
+				std::string property;
+				if (IsWindowPropertyTarget(method, *statement.target, unitId, property)) {
+					Line(indent, "WindowSetProperty(" + std::to_string(unitId) + "," + EscapeCppString(property) + "," + EmitExpression(method, *statement.expression) + ");");
+				}
+				else {
+					Line(indent, "Assign(" + EmitLvalue(method, *statement.target) + ',' + EmitExpression(method, *statement.expression) + ");");
+				}
+				break;
+			}
 			case StatementKind::Return: Line(indent, "return " + (statement.expression ? EmitExpression(method, *statement.expression) : "Empty()") + ";"); break;
 			case StatementKind::IfTrue: case StatementKind::IfElse:
 				Line(indent, "if(ToBool(" + EmitExpression(method, *statement.expression) + ")) {"); if (!EmitStatements(method, statement.body, indent + 1)) return false; Line(indent, "}");
@@ -2420,10 +2589,772 @@ private:
 		exports_.push_back({ method.exportName.empty() ? method.name : method.exportName, symbol, method.usesCdecl, AbiParameterBytes(method.parameters) });
 	}
 
+	void EmitWindowRuntime(std::ostringstream& prefix)
+	{
+		if (program_.windows.empty()) return;
+		prefix << R"CPP(
+namespace ecompiler_window_host {
+struct Unit { unsigned int id; unsigned int form; HWND hwnd; HWND parent; int tabOwner; int tabPage; };
+struct Form { unsigned int id; HWND hwnd; bool escapeCloses; bool canMove; bool firstActivated; };
+struct XmlAttribute { const char* name; const char* value; };
+struct Spec { unsigned int id; unsigned int form; unsigned int parent; int left; int top; int width; int height; bool visible; bool disabled; bool tabStop; int tabOwner; int tabPage; int tabPageCount; const char* type; const char* text; const XmlAttribute* attributes; std::size_t attributeCount; const char* const* items; std::size_t itemCount; const int* itemValues; std::size_t itemValueCount; };
+static std::vector<Unit> units;
+static std::vector<Form> forms;
+static std::unordered_set<HWND> mouseInside;
+static HINSTANCE instance=GetModuleHandleW(nullptr);
+static HFONT defaultFont=nullptr;
+static bool initializing=false;
+static std::wstring Wide(const char* value) {
+    if(value==nullptr||*value==0)return {};
+    const int length=MultiByteToWideChar(CP_ACP,0,value,-1,nullptr,0);
+    if(length<=1)return {};
+    std::wstring result(static_cast<std::size_t>(length),L'\0');
+    MultiByteToWideChar(CP_ACP,0,value,-1,result.data(),length);
+    result.resize(static_cast<std::size_t>(length-1));
+    return result;
+}
+static HFONT DefaultFont() {
+    if(defaultFont!=nullptr)return defaultFont;
+    // 易语言核心控件的空“字体”属性使用宋体 9 磅；固定这个默认值，
+    // 避免宿主系统的现代 UI 字体把控件度量和 IDE 拉开差异。
+    defaultFont=CreateFontW(-12,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,DEFAULT_QUALITY,DEFAULT_PITCH|FF_DONTCARE,L"SimSun");
+    if(defaultFont==nullptr)defaultFont=static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    return defaultFont;
+}
+static void ApplyDefaultFont(HWND window) {
+    if(window!=nullptr)SendMessageW(window,WM_SETFONT,reinterpret_cast<WPARAM>(DefaultFont()),TRUE);
+}
+static void TrackMouse(HWND window) {
+    if(window==nullptr)return;
+    TRACKMOUSEEVENT event{sizeof(TRACKMOUSEEVENT),TME_LEAVE,window,0};
+    TrackMouseEvent(&event);
+}
+static bool BeginMouseTracking(HWND window) {
+    if(window==nullptr)return false;
+    const bool firstEntry=mouseInside.insert(window).second;
+    TrackMouse(window);
+    return firstEntry;
+}
+static void EndMouseTracking(HWND window) {
+    if(window!=nullptr)mouseInside.erase(window);
+}
+static DWORD FormStyle(int border,bool controlButtons,bool maxButton,bool minButton) {
+    DWORD style=WS_OVERLAPPED|WS_CAPTION|WS_BORDER;
+    switch(border) {
+    case 0:style=WS_POPUP;break;
+    case 1:case 3:style=WS_OVERLAPPED|WS_CAPTION|WS_THICKFRAME;break;
+    case 2:case 4:style=WS_OVERLAPPED|WS_CAPTION|WS_BORDER;break;
+    case 5:style=WS_OVERLAPPED|WS_THICKFRAME;break;
+    case 6:style=WS_OVERLAPPED|WS_BORDER;break;
+    default:style=WS_OVERLAPPEDWINDOW;break;
+    }
+    if(controlButtons)style|=WS_SYSMENU;
+    if(maxButton)style|=WS_MAXIMIZEBOX;
+    if(minButton)style|=WS_MINIMIZEBOX;
+    return style;
+}
+static DWORD FormExtendedStyle(bool showInTaskbar) {
+    return showInTaskbar?0:WS_EX_TOOLWINDOW;
+}
+static void PlaceForm(HWND window,int left,int top,int position) {
+    if(window==nullptr)return;
+    if(position==1) {
+        RECT work{};
+        SystemParametersInfoW(SPI_GETWORKAREA,0,&work,0);
+        RECT current{};GetWindowRect(window,&current);
+        left=work.left+(work.right-work.left-(current.right-current.left))/2;
+        top=work.top+(work.bottom-work.top-(current.bottom-current.top))/2;
+    }
+    SetWindowPos(window,nullptr,left,top,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
+}
+static Unit* FindUnit(unsigned int id) { for(auto& item:units)if(item.id==id)return &item; return nullptr; }
+static HWND FindForm(unsigned int id) { for(const auto& item:forms)if(item.id==id)return item.hwnd; return nullptr; }
+enum NativeEventKind : unsigned int {
+    native_unknown=0,
+    native_created=1,
+    native_closing=2,
+    native_destroyed=3,
+    native_size_changed=4,
+    native_moved=5,
+    native_activated=6,
+    native_deactivated=7,
+    native_focus_gained=8,
+    native_focus_lost=9,
+    native_clicked=10,
+    native_double_clicked=11,
+    native_drop_down=12,
+    native_selection_changed=13,
+    native_position_changed=14,
+    native_changed=15,
+    native_key_down=16,
+    native_key_up=17,
+    native_mouse_down=18,
+    native_mouse_up=19,
+    native_mouse_move=20,
+    native_paint=21,
+    native_timer=22,
+    native_list_closed=23,
+    native_selection_changing=24,
+    native_char_input=25,
+    native_right_mouse_down=26,
+    native_right_mouse_up=27,
+    native_first_activated=28,
+    native_shown=29,
+    native_hidden=30,
+    native_idle=31,
+    native_tray=32,
+    native_mouse_enter=33,
+    native_mouse_leave=34,
+};
+static Value InvokeEvent(unsigned int methodId,std::vector<Value> values) {
+    switch(methodId) {
+)CPP";
+		std::unordered_set<std::size_t> eventMethods;
+		for (const auto& form : program_.windows) {
+			for (const auto& event : form.events) {
+				if (!eventMethods.insert(event.methodId).second) continue;
+				prefix << "    case " << event.methodId << "u:{std::vector<Arg> callArgs;";
+				if (event.methodId < program_.methods.size()) {
+					const auto& method = program_.methods[event.methodId];
+					for (std::size_t index = 0; index < method.parameters.size(); ++index) {
+						prefix << "if(values.size()>" << index << ")callArgs.push_back(" <<
+							(method.parameters[index].byReference ? "Arg::Ref(values[" : "Arg::Temp(values[") << index << "]));";
+					}
+				}
+				prefix << "return method_" << event.methodId << "(std::move(callArgs),nullptr);}\n";
+			}
+			for (const auto& control : form.controls) {
+				for (const auto& event : control.events) {
+					if (!eventMethods.insert(event.methodId).second) continue;
+					prefix << "    case " << event.methodId << "u:{std::vector<Arg> callArgs;";
+					if (event.methodId < program_.methods.size()) {
+						const auto& method = program_.methods[event.methodId];
+						for (std::size_t index = 0; index < method.parameters.size(); ++index) {
+							prefix << "if(values.size()>" << index << ")callArgs.push_back(" <<
+								(method.parameters[index].byReference ? "Arg::Ref(values[" : "Arg::Temp(values[") << index << "]));";
+						}
+					}
+					prefix << "return method_" << event.methodId << "(std::move(callArgs),nullptr);}\n";
+				}
+			}
+		}
+		prefix << R"CPP(
+    default:return Empty();
+    }
+}
+static bool Dispatch(unsigned int unit,unsigned int trigger,int nativeCode,std::vector<Value> values,Value* result=nullptr) {
+)CPP";
+		for (const auto& form : program_.windows) {
+			for (const auto& event : form.events) {
+				const unsigned int triggerCode = static_cast<unsigned int>(event.trigger);
+				prefix << "    if(unit==" << form.id << "u&&((trigger==" << triggerCode << "u&&" << triggerCode << "u!=0u)||(trigger==0u&&nativeCode==" << event.index << "))){if(result!=nullptr)*result=InvokeEvent(" << event.methodId << "u,std::move(values));else (void)InvokeEvent(" << event.methodId << "u,std::move(values));return true;}\n";
+			}
+			for (const auto& control : form.controls) {
+				for (const auto& event : control.events) {
+					const unsigned int triggerCode = static_cast<unsigned int>(event.trigger);
+					prefix << "    if(unit==" << control.id << "u&&((trigger==" << triggerCode << "u&&" << triggerCode << "u!=0u)||(trigger==0u&&nativeCode==" << event.index << "))){if(result!=nullptr)*result=InvokeEvent(" << event.methodId << "u,std::move(values));else (void)InvokeEvent(" << event.methodId << "u,std::move(values));return true;}\n";
+				}
+			}
+		}
+		prefix << R"CPP(
+    return false;
+}
+static unsigned int UnitIdFromWindow(HWND window) {
+    return window==nullptr?0u:static_cast<unsigned int>(GetDlgCtrlID(window));
+}
+static unsigned int CommandEventKind(unsigned int notification) {
+    switch(notification) {
+    case BN_CLICKED:return native_clicked;
+    case CBN_DROPDOWN:return native_drop_down;
+    case CBN_CLOSEUP:return native_list_closed;
+    case CBN_SELCHANGE:return native_selection_changed;
+    case CBN_DBLCLK:return native_double_clicked;
+    case CBN_EDITCHANGE:return native_changed;
+    case CBN_SELENDOK:return native_selection_changed;
+    case EN_CHANGE:return native_changed;
+    case EN_SETFOCUS:return native_focus_gained;
+    case EN_KILLFOCUS:return native_focus_lost;
+    default:return native_unknown;
+    }
+}
+static void DispatchNative(HWND source,unsigned int trigger,int nativeCode,std::vector<Value> values={}) {
+    if(initializing||source==nullptr)return;
+    const unsigned int unit=UnitIdFromWindow(source);
+    if(unit!=0)Dispatch(unit,trigger,nativeCode,std::move(values));
+}
+static bool DispatchNativeResult(HWND source,unsigned int trigger,int nativeCode,std::vector<Value> values,Value* result) {
+    if(initializing||source==nullptr)return false;
+    const unsigned int unit=UnitIdFromWindow(source);
+    return unit!=0&&Dispatch(unit,trigger,nativeCode,std::move(values),result);
+}
+static bool IsDirectChild(HWND parent,HWND child) {
+    return parent!=nullptr&&child!=nullptr&&GetParent(child)==parent;
+}
+static void UpdateTabVisibility(unsigned int tabId);
+static LRESULT RouteChildNotification(HWND parent,UINT message,WPARAM wParam,LPARAM lParam) {
+    constexpr LRESULT not_routed=(std::numeric_limits<LRESULT>::min)();
+    if(message==WM_COMMAND) {
+        HWND source=reinterpret_cast<HWND>(lParam);
+        if(!IsDirectChild(parent,source))return not_routed;
+        DispatchNative(source,CommandEventKind(HIWORD(wParam)),static_cast<int>(HIWORD(wParam)));
+        return 0;
+    }
+    if(message==WM_HSCROLL||message==WM_VSCROLL) {
+        HWND source=reinterpret_cast<HWND>(lParam);
+        if(!IsDirectChild(parent,source))return not_routed;
+        DispatchNative(source,native_position_changed,static_cast<int>(LOWORD(wParam)));
+        return 0;
+    }
+    if(message==WM_NOTIFY) {
+        const auto* header=reinterpret_cast<const NMHDR*>(lParam);
+        if(header==nullptr||!IsDirectChild(parent,header->hwndFrom))return not_routed;
+        const unsigned int trigger=header->code==TCN_SELCHANGING?native_selection_changing:
+            (header->code==TCN_SELCHANGE?native_selection_changed:
+            (header->code==DTN_DATETIMECHANGE?native_changed:
+            (header->code==NM_DBLCLK?native_double_clicked:
+            (header->code==NM_CLICK?native_clicked:native_unknown))));
+        if(trigger==native_selection_changed)UpdateTabVisibility(UnitIdFromWindow(header->hwndFrom));
+        if(trigger==native_selection_changing) {
+            Value result;
+            const bool invoked=DispatchNativeResult(header->hwndFrom,trigger,static_cast<int>(header->code),{},&result);
+            return invoked&&result.type==T_BOOL&&!ToBool(result)?1:0;
+        }
+        DispatchNative(header->hwndFrom,trigger,static_cast<int>(header->code));
+        return 0;
+    }
+    return not_routed;
+}
+static void RouteUnitInput(HWND source,UINT message,WPARAM wParam,LPARAM lParam) {
+    switch(message) {
+    case WM_LBUTTONDBLCLK:DispatchNative(source,native_double_clicked,-1,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;
+    case WM_LBUTTONDOWN:DispatchNative(source,native_mouse_down,0,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;
+    case WM_LBUTTONUP:DispatchNative(source,native_mouse_up,0,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;
+    case WM_RBUTTONDBLCLK:DispatchNative(source,native_double_clicked,-1,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;
+    case WM_RBUTTONDOWN:DispatchNative(source,native_right_mouse_down,0,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;
+    case WM_RBUTTONUP:DispatchNative(source,native_right_mouse_up,0,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;
+    case WM_MOUSEMOVE:if(BeginMouseTracking(source))DispatchNative(source,native_mouse_enter,0);DispatchNative(source,native_mouse_move,0,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;
+    case WM_MOUSELEAVE:EndMouseTracking(source);DispatchNative(source,native_mouse_leave,0);break;
+    case WM_MOVE:DispatchNative(source,native_moved,0,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam)))});break;
+    case WM_KEYDOWN:case WM_SYSKEYDOWN:DispatchNative(source,native_key_down,static_cast<int>(wParam),{Integer(static_cast<unsigned int>(wParam)),Integer(static_cast<unsigned int>(lParam))});break;
+    case WM_KEYUP:case WM_SYSKEYUP:DispatchNative(source,native_key_up,static_cast<int>(wParam),{Integer(static_cast<unsigned int>(wParam)),Integer(static_cast<unsigned int>(lParam))});break;
+    case WM_CHAR:case WM_SYSCHAR:DispatchNative(source,native_char_input,static_cast<int>(wParam),{Integer(static_cast<unsigned int>(wParam))});break;
+    case WM_SETFOCUS:DispatchNative(source,native_focus_gained,0);break;
+    case WM_KILLFOCUS:DispatchNative(source,native_focus_lost,0);break;
+    case WM_SHOWWINDOW:DispatchNative(source,wParam?native_shown:native_hidden,0);break;
+    case WM_SIZE:DispatchNative(source,native_size_changed,0,{Integer(static_cast<unsigned int>(LOWORD(lParam))),Integer(static_cast<unsigned int>(HIWORD(lParam)))});break;
+    case WM_PAINT:DispatchNative(source,native_paint,0);break;
+    case WM_TIMER:DispatchNative(source,native_timer,static_cast<int>(wParam));break;
+    default:break;
+    }
+}
+static Form* FindFormRecord(HWND window) {
+    for(auto& form:forms)if(form.hwnd==window)return &form;
+    return nullptr;
+}
+static unsigned int FormIdFromWindow(HWND window) {
+    const Form* form=FindFormRecord(window);
+    return form==nullptr?0u:form->id;
+}
+static void DispatchFormNative(HWND window,unsigned int trigger,int nativeCode=0,std::vector<Value> values={}) {
+    if(initializing||window==nullptr)return;
+    const unsigned int form=FormIdFromWindow(window);
+    if(form!=0)Dispatch(form,trigger,nativeCode,std::move(values));
+}
+static bool DispatchFormClose(HWND window) {
+    if(initializing||window==nullptr)return true;
+    const unsigned int form=FormIdFromWindow(window);
+    if(form==0)return true;
+    Value result;
+    const bool invoked=Dispatch(form,native_closing,0,{},&result);
+    return !invoked||result.type!=T_BOOL||ToBool(result);
+}
+static void RouteFormInput(HWND window,UINT message,WPARAM wParam,LPARAM lParam) {
+    switch(message) {
+    case WM_LBUTTONDBLCLK:DispatchFormNative(window,native_double_clicked,-1,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;
+    case WM_LBUTTONDOWN:DispatchFormNative(window,native_mouse_down,0,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;
+    case WM_LBUTTONUP:DispatchFormNative(window,native_mouse_up,0,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;
+    case WM_RBUTTONDBLCLK:DispatchFormNative(window,native_double_clicked,-1,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;
+    case WM_RBUTTONDOWN:DispatchFormNative(window,native_right_mouse_down,0,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;
+    case WM_RBUTTONUP:DispatchFormNative(window,native_right_mouse_up,0,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;
+    case WM_MOUSEMOVE:if(BeginMouseTracking(window))DispatchFormNative(window,native_mouse_enter,0);DispatchFormNative(window,native_mouse_move,0,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;
+    case WM_MOUSELEAVE:EndMouseTracking(window);DispatchFormNative(window,native_mouse_leave);break;
+    case WM_KEYDOWN:case WM_SYSKEYDOWN:DispatchFormNative(window,native_key_down,static_cast<int>(wParam),{Integer(static_cast<unsigned int>(wParam)),Integer(static_cast<unsigned int>(lParam))});break;
+    case WM_KEYUP:case WM_SYSKEYUP:DispatchFormNative(window,native_key_up,static_cast<int>(wParam),{Integer(static_cast<unsigned int>(wParam)),Integer(static_cast<unsigned int>(lParam))});break;
+    case WM_CHAR:case WM_SYSCHAR:DispatchFormNative(window,native_char_input,static_cast<int>(wParam),{Integer(static_cast<unsigned int>(wParam))});break;
+    case WM_SETFOCUS:DispatchFormNative(window,native_focus_gained);break;
+    case WM_KILLFOCUS:DispatchFormNative(window,native_focus_lost);break;
+    default:break;
+    }
+}
+static LRESULT CALLBACK FormProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam) {
+    if(message==WM_NCDESTROY)EndMouseTracking(window);
+    if(message==WM_COMMAND||message==WM_HSCROLL||message==WM_VSCROLL||message==WM_NOTIFY) {
+        const LRESULT routed=RouteChildNotification(window,message,wParam,lParam);
+        if(routed!=(std::numeric_limits<LRESULT>::min)())return routed;
+    }
+    switch(message) {
+    case WM_SIZE:DispatchFormNative(window,native_size_changed,0,{Integer(static_cast<unsigned int>(LOWORD(lParam))),Integer(static_cast<unsigned int>(HIWORD(lParam)))});break;
+    case WM_MOVE:DispatchFormNative(window,native_moved,0,{Integer(static_cast<unsigned int>(LOWORD(lParam))),Integer(static_cast<unsigned int>(HIWORD(lParam)))});break;
+    case WM_ACTIVATE: {
+        const bool active=LOWORD(wParam)!=WA_INACTIVE;
+        DispatchFormNative(window,active?native_activated:native_deactivated,static_cast<int>(LOWORD(wParam)));
+        if(active&&!initializing) {
+            if(auto* form=FindFormRecord(window);form!=nullptr&&!form->firstActivated) {
+                form->firstActivated=true;
+                DispatchFormNative(window,native_first_activated);
+            }
+        }
+        break;
+    }
+    case WM_KEYDOWN:
+        if(wParam==VK_ESCAPE) {
+            const Form* form=FindFormRecord(window);
+            if(form!=nullptr&&form->escapeCloses){SendMessageW(window,WM_CLOSE,0,0);return 0;}
+        }
+        RouteFormInput(window,message,wParam,lParam);
+        break;
+    case WM_SYSKEYDOWN:case WM_KEYUP:case WM_SYSKEYUP:case WM_CHAR:case WM_SYSCHAR:
+    case WM_LBUTTONDBLCLK:case WM_LBUTTONDOWN:case WM_LBUTTONUP:case WM_RBUTTONDBLCLK:case WM_RBUTTONDOWN:case WM_RBUTTONUP:case WM_MOUSEMOVE:case WM_MOUSELEAVE:
+        RouteFormInput(window,message,wParam,lParam);break;
+    case WM_SHOWWINDOW:DispatchFormNative(window,wParam?native_shown:native_hidden);break;
+    case WM_PAINT:DispatchFormNative(window,native_paint);break;
+    case WM_TIMER:DispatchFormNative(window,native_timer,static_cast<int>(wParam));break;
+    case WM_CLOSE:if(DispatchFormClose(window))DestroyWindow(window);return 0;
+    case WM_DESTROY:DispatchFormNative(window,native_destroyed);PostQuitMessage(0);return 0;
+    case WM_NCHITTEST: {
+        const Form* form=FindFormRecord(window);
+        const LRESULT hit=DefWindowProcW(window,message,wParam,lParam);
+        return form!=nullptr&&!form->canMove&&hit==HTCAPTION?HTCLIENT:hit;
+    }
+    default:break;
+    }
+    return DefWindowProcW(window,message,wParam,lParam);
+}
+static LRESULT CALLBACK UnitSubclassProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam,UINT_PTR,DWORD_PTR) {
+    if(message==WM_NCDESTROY)EndMouseTracking(window);
+    if(message==WM_COMMAND||message==WM_HSCROLL||message==WM_VSCROLL||message==WM_NOTIFY) {
+        const LRESULT routed=RouteChildNotification(window,message,wParam,lParam);
+        if(routed!=(std::numeric_limits<LRESULT>::min)())return routed;
+    }
+    RouteUnitInput(window,message,wParam,lParam);
+    return DefSubclassProc(window,message,wParam,lParam);
+}
+static LRESULT CALLBACK PageProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam) {
+    if(message==WM_COMMAND||message==WM_HSCROLL||message==WM_VSCROLL||message==WM_NOTIFY) {
+        const LRESULT routed=RouteChildNotification(window,message,wParam,lParam);
+        if(routed!=(std::numeric_limits<LRESULT>::min)())return routed;
+    }
+    return DefWindowProcW(window,message,wParam,lParam);
+}
+static LRESULT CALLBACK ContainerProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam) {
+    if(message==WM_COMMAND||message==WM_HSCROLL||message==WM_VSCROLL||message==WM_NOTIFY) {
+        const LRESULT routed=RouteChildNotification(window,message,wParam,lParam);
+        if(routed!=(std::numeric_limits<LRESULT>::min)())return routed;
+    }
+    RouteUnitInput(window,message,wParam,lParam);
+    return DefWindowProcW(window,message,wParam,lParam);
+}
+static bool AttributeEquals(const char* value,const wchar_t* expected) {
+    if(value==nullptr||expected==nullptr)return false;
+    const int length=MultiByteToWideChar(CP_ACP,0,value,-1,nullptr,0);
+    if(length<=0)return false;
+    std::wstring actual(static_cast<std::size_t>(length),L'\0');
+    if(MultiByteToWideChar(CP_ACP,0,value,-1,actual.data(),length)<=0)return false;
+    actual.resize(static_cast<std::size_t>(length-1));
+    return actual==expected;
+}
+static const char* XmlAttributeValue(const Spec& spec,const wchar_t* name) {
+    for(std::size_t index=0;index<spec.attributeCount;++index)
+        if(AttributeEquals(spec.attributes[index].name,name))return spec.attributes[index].value;
+    return nullptr;
+}
+static int XmlAttributeInteger(const Spec& spec,const wchar_t* name,int fallback) {
+    const char* value=XmlAttributeValue(spec,name);
+    if(value==nullptr||*value==0)return fallback;
+    char* end=nullptr;
+    const long parsed=std::strtol(value,&end,10);
+    return end==value||*end!=0?fallback:static_cast<int>(parsed);
+}
+static bool XmlAttributeBoolean(const Spec& spec,const wchar_t* name,bool fallback) {
+    const char* value=XmlAttributeValue(spec,name);
+    if(value==nullptr)return fallback;
+    return AttributeEquals(value,L"真")||std::strcmp(value,"1")==0||AttributeEquals(value,L"true")
+        ? true
+        : (AttributeEquals(value,L"假")||std::strcmp(value,"0")==0||AttributeEquals(value,L"false") ? false : fallback);
+}
+static DWORD Style(const Spec& spec) {
+    const char* type=spec.type;
+    if(std::strcmp(type,"button")==0) {
+        DWORD style=WS_CHILD|WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY;
+        if(XmlAttributeInteger(spec,L"类型",0)==1)style=(style&~BS_TYPEMASK)|BS_DEFPUSHBUTTON;
+        const int horizontal=XmlAttributeInteger(spec,L"横向对齐方式",1);
+        if(horizontal==0)style=(style&~BS_CENTER)|BS_LEFT;
+        else if(horizontal==2)style=(style&~BS_CENTER)|BS_RIGHT;
+        const int vertical=XmlAttributeInteger(spec,L"纵向对齐方式",1);
+        if(vertical==0)style=(style&~BS_TOP)|BS_TOP;
+        else if(vertical==2)style=(style&~BS_TOP)|BS_BOTTOM;
+        return style;
+    }
+    if(std::strcmp(type,"checkbox")==0) {
+        DWORD style=WS_CHILD|WS_TABSTOP|BS_AUTOCHECKBOX|BS_NOTIFY;
+        if(XmlAttributeBoolean(spec,L"按钮形式",false))style|=BS_PUSHLIKE;
+        if(XmlAttributeBoolean(spec,L"平面",false))style|=BS_FLAT;
+        return style;
+    }
+    if(std::strcmp(type,"radio")==0)return WS_CHILD|WS_TABSTOP|BS_AUTORADIOBUTTON|BS_NOTIFY;
+    if(std::strcmp(type,"group")==0)return WS_CHILD|BS_GROUPBOX;
+    if(std::strcmp(type,"edit")==0) {
+        DWORD style=WS_CHILD|WS_BORDER|WS_TABSTOP|ES_LEFT;
+        if(XmlAttributeBoolean(spec,L"是否允许多行",false))style|=ES_MULTILINE|ES_AUTOVSCROLL|WS_VSCROLL;
+        return style;
+    }
+    if(std::strcmp(type,"list")==0) {
+        DWORD style=WS_CHILD|WS_BORDER|WS_TABSTOP|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT|WS_VSCROLL;
+        if(XmlAttributeBoolean(spec,L"允许选择多项",false))style|=LBS_MULTIPLESEL;
+        if(XmlAttributeBoolean(spec,L"多列",false))style|=LBS_MULTICOLUMN;
+        return style;
+    }
+    if(std::strcmp(type,"combo")==0) {
+        const int comboType=XmlAttributeInteger(spec,L"类型",2);
+        const DWORD comboStyle=comboType==0?CBS_SIMPLE:(comboType==1?CBS_DROPDOWN:CBS_DROPDOWNLIST);
+        return WS_CHILD|WS_TABSTOP|comboStyle|WS_VSCROLL;
+    }
+    if(std::strcmp(type,"tab")==0)return WS_CHILD|WS_CLIPSIBLINGS|WS_TABSTOP;
+    if(std::strcmp(type,"progress")==0) {
+        return WS_CHILD|(XmlAttributeInteger(spec,L"方向",0)!=0?PBS_VERTICAL:0);
+    }
+    if(std::strcmp(type,"trackbar")==0) {
+        return WS_CHILD|WS_TABSTOP|(XmlAttributeInteger(spec,L"方向",0)!=0?TBS_VERT:0);
+    }
+    if(std::strcmp(type,"hscroll")==0)return WS_CHILD|SBS_HORZ;
+    if(std::strcmp(type,"vscroll")==0)return WS_CHILD|SBS_VERT;
+    if(std::strcmp(type,"date")==0)
+        return WS_CHILD|WS_TABSTOP|(XmlAttributeInteger(spec,L"附件类型",0)==1?DTS_UPDOWN:0);
+    if(std::strcmp(type,"label")==0||std::strcmp(type,"canvas")==0) {
+        DWORD style=WS_CHILD|SS_NOTIFY;
+        const int horizontal=XmlAttributeInteger(spec,L"横向对齐方式",0);
+        style|=horizontal==1?SS_CENTER:(horizontal==2?SS_RIGHT:SS_LEFT);
+        const int vertical=XmlAttributeInteger(spec,L"纵向对齐方式",0);
+        if(vertical==1)style|=SS_CENTERIMAGE;
+        return style;
+    }
+    if(std::strcmp(type,"shape")==0)return WS_CHILD|SS_BLACKFRAME|SS_NOTIFY;
+    if(std::strcmp(type,"container")==0)return WS_CHILD|WS_CLIPSIBLINGS|WS_CLIPCHILDREN;
+    if(std::strcmp(type,"unsupported")==0)return 0;
+    return WS_CHILD|WS_VISIBLE;
+}
+static const wchar_t* ClassName(const char* type) {
+    if(strcmp(type,"button")==0||strcmp(type,"checkbox")==0||strcmp(type,"radio")==0||strcmp(type,"group")==0)return L"BUTTON";
+    if(strcmp(type,"edit")==0)return L"EDIT";
+    if(strcmp(type,"list")==0)return L"LISTBOX";
+    if(strcmp(type,"combo")==0)return L"COMBOBOX";
+    if(strcmp(type,"tab")==0)return L"SysTabControl32";
+    if(strcmp(type,"progress")==0)return L"msctls_progress32";
+    if(strcmp(type,"trackbar")==0)return L"msctls_trackbar32";
+    if(strcmp(type,"hscroll")==0||strcmp(type,"vscroll")==0)return L"SCROLLBAR";
+    if(strcmp(type,"date")==0)return L"SysDateTimePick32";
+    if(strcmp(type,"container")==0)return L"ecompiler_window_container";
+    if(strcmp(type,"shape")==0||strcmp(type,"canvas")==0)return L"STATIC";
+    return L"STATIC";
+}
+static void UpdateTabVisibility(unsigned int tabId) {
+    const Unit* tab=FindUnit(tabId);
+    if(tab==nullptr)return;
+    const int page=static_cast<int>(SendMessageW(tab->hwnd,TCM_GETCURSEL,0,0));
+    for(auto& item:units)if(item.tabOwner==static_cast<int>(tabId))ShowWindow(item.hwnd,item.tabPage==page?SW_SHOW:SW_HIDE);
+}
+static void ApplyAttributes(HWND window,const Spec& spec) {
+    if(window==nullptr)return;
+    if(XmlAttributeBoolean(spec,L"选中",false))SendMessageW(window,BM_SETCHECK,BST_CHECKED,0);
+    const int limit=XmlAttributeInteger(spec,L"最大文本长度",XmlAttributeInteger(spec,L"最大允许长度",0));
+    if(limit>0&&std::strcmp(spec.type,"edit")==0)SendMessageW(window,EM_SETLIMITTEXT,static_cast<WPARAM>(limit),0);
+    if(std::strcmp(spec.type,"progress")==0) {
+        const int minimum=XmlAttributeInteger(spec,L"最小位置",0);
+        const int maximum=XmlAttributeInteger(spec,L"最大位置",100);
+        const int position=XmlAttributeInteger(spec,L"位置",minimum);
+        SendMessageW(window,PBM_SETRANGE32,minimum,maximum);
+        SendMessageW(window,PBM_SETPOS,position,0);
+    }
+    if(std::strcmp(spec.type,"trackbar")==0) {
+        const int minimum=XmlAttributeInteger(spec,L"最小位置",0);
+        const int maximum=XmlAttributeInteger(spec,L"最大位置",100);
+        const int position=XmlAttributeInteger(spec,L"位置",minimum);
+        SendMessageW(window,TBM_SETRANGE,TRUE,MAKELONG(minimum,maximum));
+        SendMessageW(window,TBM_SETPAGESIZE,0,XmlAttributeInteger(spec,L"页改变值",5));
+        SendMessageW(window,TBM_SETLINESIZE,0,XmlAttributeInteger(spec,L"行改变值",1));
+        SendMessageW(window,TBM_SETPOS,TRUE,position);
+    }
+    if(std::strcmp(spec.type,"hscroll")==0||std::strcmp(spec.type,"vscroll")==0) {
+        SCROLLINFO info{sizeof(SCROLLINFO),SIF_RANGE|SIF_PAGE|SIF_POS,
+            XmlAttributeInteger(spec,L"最小位置",0),XmlAttributeInteger(spec,L"最大位置",100),
+            static_cast<UINT>(XmlAttributeInteger(spec,L"页改变值",10)),
+            XmlAttributeInteger(spec,L"位置",0),0};
+        SetScrollInfo(window,SB_CTL,&info,TRUE);
+    }
+}
+static void ApplyStructuredData(HWND window,const Spec& spec) {
+    if(window==nullptr)return;
+    if(std::strcmp(spec.type,"list")==0) {
+        for(std::size_t index=0;index<spec.itemCount;++index) {
+            const LRESULT item=SendMessageW(window,LB_ADDSTRING,0,reinterpret_cast<LPARAM>(Wide(spec.items[index]).c_str()));
+            if(index<spec.itemValueCount&&item>=0)SendMessageW(window,LB_SETITEMDATA,item,spec.itemValues[index]);
+        }
+        const int selected=XmlAttributeInteger(spec,L"现行选中项",-1);
+        if(selected>=0)SendMessageW(window,LB_SETCURSEL,selected,0);
+    }
+    else if(std::strcmp(spec.type,"combo")==0) {
+        for(std::size_t index=0;index<spec.itemCount;++index) {
+            const LRESULT item=SendMessageW(window,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(Wide(spec.items[index]).c_str()));
+            if(index<spec.itemValueCount&&item>=0)SendMessageW(window,CB_SETITEMDATA,item,spec.itemValues[index]);
+        }
+        const int selected=XmlAttributeInteger(spec,L"现行选中项",-1);
+        if(selected>=0)SendMessageW(window,CB_SETCURSEL,selected,0);
+    }
+}
+static void CreateUnit(const Spec& spec) {
+    if(strcmp(spec.type,"unsupported")==0)return;
+    HWND parent=nullptr;
+    if(spec.parent==0)parent=FindForm(spec.form);
+    else parent=FindUnit(spec.parent)==nullptr?nullptr:FindUnit(spec.parent)->hwnd;
+    if(parent==nullptr)return;
+    DWORD style=Style(spec);
+    if(!spec.tabStop)style&=~WS_TABSTOP;
+    if(spec.visible)style|=WS_VISIBLE;
+    const DWORD exStyle=strcmp(spec.type,"container")==0?WS_EX_TRANSPARENT:0;
+    HWND window=CreateWindowExW(exStyle,ClassName(spec.type),Wide(spec.text).c_str(),style,
+        spec.left,spec.top,spec.width,spec.height,parent,reinterpret_cast<HMENU>(static_cast<UINT_PTR>(spec.id)),instance,nullptr);
+    if(window==nullptr)return;
+    ApplyDefaultFont(window);
+    SetWindowSubclass(window,UnitSubclassProc,static_cast<UINT_PTR>(spec.id),0);
+    ApplyAttributes(window,spec);
+    ApplyStructuredData(window,spec);
+    SetWindowPos(window,nullptr,spec.left,spec.top,spec.width,spec.height,SWP_NOZORDER|SWP_NOACTIVATE);
+    if(!spec.visible)ShowWindow(window,SW_HIDE);
+    if(spec.disabled)EnableWindow(window,FALSE);
+    units.push_back(Unit{spec.id,spec.form,window,parent,spec.tabOwner,spec.tabPage});
+}
+static void SetText(HWND window,const Value& value) { const std::wstring text=Wide(ToText(value).c_str()); SetWindowTextW(window,text.c_str()); }
+static bool PropertyEquals(const char* property,const wchar_t* expected) {
+    return AttributeEquals(property,expected);
+}
+static HWND WindowById(unsigned int id) {
+    HWND window=FindForm(id);
+    if(window==nullptr)if(const auto* unit=FindUnit(id))window=unit->hwnd;
+    return window;
+}
+static bool ClassEquals(HWND window,const wchar_t* expected) {
+    wchar_t actual[64]{};
+    return window!=nullptr&&GetClassNameW(window,actual,static_cast<int>(std::size(actual)))>0&&std::wcscmp(actual,expected)==0;
+}
+static int CurrentSelection(HWND window) {
+    if(ClassEquals(window,L"LISTBOX"))return static_cast<int>(SendMessageW(window,LB_GETCURSEL,0,0));
+    if(ClassEquals(window,L"COMBOBOX"))return static_cast<int>(SendMessageW(window,CB_GETCURSEL,0,0));
+    return -1;
+}
+static int CurrentPosition(HWND window) {
+    if(ClassEquals(window,L"msctls_progress32"))return static_cast<int>(SendMessageW(window,PBM_GETPOS,0,0));
+    if(ClassEquals(window,L"msctls_trackbar32"))return static_cast<int>(SendMessageW(window,TBM_GETPOS,0,0));
+    if(ClassEquals(window,L"SCROLLBAR")) {
+        SCROLLINFO info{sizeof(SCROLLINFO),SIF_POS,0,0,0,0,0};
+        GetScrollInfo(window,SB_CTL,&info);
+        return info.nPos;
+    }
+    return 0;
+}
+static void SetPosition(HWND window,int position) {
+    if(ClassEquals(window,L"msctls_progress32"))SendMessageW(window,PBM_SETPOS,position,0);
+    else if(ClassEquals(window,L"msctls_trackbar32"))SendMessageW(window,TBM_SETPOS,TRUE,position);
+    else if(ClassEquals(window,L"SCROLLBAR"))SetScrollPos(window,SB_CTL,position,TRUE);
+}
+static bool WindowGeometry(HWND window,int& left,int& top,int& width,int& height) {
+    RECT rect{};
+    if(window==nullptr||!GetWindowRect(window,&rect))return false;
+    HWND parent=GetParent(window);
+    if(parent==nullptr) {
+        POINT origin{0,0};
+        ClientToScreen(window,&origin);
+        RECT client{};GetClientRect(window,&client);
+        left=origin.x;top=origin.y;width=client.right;height=client.bottom;
+    }
+    else {
+        MapWindowPoints(nullptr,parent,reinterpret_cast<POINT*>(&rect),2);
+        left=rect.left;top=rect.top;width=rect.right-rect.left;height=rect.bottom-rect.top;
+    }
+    return true;
+}
+static void SetWindowGeometry(HWND window,const char* property,const Value& value) {
+    int left=0,top=0,width=0,height=0;
+    if(!WindowGeometry(window,left,top,width,height))return;
+    const int number=static_cast<int>(ToInteger(value));
+    if(PropertyEquals(property,L"\u5de6\u8fb9"))left=number;
+    else if(PropertyEquals(property,L"\u9876\u8fb9"))top=number;
+    else if(PropertyEquals(property,L"\u5bbd\u5ea6"))width=(std::max)(0,number);
+    else if(PropertyEquals(property,L"\u9ad8\u5ea6"))height=(std::max)(0,number);
+    else return;
+    if(GetParent(window)==nullptr) {
+        RECT client{0,0,width,height};
+        const LONG style=GetWindowLongW(window,GWL_STYLE);
+        const LONG exStyle=GetWindowLongW(window,GWL_EXSTYLE);
+        AdjustWindowRectEx(&client,static_cast<DWORD>(style),FALSE,static_cast<DWORD>(exStyle));
+        SetWindowPos(window,nullptr,left,top,client.right-client.left,client.bottom-client.top,SWP_NOZORDER|SWP_NOACTIVATE);
+    }
+    else SetWindowPos(window,nullptr,left,top,width,height,SWP_NOZORDER|SWP_NOACTIVATE);
+}
+static Value GetProperty(unsigned int id,const char* property) {
+    HWND window=WindowById(id);
+    if(window==nullptr)return Empty();
+    if(PropertyEquals(property,L"\u6807\u9898")||PropertyEquals(property,L"\u5185\u5bb9")){
+        wchar_t buffer[4096]{};GetWindowTextW(window,buffer,static_cast<int>(std::size(buffer)));int size=WideCharToMultiByte(CP_ACP,0,buffer,-1,nullptr,0,nullptr,nullptr);std::string text(size>0?size-1:0,'\0');if(size>1)WideCharToMultiByte(CP_ACP,0,buffer,-1,text.data(),size,nullptr,nullptr);return Text(std::move(text));
+    }
+    if(PropertyEquals(property,L"\u53ef\u89c6"))return Boolean(IsWindowVisible(window)!=FALSE);
+    if(PropertyEquals(property,L"\u7981\u6b62"))return Boolean(IsWindowEnabled(window)==FALSE);
+    if(PropertyEquals(property,L"\u9009\u4e2d"))return Boolean(SendMessageW(window,BM_GETCHECK,0,0)==BST_CHECKED);
+    if(PropertyEquals(property,L"\u73b0\u884c\u9009\u4e2d\u9879"))return Integer(CurrentSelection(window));
+    if(PropertyEquals(property,L"\u4f4d\u7f6e"))return Integer(CurrentPosition(window));
+    int left=0,top=0,width=0,height=0;
+    if(PropertyEquals(property,L"\u5de6\u8fb9")||PropertyEquals(property,L"\u9876\u8fb9")||
+        PropertyEquals(property,L"\u5bbd\u5ea6")||PropertyEquals(property,L"\u9ad8\u5ea6")) {
+        if(!WindowGeometry(window,left,top,width,height))return Empty();
+        if(PropertyEquals(property,L"\u5de6\u8fb9"))return Integer(left);
+        if(PropertyEquals(property,L"\u9876\u8fb9"))return Integer(top);
+        if(PropertyEquals(property,L"\u5bbd\u5ea6"))return Integer(width);
+        return Integer(height);
+    }
+    return Empty();
+}
+static void SetProperty(unsigned int id,const char* property,const Value& value) {
+    HWND window=WindowById(id);
+    if(window==nullptr)return;
+    if(PropertyEquals(property,L"\u6807\u9898")||PropertyEquals(property,L"\u5185\u5bb9"))SetText(window,value);
+    else if(PropertyEquals(property,L"\u53ef\u89c6"))ShowWindow(window,ToInteger(value)?SW_SHOW:SW_HIDE);
+    else if(PropertyEquals(property,L"\u7981\u6b62"))EnableWindow(window,ToInteger(value)?FALSE:TRUE);
+    else if(PropertyEquals(property,L"\u9009\u4e2d"))SendMessageW(window,BM_SETCHECK,ToInteger(value)?BST_CHECKED:BST_UNCHECKED,0);
+    else if(PropertyEquals(property,L"\u73b0\u884c\u9009\u4e2d\u9879")) {
+        if(ClassEquals(window,L"LISTBOX"))SendMessageW(window,LB_SETCURSEL,ToInteger(value),0);
+        else if(ClassEquals(window,L"COMBOBOX"))SendMessageW(window,CB_SETCURSEL,ToInteger(value),0);
+    }
+    else if(PropertyEquals(property,L"\u4f4d\u7f6e"))SetPosition(window,static_cast<int>(ToInteger(value)));
+    else if(PropertyEquals(property,L"\u5de6\u8fb9")||PropertyEquals(property,L"\u9876\u8fb9")||
+        PropertyEquals(property,L"\u5bbd\u5ea6")||PropertyEquals(property,L"\u9ad8\u5ea6"))SetWindowGeometry(window,property,value);
+}
+)CPP";
+		bool hasSpecs = false;
+		const auto typeToken = [](const std::string& type) {
+			if (type == "标签") return "label";
+			if (type == "按钮") return "button";
+			if (type == "选择框") return "checkbox";
+			if (type == "单选框") return "radio";
+			if (type == "分组框") return "group";
+			if (type == "编辑框") return "edit";
+			if (type == "列表框") return "list";
+			if (type == "组合框") return "combo";
+			if (type == "选择夹") return "tab";
+			if (type == "进度条") return "progress";
+			if (type == "滑块条") return "trackbar";
+			if (type == "横向滚动条") return "hscroll";
+			if (type == "纵向滚动条") return "vscroll";
+			if (type == "日期框") return "date";
+			if (type == "图片框" || type == "影像框") return "container";
+			if (type == "外形框") return "shape";
+			if (type == "画板") return "canvas";
+			if (type == "图形按钮") return "button";
+			return "unsupported";
+		};
+		for (const auto& form : program_.windows) {
+			for (const auto& control : form.controls) {
+				if (!control.attributes.empty()) {
+					prefix << "static const XmlAttribute xml_attributes_" << control.id << "[]={";
+					for (const auto& [name, value] : control.attributes) {
+						prefix << "{" << EscapeCppString(name) << "," << EscapeCppString(value) << "},";
+					}
+					prefix << "};\n";
+				}
+				if (control.listItemsDefined && !control.listItems.empty()) {
+					prefix << "static const char* xml_items_" << control.id << "[]={";
+					for (const auto& item : control.listItems) prefix << EscapeCppString(item) << ",";
+					prefix << "};\n";
+				}
+				if (control.itemValuesDefined && !control.itemValues.empty()) {
+					prefix << "static const int xml_item_values_" << control.id << "[]={";
+					for (const int value : control.itemValues) prefix << value << ",";
+					prefix << "};\n";
+				}
+			}
+		}
+		prefix << "static const Spec specs[]={\n";
+		for (const auto& form : program_.windows) {
+			for (const auto& control : form.controls) {
+				const char* token = typeToken(control.typeName);
+				// There is no reliable Win32 class for an unknown support-library
+				// unit.  Do not turn an unsupported leaf into a visible STATIC;
+				// retain unknown units only when they provide a real parent for
+				// supported nested controls.
+				if (std::strcmp(token, "unsupported") == 0) {
+					if (control.children.empty()) continue;
+					token = "container";
+				}
+				hasSpecs = true;
+				const std::string attributes = control.attributes.empty() ? "nullptr" : "xml_attributes_" + std::to_string(control.id);
+				const std::string items = control.listItemsDefined && !control.listItems.empty()
+					? "xml_items_" + std::to_string(control.id) : "nullptr";
+				const std::string itemValues = control.itemValuesDefined && !control.itemValues.empty()
+					? "xml_item_values_" + std::to_string(control.id) : "nullptr";
+				prefix << "{" << control.id << "u," << form.id << "u," << control.parentId << "u," << control.left << "," << control.top << "," << control.width << "," << control.height << "," << (control.visible ? "true" : "false") << "," << (control.disabled ? "true" : "false") << "," << (control.tabStop ? "true" : "false") << "," << control.tabOwner << "," << control.tabPage << "," << control.tabPageTitles.size() << "," << EscapeCppString(token) << "," << EscapeCppString(control.text) << "," << attributes << "," << control.attributes.size() << "," << items << "," << (control.listItemsDefined ? control.listItems.size() : 0) << "," << itemValues << "," << (control.itemValuesDefined ? control.itemValues.size() : 0) << "},\n";
+			}
+		}
+		if (!hasSpecs) prefix << "{0u,0u,0u,0,0,0,0,false,false,false,0,-1,0,\"unsupported\",\"\",nullptr,0,nullptr,0,nullptr,0},\n";
+		prefix << R"CPP(};
+static void Initialize() {
+    initializing=true;
+    INITCOMMONCONTROLSEX common{sizeof(INITCOMMONCONTROLSEX),ICC_WIN95_CLASSES|ICC_DATE_CLASSES|ICC_BAR_CLASSES|ICC_TAB_CLASSES};InitCommonControlsEx(&common);
+    WNDCLASSW klass{};klass.hInstance=instance;klass.lpfnWndProc=FormProc;klass.hCursor=LoadCursorW(nullptr,MAKEINTRESOURCEW(IDC_ARROW));klass.hbrBackground=reinterpret_cast<HBRUSH>(COLOR_WINDOW+1);klass.lpszClassName=L"ecompiler_window_form";RegisterClassW(&klass);
+    WNDCLASSW containerClass{};containerClass.hInstance=instance;containerClass.lpfnWndProc=ContainerProc;containerClass.hCursor=LoadCursorW(nullptr,MAKEINTRESOURCEW(IDC_ARROW));containerClass.lpszClassName=L"ecompiler_window_container";RegisterClassW(&containerClass);
+)CPP";
+		for (const auto& form : program_.windows) {
+			prefix << "    DWORD formStyle_" << form.id << "=FormStyle(" << form.border << "," << (form.controlButtons ? "true" : "false") << "," << (form.maximizeButton ? "true" : "false") << "," << (form.minimizeButton ? "true" : "false") << ");DWORD formExStyle_" << form.id << "=FormExtendedStyle(" << (form.showInTaskbar ? "true" : "false") << ");RECT formRect_" << form.id << "{0,0," << form.width << "," << form.height << "};AdjustWindowRectEx(&formRect_" << form.id << ",formStyle_" << form.id << ",FALSE,formExStyle_" << form.id << ");HWND form_" << form.id << "=CreateWindowExW(formExStyle_" << form.id << ",L\"ecompiler_window_form\",Wide(" << EscapeCppString(form.title) << ").c_str(),formStyle_" << form.id << "," << form.left << "," << form.top << ",formRect_" << form.id << ".right-formRect_" << form.id << ".left,formRect_" << form.id << ".bottom-formRect_" << form.id << ".top,nullptr,nullptr,instance,nullptr);if(form_" << form.id << "==nullptr)return;ApplyDefaultFont(form_" << form.id << ");forms.push_back(Form{" << form.id << "u,form_" << form.id << "," << (form.escapeCloses ? "true" : "false") << "," << (form.canMove ? "true" : "false") << ",false});PlaceForm(form_" << form.id << "," << form.left << "," << form.top << "," << form.position << ");if(" << (form.topmost ? "true" : "false") << ")SetWindowPos(form_" << form.id << ",HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);if(" << (form.disabled ? "true" : "false") << ")EnableWindow(form_" << form.id << ",FALSE);\n";
+		}
+		prefix << R"CPP(    constexpr std::size_t count=sizeof(specs)/sizeof(specs[0]);
+    for(std::size_t pass=0;pass<count+1;++pass)for(const auto& spec:specs)if(spec.id!=0&&spec.tabOwner==0&&FindUnit(spec.id)==nullptr&& (spec.parent==0||FindUnit(spec.parent)!=nullptr))CreateUnit(spec);
+)CPP";
+		for (const auto& form : program_.windows) {
+			for (const auto& control : form.controls) {
+				if (control.typeName != "选择夹") continue;
+				for (std::size_t page = 0; page < control.tabPageTitles.size(); ++page) {
+				prefix << "    if(auto* tab_" << control.id << "=FindUnit(" << control.id << "u)){TCITEMW item_" << control.id << "_" << page << "{};item_" << control.id << "_" << page << ".mask=TCIF_TEXT;std::wstring title_" << control.id << "_" << page << "=Wide(" << EscapeCppString(control.tabPageTitles[page]) << ");item_" << control.id << "_" << page << ".pszText=title_" << control.id << "_" << page << ".data();TabCtrl_InsertItem(tab_" << control.id << "->hwnd," << page << ",&item_" << control.id << "_" << page << ");}\n";
+				}
+			}
+		}
+		prefix << R"CPP(    for(std::size_t pass=0;pass<count+1;++pass)for(const auto& spec:specs)if(spec.id!=0&&spec.tabOwner!=0&&FindUnit(spec.id)==nullptr&& (spec.parent==0||FindUnit(spec.parent)!=nullptr))CreateUnit(spec);
+)CPP";
+		for (const auto& form : program_.windows) {
+			for (const auto& control : form.controls) {
+				if (control.typeName != "选择夹") continue;
+				prefix << "    UpdateTabVisibility(" << control.id << "u);\n";
+			}
+		}
+		for (const auto& form : program_.windows) {
+			prefix << "    Dispatch(" << form.id << "u,native_created,0,{});\n";
+			const char* showCommand = !form.visible ? "SW_HIDE" : (form.position == 2 ? "SW_MINIMIZE" : (form.position == 3 ? "SW_MAXIMIZE" : "SW_SHOW"));
+			prefix << "    ShowWindow(form_" << form.id << "," << showCommand << ");UpdateWindow(form_" << form.id << ");\n";
+		}
+		prefix << "    initializing=false;\n";
+		prefix << R"CPP(}
+}
+static ert::Value WindowGetProperty(unsigned int id,const char* property){return ecompiler_window_host::GetProperty(id,property);}
+static void WindowSetProperty(unsigned int id,const char* property,const ert::Value& value){ecompiler_window_host::SetProperty(id,property,value);}
+static void EWindowInitialize(){ecompiler_window_host::Initialize();}
+)CPP";
+	}
+
 	void EmitDeclarationsAndStartup()
 	{
 		std::ostringstream prefix;
 		const bool targetX64 = program_.targetArchitecture == TargetArchitecture::X64;
+		if (!program_.buildDll) {
+			// Match the IDE's default EXE manifest and activate common-controls 6.0.
+			prefix << "#pragma comment(linker,\"/manifestdependency:\\\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\\\"\")\n";
+		}
 		prefix << "\n";
 		for (const std::size_t method : pendingMethods_) {
 			prefix << "static ert::Value method_" << method
@@ -2440,7 +3371,12 @@ private:
 					<< "(int,ert::EPointer,ert::EPointer);\n";
 			}
 		}
+		if (!program_.windows.empty()) {
+			prefix << "static ert::Value WindowGetProperty(unsigned int,const char*);\n";
+			prefix << "static void WindowSetProperty(unsigned int,const char*,const ert::Value&);\n";
+		}
 		prefix << declarations_.str() << body_.str();
+		EmitWindowRuntime(prefix);
 		prefix << "\nextern \"C\" ert::EPointer BlackMoonFuncForeLib="
 			<< "reinterpret_cast<ert::EPointer>(&ert::BlackMoonFuncForeLibNotifySys);\n";
 		prefix << R"CPP(
@@ -2587,13 +3523,16 @@ extern "C" ert::EIntPtr __stdcall BlackMoonFuncForeLibNotifySys(
 		if (!program_.buildDll) {
 			if (program_.windowsGui) {
 				if (targetX64) {
-					prefix << "int WINAPI WinMain(HINSTANCE,HINSTANCE,LPSTR,int){E_Init();if(!EStartup())ExitProcess(1);const int result=ECodeStart();ecompiler_safe_destroy();return result;}\n";
+					if (!program_.windows.empty()) prefix << "int WINAPI WinMain(HINSTANCE,HINSTANCE,LPSTR,int){E_Init();if(!EStartup())ExitProcess(1);EWindowInitialize();const int result=ECodeStart();MSG message{};while(GetMessageW(&message,nullptr,0,0)>0){TranslateMessage(&message);DispatchMessageW(&message);}ecompiler_safe_destroy();return result;}\n";
+					else prefix << "int WINAPI WinMain(HINSTANCE,HINSTANCE,LPSTR,int){E_Init();if(!EStartup())ExitProcess(1);const int result=ECodeStart();ecompiler_safe_destroy();return result;}\n";
 				}
 				else if (program_.useLegacyX86RuntimeBridge) {
-					prefix << "int WINAPI WinMain(HINSTANCE,HINSTANCE,LPSTR,int){ert::InitializeLegacyCrtData();E_Init();if(!EStartup())ExitProcess(1);const int result=ECodeStart();ecompiler_safe_destroy();ExitProcess(static_cast<UINT>(result));}\n";
+					if (!program_.windows.empty()) prefix << "int WINAPI WinMain(HINSTANCE,HINSTANCE,LPSTR,int){ert::InitializeLegacyCrtData();E_Init();if(!EStartup())ExitProcess(1);EWindowInitialize();const int result=ECodeStart();MSG message{};while(GetMessageW(&message,nullptr,0,0)>0){TranslateMessage(&message);DispatchMessageW(&message);}ecompiler_safe_destroy();ExitProcess(static_cast<UINT>(result));}\n";
+					else prefix << "int WINAPI WinMain(HINSTANCE,HINSTANCE,LPSTR,int){ert::InitializeLegacyCrtData();E_Init();if(!EStartup())ExitProcess(1);const int result=ECodeStart();ecompiler_safe_destroy();ExitProcess(static_cast<UINT>(result));}\n";
 				}
 				else {
-					prefix << "int WINAPI WinMain(HINSTANCE,HINSTANCE,LPSTR,int){ert::InitializeLegacyTimezoneData();E_Init();if(!EStartup())ExitProcess(1);const int result=ECodeStart();ecompiler_safe_destroy();return result;}\n";
+					if (!program_.windows.empty()) prefix << "int WINAPI WinMain(HINSTANCE,HINSTANCE,LPSTR,int){ert::InitializeLegacyTimezoneData();E_Init();if(!EStartup())ExitProcess(1);EWindowInitialize();const int result=ECodeStart();MSG message{};while(GetMessageW(&message,nullptr,0,0)>0){TranslateMessage(&message);DispatchMessageW(&message);}ecompiler_safe_destroy();return result;}\n";
+					else prefix << "int WINAPI WinMain(HINSTANCE,HINSTANCE,LPSTR,int){ert::InitializeLegacyTimezoneData();E_Init();if(!EStartup())ExitProcess(1);const int result=ECodeStart();ecompiler_safe_destroy();return result;}\n";
 				}
 			}
 			else if (targetX64) {

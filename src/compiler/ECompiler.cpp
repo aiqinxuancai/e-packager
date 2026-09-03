@@ -11,6 +11,7 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <cwchar>
 #include <cwctype>
 #include <chrono>
 #include <cstdint>
@@ -174,6 +175,28 @@ std::filesystem::path LatestVersionDirectory(const std::filesystem::path& root)
 		return left.filename().wstring() > right.filename().wstring();
 	});
 	return directories.empty() ? std::filesystem::path() : directories.front();
+}
+
+std::filesystem::path FindWindowsResourceCompiler(const TargetArchitecture architecture)
+{
+	std::vector<std::filesystem::path> roots;
+	wchar_t configured[MAX_PATH * 4] {};
+	if (GetEnvironmentVariableW(L"WindowsSdkDir", configured, std::size(configured)) > 0) {
+		roots.push_back(std::filesystem::path(configured));
+	}
+	roots.push_back(L"C:\\Program Files (x86)\\Windows Kits\\10");
+	roots.push_back(L"C:\\Program Files\\Windows Kits\\10");
+	const std::wstring machine = architecture == TargetArchitecture::X64 ? L"x64" : L"x86";
+	for (const auto& root : roots) {
+		const auto binRoot = root / L"bin";
+		std::error_code filesystemError;
+		for (const auto& entry : std::filesystem::recursive_directory_iterator(binRoot, filesystemError)) {
+			if (!std::filesystem::is_regular_file(entry.path(), filesystemError) || entry.path().filename() != L"rc.exe" ||
+				entry.path().parent_path().filename() != machine) continue;
+			return entry.path();
+		}
+	}
+	return {};
 }
 
 bool DiscoverBuildEnvironment(
@@ -372,7 +395,8 @@ bool RunProcess(
 	const std::filesystem::path& workingDirectory,
 	const std::filesystem::path& logPath,
 	std::string& output,
-	std::string& error)
+	std::string& error,
+	const std::filesystem::path& additionalPath = {})
 {
 	std::wstring command = Quote(executable);
 	for (const std::wstring& argument : arguments) {
@@ -396,9 +420,33 @@ bool RunProcess(
 	PROCESS_INFORMATION process {};
 	std::vector<wchar_t> mutableCommand(command.begin(), command.end());
 	mutableCommand.push_back(L'\0');
+	std::vector<wchar_t> environment;
+	if (!additionalPath.empty()) {
+		LPWCH current = GetEnvironmentStringsW();
+		if (current != nullptr) {
+			bool pathFound = false;
+			for (const wchar_t* item = current; *item != L'\0'; item += std::wcslen(item) + 1) {
+				std::wstring entry(item);
+				if (entry.size() >= 5 && _wcsnicmp(entry.c_str(), L"PATH=", 5) == 0) {
+					entry = L"PATH=" + additionalPath.wstring() + L";" + entry.substr(5);
+					pathFound = true;
+				}
+				environment.insert(environment.end(), entry.begin(), entry.end());
+				environment.push_back(L'\0');
+			}
+			if (!pathFound) {
+				const std::wstring entry = L"PATH=" + additionalPath.wstring();
+				environment.insert(environment.end(), entry.begin(), entry.end());
+				environment.push_back(L'\0');
+			}
+			environment.push_back(L'\0');
+			FreeEnvironmentStringsW(current);
+		}
+	}
 	const BOOL started = CreateProcessW(
-		executable.c_str(), mutableCommand.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
-		nullptr, workingDirectory.c_str(), &startup, &process);
+		executable.c_str(), mutableCommand.data(), nullptr, nullptr, TRUE,
+		CREATE_NO_WINDOW | (environment.empty() ? 0u : CREATE_UNICODE_ENVIRONMENT),
+		environment.empty() ? nullptr : environment.data(), workingDirectory.c_str(), &startup, &process);
 	if (!started) {
 		const DWORD code = GetLastError();
 		CloseHandle(log);
@@ -991,10 +1039,6 @@ bool Compile(
 		result.message = error;
 		return false;
 	}
-	if (!bundle.formFiles.empty() || !bundle.windowBindings.empty()) {
-		result.message = "window_project_not_supported_by_independent_compiler";
-		return false;
-	}
 	Program program;
 	if (!BuildCompilerModel(
 		std::move(bundle), inputRoot, supportLibrarySearchDirectories, options.conditionMacros,
@@ -1201,6 +1245,7 @@ bool Compile(
 			Quote(result.objectPath), Quote(mfcLibrary),
 		};
 	}
+	if (!program.buildDll) linkerArguments.push_back(L"/MANIFEST:EMBED");
 	if (program.buildDll) {
 		linkerArguments.push_back(L"/DLL");
 		linkerArguments.push_back(L"/SUBSYSTEM:WINDOWS");
@@ -1210,6 +1255,14 @@ bool Compile(
 			return false;
 		}
 		linkerArguments.push_back(L"/DEF:" + Quote(definitionPath));
+	}
+	std::filesystem::path resourceCompiler;
+	if (!program.buildDll) {
+		resourceCompiler = FindWindowsResourceCompiler(targetArchitecture);
+		if (resourceCompiler.empty()) {
+			result.message = "windows_sdk_resource_compiler_not_found";
+			return false;
+		}
 	}
 	for (const auto& directory : systemLibraryDirectories) linkerArguments.push_back(L"/LIBPATH:" + Quote(directory));
 	for (const auto& library : { modernRuntimeLibrary, modernCppRuntimeLibrary, modernVcruntimeLibrary, modernUcrtLibrary }) {
@@ -1232,7 +1285,8 @@ bool Compile(
 			systemLibraryDirectories, PathToUtf8(std::filesystem::path(importLibrary)));
 		if (!artifact.empty()) linkerArguments.push_back(Quote(artifact));
 	}
-	if (!RunProcess(linker, linkerArguments, outputDirectory, logPath, processOutput, error)) {
+	if (!RunProcess(linker, linkerArguments, outputDirectory, logPath, processOutput, error,
+		resourceCompiler.empty() ? std::filesystem::path() : resourceCompiler.parent_path())) {
 		result.message = error;
 		return false;
 	}

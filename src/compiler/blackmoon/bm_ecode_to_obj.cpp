@@ -2597,14 +2597,20 @@ bool EcodeToObjFile::loadEProgram(const std::string& strEFilePath, LPBYTE& lpRAW
         pMem + sectionTableOffset);
     DWORD dwEcodeVirtualAddress = 0;
 
-    // 查找 .text 代码段,并验证每个节的原始数据范围。
+    // 易语言不同版本的 IDE/链接器会把易代码节标记为
+    // RWX(0xE0000040) 或 RW(0xC0000040)。两者都可能是 .data 节，
+    // 不能只按旧版的精确属性匹配。
     for (WORD i = 0; i < fileHeader->NumberOfSections; i++) {
         if (section[i].SizeOfRawData > 0 &&
             !isEcodeRangeValid(fileSize, section[i].PointerToRawData,
                                section[i].SizeOfRawData)) {
             return failLoad("PE节数据超出文件范围");
         }
-        if (section[i].Characteristics == 0xe0000040) {
+        const DWORD ecodeCharacteristics = section[i].Characteristics;
+        const bool isEcodeSection =
+            (ecodeCharacteristics & 0xc0000040u) == 0xc0000040u &&
+            (ecodeCharacteristics & 0x00000020u) == 0;
+        if (isEcodeSection) {
             if (section[i].SizeOfRawData == 0 || lpRAWData != nullptr) {
                 continue;
             }

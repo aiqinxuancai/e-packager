@@ -28,6 +28,7 @@ struct FormControlPropertyDefinition {
 
 // 属性值的稳定表示，避免把支持库内部指针泄漏到 XML 编解码之外。
 enum class FormControlPropertyValueKind {
+	Unknown,
 	Integer,
 	Double,
 	Boolean,
@@ -37,12 +38,26 @@ enum class FormControlPropertyValueKind {
 
 struct FormControlPropertyValue {
 	FormControlPropertyDefinition definition;
-	FormControlPropertyValueKind kind = FormControlPropertyValueKind::Binary;
+	FormControlPropertyValueKind kind = FormControlPropertyValueKind::Unknown;
 	std::int32_t integerValue = 0;
 	double doubleValue = 0;
 	bool booleanValue = false;
 	std::string textValue;
 	std::vector<std::uint8_t> binaryValue;
+};
+
+// 从自定义属性中识别出的通用集合。原始二进制属性始终另外保留，
+// 集合只是便于窗口 XML 读写列表、页签等公开的重复数据。
+enum class FormControlPropertyCollectionKind {
+	Text,
+	Integer,
+};
+
+struct FormControlPropertyCollection {
+	FormControlPropertyDefinition definition;
+	FormControlPropertyCollectionKind kind = FormControlPropertyCollectionKind::Text;
+	std::vector<std::string> textValues;
+	std::vector<std::int32_t> integerValues;
 };
 
 // 窗口 XML 中用于描述定制属性的轻量节点，避免 codec 依赖 XML 解析器实现。
@@ -52,14 +67,9 @@ struct FormControlPropertyXmlNode {
 	std::vector<FormControlPropertyXmlNode> children;
 };
 
-// 已知核心控件定制属性的语义值。
+// 可从公开属性数据中无损识别的重复值集合。
 struct FormControlPropertySemanticData {
-	bool hasListItems = false;
-	std::vector<std::string> listItems;
-	bool hasItemValues = false;
-	std::vector<std::int32_t> itemValues;
-	bool hasTabItems = false;
-	std::vector<std::string> tabItems;
+	std::vector<FormControlPropertyCollection> collections;
 };
 
 // 使用支持库公开的窗口单元接口读取和更新专属属性。

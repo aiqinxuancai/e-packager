@@ -1,6 +1,6 @@
 ﻿# 不打开易语言 IDE，把 `.e` 直接编译成 EXE
 
-> ⚠️ **`compile` 是试验性功能。** 编译结果尚未经过大规模验证，行为和选项可能随版本变化。窗口控件与窗口事件、少见的支持库暂不保证可用。交付前请继续用 `compile-check` 或易语言 IDE 复核，不要直接把产物用于生产环境。
+> ⚠️ **`compile` 是试验性功能。** 语义编译已覆盖当前样例中的常用 Win32 控件、嵌套控件、常见属性和事件，但不是易语言 IDE 的完整替代品。第三方窗口组件仍需要自己的原生运行时适配；交付前请继续用 `compile-check` 或易语言 IDE 复核。
 >
 > 本文所有命令、输出和文件尺寸都来自一次真实执行，环境为 Windows 11 + Visual Studio 18 Professional（MSVC 14.51.36231）+ e-packager `dev` 构建。你的数字会略有差异，但量级应当一致。
 
@@ -14,13 +14,17 @@
 e-packager compile <input.e|input-dir> <output.exe|output.dll> [选项]
 ```
 
-输入可以是原生 `.e`，也可以是 `e-packager unpack` 出来的工程目录。输出扩展名写 `.dll` 就按 DLL 编译。整个过程不启动 `e.exe`，由 e-packager 自己完成源码解析、语义建模、C++ 生成、`cl.exe` 编译和 `link.exe` 链接。
+输入可以是原生 `.e`，也可以是 `e-packager unpack` 出来的工程目录。输出扩展名写 `.dll` 就按 DLL 编译。semantic 路线不启动易语言 IDE，由 e-packager 自己完成源码解析、语义建模、C++ 生成、`cl.exe` 编译和 `link.exe` 链接；legacy-blackmoon 只在生成黑月所需的中间易代码 PE 时直接启动用户指定版本的 IDE。
 
 它和已有的 `compile-check` 是两件不同的事：`compile-check` 借 AutoLinker 调用真实 IDE 做权威确认，`compile` 则完全不依赖 IDE，自己生成产物。前者是"裁判"，后者是"另一条生产线"。
 
 ## 第一步：确认手上有什么
 
-只需要两样东西：一份 e-packager，和一套 Visual C++ 工具链。
+需要 e-packager、一套完整的 Visual Studio C++ 工具链，以及与工程匹配的支持库实现。
+
+`compile` 会调用 VS 的 `cl.exe` 和 `link.exe` 编译/链接生成的 C++，还会调用 Windows SDK 的 `rc.exe`，并包含 `windows.h` 以及 SDK 的系统导入库。请在 Visual Studio Installer 中安装 **使用 C++ 的桌面开发**，确认选中了 MSVC 编译工具、Windows 10/11 SDK 和 Windows 通用 C 运行库。安装后，在 VS Developer PowerShell 中应能找到 `cl.exe`、`link.exe`、`rc.exe`，SDK Include 目录中应有 `windows.h`。
+
+不要把易语言安装目录 `e5.6\linker` 下的 VC 打包链接器当作 semantic 的编译环境。它可能包含一个可执行的 `link.exe`，但不包含完整的 MSVC 头文件、CRT、Windows SDK 和资源编译器。e-packager 不要求也不依赖这个目录。
 
 ```bash
 $ ./bin/Win32/Release/e-packager.exe version
@@ -31,12 +35,12 @@ e-packager dev
 
 ```powershell
 e-packager.exe compile MyApp.e .\out\MyApp.exe `
-  --compiler "C:\path\to\VC\bin\Hostx64\x86\cl.exe" `
-  --linker   "C:\path\to\VC\bin\Hostx64\x86\link.exe" `
-  --lib      "C:\path\to\VC\lib\x86"
+  --compiler "C:\path\to\VC\Tools\MSVC\<版本>\bin\Hostx64\x86\cl.exe" `
+  --linker   "C:\path\to\VC\Tools\MSVC\<版本>\bin\Hostx64\x86\link.exe" `
+  --lib      "D:\deps\support-libraries"
 ```
 
-第三样东西——核心库实现——不用提前准备，下一节会看到它自己出现。
+核心库实现可从 BlackMoonModernCore Release 获取；第三方支持库则必须自行提供与目标架构匹配的 FNE 和静态库。
 
 ## 第二步：第一次编译，以及那个提问
 
@@ -263,16 +267,21 @@ $ dumpbin /imports temp/full-test-x86.exe
 
 `compile` 默认 `--subsystem auto`：控制台工程用 `CONSOLE`，易语言系统信息段标记为窗口工程的项目用 `WINDOWS`。
 
-带窗体的工程目前会被明确拒绝：
+带窗体的工程现在由独立 Win32 宿主创建。当前测试工程覆盖窗口创建完毕、关闭、常见尺寸/焦点/鼠标消息、按钮/选择/列表/组合框/滚动条/滑块事件，以及分组框、图片框和分页夹中的嵌套控件。第三方自绘控件仍需要单独的原生适配。
 
-```bash
-$ ./bin/Win32/Release/e-packager.exe compile eproj/e-window-exe-new-proj.e temp/window.exe
-compile failed: window_project_not_supported_by_independent_compiler
+可以直接编译仓库中的窗口样例：
+
+```powershell
+e-packager.exe compile eproj\e-window-exe-full.e temp\window-x86.exe `
+  --arch x86 `
+  --x86-decoder bin\Win32\Release\e-packager.exe `
+  --blackmoon-x86-dir D:\deps\BlackMoonModernCore\adapter `
+  --lib C:\path\to\e-language\lib
 ```
 
-控件布局和事件生成还没进入语义编译器，所以它宁可报错，也不生成一个"看起来成功但运行不对"的程序。
+`--lib` 目录需要包含 `json.fne`/`json.txt` 和对应的 `JSON_static.lib`（或等价静态归档）；只有接口文本不能链接出 JSON 命令实现。样例中的长文本 JSON 常量也会按 GBK/UTF-8 源码字面量正确解码。
 
-但窗口工程删掉全部窗体、只留纯代码后是可以编译的，而且会保留 GUI 子系统。我拆了 `e-window-exe-new-proj.e`，删掉 `src/_启动窗口.xml`，把 `project/_meta.json` 的 `formFiles` 清空、改指向一个代码程序集（`projectSubsystem` 保持 `windows`），源码写：
+窗口工程保留 `projectSubsystem=windows` 时会生成 Windows GUI 子系统；删除全部窗体、只保留纯代码时仍会保留该子系统。我拆了 `e-window-exe-new-proj.e`，删掉 `src/_启动窗口.xml`，把 `project/_meta.json` 的 `formFiles` 清空、改指向一个代码程序集（`projectSubsystem` 保持 `windows`），源码写：
 
 ```text
 .子程序 _启动子程序, 整数型, , 本子程序在程序启动后最先执行
@@ -345,7 +354,8 @@ JSON 始终包含 `phase`、`code`、`file`、`line`、`column`、`message`、`s
 | `--dll` | 按 DLL 编译；输出为 `.dll` 时可省略 |
 | `--define <宏>` / `-D <宏>` | 条件编译宏，可重复；对应子程序头注释里的 `$(宏名,...)` |
 | `--diagnostics text\|json` | 诊断格式 |
-| `--compiler` / `--linker` / `--lib` | 显式指定 C++ 工具链 |
+| `--compiler` / `--linker` | 显式指定 Visual Studio 自带的同架构 C++ 工具 |
+| `--lib` | 支持库公开接口和静态实现的搜索目录，不是易语言安装目录里的替代链接器 |
 | `--blackmoon-x86-dir` / `--blackmoon-x64-dir` | 核心 adapter 目录，可重复传入 |
 | `--blackmoon-timeout <秒>` | 编译链接超时，默认 120，范围 1–3600 |
 
@@ -355,16 +365,25 @@ adapter 里的 FNE、主归档、后备归档和清单必须来自**同一个** 
 
 | `--compile-mode` | 架构 | 需要什么 |
 | --- | --- | --- |
-| `semantic`（默认，推荐） | x86 / x64 | 一套 Visual C++ 工具链；调用核心库命令时加一份同架构 BlackMoonModernCore adapter |
-| `legacy-blackmoon` | 仅 x86 | 已安装的易语言、AutoLinker、黑月工具链，以及匹配的传统核心归档 |
+| `semantic`（默认，推荐） | x86 / x64 | Visual Studio C++ 工具链、Windows SDK、同架构 BlackMoonModernCore adapter；第三方库还需静态实现 |
+| `legacy-blackmoon` | 仅 x86 | 易语言 IDE + 已启用的 AutoLinker.fne、BlackMoon 工具链和匹配的传统核心归档 |
 
-本文全程用的是 `semantic`。没有特殊需求就别动它。只有两种情况需要 `legacy-blackmoon`：你依赖传统黑月工具链，或者需要和旧编译产物保持逐字节一致。传统路线仍需完整的 `BlackMoon\bin\LINK.EXE`、`BlackMoonExe.obj`、`EyInit.obj`，以及 x86 Release 包里 `legacy_static_lib\x86\krnln.lib` 那份 VC6 归档——它不能替代 semantic adapter，两者也不能混用。
+本文全程用的是 `semantic`。没有特殊需求就别动它。只有两种情况需要 `legacy-blackmoon`：你依赖传统黑月工具链，或者需要和旧编译产物保持逐字节一致。传统路线仍需完整的 `BlackMoon\bin\LINK.EXE`、`BlackMoonExe.obj`、`EyInit.obj`，以及 x86 Release 包里 `legacy_static_lib\x86\krnln.lib` 那份 VC6 归档；它不使用 `e5.6\linker` 的打包链接器，也不能用 semantic adapter 替代。
+
+legacy-blackmoon 的中间阶段由 e-packager 直接启动用户指定版本的易语言 IDE。程序向 IDE 传递 AutoLinker 的 `--autolinker-headless-compile`、输出路径、目标类型和 `--autolinker-exit` 参数，然后把生成的易代码 PE 交给 BlackMoonNG 转换。它不需要 `AutoLinkerTest.exe` 或 `AutoLinkerText.exe`，但易语言 IDE 的 `lib` 目录必须安装并启用匹配版本的 `AutoLinker.fne`：
+
+```powershell
+e-packager.exe compile eproj\e-console-exe-new-proj.e temp\legacy-console.exe `
+  --compile-mode legacy-blackmoon --legacy-blackmoon-mode asm `
+  --eide C:\path\to\IDE.exe `
+  --legacy-blackmoon-dir C:\path\to\BlackMoon
+```
 
 ## 当前边界
 
 这条链路已经贯通"源码 → 语义模型 → 元数据驱动的 FNE 调用 → C++/OBJ → 链接 → EXE/DLL"，但它不是易语言 IDE 的等价替代。以下是实测确认的边界：
 
-- **带窗体的窗口工程不支持**，返回 `window_project_not_supported_by_independent_compiler`。删净窗体的纯代码工程可以编译并保留 GUI 子系统。
+- **窗口工程使用独立的 Win32 宿主**。当前已覆盖常用核心控件、分组框/图片框/分页夹中的嵌套控件、常见初始属性、列表数据和常见事件；尚未宣称等价实现所有第三方自绘控件。
 - **需要匹配架构的 adapter**。只有 x86 归档时编译 x64 会在库发现阶段被拒绝，编译器不会跨位数猜测。
 - **完整易语言语法仍在扩展**。特殊编译指令、少见表达式、全部隐式类型转换尚未宣称覆盖。
 - **`置入代码`** 目前支持字节集字面量 + x86 naked helper；与普通语句混合的机器码会明确报错，而不是猜寄存器状态。

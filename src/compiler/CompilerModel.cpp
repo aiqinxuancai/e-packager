@@ -1,5 +1,7 @@
 ﻿#include "CompilerModel.h"
 
+#include "WindowModel.h"
+
 #include "../PathHelper.h"
 #include "../EFolderCodec.h"
 
@@ -118,6 +120,7 @@ bool ExpandEComDependencies(
 {
 	std::vector<e2txt::Dependency> additionalDependencies;
 	std::unordered_set<std::string> knownECom;
+	std::size_t moduleOrdinal = 0;
 	for (const auto& dependency : bundle.dependencies) {
 		if (dependency.kind != e2txt::DependencyKind::ECom) continue;
 		const std::string identity = dependency.resolvedPath.empty() ? dependency.path : dependency.resolvedPath;
@@ -189,6 +192,68 @@ bool ExpandEComDependencies(
 				return false;
 			}
 		}
+		++moduleOrdinal;
+		const std::string moduleRenamePrefix = "__ecom_" + std::to_string(moduleOrdinal) + "_";
+		std::unordered_set<std::string> existingSymbols;
+		const auto collectDeclarations = [&](const std::string& text, const std::string& directive) {
+			for (const std::string& rawLine : SplitLines(text)) {
+				const std::string line = Trim(StripComment(rawLine));
+				if (!StartsWith(line, directive)) continue;
+				std::string declaration = Trim(line.substr(directive.size()));
+				const std::size_t comma = declaration.find(',');
+				if (comma != std::string::npos) declaration.resize(comma);
+				if (!declaration.empty()) existingSymbols.insert(declaration);
+			}
+		};
+		for (const auto& source : bundle.sourceFiles) collectDeclarations(source.content, ".程序集 ");
+		collectDeclarations(bundle.dataTypeText, ".数据类型 ");
+		collectDeclarations(bundle.dllDeclareText, ".DLL命令 ");
+		collectDeclarations(bundle.globalText, ".全局变量 ");
+		collectDeclarations(bundle.constantText, ".常量 ");
+		std::unordered_map<std::string, std::string> symbolRenames;
+		const auto collectConflictingDeclarations = [&](const std::string& text, const std::string& directive) {
+			for (const std::string& rawLine : SplitLines(text)) {
+				const std::string line = Trim(StripComment(rawLine));
+				if (!StartsWith(line, directive)) continue;
+				std::string declaration = Trim(line.substr(directive.size()));
+				const std::size_t comma = declaration.find(',');
+				if (comma != std::string::npos) declaration.resize(comma);
+				if (declaration.empty() || !existingSymbols.contains(declaration) || symbolRenames.contains(declaration)) continue;
+				std::string replacement = moduleRenamePrefix + declaration;
+				std::size_t suffix = 1;
+				while (existingSymbols.contains(replacement)) replacement = moduleRenamePrefix + std::to_string(suffix++) + "_" + declaration;
+				symbolRenames.emplace(declaration, std::move(replacement));
+			}
+		};
+		collectConflictingDeclarations(module.dataTypeText, ".数据类型 ");
+		collectConflictingDeclarations(module.dllDeclareText, ".DLL命令 ");
+		collectConflictingDeclarations(module.globalText, ".全局变量 ");
+		collectConflictingDeclarations(module.constantText, ".常量 ");
+		collectConflictingDeclarations(
+			[&]() { std::string all; for (const auto& source : module.sourceFiles) all += source.content + "\r\n"; return all; }(),
+			".程序集 ");
+		std::vector<std::pair<std::string, std::string>> orderedRenames(symbolRenames.begin(), symbolRenames.end());
+		std::sort(orderedRenames.begin(), orderedRenames.end(),
+			[](const auto& left, const auto& right) { return left.first.size() > right.first.size(); });
+		const auto applyRenames = [&](std::string& text) {
+			for (const auto& [oldName, newName] : orderedRenames) {
+				const std::string constantOld = "#" + oldName;
+				const std::string constantNew = "#" + newName;
+				for (std::size_t offset = text.find(constantOld); offset != std::string::npos;
+					offset = text.find(constantOld, offset + constantNew.size())) {
+					text.replace(offset, constantOld.size(), constantNew);
+				}
+				for (std::size_t offset = text.find(oldName); offset != std::string::npos;
+					offset = text.find(oldName, offset + newName.size())) {
+					text.replace(offset, oldName.size(), newName);
+				}
+			}
+		};
+		for (auto& source : module.sourceFiles) applyRenames(source.content);
+		applyRenames(module.dataTypeText);
+		applyRenames(module.dllDeclareText);
+		applyRenames(module.globalText);
+		applyRenames(module.constantText);
 		const std::string moduleSourcePrefix = "ecom/" +
 			(!module.projectName.empty()
 				? module.projectName
@@ -204,7 +269,8 @@ bool ExpandEComDependencies(
 					std::string line = rawLine;
 					if (StartsWith(Trim(line), ".子程序 ")) {
 						const std::string declaration = Trim(line.substr(line.find(".子程序 ") + std::string(".子程序 ").size()));
-						if (declaration.rfind("_临时子程序", 0) == 0) line.replace(line.find("_临时子程序"), std::string("_临时子程序").size(), "__ecom_temp_subprogram");
+						if (declaration.rfind("_临时子程序", 0) == 0) line.replace(
+							line.find("_临时子程序"), std::string("_临时子程序").size(), "__ecom_temp_subprogram");
 					}
 					renamed << line << "\r\n";
 				}
@@ -216,6 +282,49 @@ bool ExpandEComDependencies(
 		AppendPageText(bundle.dllDeclareText, module.dllDeclareText);
 		AppendPageText(bundle.constantText, module.constantText);
 		AppendPageText(bundle.globalText, module.globalText);
+		// A module's sidecar exports belong to that module's workspace.  Keep
+		// the dependency anchored there before flattening the module into the
+		// parent bundle; otherwise a relative `elib/...` path is incorrectly
+		// resolved against the parent project root.
+		const std::filesystem::path moduleWorkspaceRoot =
+			(!workspacePath.empty() && std::filesystem::is_directory(workspacePath, ec))
+				? workspacePath
+				: (!moduleFilePath.empty() ? moduleFilePath.parent_path() : std::filesystem::path());
+		const auto findModuleSidecar = [&](const e2txt::Dependency& dependency) {
+			if (moduleWorkspaceRoot.empty()) return std::filesystem::path();
+			std::vector<std::filesystem::path> candidates;
+			for (const std::string& name : { dependency.fileName, dependency.name }) {
+				if (name.empty()) continue;
+				std::filesystem::path candidate = Utf8PathToPath(name);
+				candidate.replace_extension(L".txt");
+				candidates.push_back(moduleWorkspaceRoot / L"elib" / candidate.filename());
+			}
+			for (const auto& candidate : candidates) {
+				if (IsRegularFilePath(candidate)) return AbsolutePathValue(candidate);
+			}
+			// Native module bundles do not carry localWorkspace fields.  Match
+			// their dependency name against the first metadata line instead of
+			// guessing an installed FNE path.
+			std::error_code iteratorError;
+			const std::filesystem::path elibDirectory = moduleWorkspaceRoot / L"elib";
+			for (const auto& entry : std::filesystem::directory_iterator(elibDirectory, iteratorError)) {
+				if (!entry.is_regular_file(iteratorError) || entry.path().extension() != L".txt") continue;
+				std::ifstream input(entry.path(), std::ios::binary);
+				std::string firstLine;
+				std::getline(input, firstLine);
+				if (firstLine.size() >= 3 &&
+					static_cast<unsigned char>(firstLine[0]) == 0xEF &&
+					static_cast<unsigned char>(firstLine[1]) == 0xBB &&
+					static_cast<unsigned char>(firstLine[2]) == 0xBF) {
+					firstLine.erase(0, 3);
+				}
+				if (firstLine == "支持库名称：" + dependency.name ||
+					firstLine == "支持库名称:" + dependency.name) {
+					return AbsolutePathValue(entry.path());
+				}
+			}
+			return std::filesystem::path();
+		};
 		for (const auto& nested : module.dependencies) {
 			if (nested.kind != e2txt::DependencyKind::ELib) continue;
 			const std::string nestedName = nested.fileName.empty() ? nested.name : nested.fileName;
@@ -224,7 +333,20 @@ bool ExpandEComDependencies(
 				const std::string currentName = current.fileName.empty() ? current.name : current.fileName;
 				if (current.kind == e2txt::DependencyKind::ELib && currentName == nestedName) { exists = true; break; }
 			}
-			if (!exists) additionalDependencies.push_back(nested);
+			if (exists) continue;
+			e2txt::Dependency anchored = nested;
+			if (!moduleWorkspaceRoot.empty() && !anchored.localWorkspace.empty()) {
+				std::filesystem::path localWorkspace = Utf8PathToPath(anchored.localWorkspace);
+				if (localWorkspace.is_relative()) {
+					anchored.localWorkspace = PathToUtf8(
+						(moduleWorkspaceRoot / localWorkspace).lexically_normal());
+				}
+			}
+			if (anchored.localWorkspace.empty()) {
+				const std::filesystem::path sidecar = findModuleSidecar(anchored);
+				if (!sidecar.empty()) anchored.localWorkspace = PathToUtf8(sidecar);
+			}
+			additionalDependencies.push_back(std::move(anchored));
 		}
 	}
 	for (auto& dependency : additionalDependencies) bundle.dependencies.push_back(std::move(dependency));
@@ -281,16 +403,33 @@ std::vector<std::string> SplitFields(const std::string& text)
 	return result;
 }
 
+bool StripChineseTextQuotes(std::string& value)
+{
+	if (value.size() >= 6 && value.compare(0, 3, "\xE2\x80\x9C") == 0 &&
+		value.compare(value.size() - 3, 3, "\xE2\x80\x9D") == 0) {
+		value = value.substr(3, value.size() - 6);
+		return true;
+	}
+	// e language source is commonly stored in the local GBK code page.  Its
+	// Chinese quotation marks are A1 B0/A1 B1 rather than UTF-8 sequences.
+	if (value.size() >= 4 &&
+		static_cast<unsigned char>(value[0]) == 0xA1 &&
+		static_cast<unsigned char>(value[1]) == 0xB0 &&
+		static_cast<unsigned char>(value[value.size() - 2]) == 0xA1 &&
+		static_cast<unsigned char>(value[value.size() - 1]) == 0xB1) {
+		value = value.substr(2, value.size() - 4);
+		return true;
+	}
+	return false;
+}
+
 std::string DecodeConstantLiteral(std::string value)
 {
 	value = Trim(std::move(value));
 	if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
 		value = value.substr(1, value.size() - 2);
 	}
-    if (value.size() >= 6 && value.compare(0, 3, "\xE2\x80\x9C") == 0 &&
-        value.compare(value.size() - 3, 3, "\xE2\x80\x9D") == 0) {
-        value = value.substr(3, value.size() - 6);
-    }
+	StripChineseTextQuotes(value);
     const std::string escapedTextPrefix = "#e2txt_text#";
     const std::string escapedLongTextPrefix = "#e2txt_long_text#";
     if (value.compare(0, escapedTextPrefix.size(), escapedTextPrefix) == 0) value.erase(0, escapedTextPrefix.size());
@@ -343,8 +482,7 @@ bool IsExplicitTextLiteral(std::string value)
 {
 	value = Trim(std::move(value));
 	if (value.size() >= 2 && value.front() == '"' && value.back() == '"') value = value.substr(1, value.size() - 2);
-	if (value.size() >= 6 && value.compare(0, 3, "\xE2\x80\x9C") == 0 &&
-		value.compare(value.size() - 3, 3, "\xE2\x80\x9D") == 0) return true;
+	if (StripChineseTextQuotes(value)) return true;
 	return value.compare(0, std::string("#e2txt_text#").size(), "#e2txt_text#") == 0 ||
 		value.compare(0, std::string("#e2txt_long_text#").size(), "#e2txt_long_text#") == 0;
 }
@@ -408,7 +546,7 @@ std::string MarkerName(const std::string& line)
 		const std::size_t end = line.find_first_of(" \t(");
 		return line.substr(0, end);
 	}
-	// e5.95 sources may omit the leading dot on flow-control directives.
+	// Some newer E-language sources may omit the leading dot on flow-control directives.
 	// Normalize only the reserved directive vocabulary; ordinary calls remain
 	// expressions and are never mistaken for control flow.
 	static constexpr std::string_view kBareMarkers[] = {
@@ -1952,7 +2090,7 @@ bool LoadLibraries(Program& program, std::string& error)
 			std::string sidecarError;
 			if (sidecar.empty() || !LoadSupportLibrarySidecarMetadata(
 					sidecar, dependency, library.metadata, sidecarError)) {
-				error = "support_library_not_found:" + dependency.fileName + ":" + dependency.name;
+				error = "support_library_not_found:" + dependency.fileName + ":" + dependency.name + ":" + dependency.localWorkspace;
 				return false;
 			}
 			library.implementationAvailable = false;
@@ -2163,6 +2301,7 @@ bool ParseSources(Program& program, std::string& error)
 			method.sourceFile = fileName;
 			method.sourceLine = index + 1;
 			const std::string returnTypeName = fields.size() >= 2 ? fields[1] : std::string();
+		method.returnTypeName = returnTypeName;
 		method.returnType = returnTypeName.empty() ? TypeRef { kTypeNull, false, true } : ResolveTypeName(program, returnTypeName, false);
 		method.isPublic = fields.size() >= 3 && Trim(fields[2]) == "公开";
 		const std::string methodComment = fields.size() >= 4 ? Trim(fields[3]) : std::string();
@@ -2177,10 +2316,6 @@ bool ParseSources(Program& program, std::string& error)
 			if (const std::string customName = ExtractDirectiveValue(methodComment, "name"); !customName.empty()) method.exportName = customName;
 			method.usesCdecl = methodComment.find("($cdecl)") != std::string::npos || methodComment.find("($cdecl") != std::string::npos;
 			if (methodComment.find("($stdcall)") != std::string::npos) method.usesCdecl = false;
-			if (!method.returnType.valid) {
-				error = fileName + ":" + std::to_string(index + 1) + ": unknown_return_type:" + returnTypeName;
-				return false;
-			}
 			for (std::size_t declarationIndex = bodyBegin; declarationIndex < bodyEnd; ++declarationIndex) {
 				const std::string declaration = Trim(StripComment(lines[declarationIndex]));
 				if (StartsWith(declaration, ".参数 ")) method.parameters.push_back(ParseVariableDeclaration(declaration, declarationIndex + 1));
@@ -2188,9 +2323,10 @@ bool ParseSources(Program& program, std::string& error)
 			}
 			std::size_t parseIndex = bodyBegin;
 			if (!ParseStatements(lines, parseIndex, bodyEnd, {}, fileName, method.body, error)) return false;
-			const std::string methodKey = program.assemblies[assemblyIndex].isClass
-				? program.assemblies[assemblyIndex].name + "." + method.name
-				: method.name;
+			// Ordinary assemblies also have their own method namespace in the
+			// IDE.  Keeping only an unqualified global key makes two assemblies
+			// containing the common name `子程序1` collide during module import.
+			const std::string methodKey = program.assemblies[assemblyIndex].name + "." + method.name;
 			if (!program.methodByName.emplace(methodKey, method.id).second) {
 				error = "duplicate_method_name:" + methodKey;
 				return false;
@@ -2201,8 +2337,21 @@ bool ParseSources(Program& program, std::string& error)
 		}
 	}
 	if (!program.methodByName.contains("_启动子程序")) {
-		error = "startup_method_not_found:_启动子程序";
-		return false;
+		// 窗口工程的隐藏启动方法由 IDE 生成，源码目录中通常只有窗口
+		// 创建事件。独立编译器用一个空启动方法承接同一生命周期入口。
+		if (program.bundle.formFiles.empty()) {
+			error = "startup_method_not_found:_启动子程序";
+			return false;
+		}
+		Method startup;
+		startup.id = program.methods.size();
+		startup.name = "_启动子程序";
+		startup.sourceFile = "<window-startup>";
+		startup.returnType = { kTypeNull, false, true };
+		startup.assemblyIndex = program.assemblies.empty() ? 0 : 0;
+		if (!program.assemblies.empty()) program.assemblies[0].methodIds.push_back(startup.id);
+		program.methodByName.emplace(startup.name, startup.id);
+		program.methods.push_back(std::move(startup));
 	}
 	return true;
 }
@@ -2347,6 +2496,18 @@ bool BuildCompilerModel(
 	if (!RegisterDllCommands(outProgram, outError)) return false;
 	if (!ParseSources(outProgram, outError)) return false;
 	if (!RegisterClassTypes(outProgram, outError)) return false;
+	for (Method& method : outProgram.methods) {
+		if (method.returnTypeName.empty()) {
+			method.returnType = { kTypeNull, false, true };
+			continue;
+		}
+		method.returnType = ResolveTypeName(outProgram, method.returnTypeName, false);
+		if (!method.returnType.valid) {
+			outError = method.sourceFile + ":" + std::to_string(method.sourceLine) +
+				": unknown_return_type:" + method.returnTypeName;
+			return false;
+		}
+	}
 	if (!ResolveVariables(outProgram, outError)) return false;
 	PopulateClassTypeFields(outProgram);
 	RegisterCommands(outProgram);
@@ -2354,6 +2515,7 @@ bool BuildCompilerModel(
 	// ResolveVariables runs before library commands are registered, so class
 	// declarations that refer to support-library types need one final pass.
 	if (!ResolveVariables(outProgram, outError)) return false;
+	if (!outProgram.bundle.formFiles.empty() && !BuildWindowModel(outProgram, outError)) return false;
 	return true;
 }
 

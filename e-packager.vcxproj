@@ -185,6 +185,7 @@
 	<ClCompile Include="src\compiler\BlackMoonEcodeBridge.cpp" />
 	<ClCompile Include="src\compiler\BlackMoonCompiler.cpp" />
     <ClCompile Include="src\compiler\CompilerModel.cpp" />
+	<ClCompile Include="src\compiler\WindowModel.cpp" />
 	<ClCompile Include="src\compiler\CppEmitter.cpp" />
     <ClCompile Include="src\compiler\ECompiler.cpp" />
 	<ClCompile Include="src\compiler\blackmoon\bm_ecode_to_obj.cpp" />
@@ -212,6 +213,7 @@
 	<ClInclude Include="src\compiler\BlackMoonEcodeBridge.h" />
 	<ClInclude Include="src\compiler\BlackMoonCompiler.h" />
 	<ClInclude Include="src\compiler\CompilerModel.h" />
+	<ClInclude Include="src\compiler\WindowModel.h" />
 	<ClInclude Include="src\compiler\CompilerTarget.h" />
 	<ClInclude Include="src\compiler\CppEmitter.h" />
     <ClInclude Include="src\compiler\ECompiler.h" />

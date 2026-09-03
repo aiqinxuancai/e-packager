@@ -31,6 +31,8 @@ inline constexpr std::uint32_t kTypeText = 0x80000004u;
 inline constexpr std::uint32_t kTypeBinary = 0x80000005u;
 inline constexpr std::uint32_t kTypeSubroutine = 0x80000006u;
 inline constexpr std::uint32_t kTypeArrayFlag = 0x20000000u;
+// 窗口组件是运行时句柄，不把它伪装成支持库复合对象布局。
+inline constexpr std::uint32_t kTypeWindowUnit = 0x70000001u;
 
 struct TypeRef {
 	std::uint32_t code = kTypeNull;
@@ -87,6 +89,7 @@ struct Method {
 	std::string name;
 	std::string sourceFile;
 	std::size_t sourceLine = 0;
+	std::string returnTypeName;
 	TypeRef returnType;
 	TypeRef ownerType;
 	std::string exportName;
@@ -155,6 +158,127 @@ struct TypeInfo {
 	std::vector<std::size_t> memberMethodIds;
 };
 
+// 窗口事件对应的宿主消息类别。Unknown 保留原始事件索引回退路径。
+enum class WindowEventTrigger {
+	Unknown,
+	Created,
+	Closing,
+	Destroyed,
+	SizeChanged,
+	Moved,
+	Activated,
+	Deactivated,
+	FocusGained,
+	FocusLost,
+	Clicked,
+	DoubleClicked,
+	DropDown,
+	SelectionChanged,
+	PositionChanged,
+	Changed,
+	KeyDown,
+	KeyUp,
+	MouseDown,
+	MouseUp,
+	MouseMove,
+	Paint,
+	Timer,
+	ListClosed,
+	SelectionChanging,
+	CharInput,
+	RightMouseDown,
+	RightMouseUp,
+	FirstActivated,
+	Shown,
+	Hidden,
+	Idle,
+	Tray,
+	MouseEnter,
+	MouseLeave,
+};
+
+// 窗口 XML 中的事件绑定及其运行时触发类别。
+struct WindowEventBinding {
+	std::int32_t index = -1;
+	std::size_t methodId = static_cast<std::size_t>(-1);
+	std::string name;
+	WindowEventTrigger trigger = WindowEventTrigger::Unknown;
+};
+
+// 独立编译器使用的窗口设计期模型。窗口组件的原始扩展数据同时保留，
+// 已能从支持库公开接口解码的属性放入 properties，供编译器和诊断使用。
+struct WindowProperty {
+	std::string name;
+	std::string englishName;
+	std::string xmlName;
+	std::int16_t dataType = 0;
+	std::uint16_t state = 0;
+	std::size_t metadataIndex = 0;
+	std::size_t callbackIndex = 0;
+	std::int32_t integerValue = 0;
+	double doubleValue = 0;
+	bool booleanValue = false;
+	std::string textValue;
+	std::vector<std::uint8_t> binaryValue;
+};
+
+struct WindowControl {
+	std::uint32_t id = 0;
+	std::int32_t parentId = 0;
+	std::string typeName;
+	std::string name;
+	std::int32_t left = 0;
+	std::int32_t top = 0;
+	std::int32_t width = 0;
+	std::int32_t height = 0;
+	std::string text;
+	bool visible = true;
+	bool disabled = false;
+	bool tabStop = true;
+	std::int32_t tabIndex = 0;
+	bool tabPageBreak = false;
+	std::int32_t tabOwner = 0;
+	std::int32_t tabPage = -1;
+	std::vector<std::string> tabPageTitles;
+	std::vector<std::pair<std::string, std::string>> attributes;
+	std::vector<std::string> listItems;
+	std::vector<std::int32_t> itemValues;
+	bool listItemsDefined = false;
+	bool itemValuesDefined = false;
+	std::vector<std::uint8_t> extensionData;
+	std::vector<WindowProperty> properties;
+	std::vector<std::int32_t> children;
+	std::vector<WindowEventBinding> events;
+};
+
+struct WindowForm {
+	std::string name;
+	std::string className;
+	std::size_t assemblyIndex = static_cast<std::size_t>(-1);
+	std::uint32_t id = 0;
+	std::int32_t left = 0;
+	std::int32_t top = 0;
+	std::int32_t width = 640;
+	std::int32_t height = 480;
+	std::string title;
+	std::int32_t border = 2;
+	std::int32_t position = 0;
+	bool visible = true;
+	bool disabled = false;
+	bool controlButtons = true;
+	bool maximizeButton = true;
+	bool minimizeButton = true;
+	bool canMove = true;
+	bool topmost = false;
+	bool showInTaskbar = true;
+	bool escapeCloses = false;
+	std::vector<std::pair<std::string, std::string>> attributes;
+	std::vector<std::uint8_t> extensionData;
+	std::vector<WindowProperty> properties;
+	std::vector<WindowControl> controls;
+	std::vector<WindowEventBinding> events;
+};
+
 struct Program {
 	bool buildDll = false;
 	bool windowsGui = false;
@@ -179,6 +303,7 @@ struct Program {
 	std::unordered_map<std::string, std::vector<std::pair<std::size_t, std::size_t>>> globalCommands;
 	std::unordered_map<std::string, std::size_t> dllCommandByName;
 	std::unordered_map<std::string, Constant> constants;
+	std::vector<WindowForm> windows;
 
 	const TypeInfo* FindType(std::uint32_t code) const;
 	std::uint32_t NormalizeLibraryType(std::size_t libraryIndex, std::uint32_t code) const;

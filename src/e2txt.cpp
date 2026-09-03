@@ -3149,15 +3149,30 @@ std::vector<std::string> BuildSupportTypeEventNames(const LIB_DATA_TYPE_INFO& da
 	if (dataType.m_nEventCount <= 0 ||
 		dataType.m_nEventCount > kMaxSupportLibraryArrayCount ||
 		dataType.m_pEventBegin == nullptr ||
-		!IsReadableMemoryRange(
+		!IsReadableMemoryRange(dataType.m_pEventBegin, sizeof(EVENT_INFO))) {
+		return eventNames;
+	}
+
+	// EVENT_INFO2 keeps EVENT_INFO as a prefix, but old FNEs still publish
+	// an EVENT_INFO array.  The two layouts have different strides, so using
+	// EVENT_INFO2[] for every library shifts all events after the first one.
+	const auto* first = reinterpret_cast<const EVENT_INFO*>(dataType.m_pEventBegin);
+	const bool version2 = (first->m_dwState & EV_IS_VER2) != 0;
+	const size_t stride = version2 ? sizeof(EVENT_INFO2) : sizeof(EVENT_INFO);
+	if (!IsReadableMemoryRange(
 			dataType.m_pEventBegin,
-			sizeof(EVENT_INFO2) * static_cast<size_t>(dataType.m_nEventCount))) {
+			stride * static_cast<size_t>(dataType.m_nEventCount))) {
 		return eventNames;
 	}
 
 	eventNames.reserve(static_cast<size_t>(dataType.m_nEventCount));
 	for (int eventIndex = 0; eventIndex < dataType.m_nEventCount; ++eventIndex) {
-		eventNames.emplace_back(ReadSupportLibraryName(dataType.m_pEventBegin[eventIndex].m_szName));
+		const auto* address = reinterpret_cast<const std::uint8_t*>(dataType.m_pEventBegin) +
+			stride * static_cast<size_t>(eventIndex);
+		const char* name = version2
+			? reinterpret_cast<const EVENT_INFO2*>(address)->m_szName
+			: reinterpret_cast<const EVENT_INFO*>(address)->m_szName;
+		eventNames.emplace_back(ReadSupportLibraryName(name));
 	}
 	return eventNames;
 }
@@ -4277,12 +4292,23 @@ std::string BuildVarFlags(const VariableInfo& info)
 	return JoinStrings(parts, " ");
 }
 
-std::string BuildTypeField(const VariableInfo& info, SymbolResolver& resolver)
+std::string ResolveTypeWithHints(
+	const std::int32_t typeId,
+	SymbolResolver& resolver,
+	const AnonymousTypeHints& hints)
 {
-	return TrimAsciiCopy(resolver.ResolveType(info.dataType));
+	const std::string resolved = TrimAsciiCopy(resolver.ResolveType(typeId));
+	if (!IsAnonymousPlaceholderTypeName(resolved)) return resolved;
+	if (const auto it = hints.localTypeAliases.find(typeId); it != hints.localTypeAliases.end()) return it->second;
+	return resolved;
 }
 
-std::string BuildMethodParameterLine(const VariableInfo& info, SymbolResolver& resolver)
+std::string BuildTypeField(const VariableInfo& info, SymbolResolver& resolver, const AnonymousTypeHints* hints = nullptr)
+{
+	return hints == nullptr ? TrimAsciiCopy(resolver.ResolveType(info.dataType)) : ResolveTypeWithHints(info.dataType, resolver, *hints);
+}
+
+std::string BuildMethodParameterLine(const VariableInfo& info, SymbolResolver& resolver, const AnonymousTypeHints* hints = nullptr)
 {
 	std::vector<std::string> flags;
 	if ((info.attr & kVarAttrByRef) != 0) {
@@ -4298,45 +4324,45 @@ std::string BuildMethodParameterLine(const VariableInfo& info, SymbolResolver& r
 		"参数",
 		{
 			TrimAsciiCopy(resolver.ResolveUserName(info.marker)),
-			BuildTypeField(info, resolver),
+			BuildTypeField(info, resolver, hints),
 			JoinStrings(flags, " "),
 			TrimAsciiCopy(info.comment),
 		});
 }
 
-std::string BuildLocalVariableLine(const VariableInfo& info, SymbolResolver& resolver)
+std::string BuildLocalVariableLine(const VariableInfo& info, SymbolResolver& resolver, const AnonymousTypeHints* hints = nullptr)
 {
 	return BuildDefinitionLine(
 		"局部变量",
 		{
 			TrimAsciiCopy(resolver.ResolveUserName(info.marker)),
-			BuildTypeField(info, resolver),
+			BuildTypeField(info, resolver, hints),
 			(info.attr & 0x0001) != 0 ? "静态" : std::string(),
 			BuildArraySuffix(info.arrayBounds),
 			TrimAsciiCopy(info.comment),
 		});
 }
 
-std::string BuildClassVariableLine(const VariableInfo& info, SymbolResolver& resolver)
+std::string BuildClassVariableLine(const VariableInfo& info, SymbolResolver& resolver, const AnonymousTypeHints* hints = nullptr)
 {
 	return BuildDefinitionLine(
 		"程序集变量",
 		{
 			TrimAsciiCopy(resolver.ResolveUserName(info.marker)),
-			BuildTypeField(info, resolver),
+			BuildTypeField(info, resolver, hints),
 			std::string(),
 			BuildArraySuffix(info.arrayBounds),
 			TrimAsciiCopy(info.comment),
 		});
 }
 
-std::string BuildGlobalVariableLine(const VariableInfo& info, SymbolResolver& resolver)
+std::string BuildGlobalVariableLine(const VariableInfo& info, SymbolResolver& resolver, const AnonymousTypeHints* hints = nullptr)
 {
 	return BuildDefinitionLine(
 		"全局变量",
 		{
 			TrimAsciiCopy(resolver.ResolveUserName(info.marker)),
-			BuildTypeField(info, resolver),
+			BuildTypeField(info, resolver, hints),
 			(info.attr & 0x0100) != 0 ? "公开" : std::string(),
 			BuildArraySuffix(info.arrayBounds),
 			TrimAsciiCopy(info.comment),
@@ -5829,7 +5855,11 @@ bool IsProgramPagePublic(const ModuleSections& sections, std::int32_t pageId)
 	return false;
 }
 
-void BuildProgramPages(const ModuleSections& sections, const GenerateOptions& options, Document& outDocument)
+void BuildProgramPages(
+	const ModuleSections& sections,
+	const AnonymousTypeHints& hints,
+	const GenerateOptions& options,
+	Document& outDocument)
 {
 	SymbolResolver resolver(
 		sections.program,
@@ -5882,7 +5912,7 @@ void BuildProgramPages(const ModuleSections& sections, const GenerateOptions& op
 			headerFields));
 
 		for (const auto& pageVar : pageInfo.pageVars) {
-			AppendLine(page, BuildClassVariableLine(pageVar, resolver));
+			AppendLine(page, BuildClassVariableLine(pageVar, resolver, &hints));
 		}
 		AppendLine(page, "");
 
@@ -5895,17 +5925,17 @@ void BuildProgramPages(const ModuleSections& sections, const GenerateOptions& op
 				"子程序",
 				{
 					TrimAsciiCopy(resolver.ResolveUserName(functionInfo->header.dwId)),
-					TrimAsciiCopy(resolver.ResolveType(functionInfo->returnType)),
+					ResolveTypeWithHints(functionInfo->returnType, resolver, hints),
 					(functionInfo->attr & 0x8) != 0 ? "公开" : std::string(),
 					TrimAsciiCopy(functionInfo->comment),
 				}));
 
 				for (const auto& param : functionInfo->params) {
-					AppendLine(page, BuildMethodParameterLine(param, resolver));
+					AppendLine(page, BuildMethodParameterLine(param, resolver, &hints));
 				}
 
 				for (const auto& local : functionInfo->locals) {
-					AppendLine(page, BuildLocalVariableLine(local, resolver));
+					AppendLine(page, BuildLocalVariableLine(local, resolver, &hints));
 				}
 
 				std::vector<std::string> bodyLines;
@@ -5945,7 +5975,11 @@ void BuildProgramPages(const ModuleSections& sections, const GenerateOptions& op
 	TraceLine("BuildProgramPages end count=" + std::to_string(outDocument.pages.size()));
 }
 
-void BuildGlobalPage(const ModuleSections& sections, const GenerateOptions& options, Document& outDocument)
+void BuildGlobalPage(
+	const ModuleSections& sections,
+	const AnonymousTypeHints& hints,
+	const GenerateOptions& options,
+	Document& outDocument)
 {
 	if (sections.program.globals.empty()) {
 		return;
@@ -5970,7 +6004,7 @@ void BuildGlobalPage(const ModuleSections& sections, const GenerateOptions& opti
 			(IsGlobalHidden(item) || IsDependencyDefinedId(dependencyRecords, item.marker))) {
 			continue;
 		}
-		AppendLine(page, BuildGlobalVariableLine(item, resolver));
+		AppendLine(page, BuildGlobalVariableLine(item, resolver, &hints));
 	}
 	if (page.lines.size() > 2) {
 		outDocument.pages.push_back(std::move(page));
@@ -6002,7 +6036,7 @@ void BuildStructPage(
 	AppendLine(page, ".版本 2");
 	AppendLine(page, "");
 	for (const auto& item : sections.program.dataTypes) {
-		if (IsTxt2EPlaceholderStruct(item) ||
+		if ((IsTxt2EPlaceholderStruct(item) && !options.includeImportedFunctions) ||
 			(!options.includeImportedFunctions &&
 				(IsStructHidden(item) || IsDependencyDefinedId(dependencyRecords, item.header.dwId)))) {
 			continue;
@@ -6068,7 +6102,7 @@ void BuildDllPage(
 			"DLL命令",
 			{
 				dllName,
-				TrimAsciiCopy(resolver.ResolveType(item.returnType)),
+				ResolveTypeWithHints(item.returnType, resolver, hints),
 				QuoteIfNotEmpty(item.fileName),
 				QuoteIfNotEmpty(item.commandName),
 				(item.attr & 0x2) != 0 ? "公开" : std::string(),
@@ -6383,14 +6417,6 @@ void AppendFormControlPropertyXmlAttributes(
 		if (value.definition.xmlName.empty()) {
 			continue;
 		}
-		const bool semanticAvailable =
-			outSemantic != nullptr &&
-			((value.definition.name == "列表项目" && outSemantic->hasListItems) ||
-				(value.definition.name == "项目数值" && outSemantic->hasItemValues) ||
-				(value.definition.name == "子夹管理" && outSemantic->hasTabItems));
-		if (value.definition.dataType == UD_CUSTOMIZE && semanticAvailable) {
-			continue;
-		}
 		attributes.emplace_back(
 			value.definition.xmlName,
 			FormControlPropertyCodec::ValueToXmlText(value));
@@ -6401,76 +6427,33 @@ bool AppendFormControlPropertyXmlChildren(
 	FormXml& formXml,
 	const std::string& tagName,
 	const int indent,
-	const FormControlPropertySemanticData& semantic)
+	const FormControlPropertySemanticData& semantic,
+	const bool tabControl)
 {
 	bool appended = false;
-	if (semantic.hasListItems) {
-		const std::string containerName = tagName + ".列表项目";
-		if (semantic.listItems.empty()) {
-			AppendXmlLine(formXml, indent, BuildXmlOpenTag(containerName, {}, true));
+	for (const auto& collection : semantic.collections) {
+		const std::string propertyName = !collection.definition.xmlName.empty()
+			? collection.definition.xmlName : collection.definition.name;
+		if (propertyName.empty()) continue;
+		const std::string containerName = tagName + "." + propertyName;
+		AppendXmlLine(formXml, indent, BuildXmlOpenTag(containerName, {}, false));
+		if (collection.kind == FormControlPropertyCollectionKind::Integer) {
+			for (std::size_t index = 0; index < collection.integerValues.size(); ++index) {
+				AppendXmlLine(formXml, indent + 1, BuildXmlOpenTag(
+					"项目", {{ "索引", std::to_string(index) },
+					{ "数值", std::to_string(collection.integerValues[index]) }}, true));
+			}
 		}
 		else {
-			AppendXmlLine(formXml, indent, BuildXmlOpenTag(containerName, {}, false));
-			for (std::size_t index = 0; index < semantic.listItems.size(); ++index) {
-				AppendXmlLine(
-					formXml,
-					indent + 1,
-					BuildXmlOpenTag(
-						"项目",
-						{
-							{ "索引", std::to_string(index) },
-							{ "文本", semantic.listItems[index] },
-						},
-						true));
+			const char* itemName = tabControl ? "子夹" : "项目";
+			const char* valueName = tabControl ? "标题" : "文本";
+			for (std::size_t index = 0; index < collection.textValues.size(); ++index) {
+				AppendXmlLine(formXml, indent + 1, BuildXmlOpenTag(
+					itemName, {{ "索引", std::to_string(index) },
+					{ valueName, collection.textValues[index] }}, true));
 			}
-			AppendXmlLine(formXml, indent, "</" + containerName + ">");
 		}
-		appended = true;
-	}
-	if (semantic.hasItemValues) {
-		const std::string containerName = tagName + ".项目数值";
-		if (semantic.itemValues.empty()) {
-			AppendXmlLine(formXml, indent, BuildXmlOpenTag(containerName, {}, true));
-		}
-		else {
-			AppendXmlLine(formXml, indent, BuildXmlOpenTag(containerName, {}, false));
-			for (std::size_t index = 0; index < semantic.itemValues.size(); ++index) {
-				AppendXmlLine(
-					formXml,
-					indent + 1,
-					BuildXmlOpenTag(
-						"项目",
-						{
-							{ "索引", std::to_string(index) },
-							{ "数值", std::to_string(semantic.itemValues[index]) },
-						},
-						true));
-			}
-			AppendXmlLine(formXml, indent, "</" + containerName + ">");
-		}
-		appended = true;
-	}
-	if (semantic.hasTabItems) {
-		const std::string containerName = tagName + ".子夹管理";
-		if (semantic.tabItems.empty()) {
-			AppendXmlLine(formXml, indent, BuildXmlOpenTag(containerName, {}, true));
-		}
-		else {
-			AppendXmlLine(formXml, indent, BuildXmlOpenTag(containerName, {}, false));
-			for (std::size_t index = 0; index < semantic.tabItems.size(); ++index) {
-				AppendXmlLine(
-					formXml,
-					indent + 1,
-					BuildXmlOpenTag(
-						"子夹",
-						{
-							{ "索引", std::to_string(index) },
-							{ "标题", semantic.tabItems[index] },
-						},
-						true));
-			}
-			AppendXmlLine(formXml, indent, "</" + containerName + ">");
-		}
+		AppendXmlLine(formXml, indent, "</" + containerName + ">");
 		appended = true;
 	}
 	return appended;
@@ -6584,7 +6567,7 @@ void BuildFormXmlEntries(
 			rootAttributes.insert(rootAttributes.begin() + 1, std::make_pair("备注", TrimAsciiCopy(form.comment)));
 		}
 		AppendXmlLine(formXml, 0, BuildXmlOpenTag("窗口", rootAttributes, false));
-		AppendFormControlPropertyXmlChildren(formXml, "窗口", 1, rootSemantic);
+		AppendFormControlPropertyXmlChildren(formXml, "窗口", 1, rootSemantic, false);
 		if (formSelf != nullptr) {
 			AppendFormControlEventXmlLines(formXml, *formSelf, "窗口", 1, resolver);
 		}
@@ -6691,15 +6674,15 @@ void BuildFormXmlEntries(
 			const bool isTabControl = resolver.IsTabControlDataType(item.dataType);
 			const bool hasChildren = !item.children.empty();
 			const bool hasEventBindings = !item.events.empty();
-			const bool hasSemanticProperties =
-				semantic.hasListItems || semantic.hasItemValues || semantic.hasTabItems;
+			const bool hasSemanticProperties = !semantic.collections.empty();
 			if (!hasChildren && !hasEventBindings && !hasSemanticProperties) {
 				AppendXmlLine(formXml, indent, BuildXmlOpenTag(tagName, attributes, true));
 				return;
 			}
 
 			AppendXmlLine(formXml, indent, BuildXmlOpenTag(tagName, attributes, false));
-			AppendFormControlPropertyXmlChildren(formXml, tagName, indent + 1, semantic);
+			AppendFormControlPropertyXmlChildren(
+				formXml, tagName, indent + 1, semantic, isTabControl);
 			AppendFormControlEventXmlLines(formXml, item, tagName, indent + 1, resolver);
 			if (isTabControl) {
 				std::vector<const FormInfo::ElementInfo*> currentGroup;
@@ -6777,8 +6760,8 @@ bool BuildDocumentFromSections(
 
 	BuildDependencies(sections, document);
 	const AnonymousTypeHints anonymousTypeHints = BuildAnonymousTypeHints(sections, sourcePath);
-	BuildProgramPages(sections, options, document);
-	BuildGlobalPage(sections, options, document);
+	BuildProgramPages(sections, anonymousTypeHints, options, document);
+	BuildGlobalPage(sections, anonymousTypeHints, options, document);
 	BuildStructPage(sections, anonymousTypeHints, options, document);
 	BuildDllPage(sections, anonymousTypeHints, options, document);
 	BuildFormPage(sections, document);
@@ -7579,8 +7562,8 @@ bool BuildBundleFromSections(
 			BuildItemKey("global", resolver.ResolveUserName(item.marker), keyCounters));
 	}
 	for (const auto& item : sections.program.dataTypes) {
-		if (IsTxt2EPlaceholderStruct(item) ||
-			IsStructHidden(item) ||
+		if ((IsTxt2EPlaceholderStruct(item) && !options.includeImportedFunctions) ||
+			(IsStructHidden(item) && !options.includeImportedFunctions) ||
 			IsDependencyDefinedId(dependencyRecords, item.header.dwId)) {
 			continue;
 		}
@@ -7889,7 +7872,7 @@ bool BuildBundleFromSections(
 		appendRootItemKey(item.header.dwId);
 	}
 	for (const auto& item : sections.program.dataTypes) {
-		if (IsTxt2EPlaceholderStruct(item) ||
+		if ((IsTxt2EPlaceholderStruct(item) && !options.includeImportedFunctions) ||
 			IsStructHidden(item) ||
 			IsDependencyDefinedId(dependencyRecords, item.header.dwId)) {
 			continue;

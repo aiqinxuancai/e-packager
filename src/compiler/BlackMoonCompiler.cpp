@@ -385,20 +385,18 @@ bool Compile(
 	}
 
 	const bool requestedDll = options.buildDll || HasExtension(effectiveOutput, L".dll");
-	autolinker_compile_check::Options stageOptions;
-	stageOptions.eIdePath = options.eIdePath;
-	stageOptions.launcherPath = options.autoLinkerTestPath;
-	stageOptions.target = requestedDll ? "win_dll" : "auto";
-	stageOptions.staticCompile = false;
-	stageOptions.timeoutSeconds = options.blackMoonTimeoutSeconds;
-	autolinker_compile_check::PreparedOptions preparedStageOptions;
-	if (!autolinker_compile_check::Prepare(stageOptions, preparedStageOptions, error)) {
-		result.message = "blackmoon_stage_prepare_failed:" + error;
-		return false;
-	}
-
 	const std::filesystem::path stagePe = workingDirectory / (requestedDll ? L"ecode.dll" : L"ecode.exe");
-	const auto stageResult = autolinker_compile_check::CompileToOutput(sourcePath, stagePe, preparedStageOptions);
+	const auto stageResult = autolinker_compile_check::CompileToOutputWithEide(
+		sourcePath,
+		stagePe,
+		options.eIdePath,
+		requestedDll ? "win_dll" : "auto",
+		// BlackMoon consumes the IDE's E-code container PE.  A static compile
+		// performs the final linker pass and produces a normal PE instead, so the
+		// staging compile must remain non-static.
+		false,
+		options.blackMoonTimeoutSeconds,
+		effectiveInput);
 	if (!stageResult.ok) {
 		result.message = "blackmoon_stage_compile_failed:" + stageResult.error;
 		return false;
@@ -418,7 +416,33 @@ bool Compile(
 		}
 	}
 
-	const std::filesystem::path eideDirectory = preparedStageOptions.eIdePath.parent_path();
+	std::filesystem::path eidePath = options.eIdePath;
+	if (eidePath.empty()) {
+		const DWORD required = GetEnvironmentVariableW(L"E_PACKAGER_EIDE", nullptr, 0);
+		if (required > 0) {
+			std::wstring value(static_cast<std::size_t>(required), L'\0');
+			const DWORD written = GetEnvironmentVariableW(L"E_PACKAGER_EIDE", value.data(), required);
+			if (written > 0 && written < required) {
+				value.resize(written);
+				eidePath = value;
+			}
+		}
+	}
+	if (eidePath.empty()) {
+		const auto candidates = GetRegisteredEplOpenCommandExecutablePaths();
+		for (const auto& candidate : candidates) {
+			if (IsRegularFile(candidate)) {
+				eidePath = candidate;
+				break;
+			}
+		}
+	}
+	if (eidePath.empty()) {
+		result.message = "blackmoon_eide_not_found: use --eide <e.exe> or E_PACKAGER_EIDE";
+		return false;
+	}
+	eidePath = AbsolutePath(eidePath);
+	const std::filesystem::path eideDirectory = eidePath.parent_path();
 	const std::filesystem::path blackMoonDirectory = options.blackMoonDirectory.empty()
 		? eideDirectory / L"BlackMoon" : AbsolutePath(options.blackMoonDirectory);
 	const std::filesystem::path blackMoonLibraryDirectory = blackMoonDirectory / L"lib";

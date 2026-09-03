@@ -57,9 +57,8 @@ struct Options {
 	BlackMoonMode blackMoonMode = BlackMoonMode::Assembly;
 	// 黑月目录，包含 bin/ 与 lib/；留空时根据 e.exe 自动推导。
 	std::filesystem::path blackMoonDirectory;
-	// 黑月编译方式用于生成原生易代码 PE 的无头 IDE 工具。
+	// 黑月编译方式用于生成原生易代码 PE 的易语言 IDE。
 	std::filesystem::path eIdePath;
-	std::filesystem::path autoLinkerTestPath;
 	unsigned int blackMoonTimeoutSeconds = 120;
 	bool keepObject = true;
 	bool buildDll = false;
@@ -76,7 +75,8 @@ struct Result {
 	std::string message;
 };
 
-// 将原生 .e 或拆包目录编译为目标架构的 EXE（控制台或 Windows GUI）或 DLL，不启动易语言 IDE。
+// 将原生 .e 或拆包目录编译为目标架构的 EXE 或 DLL；semantic 不启动 IDE，
+// legacy-blackmoon 仅使用 IDE 生成黑月所需的中间易代码 PE。
 bool Compile(
 	const std::filesystem::path& inputPath,
 	const std::filesystem::path& outputPath,

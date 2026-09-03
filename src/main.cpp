@@ -2776,7 +2776,7 @@ void PrintUsage()
 	std::cout << Utf8Literal(u8"  e-packager pack <input-dir> <output.e|output.ec> [--password <text>] [--compile-check ...]  # 封包，可选 AutoLinker 无头编译确认") << std::endl;
 	std::cout << Utf8Literal(u8"       --compile-check [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--compile-target auto|win_exe|win_console_exe|win_dll|ecom] [--compile-static] [--compile-timeout <seconds>]") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager validate <input-dir> [--diagnostics text|json]  # 快速检查声明、基础语法和可确定的类型错误") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager compile <input.e|input-dir> <output.exe|output.dll> [--diagnostics text|json] [--compile-mode semantic|legacy-blackmoon|blackmoon] [--arch host|x86|x64] [--subsystem auto|console|windows] [--legacy-blackmoon-mode asm|cpp|mfc] [--dll] [--define <macro>]... [--compiler <cl.exe>] [--linker <link.exe>] [--lib <lib-dir>] [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--legacy-blackmoon-dir <dir>] [--blackmoon-core-dir <dir>] [--blackmoon-x86-dir <dir>] [--blackmoon-x64-dir <dir>] [--x86-decoder <e-packager.exe>] [--blackmoon-timeout <seconds>]  # 默认 semantic；窗口工程自动使用 Windows 子系统") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager compile <input.e|input-dir> <output.exe|output.dll> [--diagnostics text|json] [--compile-mode semantic|legacy-blackmoon|blackmoon] [--arch host|x86|x64] [--subsystem auto|console|windows] [--legacy-blackmoon-mode asm|cpp|mfc] [--dll] [--define <macro>]... [--compiler <cl.exe>] [--linker <link.exe>] [--lib <lib-dir>] [--eide <e.exe>] [--legacy-blackmoon-dir <dir>] [--blackmoon-core-dir <dir>] [--blackmoon-x86-dir <dir>] [--blackmoon-x64-dir <dir>] [--x86-decoder <e-packager.exe>] [--blackmoon-timeout <seconds>]  # 默认 semantic；窗口工程自动使用 Windows 子系统") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager compile-check <input.e|input.ec> [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--compile-target ...] [--compile-static] [--compile-timeout <seconds>]  # 直接执行权威无头编译") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager update <input-dir> [--add-ecom <file.ec>]... [--add-elib <name|file.fne>]... [--add-image <file|name=file>]... [--add-audio <file|name=file>]...   # 刷新派生内容并新增资源") << std::endl;
 #if defined(_M_X64)
@@ -3011,10 +3011,6 @@ int RunCommand(int argc, char* argv[])
 			}
 			if (option == "--eide" && index + 1 < argc) {
 				options.eIdePath = ResolveAbsolutePath(std::filesystem::path(argv[++index]));
-				continue;
-			}
-			if (option == "--autolinker-test" && index + 1 < argc) {
-				options.autoLinkerTestPath = ResolveAbsolutePath(std::filesystem::path(argv[++index]));
 				continue;
 			}
 			if ((option == "--blackmoon-dir" || option == "--legacy-blackmoon-dir") && index + 1 < argc) {

@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <sstream>
 #include <string_view>
@@ -28,6 +29,10 @@ constexpr std::size_t kFixedPropertyCount = FIXED_WIN_UNIT_PROPERTY_COUNT;
 constexpr std::size_t kMaxPropertyDataSize = 64u * 1024u * 1024u;
 constexpr std::size_t kMaxPublishedStringLength = 4096;
 
+// Older core FNEs expose these design-time text editors without publishing
+// their symbolic type constants through lib2.h.  They are still part of the
+// stable window-property ABI and must be decoded as text rather than as the
+// integer arm of UNIT_PROPERTY_VALUE.
 constexpr std::int16_t kInternalTextProperty = 1018;
 constexpr std::int16_t kInternalProviderProperty = 1019;
 constexpr std::int16_t kInternalColumnProperty = 1020;
@@ -568,8 +573,9 @@ bool CopyDirectBytes(const std::uint8_t* data, const std::int32_t size, std::vec
 bool IsTextPropertyType(const std::int16_t type)
 {
 	return type == UD_TEXT || type == UD_PICK_TEXT || type == UD_EDIT_PICK_TEXT ||
-		type == UD_FILE_NAME || type == kInternalTextProperty || type == kInternalProviderProperty ||
-		type == kInternalColumnProperty || type == kInternalConnectProperty || type == kInternalSqlProperty;
+		type == UD_FILE_NAME || type == kInternalTextProperty ||
+		type == kInternalProviderProperty || type == kInternalColumnProperty ||
+		type == kInternalConnectProperty || type == kInternalSqlProperty;
 }
 
 bool IsBinaryPropertyType(const std::int16_t type)
@@ -586,6 +592,35 @@ bool IsDoublePropertyType(const std::int16_t type)
 bool IsBooleanPropertyType(const std::int16_t type)
 {
 	return type == UD_BOOL;
+}
+
+bool TryReadUnknownTextValue(
+	const UNIT_PROPERTY_VALUE& raw,
+	const bool utf8,
+	std::string& outText)
+{
+	// A property type not defined by lib2.h may still be a support-library
+	// text editor type.  The public getter exposes only UNIT_PROPERTY_VALUE,
+	// so identify the pointer representation conservatively: a non-null,
+	// readable C string is a valid text value; integer values normally fail the
+	// readable-range check immediately.
+	if (raw.m_szText == nullptr || raw.m_data.m_nDataSize > 0) return false;
+	std::string rawText;
+	if (!TryReadCString(raw.m_szText, rawText)) return false;
+	if (!utf8) {
+		outText = std::move(rawText);
+		return true;
+	}
+	return TryConvertUtf8ToLocal(rawText, outText);
+}
+
+bool TryReadUnknownBinaryValue(
+	const UNIT_PROPERTY_VALUE& raw,
+	std::vector<std::uint8_t>& outBytes)
+{
+	if (raw.m_data.m_nDataSize <= 0 || raw.m_data.m_nDataSize > static_cast<INT>(kMaxPropertyDataSize) ||
+		raw.m_data.m_pData == nullptr) return false;
+	return CopyDirectBytes(raw.m_data.m_pData, raw.m_data.m_nDataSize, outBytes);
 }
 
 std::string TrimAscii(std::string value)
@@ -1238,12 +1273,6 @@ bool IsReservedXmlAttribute(const std::string& name)
 	return std::find(kReserved.begin(), kReserved.end(), name) != kReserved.end();
 }
 
-bool IsKnownStructuredCustomizeProperty(const FormControlPropertyDefinition& definition)
-{
-	return definition.dataType == UD_CUSTOMIZE &&
-		(definition.name == "列表项目" || definition.name == "项目数值" || definition.name == "子夹管理");
-}
-
 bool IsStructuredPropertyNodeName(const std::string& nodeName, const std::string& propertyName)
 {
 	if (nodeName == propertyName) {
@@ -1271,19 +1300,6 @@ const FormControlPropertyXmlNode* FindStructuredPropertyNode(
 		match = &child;
 	}
 	return match;
-}
-
-bool HasKnownStructuredPropertyNode(
-	const std::vector<FormControlPropertyXmlNode>& children)
-{
-	return std::any_of(
-		children.begin(),
-		children.end(),
-		[](const FormControlPropertyXmlNode& child) {
-			return IsStructuredPropertyNodeName(child.name, "列表项目") ||
-				IsStructuredPropertyNodeName(child.name, "项目数值") ||
-				IsStructuredPropertyNodeName(child.name, "子夹管理");
-		});
 }
 
 std::string GetXmlNodeAttribute(
@@ -1317,70 +1333,133 @@ bool TryGetXmlNodeIndex(
 	return true;
 }
 
-bool DecodeStructuredStringProperty(
+bool TryReadStructuredTextValue(
 	const FormControlPropertyXmlNode& node,
-	const bool tabItems,
+	std::string& outValue)
+{
+	for (const char* name : { "文本", "标题", "值" }) {
+		const std::string value = GetXmlNodeAttribute(node, name);
+		if (!value.empty() || std::any_of(
+				node.attributes.begin(), node.attributes.end(),
+				[name](const auto& attribute) { return attribute.first == name; })) {
+			outValue = value;
+			return true;
+		}
+	}
+	return false;
+}
+
+bool EncodeStructuredProperty(
+	const FormControlPropertyXmlNode& node,
+	const FormControlPropertyCollectionKind kind,
 	const bool utf8,
 	std::vector<std::uint8_t>& outData)
 {
-	std::vector<std::string> values;
+	std::vector<std::string> textValues;
+	std::vector<std::int32_t> integerValues;
 	std::vector<bool> assigned;
 	std::size_t nextIndex = 0;
-	const std::string expectedNodeName = tabItems ? "子夹" : "项目";
-	const std::string valueName = tabItems ? "标题" : "文本";
 	for (const auto& item : node.children) {
-		if (item.name != expectedNodeName) {
-			return false;
-		}
 		std::size_t index = 0;
-		if (!TryGetXmlNodeIndex(item, nextIndex, index)) {
-			return false;
-		}
-		if (index >= values.size()) {
-			values.resize(index + 1);
+		if (!TryGetXmlNodeIndex(item, nextIndex, index)) return false;
+		if (index >= assigned.size()) {
 			assigned.resize(index + 1, false);
+			if (kind == FormControlPropertyCollectionKind::Text) textValues.resize(index + 1);
+			else integerValues.resize(index + 1, 0);
 		}
-		if (assigned[index]) {
-			return false;
+		if (assigned[index]) return false;
+		if (kind == FormControlPropertyCollectionKind::Integer) {
+			std::int32_t value = 0;
+			if (!TryParseInt32(GetXmlNodeAttribute(item, "数值"), value)) return false;
+			integerValues[index] = value;
 		}
-		values[index] = GetXmlNodeAttribute(item, valueName);
+		else {
+			if (!TryReadStructuredTextValue(item, textValues[index])) return false;
+		}
 		assigned[index] = true;
 		nextIndex = index + 1;
 	}
-	return EncodeLengthPrefixedStringArray(values, utf8, outData);
+	if (kind == FormControlPropertyCollectionKind::Integer) {
+		return EncodeInt32Array(integerValues, outData);
+	}
+	return EncodeLengthPrefixedStringArray(textValues, utf8, outData);
 }
 
-bool DecodeStructuredInt32Property(
-	const FormControlPropertyXmlNode& node,
-	std::vector<std::uint8_t>& outData)
+bool TryInferCollectionKind(
+	const FormControlPropertyValue& value,
+	FormControlPropertyCollectionKind& outKind)
 {
-	std::vector<std::int32_t> values;
-	std::vector<bool> assigned;
-	std::size_t nextIndex = 0;
-	for (const auto& item : node.children) {
-		if (item.name != "项目") {
-			return false;
-		}
-		std::size_t index = 0;
-		if (!TryGetXmlNodeIndex(item, nextIndex, index)) {
-			return false;
-		}
-		std::int32_t value = 0;
-		if (!TryParseInt32(GetXmlNodeAttribute(item, "数值"), value)) {
-			return false;
-		}
-		if (index >= values.size()) {
-			values.resize(index + 1, 0);
-			assigned.resize(index + 1, false);
-		}
-		if (assigned[index]) {
-			return false;
-		}
-		values[index] = value;
-		assigned[index] = true;
-		nextIndex = index + 1;
+	if (value.kind != FormControlPropertyValueKind::Binary || value.binaryValue.empty()) return false;
+	std::vector<std::string> strings;
+	if (DecodeLengthPrefixedStringArray(value.binaryValue, false, strings)) {
+		outKind = FormControlPropertyCollectionKind::Text;
+		return true;
 	}
-	return EncodeInt32Array(values, outData);
+	std::vector<std::int32_t> integers;
+	if (DecodeInt32Array(value.binaryValue, integers)) {
+		outKind = FormControlPropertyCollectionKind::Integer;
+		return true;
+	}
+	return false;
+}
+
+bool HasXmlNodeAttribute(
+	const FormControlPropertyXmlNode& node,
+	const std::string& name)
+{
+	return std::any_of(
+		node.attributes.begin(),
+		node.attributes.end(),
+		[&name](const auto& attribute) { return attribute.first == name; });
+}
+
+const FormControlPropertyXmlNode* FindPropertyXmlNode(
+	const std::vector<FormControlPropertyXmlNode>& children,
+	const FormControlPropertyDefinition& definition,
+	bool& outDuplicate)
+{
+	outDuplicate = false;
+	const FormControlPropertyXmlNode* result = nullptr;
+	const auto matches = [&definition](const std::string& nodeName) {
+		for (const std::string& candidate : {
+			definition.name, definition.englishName, definition.xmlName }) {
+			if (!candidate.empty() && IsStructuredPropertyNodeName(nodeName, candidate)) return true;
+		}
+		return false;
+	};
+	for (const auto& child : children) {
+		if (!matches(child.name)) continue;
+		if (result != nullptr) {
+			outDuplicate = true;
+			continue;
+		}
+		result = &child;
+	}
+	return result;
+}
+
+bool TryInferXmlCollectionKind(
+	const FormControlPropertyXmlNode& node,
+	FormControlPropertyCollectionKind& outKind)
+{
+	bool found = false;
+	for (const auto& item : node.children) {
+		FormControlPropertyCollectionKind candidate;
+		if (HasXmlNodeAttribute(item, "数值")) {
+			candidate = FormControlPropertyCollectionKind::Integer;
+		}
+		else if (HasXmlNodeAttribute(item, "文本") ||
+			HasXmlNodeAttribute(item, "标题") || HasXmlNodeAttribute(item, "值")) {
+			candidate = FormControlPropertyCollectionKind::Text;
+		}
+		else {
+			return false;
+		}
+		if (found && candidate != outKind) return false;
+		outKind = candidate;
+		found = true;
+	}
+	return found;
 }
 
 bool AreValuesEquivalent(const FormControlPropertyValue& left, const FormControlPropertyValue& right)
@@ -1401,7 +1480,8 @@ bool AreValuesEquivalent(const FormControlPropertyValue& left, const FormControl
 bool ParseXmlPropertyValue(
 	const FormControlPropertyDefinition& definition,
 	const std::string& text,
-	FormControlPropertyValue& outValue)
+	FormControlPropertyValue& outValue,
+	const FormControlPropertyValueKind unknownKind = FormControlPropertyValueKind::Unknown)
 {
 	outValue = {};
 	outValue.definition = definition;
@@ -1422,9 +1502,26 @@ bool ParseXmlPropertyValue(
 		outValue.kind = FormControlPropertyValueKind::Binary;
 		return DecodeBase64(text, outValue.binaryValue);
 	}
+	if (unknownKind == FormControlPropertyValueKind::Text) {
+		outValue.kind = FormControlPropertyValueKind::Text;
+		outValue.textValue = text;
+		return true;
+	}
+	if (unknownKind == FormControlPropertyValueKind::Binary) {
+		outValue.kind = FormControlPropertyValueKind::Binary;
+		return DecodeBase64(text, outValue.binaryValue);
+	}
+	if (unknownKind == FormControlPropertyValueKind::Integer) {
+		outValue.kind = FormControlPropertyValueKind::Integer;
+		return TryParseInt32(text, outValue.integerValue);
+	}
 
-	outValue.kind = FormControlPropertyValueKind::Integer;
-	return TryParseInt32(text, outValue.integerValue);
+	// Unknown property editor types are preserved as text unless their public
+	// metadata supplied a concrete type above.  This keeps a new FNE's
+	// extension attributes editable without guessing a private numeric code.
+	outValue.kind = FormControlPropertyValueKind::Text;
+	outValue.textValue = text;
+	return true;
 }
 
 bool ReadUnitPropertyValue(
@@ -1460,6 +1557,15 @@ bool ReadUnitPropertyValue(
 	if (IsBinaryPropertyType(definition.dataType)) {
 		outValue.kind = FormControlPropertyValueKind::Binary;
 		return CopyDirectBytes(raw.m_data.m_pData, raw.m_data.m_nDataSize, outValue.binaryValue);
+	}
+	// Unknown editor types are intentionally not guessed as text.  The
+	// UNIT_PROPERTY_VALUE union has no discriminator; interpreting an integer
+	// bit pattern as a pointer can produce readable-looking garbage and corrupt
+	// the generated XML.  Only public metadata-declared text types above may be
+	// decoded as strings.
+	if (TryReadUnknownBinaryValue(raw, outValue.binaryValue)) {
+		outValue.kind = FormControlPropertyValueKind::Binary;
+		return true;
 	}
 
 	outValue.kind = FormControlPropertyValueKind::Integer;
@@ -1748,10 +1854,12 @@ bool FormControlPropertyCodec::BuildTypeContext(
 	out.notify = reinterpret_cast<PFN_NOTIFY_PROPERTY_CHANGED>(CallGetInterfaceSafely(getter, ITF_NOTIFY_PROPERTY_CHANGED));
 	out.getAll = reinterpret_cast<PFN_GET_ALL_PROPERTY_DATA>(CallGetInterfaceSafely(getter, ITF_GET_ALL_PROPERTY_DATA));
 	out.getProperty = reinterpret_cast<PFN_GET_PROPERTY_DATA>(CallGetInterfaceSafely(getter, ITF_GET_PROPERTY_DATA));
-	if (out.properties.size() > out.fixedPropertyCount && out.create == nullptr) {
-		if (outError != nullptr) *outError = "window_control_create_interface_unavailable";
-		return false;
-	}
+	std::cerr << "property probe interfaces type=" << rawType
+		<< " getter=" << reinterpret_cast<const void*>(getter)
+		<< " create=" << reinterpret_cast<const void*>(out.create)
+		<< " get=" << reinterpret_cast<const void*>(out.getProperty)
+		<< " all=" << reinterpret_cast<const void*>(out.getAll)
+		<< " set=" << reinterpret_cast<const void*>(out.notify) << "\n";
 	return true;
 }
 
@@ -1885,10 +1993,12 @@ bool FormControlPropertyCodec::Decode(
 	if (context.properties.size() <= context.fixedPropertyCount) {
 		return true;
 	}
-	if (context.getProperty == nullptr) {
-		if (outError != nullptr) *outError = "window_control_property_get_interface_unavailable";
-		return false;
-	}
+	// A library may publish property definitions while intentionally omitting
+	// the design-time unit interfaces (for example a runtime-only or partially
+	// implemented control).  The raw extension bytes remain authoritative; a
+	// missing getter therefore means “not decoded”, rather than a malformed
+	// window file.
+	if (context.getProperty == nullptr || context.create == nullptr) return true;
 
 	const HUNIT unit = static_cast<HUNIT>(CreateUnit(context, propertyData, formId, unitId));
 	if (unit == 0) {
@@ -1905,46 +2015,35 @@ bool FormControlPropertyCodec::Decode(
 			continue;
 		}
 		FormControlPropertyValue value;
-		const bool isPointerProperty =
-			IsTextPropertyType(context.properties[index].dataType) ||
-			IsBinaryPropertyType(context.properties[index].dataType);
-		const void* returnedData = nullptr;
-		if (IsTextPropertyType(context.properties[index].dataType)) {
-			returnedData = rawValue.m_szText;
-		}
-		else if (IsBinaryPropertyType(context.properties[index].dataType)) {
-			returnedData = rawValue.m_data.m_pData;
-		}
 		const bool valueRead = ReadUnitPropertyValue(context.properties[index], rawValue, context.utf8, value);
-		if (isPointerProperty) {
+		if (valueRead &&
+			(value.kind == FormControlPropertyValueKind::Text ||
+				value.kind == FormControlPropertyValueKind::Binary)) {
+			const void* returnedData = value.kind == FormControlPropertyValueKind::Text
+				? static_cast<const void*>(rawValue.m_szText)
+				: static_cast<const void*>(rawValue.m_data.m_pData);
 			// lib2.h 明确规定 getter 返回的文本/字节集由调用方释放。
 			FreePropertyValueDataSafely(context.notifyLibrary, returnedData);
 		}
 		if (!valueRead) {
 			continue;
 		}
-		if (outSemantic != nullptr && value.kind == FormControlPropertyValueKind::Binary &&
-			value.definition.dataType == UD_CUSTOMIZE) {
-			if (value.definition.name == "列表项目") {
-				if (DecodeLengthPrefixedStringArray(
+		if (outSemantic != nullptr && value.definition.dataType == UD_CUSTOMIZE) {
+			FormControlPropertyCollectionKind collectionKind;
+			if (TryInferCollectionKind(value, collectionKind)) {
+				FormControlPropertyCollection collection;
+				collection.definition = value.definition;
+				collection.kind = collectionKind;
+				if (collectionKind == FormControlPropertyCollectionKind::Text) {
+					(void)DecodeLengthPrefixedStringArray(
 						value.binaryValue,
 						context.utf8,
-						outSemantic->listItems)) {
-					outSemantic->hasListItems = true;
+						collection.textValues);
 				}
-			}
-			else if (value.definition.name == "项目数值") {
-				if (DecodeInt32Array(value.binaryValue, outSemantic->itemValues)) {
-					outSemantic->hasItemValues = true;
+				else {
+					(void)DecodeInt32Array(value.binaryValue, collection.integerValues);
 				}
-			}
-			else if (value.definition.name == "子夹管理") {
-				if (DecodeLengthPrefixedStringArray(
-						value.binaryValue,
-						context.utf8,
-						outSemantic->tabItems)) {
-					outSemantic->hasTabItems = true;
-				}
+				outSemantic->collections.push_back(std::move(collection));
 			}
 		}
 		outValues.push_back(std::move(value));
@@ -1973,7 +2072,7 @@ bool FormControlPropertyCodec::Apply(
 			propertyAttributes.push_back(attribute);
 		}
 	}
-	if (propertyAttributes.empty() && !HasKnownStructuredPropertyNode(xmlChildren)) {
+	if (propertyAttributes.empty() && xmlChildren.empty()) {
 		return true;
 	}
 
@@ -2004,20 +2103,24 @@ bool FormControlPropertyCodec::Apply(
 			continue;
 		}
 		bool duplicateStructuredNode = false;
-		if (definitionIt->dataType == UD_CUSTOMIZE &&
-			IsKnownStructuredCustomizeProperty(*definitionIt) &&
-			FindStructuredPropertyNode(xmlChildren, definitionIt->name, duplicateStructuredNode) != nullptr) {
+		const auto* structuredNode = definitionIt->dataType == UD_CUSTOMIZE
+			? FindPropertyXmlNode(xmlChildren, *definitionIt, duplicateStructuredNode) : nullptr;
+		if (structuredNode != nullptr) {
 			if (duplicateStructuredNode) {
-				if (outError != nullptr) {
-					*outError = "window_control_customize_data_duplicate: " + definitionIt->xmlName;
-				}
+				if (outError != nullptr) *outError = "window_control_customize_data_duplicate: " + definitionIt->xmlName;
 				return false;
 			}
 			continue;
 		}
 
 		FormControlPropertyValue parsed;
-		if (!ParseXmlPropertyValue(*definitionIt, attribute.second, parsed)) {
+		FormControlPropertyValueKind unknownKind = FormControlPropertyValueKind::Unknown;
+		if (definitionIt->dataType == UD_CUSTOMIZE) {
+			// A scalar representation of a custom value is base64 by convention;
+			// preserve it as bytes without needing to know the private payload ABI.
+			unknownKind = FormControlPropertyValueKind::Binary;
+		}
+		if (!ParseXmlPropertyValue(*definitionIt, attribute.second, parsed, unknownKind)) {
 			if (outError != nullptr) {
 				*outError = "window_control_property_value_invalid: " + attribute.first;
 			}
@@ -2036,14 +2139,10 @@ bool FormControlPropertyCodec::Apply(
 	}
 
 	for (const auto& definition : context.properties) {
-		if (!IsKnownStructuredCustomizeProperty(definition)) {
-			continue;
-		}
+		if (definition.dataType != UD_CUSTOMIZE) continue;
 		bool duplicateStructuredNode = false;
-		const FormControlPropertyXmlNode* structuredNode = FindStructuredPropertyNode(
-			xmlChildren,
-			definition.name,
-			duplicateStructuredNode);
+		const FormControlPropertyXmlNode* structuredNode = FindPropertyXmlNode(
+			xmlChildren, definition, duplicateStructuredNode);
 		if (structuredNode == nullptr) {
 			continue;
 		}
@@ -2053,29 +2152,16 @@ bool FormControlPropertyCodec::Apply(
 			}
 			return false;
 		}
-		std::vector<std::uint8_t> structuredData;
-		bool encoded = false;
-		if (definition.name == "列表项目") {
-			encoded = DecodeStructuredStringProperty(
-				*structuredNode,
-				false,
-				context.utf8,
-				structuredData);
-		}
-		else if (definition.name == "项目数值") {
-			encoded = DecodeStructuredInt32Property(*structuredNode, structuredData);
-		}
-		else if (definition.name == "子夹管理") {
-			encoded = DecodeStructuredStringProperty(
-				*structuredNode,
-				true,
-				context.utf8,
-				structuredData);
-		}
-		if (!encoded) {
+		FormControlPropertyCollectionKind collectionKind;
+		if (!TryInferXmlCollectionKind(*structuredNode, collectionKind)) {
 			if (outError != nullptr) {
 				*outError = "window_control_customize_data_invalid: " + definition.xmlName;
 			}
+			return false;
+		}
+		std::vector<std::uint8_t> structuredData;
+		if (!EncodeStructuredProperty(*structuredNode, collectionKind, context.utf8, structuredData)) {
+			if (outError != nullptr) *outError = "window_control_customize_data_invalid: " + definition.xmlName;
 			return false;
 		}
 		FormControlPropertyValue parsed;
@@ -2107,11 +2193,6 @@ bool FormControlPropertyCodec::Apply(
 		return false;
 	}
 	for (const auto& update : updates) {
-		if (update.definition.dataType == UD_CUSTOMIZE &&
-			!IsKnownStructuredCustomizeProperty(update.definition)) {
-			if (outError != nullptr) *outError = "window_control_customize_property_requires_editor: " + update.definition.xmlName;
-			return false;
-		}
 		UNIT_PROPERTY_VALUE nativeValue = {};
 		std::string nativeText;
 		bool needsRecreate = false;

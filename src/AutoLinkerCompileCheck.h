@@ -28,6 +28,16 @@ struct Result {
 // 解析显式参数、环境变量和注册表中的工具路径。
 bool Prepare(const Options& options, PreparedOptions& outOptions, std::string& outError);
 
+// 直接启动用户指定版本化 IDE 的 AutoLinker 无头编译入口，不需要 AutoLinkerTest.exe。
+Result CompileToOutputWithEide(
+	const std::filesystem::path& sourcePath,
+	const std::filesystem::path& outputPath,
+	const std::filesystem::path& eIdePath,
+	const std::string& target,
+	bool staticCompile,
+	unsigned int timeoutSeconds,
+	const std::filesystem::path& projectSourcePath = {});
+
 // 调用 AutoLinkerTest 对指定易语言工程执行真实编译。
 Result Run(const std::filesystem::path& sourcePath, const PreparedOptions& options);
 

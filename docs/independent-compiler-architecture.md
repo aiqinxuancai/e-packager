@@ -1,6 +1,6 @@
 ﻿# 易语言源码直接编译：实现原理与当前成果
 
-本文记录 `e-packager` 当前已经实现的独立编译方式。这里的“独立”是指：输入易语言 `.e` 工程或其拆包目录后，由 `e-packager` 自己完成源码读取、语义建模、C++ 代码生成、OBJ 编译和最终链接，不启动易语言 IDE。文档统一使用“编译方式”这一名称；命令行对应 `--compile-mode`，`--backend` 仅是兼容旧脚本的别名。
+本文记录 `e-packager` 当前已经实现的编译方式。`semantic` 输入易语言 `.e` 工程或其拆包目录后，由 `e-packager` 自己完成源码读取、语义建模、C++ 代码生成、OBJ 编译和最终链接，不启动易语言 IDE；`legacy-blackmoon` 会直接启动 IDE 生成黑月转换器所需的中间易代码 PE。文档统一使用“编译方式”这一名称；命令行对应 `--compile-mode`，`--backend` 仅是兼容旧脚本的别名。
 
 本文描述的是现有代码的真实能力和边界，不把当前编译方式描述成对全部易语言语法、窗口框架和所有支持库 ABI 的完全替代。
 
@@ -19,10 +19,9 @@
 
 ### 非目标
 
-- 当前不编译窗口工程。检测到窗体文件或窗口绑定时，会返回
-  `window_project_not_supported_by_independent_compiler`。
+- 窗口工程由独立 Win32 宿主创建。当前已覆盖常用核心控件、嵌套控件、分页夹、部分公开扩展属性和常见事件；第三方自绘控件及其私有运行时仍需适配。
 - `semantic` 需要目标架构匹配的核心 FNE 和静态 adapter。缺少 adapter 时，Win32 仍可使用历史兼容静态库，但不应把它与现代 adapter 混用；x64 必须提供 x64 adapter。
-- 当前不是易语言 IDE 的逐字节代码生成器。完整语法、窗口事件、所有隐式转换、COM/Variant 边界、线程语义以及每一个支持库的特殊 ABI 仍需要逐步补齐和验证。
+- 当前不是易语言 IDE 的逐字节代码生成器。完整语法、全部窗口事件、所有隐式转换、COM/Variant 边界、线程语义以及每一个支持库的特殊 ABI 仍需要逐步补齐和验证。
 
 因此，准确的表述是：已经形成一条可运行的、元数据驱动的 x86/x64 `semantic` 独立编译链，并保留一条独立的 x86 传统黑月兼容链；两条链都覆盖控制台程序、DLL、支持库调用和外部 DLL 导入等核心路径，但不是“任意易语言项目都已经与 IDE 完全等价”。
 
@@ -92,7 +91,7 @@ e-packager compile <input.e|input-dir> <output.exe|output.dll> [--dll] [--compil
 
 ### 窗口项目检查
 
-若 `ProjectBundle` 含有窗体文件或窗口绑定，当前编译方式在生成 C++ 前明确拒绝。这样不会把窗口语义误当成控制台语义，也不会生成一个看似成功但运行时不正确的程序。
+若 `ProjectBundle` 含有窗体文件或窗口绑定，编译器会读取窗口 XML、建立控件父子树、解析公开扩展属性和事件绑定，并生成 Win32 宿主。无法映射的第三方控件会保留为容器/占位控件，同时不伪造其私有绘制和事件实现。
 
 ## 4. FNE 元数据：接口与实现的分工
 
@@ -321,9 +320,9 @@ dumpbin /exports temp\e-win32-dll-new-proj.dll
 
 ```powershell
 bin\Win32\Release\e-packager.exe compile <input.e> <output.exe> `
-  --compiler C:\Users\aiqin\OneDrive\e5.6\linker\VC2022Linker\bin\cl.exe `
-  --linker C:\Users\aiqin\OneDrive\e5.6\linker\VC2022Linker\bin\link.exe `
-  --lib C:\Users\aiqin\OneDrive\e5.6\linker\VC2022Linker\lib
+  --compiler "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Tools\MSVC\<版本>\bin\Hostx64\x86\cl.exe" `
+  --linker "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Tools\MSVC\<版本>\bin\Hostx64\x86\link.exe" `
+  --lib "D:\deps\support-libraries"
 ```
 
 编译原生 `.e` 和编译拆包目录的命令形式相同；目录必须是 `e-packager unpack` 生成或符合项目目录布局的目录。
@@ -442,16 +441,15 @@ TestPub1
 ```powershell
 bin\Win32\Release\e-packager.exe compile <input.e|input-dir> <output.exe|output.dll> `
   --compile-mode legacy-blackmoon --legacy-blackmoon-mode asm `
-  --eide C:\Users\aiqin\OneDrive\e5.6\e5.95.exe `
-  --autolinker-test D:\git\AutoLinker\bin\fne_release\AutoLinkerTest.exe `
-  --legacy-blackmoon-dir C:\Users\aiqin\OneDrive\e5.6\BlackMoon
+  --eide C:\path\to\IDE.exe `
+  --legacy-blackmoon-dir C:\path\to\BlackMoon
 ```
 
 该编译方式不加载、不注入、也不调用 `BlackMoon.fne`。它采用 BlackMoonNG 的易代码到 COFF 转换实现：
 
 ```text
 .e / 拆包目录
-  -> AutoLinker 无头动态编译（取得原生易代码 PE）
+  -> e-packager 直接启动用户指定的 IDE + AutoLinker.fne 无头编译（取得原生易代码 PE）
   -> BlackMoonNG EcodeToObjFile 源码转换
   -> BlackMoon.obj
   -> BlackMoonKernelStaticLib 入口 OBJ + krnln.lib
@@ -459,7 +457,7 @@ bin\Win32\Release\e-packager.exe compile <input.e|input-dir> <output.exe|output.
   -> output.exe / output.dll
 ```
 
-动态阶段仍需 `e.exe`，因为黑月转换器的输入是 IDE 生成 PE 中 `E0000040` 标志的易代码段，而不是 `.e` 源码文本。该步骤通过 AutoLinker 无头接口完成；黑月 FNE 插件不参与其中。
+动态阶段仍需指定版本化的 IDE，因为黑月转换器的输入是 IDE 生成 PE 中的易代码段，而不是 `.e` 源码文本。e-packager 直接向 IDE 传递 `--autolinker-headless-compile`、`--autolinker-output`、`--autolinker-target`、`--autolinker-result` 和 `--autolinker-exit` 参数，因此 legacy-blackmoon 不再依赖 `AutoLinkerTest.exe` 或 `AutoLinkerText.exe`；IDE 的 `lib` 目录中仍必须启用匹配版本的 `AutoLinker.fne`。
 
 `--blackmoon-timeout <seconds>` 同时限制无头易代码阶段和最终 `LINK.EXE` 阶段，允许范围为 1 至 3600 秒。
 

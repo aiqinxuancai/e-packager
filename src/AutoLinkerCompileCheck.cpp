@@ -364,6 +364,177 @@ bool Prepare(const Options& options, PreparedOptions& outOptions, std::string& o
 	return true;
 }
 
+Result CompileToOutputWithEide(
+	const std::filesystem::path& sourcePath,
+	const std::filesystem::path& outputPath,
+	const std::filesystem::path& eIdePath,
+	const std::string& target,
+	const bool staticCompile,
+	const unsigned int timeoutSeconds,
+	const std::filesystem::path& projectSourcePath)
+{
+	Result checkResult;
+	const std::filesystem::path effectiveSourcePath = ResolveAbsolutePath(sourcePath);
+	const std::filesystem::path effectiveOutputPath = ResolveAbsolutePath(outputPath);
+	const std::filesystem::path effectiveEidePath = ResolveEIdePath(eIdePath);
+	if (!IsRegularFile(effectiveSourcePath)) {
+		checkResult.error = "eide_compile_source_not_found: " + PathToUtf8(effectiveSourcePath);
+		return checkResult;
+	}
+	if (effectiveOutputPath.empty()) {
+		checkResult.error = "eide_compile_output_path_missing";
+		return checkResult;
+	}
+	if (!IsRegularFile(effectiveEidePath)) {
+		checkResult.error = "eide_compile_eide_not_found: use --eide <e.exe> or E_PACKAGER_EIDE";
+		return checkResult;
+	}
+	const std::string effectiveTarget = target.empty() ? "auto" : target;
+	if (!IsSupportedTarget(effectiveTarget)) {
+		checkResult.error = "eide_compile_target_invalid: " + effectiveTarget;
+		return checkResult;
+	}
+	if (timeoutSeconds == 0 || timeoutSeconds > 3600) {
+		checkResult.error = "eide_compile_timeout_invalid: expected 1..3600 seconds";
+		return checkResult;
+	}
+
+	std::error_code filesystemError;
+	if (effectiveOutputPath.has_parent_path()) {
+		std::filesystem::create_directories(effectiveOutputPath.parent_path(), filesystemError);
+		if (filesystemError) {
+			checkResult.error = "eide_compile_output_directory_create_failed: " + filesystemError.message();
+			return checkResult;
+		}
+	}
+	std::filesystem::path invocationDirectory;
+	if (!CreateTemporaryDirectory(invocationDirectory, checkResult.error)) {
+		return checkResult;
+	}
+	const TemporaryDirectory invocationGuard(invocationDirectory);
+	const std::filesystem::path resultPath = invocationDirectory / L"result.json";
+	const std::string invocationId =
+		"e-packager-" + std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64());
+
+	std::wstring commandLine;
+	AppendCommandLineArgument(commandLine, effectiveEidePath.wstring());
+	AppendCommandLineArgument(commandLine, effectiveSourcePath.wstring());
+	AppendCommandLineArgument(commandLine, L"--autolinker-headless-compile");
+	AppendCommandLineArgument(commandLine, L"--autolinker-output");
+	AppendCommandLineArgument(commandLine, effectiveOutputPath.wstring());
+	AppendCommandLineArgument(commandLine, L"--autolinker-target");
+	AppendCommandLineArgument(commandLine, Utf8PathToPath(effectiveTarget).wstring());
+	// AutoLinker uses the original project path for IDE-side diagnostics and
+	// project-scoped linker settings.  Keep it explicit when e-packager starts
+	// e.exe directly (the temporary source path is only the transport file).
+	if (!projectSourcePath.empty()) {
+		AppendCommandLineArgument(commandLine, L"--autolinker-project-source");
+		AppendCommandLineArgument(commandLine, ResolveAbsolutePath(projectSourcePath).wstring());
+	}
+	AppendCommandLineArgument(commandLine, L"--autolinker-result");
+	AppendCommandLineArgument(commandLine, resultPath.wstring());
+	AppendCommandLineArgument(commandLine, L"--autolinker-startup-timeout");
+	AppendCommandLineArgument(commandLine, std::to_wstring(timeoutSeconds));
+	AppendCommandLineArgument(commandLine, L"--autolinker-invocation-id");
+	AppendCommandLineArgument(commandLine, Utf8PathToPath(invocationId).wstring());
+	AppendCommandLineArgument(commandLine, staticCompile ? L"--autolinker-static" : L"--autolinker-no-static");
+	AppendCommandLineArgument(commandLine, L"--autolinker-hide-window");
+	AppendCommandLineArgument(commandLine, L"--autolinker-exit");
+
+	STARTUPINFOW startup{};
+	startup.cb = sizeof(startup);
+	startup.dwFlags = STARTF_USESHOWWINDOW;
+	startup.wShowWindow = SW_HIDE;
+	PROCESS_INFORMATION process{};
+	std::vector<wchar_t> mutableCommandLine(commandLine.begin(), commandLine.end());
+	mutableCommandLine.push_back(L'\0');
+	const BOOL created = CreateProcessW(
+		effectiveEidePath.c_str(),
+		mutableCommandLine.data(),
+		nullptr,
+		nullptr,
+		FALSE,
+		CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+		nullptr,
+		effectiveSourcePath.parent_path().empty() ? nullptr : effectiveSourcePath.parent_path().c_str(),
+		&startup,
+		&process);
+	if (!created) {
+		checkResult.error = "eide_compile_start_failed: win32_error=" + std::to_string(GetLastError());
+		return checkResult;
+	}
+	if (ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
+		const DWORD error = GetLastError();
+		TerminateProcess(process.hProcess, ERROR_PROCESS_ABORTED);
+		WaitForSingleObject(process.hProcess, 5000);
+		CloseHandle(process.hThread);
+		CloseHandle(process.hProcess);
+		checkResult.error = "eide_compile_resume_failed: win32_error=" + std::to_string(error);
+		return checkResult;
+	}
+	CloseHandle(process.hThread);
+
+	const std::uint64_t timeoutMilliseconds =
+		(static_cast<std::uint64_t>(timeoutSeconds) + 60u) * 1000u;
+	const DWORD waitMilliseconds = timeoutMilliseconds > MAXDWORD
+		? MAXDWORD : static_cast<DWORD>(timeoutMilliseconds);
+	const DWORD waitResult = WaitForSingleObject(process.hProcess, waitMilliseconds);
+	const bool timedOut = waitResult == WAIT_TIMEOUT;
+	if (timedOut) {
+		TerminateProcess(process.hProcess, ERROR_TIMEOUT);
+		WaitForSingleObject(process.hProcess, 5000);
+	}
+	DWORD exitCode = static_cast<DWORD>(-1);
+	GetExitCodeProcess(process.hProcess, &exitCode);
+	CloseHandle(process.hProcess);
+	const std::string resultText = ReadTextFile(resultPath);
+	json parsedResult;
+	const json* resultPointer = nullptr;
+	if (!resultText.empty()) {
+		try {
+			parsedResult = json::parse(resultText);
+			if (parsedResult.is_object()) resultPointer = &parsedResult;
+		}
+		catch (...) {
+			resultPointer = nullptr;
+		}
+	}
+	if (waitResult == WAIT_FAILED) {
+		checkResult.error = "eide_compile_wait_failed: win32_error=" + std::to_string(GetLastError());
+		return checkResult;
+	}
+	if (timedOut || resultPointer == nullptr) {
+		checkResult.error = BuildFailureDiagnostic(resultPointer, exitCode, timedOut, resultText);
+		return checkResult;
+	}
+
+	bool artifactVerified = false;
+	std::uint64_t artifactBytes = 0;
+	std::string resolvedTarget = effectiveTarget;
+	try {
+		artifactVerified = parsedResult.value("ok", false) &&
+			parsedResult.contains("compile_result") && parsedResult["compile_result"].is_object() &&
+			parsedResult["compile_result"].value("artifact_verified", false) &&
+			parsedResult["compile_result"].value("output_file_exists", false);
+		resolvedTarget = parsedResult.value("resolved_target", resolvedTarget);
+		if (parsedResult.contains("compile_result") && parsedResult["compile_result"].is_object()) {
+			artifactBytes = parsedResult["compile_result"].value("output_file_size_after_compile", std::uint64_t(0));
+		}
+	}
+	catch (...) {
+		artifactVerified = false;
+	}
+	if (exitCode != 0 || !parsedResult.value("ok", false) || !artifactVerified || !IsRegularFile(effectiveOutputPath)) {
+		checkResult.error = BuildFailureDiagnostic(resultPointer, exitCode, false, resultText);
+		return checkResult;
+	}
+	checkResult.ok = true;
+	checkResult.summary = "eide_compile=passed, target=" + resolvedTarget +
+		", static=" + (staticCompile ? "true" : "false") +
+		", artifact_bytes=" + std::to_string(artifactBytes);
+	return checkResult;
+}
+
 Result RunToArtifact(
 	const std::filesystem::path& sourcePath,
 	const std::filesystem::path& artifactPath,
