@@ -447,17 +447,17 @@ bool Compile(
 		? eideDirectory / L"BlackMoon" : AbsolutePath(options.blackMoonDirectory);
 	const std::filesystem::path blackMoonLibraryDirectory = blackMoonDirectory / L"lib";
 	const std::filesystem::path blackMoonBinaryDirectory = blackMoonDirectory / L"bin";
-	const std::filesystem::path linkerPath = options.linkerPath.empty()
-		? blackMoonBinaryDirectory / L"LINK.EXE" : AbsolutePath(options.linkerPath);
+	const std::filesystem::path linkerPath = options.legacyBlackMoonLinkerPath.empty()
+		? blackMoonBinaryDirectory / L"LINK.EXE" : AbsolutePath(options.legacyBlackMoonLinkerPath);
 	if (!IsRegularFile(linkerPath) || !std::filesystem::is_directory(blackMoonLibraryDirectory, filesystemError)) {
 		result.message = "blackmoon_toolchain_not_found:root=" + PathToUtf8(blackMoonDirectory);
 		return false;
 	}
 
 	std::vector<std::filesystem::path> libraryDirectories;
-	// 显式指定的库目录应覆盖随黑月工具链安装的同名归档，例如 Release
-	// 中单独下载的 VC6 核心库。其余目录仍保持确定的自动搜索顺序。
-	if (!options.libraryPath.empty()) libraryDirectories.push_back(AbsolutePath(options.libraryPath));
+	if (!options.eDirectory.empty()) {
+		libraryDirectories.push_back(AbsolutePath(options.eDirectory) / L"static_lib");
+	}
 	libraryDirectories.insert(libraryDirectories.end(), {
 		blackMoonLibraryDirectory,
 		blackMoonDirectory,

@@ -177,41 +177,73 @@ std::filesystem::path LatestVersionDirectory(const std::filesystem::path& root)
 	return directories.empty() ? std::filesystem::path() : directories.front();
 }
 
-std::filesystem::path FindWindowsResourceCompiler(const TargetArchitecture architecture)
+bool IsVcToolsDirectory(const std::filesystem::path& directory)
 {
-	std::vector<std::filesystem::path> roots;
-	wchar_t configured[MAX_PATH * 4] {};
-	if (GetEnvironmentVariableW(L"WindowsSdkDir", configured, std::size(configured)) > 0) {
-		roots.push_back(std::filesystem::path(configured));
+	return IsRegularFile(directory / L"include" / L"vector") &&
+		std::filesystem::is_directory(directory / L"bin") &&
+		std::filesystem::is_directory(directory / L"lib");
+}
+
+std::filesystem::path NormalizeVcToolsDirectory(const std::filesystem::path& configured)
+{
+	if (configured.empty()) return {};
+	const std::filesystem::path root = AbsolutePath(configured);
+	if (IsVcToolsDirectory(root)) return root;
+	const std::filesystem::path latest = LatestVersionDirectory(root);
+	return IsVcToolsDirectory(latest) ? latest : std::filesystem::path();
+}
+
+bool SelectWindowsSdk(
+	const std::filesystem::path& configured,
+	std::filesystem::path& sdkRoot,
+	std::filesystem::path& versionedInclude)
+{
+	sdkRoot.clear();
+	versionedInclude.clear();
+	if (configured.empty()) return false;
+	const std::filesystem::path root = AbsolutePath(configured);
+	if (IsRegularFile(root / L"um" / L"windows.h")) {
+		versionedInclude = root;
+		sdkRoot = root.parent_path().parent_path();
+		return true;
 	}
-	roots.push_back(L"C:\\Program Files (x86)\\Windows Kits\\10");
-	roots.push_back(L"C:\\Program Files\\Windows Kits\\10");
-	const std::wstring machine = architecture == TargetArchitecture::X64 ? L"x64" : L"x86";
-	for (const auto& root : roots) {
-		const auto binRoot = root / L"bin";
-		std::error_code filesystemError;
-		for (const auto& entry : std::filesystem::recursive_directory_iterator(binRoot, filesystemError)) {
-			if (!std::filesystem::is_regular_file(entry.path(), filesystemError) || entry.path().filename() != L"rc.exe" ||
-				entry.path().parent_path().filename() != machine) continue;
-			return entry.path();
-		}
+	std::filesystem::path includeRoot;
+	if (std::filesystem::is_directory(root / L"Include")) {
+		sdkRoot = root;
+		includeRoot = root / L"Include";
 	}
-	return {};
+	else if (root.filename() == L"Include") {
+		sdkRoot = root.parent_path();
+		includeRoot = root;
+	}
+	if (includeRoot.empty()) return false;
+	versionedInclude = LatestVersionDirectory(includeRoot);
+	return IsRegularFile(versionedInclude / L"um" / L"windows.h");
 }
 
 bool DiscoverBuildEnvironment(
 	const TargetArchitecture architecture,
+	const std::filesystem::path& configuredVcToolsDirectory,
+	const std::filesystem::path& configuredWindowsSdkDirectory,
 	std::filesystem::path& matchingCompiler,
+	std::filesystem::path& resourceCompiler,
 	std::vector<std::filesystem::path>& includeDirectories,
 	std::vector<std::filesystem::path>& libraryDirectories,
 	std::string& error)
 {
 	matchingCompiler.clear();
+	resourceCompiler.clear();
 	includeDirectories.clear();
 	libraryDirectories.clear();
-	std::filesystem::path vcTools;
-	wchar_t configured[MAX_PATH] {};
-	if (GetEnvironmentVariableW(L"VCToolsInstallDir", configured, MAX_PATH) > 0) vcTools = configured;
+	std::filesystem::path vcTools = NormalizeVcToolsDirectory(configuredVcToolsDirectory);
+	if (!configuredVcToolsDirectory.empty() && vcTools.empty()) {
+		error = "vc_tools_directory_invalid:" + PathToUtf8(AbsolutePath(configuredVcToolsDirectory));
+		return false;
+	}
+	wchar_t configured[MAX_PATH * 4] {};
+	if (vcTools.empty() && GetEnvironmentVariableW(L"VCToolsInstallDir", configured, std::size(configured)) > 0) {
+		vcTools = NormalizeVcToolsDirectory(std::filesystem::path(configured));
+	}
 	if (vcTools.empty() || !std::filesystem::is_directory(vcTools)) {
 		std::error_code filesystemError;
 		std::vector<std::filesystem::path> candidates;
@@ -223,8 +255,8 @@ bool DiscoverBuildEnvironment(
 				if (!version.is_directory(filesystemError)) continue;
 				for (const auto& edition : std::filesystem::directory_iterator(version.path(), filesystemError)) {
 					if (!edition.is_directory(filesystemError)) continue;
-					const auto candidate = LatestVersionDirectory(edition.path() / L"VC" / L"Tools" / L"MSVC");
-					if (!candidate.empty() && IsRegularFile(candidate / L"include" / L"vector")) candidates.push_back(candidate);
+					const auto candidate = NormalizeVcToolsDirectory(edition.path() / L"VC" / L"Tools" / L"MSVC");
+					if (!candidate.empty()) candidates.push_back(candidate);
 				}
 			}
 		}
@@ -233,23 +265,25 @@ bool DiscoverBuildEnvironment(
 			vcTools = candidates.front();
 		}
 	}
-	std::filesystem::path windowsKitRoot;
-	wchar_t sdkDirectory[MAX_PATH * 4]{};
-	if (GetEnvironmentVariableW(L"WindowsSdkDir", sdkDirectory, std::size(sdkDirectory)) > 0) {
-		windowsKitRoot = std::filesystem::path(sdkDirectory) / L"Include";
+	std::filesystem::path windowsSdkRoot;
+	std::filesystem::path windowsKit;
+	if (!configuredWindowsSdkDirectory.empty() &&
+		!SelectWindowsSdk(configuredWindowsSdkDirectory, windowsSdkRoot, windowsKit)) {
+		error = "windows_sdk_directory_invalid:" + PathToUtf8(AbsolutePath(configuredWindowsSdkDirectory));
+		return false;
 	}
-	if (windowsKitRoot.empty() || !std::filesystem::is_directory(windowsKitRoot)) {
+	wchar_t sdkDirectory[MAX_PATH * 4]{};
+	if (windowsKit.empty() && GetEnvironmentVariableW(L"WindowsSdkDir", sdkDirectory, std::size(sdkDirectory)) > 0) {
+		SelectWindowsSdk(std::filesystem::path(sdkDirectory), windowsSdkRoot, windowsKit);
+	}
+	if (windowsKit.empty()) {
 		for (const auto& candidate : {
-			std::filesystem::path(L"C:\\Program Files (x86)\\Windows Kits\\10\\Include"),
-			std::filesystem::path(L"C:\\Program Files\\Windows Kits\\10\\Include")
+			std::filesystem::path(L"C:\\Program Files (x86)\\Windows Kits\\10"),
+			std::filesystem::path(L"C:\\Program Files\\Windows Kits\\10")
 		}) {
-			if (std::filesystem::is_directory(candidate)) {
-				windowsKitRoot = candidate;
-				break;
-			}
+			if (SelectWindowsSdk(candidate, windowsSdkRoot, windowsKit)) break;
 		}
 	}
-	const std::filesystem::path windowsKit = LatestVersionDirectory(windowsKitRoot);
 	if (vcTools.empty() || windowsKit.empty()) {
 		error = "visual_cpp_or_windows_sdk_not_found";
 		return false;
@@ -283,8 +317,9 @@ bool DiscoverBuildEnvironment(
 		windowsKit / L"winrt",
 	};
 	const std::filesystem::path kitVersion = windowsKit.filename();
-	const std::filesystem::path kitLib = windowsKit.parent_path().parent_path() / L"Lib" / kitVersion;
+	const std::filesystem::path kitLib = windowsSdkRoot / L"Lib" / kitVersion;
 	const std::filesystem::path machineDirectory = architecture == TargetArchitecture::X64 ? L"x64" : L"x86";
+	resourceCompiler = windowsSdkRoot / L"bin" / kitVersion / machineDirectory / L"rc.exe";
 	libraryDirectories = {
 		vcTools / L"lib" / machineDirectory,
 		kitLib / L"ucrt" / machineDirectory,
@@ -747,6 +782,67 @@ void AppendUniquePath(std::vector<std::filesystem::path>& paths, const std::file
 	paths.push_back(path);
 }
 
+void AppendSupportLibraryDirectories(
+	std::vector<std::filesystem::path>& paths,
+	const std::filesystem::path& configuredPath,
+	const TargetArchitecture architecture)
+{
+	if (configuredPath.empty()) return;
+	std::error_code error;
+	std::filesystem::path root = AbsolutePath(configuredPath);
+	if (std::filesystem::is_regular_file(root, error)) root = root.parent_path();
+	if (root.empty()) return;
+
+	const std::filesystem::path architectureName =
+		architecture == TargetArchitecture::X64 ? L"x64" : L"x86";
+	auto appendDirectory = [&](const std::filesystem::path& directory) {
+		error.clear();
+		if (std::filesystem::is_directory(directory, error)) AppendUniquePath(paths, directory);
+	};
+
+	appendDirectory(root);
+	appendDirectory(root / architectureName);
+	std::filesystem::path installRoot = root;
+	std::wstring leaf = root.filename().wstring();
+	std::transform(leaf.begin(), leaf.end(), leaf.begin(), towlower);
+	if (leaf == L"lib" || leaf == L"static_lib") installRoot = root.parent_path();
+	for (const auto& directoryName : { L"lib", L"static_lib" }) {
+		const std::filesystem::path directory = installRoot / directoryName;
+		appendDirectory(directory);
+		appendDirectory(directory / architectureName);
+	}
+}
+
+std::filesystem::path ReadEnvironmentPath(const wchar_t* name)
+{
+	const DWORD required = GetEnvironmentVariableW(name, nullptr, 0);
+	if (required <= 1) return {};
+	std::wstring value(static_cast<std::size_t>(required), L'\0');
+	const DWORD written = GetEnvironmentVariableW(name, value.data(), required);
+	if (written == 0 || written >= required) return {};
+	value.resize(written);
+	return std::filesystem::path(value);
+}
+
+void AppendDiscoveredELibraryDirectories(
+	std::vector<std::filesystem::path>& paths,
+	const Options& options,
+	const TargetArchitecture architecture)
+{
+	// 易语言第三方支持库目前只提供 x86 FNE/静态实现；x64 语义编译
+	// 仅使用匹配架构的 BlackMoonModernCore adapter。
+	if (architecture == TargetArchitecture::X64) return;
+	if (!options.eDirectory.empty()) {
+		AppendSupportLibraryDirectories(paths, options.eDirectory, architecture);
+		return;
+	}
+	// 省略显式目录时，只使用机器级自动发现来源。
+	AppendSupportLibraryDirectories(paths, ReadEnvironmentPath(L"E_PACKAGER_EIDE"), architecture);
+	for (const auto& baseDirectory : GetRegisteredEplOpenCommandBaseDirs()) {
+		AppendSupportLibraryDirectories(paths, baseDirectory, architecture);
+	}
+}
+
 std::filesystem::path FindStaticLibraryInDirectories(
 	const std::vector<std::filesystem::path>& directories,
 	const Library& library,
@@ -813,26 +909,16 @@ std::filesystem::path FindCoreStaticArchive(
 
 CoreLibraryRoots ResolveCoreLibraryRoots(
 	const Options& options,
-	const TargetArchitecture architecture,
-	const std::filesystem::path& compiler,
-	const std::filesystem::path& productRoot)
+	const TargetArchitecture architecture)
 {
 	std::vector<std::filesystem::path> roots;
-	if (!options.blackMoonCoreDirectories.empty()) {
-		for (const auto& directory : options.blackMoonCoreDirectories) {
-			AddRootCandidates(roots, AbsolutePath(directory), architecture);
-		}
+	for (const auto& directory : options.blackMoonCoreDirectories) {
+		AddRootCandidates(roots, AbsolutePath(directory), architecture);
 	}
-	else if (!options.blackMoonCoreDirectory.empty()) {
-		AddRootCandidates(roots, AbsolutePath(options.blackMoonCoreDirectory), architecture);
-	}
-	if (architecture == TargetArchitecture::X64) {
-		for (const auto& directory : options.blackMoonX64Directories) {
-			AddRootCandidates(roots, AbsolutePath(directory), architecture);
-		}
-		if (!options.blackMoonX64Directory.empty()) {
-			AddRootCandidates(roots, AbsolutePath(options.blackMoonX64Directory), architecture);
-		}
+	const auto& architectureDirectories = architecture == TargetArchitecture::X64
+		? options.blackMoonX64Directories : options.blackMoonX86Directories;
+	for (const auto& directory : architectureDirectories) {
+		AddRootCandidates(roots, AbsolutePath(directory), architecture);
 	}
 	wchar_t configured[MAX_PATH * 4]{};
 	if (GetEnvironmentVariableW(L"E_PACKAGER_BLACKMOON_CORE_DIR", configured, std::size(configured)) > 0) {
@@ -843,11 +929,6 @@ CoreLibraryRoots ResolveCoreLibraryRoots(
 	if (GetEnvironmentVariableW(architectureEnvironment, configured, std::size(configured)) > 0) {
 		AddRootCandidates(roots, AbsolutePath(std::filesystem::path(configured)), architecture);
 	}
-	if (!options.blackMoonDirectory.empty()) AddRootCandidates(roots, AbsolutePath(options.blackMoonDirectory), architecture);
-	if (!options.libraryPath.empty()) AddRootCandidates(roots, AbsolutePath(options.libraryPath), architecture);
-	if (!options.eIdePath.empty()) AddRootCandidates(roots, AbsolutePath(options.eIdePath).parent_path(), architecture);
-	AddRootCandidates(roots, productRoot, architecture);
-	AddRootCandidates(roots, compiler.parent_path(), architecture);
 	AddRootCandidates(roots, Utf8PathToPath(GetBasePath()), architecture);
 
 	CoreLibraryRoots result;
@@ -879,20 +960,13 @@ CoreLibraryRoots ResolveCoreLibraryRoots(
 }
 
 std::filesystem::path FindLibraryManager(
-	const TargetArchitecture architecture,
 	const std::filesystem::path& compiler,
-	const std::filesystem::path& productRoot)
+	const std::filesystem::path& linker)
 {
-	const std::vector<std::filesystem::path> candidates = architecture == TargetArchitecture::X64
-		? std::vector<std::filesystem::path> {
-			compiler.parent_path() / L"lib.exe",
-			compiler.parent_path().parent_path() / L"lib.exe",
-			productRoot / L"linker" / L"VC6linker" / L"Bin" / L"LIB.EXE",
-		}
-		: std::vector<std::filesystem::path> {
-			productRoot / L"linker" / L"VC6linker" / L"Bin" / L"LIB.EXE",
-			compiler.parent_path() / L"lib.exe",
-		};
+	const std::vector<std::filesystem::path> candidates = {
+		linker.parent_path() / L"lib.exe",
+		compiler.parent_path() / L"lib.exe",
+	};
 	for (const auto& candidate : candidates) if (IsRegularFile(candidate)) return candidate;
 	return {};
 }
@@ -911,6 +985,7 @@ bool ResolveToolchain(
 	const TargetArchitecture architecture,
 	std::filesystem::path& compiler,
 	std::filesystem::path& linker,
+	std::filesystem::path& resourceCompiler,
 	std::filesystem::path& vcLibrary,
 	std::filesystem::path& productRoot,
 	std::vector<std::filesystem::path>* outIncludeDirectories,
@@ -919,44 +994,20 @@ bool ResolveToolchain(
 {
 	if (outIncludeDirectories != nullptr) outIncludeDirectories->clear();
 	if (outSystemLibraryDirectories != nullptr) outSystemLibraryDirectories->clear();
-	if (options.compilerPath.empty()) {
-		std::vector<std::filesystem::path> includeDirectories;
-		std::vector<std::filesystem::path> systemLibraryDirectories;
-		if (!DiscoverBuildEnvironment(
-				architecture, compiler, includeDirectories, systemLibraryDirectories, error)) {
-			return false;
-		}
-		if (outIncludeDirectories != nullptr) *outIncludeDirectories = includeDirectories;
-		if (outSystemLibraryDirectories != nullptr) *outSystemLibraryDirectories = systemLibraryDirectories;
+	std::vector<std::filesystem::path> includeDirectories;
+	std::vector<std::filesystem::path> systemLibraryDirectories;
+	std::filesystem::path discoveredCompiler;
+	if (!DiscoverBuildEnvironment(
+			architecture, options.vcToolsDirectory, options.windowsSdkDirectory,
+			discoveredCompiler, resourceCompiler, includeDirectories, systemLibraryDirectories, error)) {
+		return false;
 	}
-	else {
-		compiler = options.compilerPath;
-	}
-	linker = options.linkerPath.empty() ? compiler.parent_path() / L"link.exe" : options.linkerPath;
-	productRoot = ProductRootFromCompiler(compiler);
-	if (options.libraryPath.empty()) {
-		if (outSystemLibraryDirectories != nullptr && !outSystemLibraryDirectories->empty()) {
-			vcLibrary = outSystemLibraryDirectories->front();
-		}
-		else {
-			vcLibrary = compiler.parent_path().parent_path() / L"lib";
-		}
-		if (outSystemLibraryDirectories == nullptr || outSystemLibraryDirectories->empty()) {
-			std::vector<std::filesystem::path> includeDirectories;
-			std::vector<std::filesystem::path> systemLibraryDirectories;
-			std::filesystem::path discoveredCompiler;
-			if (!DiscoverBuildEnvironment(
-					architecture, discoveredCompiler, includeDirectories, systemLibraryDirectories, error)) {
-				return false;
-			}
-			if (outIncludeDirectories != nullptr) *outIncludeDirectories = includeDirectories;
-			if (outSystemLibraryDirectories != nullptr) *outSystemLibraryDirectories = systemLibraryDirectories;
-			vcLibrary = systemLibraryDirectories.empty() ? vcLibrary : systemLibraryDirectories.front();
-		}
-	}
-	else {
-		vcLibrary = options.libraryPath;
-	}
+	compiler = options.compilerPath.empty() ? discoveredCompiler : options.compilerPath;
+	if (outIncludeDirectories != nullptr) *outIncludeDirectories = includeDirectories;
+	if (outSystemLibraryDirectories != nullptr) *outSystemLibraryDirectories = systemLibraryDirectories;
+	linker = options.linkerPath.empty() ? discoveredCompiler.parent_path() / L"link.exe" : options.linkerPath;
+	productRoot = ProductRootFromCompiler(discoveredCompiler);
+	vcLibrary = systemLibraryDirectories.front();
 	if (!IsRegularFile(compiler)) { error = "compiler_not_found:" + PathToUtf8(compiler); return false; }
 	if (!IsRegularFile(linker)) { error = "linker_not_found:" + PathToUtf8(linker); return false; }
 	if (!std::filesystem::is_directory(vcLibrary)) { error = "linker_library_directory_not_found:" + PathToUtf8(vcLibrary); return false; }
@@ -986,25 +1037,44 @@ bool Compile(
 			result.message = "legacy_blackmoon_requires_x86";
 			return false;
 		}
+		if (!options.vcToolsDirectory.empty() || !options.windowsSdkDirectory.empty() ||
+			!options.compilerPath.empty() || !options.linkerPath.empty()) {
+			result = {};
+			result.outputPath = outputPath;
+			result.message = "legacy_blackmoon_uses_legacy_blackmoon_linker_and_ignores_vc_toolchain_options";
+			return false;
+		}
 		return blackmoon_compiler::Compile(inputPath, outputPath, options, result);
 	}
 	result = {};
 	result.outputPath = outputPath;
 	std::string error;
+	if (!options.legacyBlackMoonLinkerPath.empty()) {
+		result.message = "semantic_does_not_use_legacy_blackmoon_linker";
+		return false;
+	}
+	if (!options.eDirectory.empty()) {
+		std::error_code directoryError;
+		const std::filesystem::path directory = AbsolutePath(options.eDirectory);
+		if (!std::filesystem::is_directory(directory, directoryError)) {
+			result.message = "e_language_directory_not_found:" + PathToUtf8(directory);
+			return false;
+		}
+	}
 	std::filesystem::path compiler;
 	std::filesystem::path linker;
+	std::filesystem::path resourceCompiler;
 	std::filesystem::path vcLibrary;
 	std::filesystem::path productRoot;
 	std::vector<std::filesystem::path> includeDirectories;
 	std::vector<std::filesystem::path> systemLibraryDirectories;
 	if (!ResolveToolchain(
-		options, targetArchitecture, compiler, linker, vcLibrary, productRoot,
+		options, targetArchitecture, compiler, linker, resourceCompiler, vcLibrary, productRoot,
 		&includeDirectories, &systemLibraryDirectories, error)) {
 		result.message = error;
 		return false;
 	}
-	CoreLibraryRoots coreRoots = ResolveCoreLibraryRoots(
-		options, targetArchitecture, compiler, productRoot);
+	CoreLibraryRoots coreRoots = ResolveCoreLibraryRoots(options, targetArchitecture);
 	const bool usesModernCoreAdapter = coreRoots.coreArchive.adapter;
 	std::vector<std::filesystem::path> supportLibrarySearchDirectories;
 	supportLibrarySearchDirectories = coreRoots.searchDirectories;
@@ -1018,7 +1088,8 @@ bool Compile(
 		result.message = "semantic_core_library_not_found:provide --blackmoon-core-dir";
 		return false;
 	}
-	AppendUniquePath(supportLibrarySearchDirectories, productRoot / L"lib");
+	AppendDiscoveredELibraryDirectories(
+		supportLibrarySearchDirectories, options, targetArchitecture);
 	std::filesystem::path bundleInput = inputPath;
 	TemporaryDirectoryGuard sourceDecoderDirectory;
 	std::error_code inputTypeError;
@@ -1082,16 +1153,8 @@ bool Compile(
 	}
 	const std::filesystem::path logPath = outputDirectory / (outputPath.stem().wstring() + L".compile.log");
 	std::string processOutput;
-	std::filesystem::path matchingCompiler;
-	if (includeDirectories.empty() || systemLibraryDirectories.empty()) {
-		if (!DiscoverBuildEnvironment(targetArchitecture, matchingCompiler, includeDirectories, systemLibraryDirectories, error)) {
-			result.message = error;
-			return false;
-		}
-	}
-	if (options.compilerPath.empty() && !matchingCompiler.empty()) compiler = matchingCompiler;
 	std::vector<std::filesystem::path> generatedImportLibraries;
-	const std::filesystem::path libraryManager = FindLibraryManager(targetArchitecture, compiler, productRoot);
+	const std::filesystem::path libraryManager = FindLibraryManager(compiler, linker);
 	for (const auto& import : generated.imports) {
 		if (import.moduleName.empty() || import.entryName.empty()) continue;
 		const std::filesystem::path importDef = outputDirectory /
@@ -1256,11 +1319,9 @@ bool Compile(
 		}
 		linkerArguments.push_back(L"/DEF:" + Quote(definitionPath));
 	}
-	std::filesystem::path resourceCompiler;
 	if (!program.buildDll) {
-		resourceCompiler = FindWindowsResourceCompiler(targetArchitecture);
-		if (resourceCompiler.empty()) {
-			result.message = "windows_sdk_resource_compiler_not_found";
+		if (!IsRegularFile(resourceCompiler)) {
+			result.message = "windows_sdk_resource_compiler_not_found:" + PathToUtf8(resourceCompiler);
 			return false;
 		}
 	}

@@ -2227,12 +2227,10 @@ void AppendDownloadedDependencyRoot(
 	const std::filesystem::path& root)
 {
 	if (architecture == ecompiler::TargetArchitecture::X64) {
-		if (options.blackMoonX64Directory.empty()) options.blackMoonX64Directory = root;
 		options.blackMoonX64Directories.push_back(root);
 	}
 	else {
-		if (options.blackMoonCoreDirectory.empty()) options.blackMoonCoreDirectory = root;
-		options.blackMoonCoreDirectories.push_back(root);
+		options.blackMoonX86Directories.push_back(root);
 	}
 }
 
@@ -2776,7 +2774,7 @@ void PrintUsage()
 	std::cout << Utf8Literal(u8"  e-packager pack <input-dir> <output.e|output.ec> [--password <text>] [--compile-check ...]  # 封包，可选 AutoLinker 无头编译确认") << std::endl;
 	std::cout << Utf8Literal(u8"       --compile-check [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--compile-target auto|win_exe|win_console_exe|win_dll|ecom] [--compile-static] [--compile-timeout <seconds>]") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager validate <input-dir> [--diagnostics text|json]  # 快速检查声明、基础语法和可确定的类型错误") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager compile <input.e|input-dir> <output.exe|output.dll> [--diagnostics text|json] [--compile-mode semantic|legacy-blackmoon|blackmoon] [--arch host|x86|x64] [--subsystem auto|console|windows] [--legacy-blackmoon-mode asm|cpp|mfc] [--dll] [--define <macro>]... [--compiler <cl.exe>] [--linker <link.exe>] [--lib <lib-dir>] [--eide <e.exe>] [--legacy-blackmoon-dir <dir>] [--blackmoon-core-dir <dir>] [--blackmoon-x86-dir <dir>] [--blackmoon-x64-dir <dir>] [--x86-decoder <e-packager.exe>] [--blackmoon-timeout <seconds>]  # 默认 semantic；窗口工程自动使用 Windows 子系统") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager compile <input.e|input-dir> <output.exe|output.dll> [--diagnostics text|json] [--compile-mode semantic|legacy-blackmoon|blackmoon] [--arch host|x86|x64] [--subsystem auto|console|windows] [--legacy-blackmoon-mode asm|cpp|mfc] [--dll] [--define <macro>]... [--vc-tools-dir <dir>] [--windows-sdk-dir <dir>] [--compiler <cl.exe>] [--linker <link.exe>] [--e-dir <易语言目录>] [--eide <e.exe>] [--legacy-blackmoon-dir <dir>] [--legacy-blackmoon-linker <LINK.EXE>] [--blackmoon-core-dir <dir>] [--blackmoon-x86-dir <dir>] [--blackmoon-x64-dir <dir>] [--x86-decoder <e-packager.exe>] [--blackmoon-timeout <seconds>]  # 默认 semantic；窗口工程自动使用 Windows 子系统") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager compile-check <input.e|input.ec> [--eide <e.exe>] [--autolinker-test <AutoLinkerTest.exe>] [--compile-target ...] [--compile-static] [--compile-timeout <seconds>]  # 直接执行权威无头编译") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager update <input-dir> [--add-ecom <file.ec>]... [--add-elib <name|file.fne>]... [--add-image <file|name=file>]... [--add-audio <file|name=file>]...   # 刷新派生内容并新增资源") << std::endl;
 #if defined(_M_X64)
@@ -2888,15 +2886,15 @@ int RunCommand(int argc, char* argv[])
 		DiagnosticOutputFormat diagnosticFormat = DiagnosticOutputFormat::Text;
 		const auto appendBlackMoonCoreDirectory = [&options](const std::filesystem::path& directory) {
 			const std::filesystem::path resolved = ResolveAbsolutePath(directory);
-			if (options.blackMoonCoreDirectory.empty()) options.blackMoonCoreDirectory = resolved;
 			options.blackMoonCoreDirectories.push_back(resolved);
 		};
-		const auto appendBlackMoonX64Directory = [&options](const std::filesystem::path& directory) {
+		const auto appendBlackMoonArchitectureDirectory = [&options](
+				const std::filesystem::path& directory,
+				const ecompiler::TargetArchitecture architecture) {
 			const std::filesystem::path resolved = ResolveAbsolutePath(directory);
-			if (options.blackMoonX64Directory.empty()) options.blackMoonX64Directory = resolved;
-			options.blackMoonX64Directories.push_back(resolved);
-			if (options.blackMoonCoreDirectory.empty()) options.blackMoonCoreDirectory = resolved;
-			options.blackMoonCoreDirectories.push_back(resolved);
+			auto& directories = architecture == ecompiler::TargetArchitecture::X64
+				? options.blackMoonX64Directories : options.blackMoonX86Directories;
+			directories.push_back(resolved);
 		};
 		for (int index = 4; index < argc; ++index) {
 			const std::string option = argv[index];
@@ -2987,10 +2985,24 @@ int RunCommand(int argc, char* argv[])
 				options.compileMode = ecompiler::CompileMode::LegacyBlackMoon;
 				continue;
 			}
-			if ((option == "--compiler" || option == "--linker" || option == "--lib") && index + 1 < argc) {
-				if (option == "--compiler") options.compilerPath = ResolveAbsolutePath(std::filesystem::path(argv[++index]));
-				else if (option == "--linker") options.linkerPath = ResolveAbsolutePath(std::filesystem::path(argv[++index]));
-				else options.libraryPath = ResolveAbsolutePath(std::filesystem::path(argv[++index]));
+			if ((option == "--vc-tools-dir" || option == "--windows-sdk-dir" ||
+				option == "--compiler" || option == "--linker" || option == "--e-dir" ||
+				option == "--legacy-blackmoon-linker") && index + 1 < argc) {
+				const std::filesystem::path value = ResolveAbsolutePath(std::filesystem::path(argv[++index]));
+				if (option == "--vc-tools-dir") options.vcToolsDirectory = value;
+				else if (option == "--windows-sdk-dir") options.windowsSdkDirectory = value;
+				else if (option == "--compiler") options.compilerPath = value;
+				else if (option == "--linker") options.linkerPath = value;
+				else if (option == "--e-dir") options.eDirectory = value;
+				else options.legacyBlackMoonLinkerPath = value;
+				continue;
+			}
+			if (option.rfind("--vc-tools-dir=", 0) == 0) {
+				options.vcToolsDirectory = ResolveAbsolutePath(std::filesystem::path(option.substr(std::string("--vc-tools-dir=").size())));
+				continue;
+			}
+			if (option.rfind("--windows-sdk-dir=", 0) == 0) {
+				options.windowsSdkDirectory = ResolveAbsolutePath(std::filesystem::path(option.substr(std::string("--windows-sdk-dir=").size())));
 				continue;
 			}
 			if (option.rfind("--compiler=", 0) == 0) {
@@ -3001,8 +3013,12 @@ int RunCommand(int argc, char* argv[])
 				options.linkerPath = ResolveAbsolutePath(std::filesystem::path(option.substr(std::string("--linker=").size())));
 				continue;
 			}
-			if (option.rfind("--lib=", 0) == 0) {
-				options.libraryPath = ResolveAbsolutePath(std::filesystem::path(option.substr(std::string("--lib=").size())));
+			if (option.rfind("--e-dir=", 0) == 0) {
+				options.eDirectory = ResolveAbsolutePath(std::filesystem::path(option.substr(std::string("--e-dir=").size())));
+				continue;
+			}
+			if (option.rfind("--legacy-blackmoon-linker=", 0) == 0) {
+				options.legacyBlackMoonLinkerPath = ResolveAbsolutePath(std::filesystem::path(option.substr(std::string("--legacy-blackmoon-linker=").size())));
 				continue;
 			}
 			if ((option == "--define" || option == "-D") && index + 1 < argc) {
@@ -3017,22 +3033,34 @@ int RunCommand(int argc, char* argv[])
 				options.blackMoonDirectory = ResolveAbsolutePath(std::filesystem::path(argv[++index]));
 				continue;
 			}
-			if ((option == "--blackmoon-core-dir" || option == "--blackmoon-x86-dir") && index + 1 < argc) {
+			if (option == "--blackmoon-core-dir" && index + 1 < argc) {
 				appendBlackMoonCoreDirectory(std::filesystem::path(argv[++index]));
 				continue;
 			}
-			if (option.rfind("--blackmoon-core-dir=", 0) == 0 || option.rfind("--blackmoon-x86-dir=", 0) == 0) {
-				const std::string prefix = option.rfind("--blackmoon-x86-dir=", 0) == 0
-					? "--blackmoon-x86-dir=" : "--blackmoon-core-dir=";
-				appendBlackMoonCoreDirectory(std::filesystem::path(option.substr(prefix.size())));
+			if (option.rfind("--blackmoon-core-dir=", 0) == 0) {
+				appendBlackMoonCoreDirectory(std::filesystem::path(option.substr(std::string("--blackmoon-core-dir=").size())));
+				continue;
+			}
+			if (option == "--blackmoon-x86-dir" && index + 1 < argc) {
+				appendBlackMoonArchitectureDirectory(
+					std::filesystem::path(argv[++index]), ecompiler::TargetArchitecture::X86);
+				continue;
+			}
+			if (option.rfind("--blackmoon-x86-dir=", 0) == 0) {
+				appendBlackMoonArchitectureDirectory(
+					std::filesystem::path(option.substr(std::string("--blackmoon-x86-dir=").size())),
+					ecompiler::TargetArchitecture::X86);
 				continue;
 			}
 			if (option == "--blackmoon-x64-dir" && index + 1 < argc) {
-				appendBlackMoonX64Directory(std::filesystem::path(argv[++index]));
+				appendBlackMoonArchitectureDirectory(
+					std::filesystem::path(argv[++index]), ecompiler::TargetArchitecture::X64);
 				continue;
 			}
 			if (option.rfind("--blackmoon-x64-dir=", 0) == 0) {
-				appendBlackMoonX64Directory(std::filesystem::path(option.substr(std::string("--blackmoon-x64-dir=").size())));
+				appendBlackMoonArchitectureDirectory(
+					std::filesystem::path(option.substr(std::string("--blackmoon-x64-dir=").size())),
+					ecompiler::TargetArchitecture::X64);
 				continue;
 			}
 			if (option == "--x86-decoder" && index + 1 < argc) {

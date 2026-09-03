@@ -78,7 +78,7 @@
 编译入口为：
 
 ```text
-e-packager compile <input.e|input-dir> <output.exe|output.dll> [--dll] [--compiler <cl.exe>] [--linker <link.exe>] [--lib <lib-dir>]
+e-packager compile <input.e|input-dir> <output.exe|output.dll> [--dll] [--vc-tools-dir <目录>] [--windows-sdk-dir <目录>] [--compiler <cl.exe>] [--linker <link.exe>] [--e-dir <易语言目录>]
 ```
 
 ### 原生 `.e`
@@ -216,7 +216,9 @@ FNE 中没有运行时执行符号的编译期命令由统一的英文元数据�
 3. 每个可达 FNE 的 `NL_GET_DEPENDENT_LIBS` 返回值会继续解析到产品 `static_lib`、VC 库目录或工程目录。
 4. 最终把支持库 `.lib`、VC6 CRT/MFC、现代 CRT 和 Windows SDK 导入库一并交给链接器。
 
-编译器会按目标架构自动探测本机 Visual C++ 和 Windows SDK 的 include/lib 目录，并选择对应的 `cl.exe` 与 `link.exe`。需要固定工具链版本时，可通过 `--compiler`、`--linker` 和 `--lib` 显式覆盖；环境变量 `VCToolsInstallDir` 也会作为探测入口。
+编译器会按目标架构自动探测本机 Visual C++ 和 Windows SDK 的 include/lib 目录，并选择对应的 `cl.exe`、`link.exe`、`lib.exe` 和 `rc.exe`。需要固定整套工具链时，分别使用 `--vc-tools-dir` 和 `--windows-sdk-dir`；`--compiler`、`--linker` 只覆盖 semantic 的单个可执行文件。环境变量 `VCToolsInstallDir`、`WindowsSdkDir` 仍作为自动探测入口。x86 semantic 默认从注册表发现的易语言安装目录下 `lib`、`static_lib` 搜索第三方支持库，也可用 `--e-dir` 指定安装根目录；x64 semantic 不加载第三方支持库。
+
+传统 `legacy-blackmoon` 路线不使用上述 VC/SDK 参数；如需替换传统链接器，请使用 `--legacy-blackmoon-linker`。两条路线的链接器参数不会互相回退或静默复用。
 
 为了兼容现有核心静态归档，当前还保留核心库级别的 `odbcdb_static.lib`、`mp3_static.lib` 依赖补充。这是归档级兼容项，不按某个源代码函数分支；长期方向是让这些依赖也完全由 FNE/静态库元数据发布，消除产品树约定。
 
@@ -316,13 +318,13 @@ bin\Win32\Release\e-packager.exe compile eproj\e-win32-dll-new-proj.e temp\e-win
 dumpbin /exports temp\e-win32-dll-new-proj.dll
 ```
 
-### 指定链接器或支持库目录
+### 指定链接器或易语言目录
 
 ```powershell
 bin\Win32\Release\e-packager.exe compile <input.e> <output.exe> `
-  --compiler "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Tools\MSVC\<版本>\bin\Hostx64\x86\cl.exe" `
-  --linker "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Tools\MSVC\<版本>\bin\Hostx64\x86\link.exe" `
-  --lib "D:\deps\support-libraries"
+  --vc-tools-dir "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Tools\MSVC\<版本>" `
+  --windows-sdk-dir "C:\Program Files (x86)\Windows Kits\10" `
+  --e-dir "C:\path\to\易语言安装目录"
 ```
 
 编译原生 `.e` 和编译拆包目录的命令形式相同；目录必须是 `e-packager unpack` 生成或符合项目目录布局的目录。

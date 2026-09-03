@@ -39,17 +39,18 @@ enum class BlackMoonMode {
 
 // 独立源码编译选项。编译器和链接器均可显式覆盖；semantic 支持 x86/x64。
 struct Options {
+	// MSVC 版本根目录（包含 bin/include/lib）；留空时自动发现。
+	std::filesystem::path vcToolsDirectory;
+	// Windows Kits 根目录（包含 Include/Lib/bin）；留空时自动发现。
+	std::filesystem::path windowsSdkDirectory;
 	std::filesystem::path compilerPath;
 	std::filesystem::path linkerPath;
-	std::filesystem::path libraryPath;
+	// 易语言安装目录；留空时从 IDE 环境变量和注册表自动发现。
+	std::filesystem::path eDirectory;
 	// 语义编译核心库根目录可按优先级叠加。目录中可包含 x86/x64 adapter 清单。
 	std::vector<std::filesystem::path> blackMoonCoreDirectories;
-	// 兼容旧的单目录调用方；新调用方应使用 blackMoonCoreDirectories。
-	std::filesystem::path blackMoonCoreDirectory;
-	// x64 旧选项的兼容字段；新调用方应使用 blackMoonCoreDirectories。
+	std::vector<std::filesystem::path> blackMoonX86Directories;
 	std::vector<std::filesystem::path> blackMoonX64Directories;
-	// 兼容旧的单目录调用方；新调用方应使用 blackMoonX64Directories。
-	std::filesystem::path blackMoonX64Directory;
 	// 编译原生 .e 时用于按官方 x86 命令表解码字节码的 Win32 工具。
 	std::filesystem::path x86DecoderPath;
 	TargetArchitecture targetArchitecture = TargetArchitecture::Host;
@@ -57,6 +58,8 @@ struct Options {
 	BlackMoonMode blackMoonMode = BlackMoonMode::Assembly;
 	// 黑月目录，包含 bin/ 与 lib/；留空时根据 e.exe 自动推导。
 	std::filesystem::path blackMoonDirectory;
+	// 传统黑月专用链接器；留空时使用黑月目录中的 bin/LINK.EXE。
+	std::filesystem::path legacyBlackMoonLinkerPath;
 	// 黑月编译方式用于生成原生易代码 PE 的易语言 IDE。
 	std::filesystem::path eIdePath;
 	unsigned int blackMoonTimeoutSeconds = 120;

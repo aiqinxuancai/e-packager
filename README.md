@@ -153,16 +153,16 @@ e-packager compile <input.e|input-dir> <output.exe|output.dll> [选项]
 
 `semantic` 不是只调用一个 `link.exe`。它会编译生成的 C++ 源码，并使用 Windows SDK 的 `windows.h`、`rc.exe` 和导入库。因此请在 Visual Studio Installer 中勾选 **使用 C++ 的桌面开发**，并确认包含 MSVC 编译工具、Windows 10/11 SDK 和 Windows 通用 C 运行库。
 
-安装后应能在 VS 开发者 PowerShell 中找到 `cl.exe`、`link.exe`、`rc.exe`，并在对应 SDK Include 目录中找到 `windows.h`。e-packager 会自动探测 VS；也可以显式指定 VS 自带的同架构工具：
+安装后应能在 VS 开发者 PowerShell 中找到 `cl.exe`、`link.exe`、`rc.exe`，并在对应 SDK Include 目录中找到 `windows.h`。e-packager 会自动探测 VS；也可以分别固定 VC 工具链根目录和 Windows SDK 根目录：
 
 ```powershell
 e-packager.exe compile MyApp.e .\out\MyApp-x86.exe `
   --arch x86 `
-  --compiler "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Tools\MSVC\<版本>\bin\Hostx64\x86\cl.exe" `
-  --linker "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Tools\MSVC\<版本>\bin\Hostx64\x86\link.exe"
+  --vc-tools-dir "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Tools\MSVC\<版本>" `
+  --windows-sdk-dir "C:\Program Files (x86)\Windows Kits\10"
 ```
 
-不要把 `C:\Users\<用户名>\OneDrive\e5.6\linker` 下易语言打包的链接器当作 semantic 的 C++ 工具链。它不提供完整的 VS 头文件、CRT、Windows SDK 导入库和 `rc.exe`，也不能替代 Visual Studio 安装。`--lib` 用于搜索支持库静态实现，不是用来拼出 VS SDK 的；VS 的系统库由 `cl.exe` 所属的 VS 安装自动确定。
+不要把 `C:\Users\<用户名>\OneDrive\e5.6\linker` 下易语言打包的链接器当作 semantic 的 C++ 工具链。它不提供完整的 VS 头文件、CRT、Windows SDK 导入库和 `rc.exe`，也不能替代 Visual Studio 安装。VS 的系统库由 `cl.exe` 所属的 VS 安装自动确定。
 
 #### semantic：默认方式
 
@@ -173,14 +173,16 @@ e-packager.exe compile MyApp.e .\out\MyApp.exe
 e-packager.exe compile .\MyLib .\out\MyLib.dll
 ```
 
-编译器会自动探测本机的 Visual C++ 与 Windows SDK，并在输出目录生成 `<输出名>.generated.cpp` 等中间文件，方便排查问题，可随时删除。探测失败，或想固定用某个版本时，用 `--compiler`、`--linker`、`--lib` 显式指定：
+编译器会自动探测本机的 Visual C++、Windows SDK 和易语言安装目录，并在输出目录生成 `<输出名>.generated.cpp` 等中间文件，方便排查问题，可随时删除。探测失败，或想固定用某个版本时，用 `--vc-tools-dir`、`--windows-sdk-dir`、`--e-dir` 显式指定；`--compiler`、`--linker` 只用于进一步覆盖单个 semantic 工具：
 
 ```powershell
 e-packager.exe compile MyApp.e .\out\MyApp.exe `
-  --compiler "C:\path\to\VC\Tools\MSVC\<版本>\bin\Hostx64\x86\cl.exe" `
-  --linker "C:\path\to\VC\Tools\MSVC\<版本>\bin\Hostx64\x86\link.exe" `
-  --lib "D:\deps\support-libraries"
+  --vc-tools-dir "C:\path\to\VC\Tools\MSVC\<版本>" `
+  --windows-sdk-dir "C:\path\to\Windows Kits\10" `
+  --e-dir "C:\path\to\易语言安装目录"
 ```
+
+`--e-dir` 指向包含 `lib` 和 `static_lib` 的易语言安装根目录。x86 semantic 会从这里查找第三方 FNE 和静态库；x64 semantic 不加载第三方支持库，只使用 x64 BlackMoonModernCore adapter。省略时按 `E_PACKAGER_EIDE` 和 `E.Document` 注册表打开命令自动发现。
 
 x86、x64 都可以用 `--arch x86` / `--arch x64` 指定，默认跟随当前程序架构。
 
@@ -221,7 +223,7 @@ e-packager.exe compile MyApp.e .\out\MyApp-x64.exe `
   --arch x64 --blackmoon-x64-dir "D:\deps\BlackMoonModernCore\adapter"
 ```
 
-`--blackmoon-x86-dir` / `--blackmoon-x64-dir` 均可重复传入，用于补充同架构的其他支持库；但核心 adapter 里的 FNE、主归档、后备归档和清单文件必须来自**同一个** Release，不要混用不同版本。`.e` 输入会自动调用 Win32 版 `e-packager` 做权威解码，一般无需干预。第三方支持库还必须在搜索目录中同时提供匹配架构的 `<支持库文件名>_static.lib`（或等价 `.lib`）和公开接口 FNE/`elib/*.txt`；只有接口文本而没有实现时，编译器会明确报告缺少静态实现。
+`--blackmoon-x86-dir` / `--blackmoon-x64-dir` 均可重复传入，用于补充对应架构的核心 adapter；核心 adapter 里的 FNE、主归档、后备归档和清单文件必须来自**同一个** Release，不要混用不同版本。`.e` 输入会自动调用 Win32 版 `e-packager` 做权威解码，一般无需干预。第三方易语言库目前仅支持 x86，并且必须在搜索目录中同时提供匹配架构的 `<支持库文件名>_static.lib`（或等价 `.lib`）和公开接口 FNE/`elib/*.txt`；x64 不加载第三方库。
 
 #### 诊断输出
 
@@ -247,7 +249,7 @@ JSON 诊断始终包含 `phase`、`code`、`file`、`line`、`column`、`message
 源码启用，编译已拆包目录不会暗中修改依赖搜索路径。第三方支持库只有在其发布包或本地配置提供可识别下载源时才能自动取得，
 否则命令会明确报告缺少下载提供方，不会用其他库或函数替代。
 
-传统 x86 黑月链路所需的 VC6 `krnln.lib` 位于 `BlackMoonModernCore` x86 Release 包的 `legacy_static_lib\x86\krnln.lib`。它不是 semantic adapter，不能替代包含 `krnln.fne`、`krnln_adapter.json` 和现代包装层的 `adapter` 目录；使用时将该归档放入传统黑月工具链的库搜索目录（或通过 `--lib` 指定），并按下面的 `legacy-blackmoon` 方式提供完整的 `BlackMoon\bin`、入口对象和 VC6/MFC 运行库，也不能用于 x64。
+传统 x86 黑月链路所需的 VC6 `krnln.lib` 位于 `BlackMoonModernCore` x86 Release 包的 `legacy_static_lib\x86\krnln.lib`。它不是 semantic adapter，不能替代包含 `krnln.fne`、`krnln_adapter.json` 和现代包装层的 `adapter` 目录；使用时将该归档放入传统黑月工具链的库搜索目录，并按下面的 `legacy-blackmoon` 方式提供完整的 `BlackMoon\bin`、入口对象和 VC6/MFC 运行库，也不能用于 x64。
 
 #### legacy-blackmoon（传统 x86 黑月）
 
@@ -279,10 +281,14 @@ legacy-blackmoon 会直接启动用户指定版本的易语言 IDE，向 IDE 传
 | `--legacy-blackmoon-mode asm\|cpp\|mfc` | 选择传统黑月入口模式（仅 x86） |
 | `--dll` | 按 DLL 编译；输出扩展名为 `.dll` 时可省略 |
 | `--define <宏>` / `-D <宏>` | 添加条件编译宏，可重复传入 |
-| `--compiler <cl.exe>` / `--linker <link.exe>` / `--lib <目录>` | 指定 C++ 编译器、链接器和库目录；未指定编译器时按目标架构自动探测 |
+| `--compiler <cl.exe>` / `--linker <link.exe>` | 指定 C++ 编译器和链接器；未指定时按目标架构自动探测 |
+| `--vc-tools-dir <目录>` | 指定包含 `bin`、`include`、`lib` 的 MSVC 版本根目录 |
+| `--windows-sdk-dir <目录>` | 指定包含 `Include`、`Lib`、`bin` 的 Windows Kits 根目录 |
+| `--e-dir <易语言目录>` | x86 指定包含 `lib`、`static_lib` 的易语言安装目录；x64 不使用第三方库，省略时自动发现 |
 | `--eide <IDE.exe>` | legacy-blackmoon 直启的版本化易语言 IDE；省略时从 `E_PACKAGER_EIDE` 或注册表查找 |
 | `--autolinker-test <exe>` | 仅 `compile-check`/`pack --compile-check` 使用的旧式无头启动器，semantic 和 legacy-blackmoon 不需要 |
 | `--legacy-blackmoon-dir <目录>` | 传统黑月工具链根目录（`--blackmoon-dir` 为兼容别名） |
+| `--legacy-blackmoon-linker <LINK.EXE>` | 单独覆盖传统黑月 linker；不会影响 semantic |
 | `--blackmoon-core-dir <目录>` | semantic 核心 adapter 根目录，可重复传入 |
 | `--blackmoon-x86-dir <目录>` / `--blackmoon-x64-dir <目录>` | semantic 指定架构核心 adapter 根目录 |
 | `--blackmoon-timeout <秒>` | 黑月编译与链接超时，默认 120，范围 1 至 3600 |
