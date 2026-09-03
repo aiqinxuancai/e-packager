@@ -52,43 +52,6 @@ std::filesystem::path ReadEnvironmentPath(const wchar_t* name)
 	return std::filesystem::path(value);
 }
 
-std::filesystem::path GetCurrentExecutablePath()
-{
-	std::vector<wchar_t> buffer(1024, L'\0');
-	for (;;) {
-		const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
-		if (length == 0) {
-			return {};
-		}
-		if (length < buffer.size() - 1) {
-			return std::filesystem::path(std::wstring(buffer.data(), length));
-		}
-		buffer.resize(buffer.size() * 2, L'\0');
-	}
-}
-
-std::filesystem::path SearchExecutableOnPath(const wchar_t* fileName)
-{
-	const DWORD required = SearchPathW(nullptr, fileName, nullptr, 0, nullptr, nullptr);
-	if (required == 0) {
-		return {};
-	}
-	std::wstring value(static_cast<std::size_t>(required) + 1, L'\0');
-	wchar_t* filePart = nullptr;
-	const DWORD written = SearchPathW(
-		nullptr,
-		fileName,
-		nullptr,
-		static_cast<DWORD>(value.size()),
-		value.data(),
-		&filePart);
-	if (written == 0 || written >= value.size()) {
-		return {};
-	}
-	value.resize(written);
-	return std::filesystem::path(value);
-}
-
 std::filesystem::path ResolveEIdePath(const std::filesystem::path& requested)
 {
 	if (!requested.empty()) {
@@ -104,28 +67,6 @@ std::filesystem::path ResolveEIdePath(const std::filesystem::path& requested)
 		}
 	}
 	return {};
-}
-
-std::filesystem::path ResolveLauncherPath(const std::filesystem::path& requested)
-{
-	if (!requested.empty()) {
-		return ResolveAbsolutePath(requested);
-	}
-	const std::filesystem::path environment = ReadEnvironmentPath(L"E_PACKAGER_AUTOLINKER_TEST");
-	if (!environment.empty()) {
-		return ResolveAbsolutePath(environment);
-	}
-
-	const std::filesystem::path executable = GetCurrentExecutablePath();
-	if (!executable.empty()) {
-		const std::filesystem::path sibling = executable.parent_path() / L"AutoLinkerTest.exe";
-		if (IsRegularFile(sibling)) {
-			return ResolveAbsolutePath(sibling);
-		}
-	}
-
-	const std::filesystem::path fromPath = SearchExecutableOnPath(L"AutoLinkerTest.exe");
-	return fromPath.empty() ? std::filesystem::path() : ResolveAbsolutePath(fromPath);
 }
 
 bool IsSupportedTarget(const std::string_view target)
@@ -286,14 +227,14 @@ std::string ArtifactExtension(const std::string_view target)
 
 std::string BuildFailureDiagnostic(
 	const json* result,
-	const DWORD launcherExitCode,
-	const bool launcherTimedOut,
-	const std::string& launcherOutput)
+	const DWORD ideExitCode,
+	const bool ideTimedOut,
+	const std::string& ideOutput)
 {
 	std::ostringstream detail;
 	detail << "compile_check_failed";
-	if (launcherTimedOut) {
-		detail << ": AutoLinker launcher exceeded the outer timeout";
+	if (ideTimedOut) {
+		detail << ": IDE exceeded the outer timeout";
 	}
 	else if (result != nullptr) {
 		const std::string error = result->value("error", std::string());
@@ -304,7 +245,7 @@ std::string BuildFailureDiagnostic(
 	else {
 		detail << ": AutoLinker result JSON was not produced";
 	}
-	detail << "\nlauncher_exit_code=" << launcherExitCode;
+	detail << "\nide_exit_code=" << ideExitCode;
 
 	if (result != nullptr && result->contains("compile_result") && (*result)["compile_result"].is_object()) {
 		const json& compileResult = (*result)["compile_result"];
@@ -325,9 +266,9 @@ std::string BuildFailureDiagnostic(
 	}
 
 	if (result == nullptr) {
-		const std::string fallback = TruncateDiagnostic(launcherOutput);
+		const std::string fallback = TruncateDiagnostic(ideOutput);
 		if (!fallback.empty()) {
-			detail << "\nAutoLinker output:\n" << fallback;
+			detail << "\nIDE output:\n" << fallback;
 		}
 	}
 	return detail.str();
@@ -340,17 +281,12 @@ bool Prepare(const Options& options, PreparedOptions& outOptions, std::string& o
 	outOptions = {};
 	outError.clear();
 	outOptions.eIdePath = ResolveEIdePath(options.eIdePath);
-	outOptions.launcherPath = ResolveLauncherPath(options.launcherPath);
 	outOptions.target = options.target.empty() ? "auto" : options.target;
 	outOptions.staticCompile = options.staticCompile;
 	outOptions.timeoutSeconds = options.timeoutSeconds;
 
 	if (!IsRegularFile(outOptions.eIdePath)) {
 		outError = "compile_check_eide_not_found: use --eide <e.exe> or E_PACKAGER_EIDE";
-		return false;
-	}
-	if (!IsRegularFile(outOptions.launcherPath)) {
-		outError = "compile_check_autolinker_test_not_found: use --autolinker-test <AutoLinkerTest.exe> or E_PACKAGER_AUTOLINKER_TEST";
 		return false;
 	}
 	if (!IsSupportedTarget(outOptions.target)) {
@@ -535,161 +471,6 @@ Result CompileToOutputWithEide(
 	return checkResult;
 }
 
-Result RunToArtifact(
-	const std::filesystem::path& sourcePath,
-	const std::filesystem::path& artifactPath,
-	const PreparedOptions& options,
-	const std::filesystem::path& invocationDirectory)
-{
-	Result checkResult;
-	const std::filesystem::path effectiveSourcePath = ResolveAbsolutePath(sourcePath);
-	const std::filesystem::path effectiveArtifactPath = ResolveAbsolutePath(artifactPath);
-	if (!IsRegularFile(effectiveSourcePath)) {
-		checkResult.error = "compile_check_source_not_found: " + PathToUtf8(effectiveSourcePath);
-		return checkResult;
-	}
-	if (effectiveArtifactPath.empty()) {
-		checkResult.error = "compile_check_output_path_missing";
-		return checkResult;
-	}
-	const std::filesystem::path resultPath = invocationDirectory / L"result.json";
-	const std::filesystem::path launcherLogPath = invocationDirectory / L"launcher.log";
-
-	std::wstring commandLine;
-	AppendCommandLineArgument(commandLine, options.launcherPath.wstring());
-	AppendCommandLineArgument(commandLine, L"headless-compile");
-	AppendCommandLineArgument(commandLine, options.eIdePath.wstring());
-	AppendCommandLineArgument(commandLine, effectiveSourcePath.wstring());
-	AppendCommandLineArgument(commandLine, effectiveArtifactPath.wstring());
-	AppendCommandLineArgument(commandLine, L"--target");
-	AppendCommandLineArgument(commandLine, Utf8PathToPath(options.target).wstring());
-	if (options.staticCompile) {
-		AppendCommandLineArgument(commandLine, L"--static");
-	}
-	AppendCommandLineArgument(commandLine, L"--result");
-	AppendCommandLineArgument(commandLine, resultPath.wstring());
-	AppendCommandLineArgument(commandLine, L"--timeout");
-	AppendCommandLineArgument(commandLine, std::to_wstring(options.timeoutSeconds));
-
-	SECURITY_ATTRIBUTES inheritedSecurityAttributes{};
-	inheritedSecurityAttributes.nLength = sizeof(inheritedSecurityAttributes);
-	inheritedSecurityAttributes.bInheritHandle = TRUE;
-	HANDLE launcherLog = CreateFileW(
-		launcherLogPath.c_str(),
-		GENERIC_WRITE,
-		FILE_SHARE_READ | FILE_SHARE_DELETE,
-		&inheritedSecurityAttributes,
-		CREATE_ALWAYS,
-		FILE_ATTRIBUTE_TEMPORARY,
-		nullptr);
-	if (launcherLog == INVALID_HANDLE_VALUE) {
-		checkResult.error = "compile_check_launcher_log_create_failed";
-		return checkResult;
-	}
-
-	STARTUPINFOW startup{};
-	startup.cb = sizeof(startup);
-	startup.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
-	startup.wShowWindow = SW_HIDE;
-	startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-	startup.hStdOutput = launcherLog;
-	startup.hStdError = launcherLog;
-	PROCESS_INFORMATION process{};
-	std::vector<wchar_t> mutableCommandLine(commandLine.begin(), commandLine.end());
-	mutableCommandLine.push_back(L'\0');
-	const std::filesystem::path workingDirectory = effectiveSourcePath.parent_path();
-	const BOOL created = CreateProcessW(
-		options.launcherPath.c_str(),
-		mutableCommandLine.data(),
-		nullptr,
-		nullptr,
-		TRUE,
-		CREATE_NO_WINDOW,
-		nullptr,
-		workingDirectory.empty() ? nullptr : workingDirectory.c_str(),
-		&startup,
-		&process);
-	CloseHandle(launcherLog);
-	if (created == FALSE) {
-		checkResult.error = "compile_check_launcher_start_failed: win32_error=" +
-			std::to_string(GetLastError());
-		return checkResult;
-	}
-
-	const std::uint64_t outerTimeoutMilliseconds =
-		(static_cast<std::uint64_t>(options.timeoutSeconds) + 60u) * 1000u;
-	const DWORD waitMilliseconds = outerTimeoutMilliseconds > MAXDWORD
-		? MAXDWORD
-		: static_cast<DWORD>(outerTimeoutMilliseconds);
-	const DWORD waitResult = WaitForSingleObject(process.hProcess, waitMilliseconds);
-	const bool launcherTimedOut = waitResult == WAIT_TIMEOUT;
-	if (launcherTimedOut) {
-		TerminateProcess(process.hProcess, 5);
-		WaitForSingleObject(process.hProcess, 5000);
-	}
-
-	DWORD launcherExitCode = static_cast<DWORD>(-1);
-	GetExitCodeProcess(process.hProcess, &launcherExitCode);
-	CloseHandle(process.hThread);
-	CloseHandle(process.hProcess);
-
-	json parsedResult;
-	const json* resultPointer = nullptr;
-	const std::string resultText = ReadTextFile(resultPath);
-	if (!resultText.empty()) {
-		try {
-			parsedResult = json::parse(resultText);
-			if (parsedResult.is_object()) {
-				resultPointer = &parsedResult;
-			}
-		}
-		catch (...) {
-			resultPointer = nullptr;
-		}
-	}
-
-	bool jsonOk = false;
-	bool artifactVerified = false;
-	if (resultPointer != nullptr) {
-		try {
-			jsonOk = resultPointer->value("ok", false);
-			if (resultPointer->contains("compile_result") && (*resultPointer)["compile_result"].is_object()) {
-				artifactVerified = (*resultPointer)["compile_result"].value("artifact_verified", false);
-			}
-		}
-		catch (...) {
-			jsonOk = false;
-			artifactVerified = false;
-		}
-	}
-
-	checkResult.ok = !launcherTimedOut && launcherExitCode == 0 && jsonOk && artifactVerified &&
-		IsRegularFile(effectiveArtifactPath);
-	if (!checkResult.ok) {
-		checkResult.error = BuildFailureDiagnostic(
-			resultPointer,
-			launcherExitCode,
-			launcherTimedOut,
-			ReadTextFile(launcherLogPath, kMaximumDiagnosticTextBytes));
-		return checkResult;
-	}
-
-	std::string resolvedTarget = options.target;
-	std::uint64_t artifactBytes = 0;
-	try {
-		resolvedTarget = resultPointer->value("resolved_target", resolvedTarget);
-		const json& compileResult = (*resultPointer)["compile_result"];
-		artifactBytes = compileResult.value("output_file_size_after_compile", std::uint64_t(0));
-	}
-	catch (...) {
-		// 成功条件已经由 ok 和 artifact_verified 确认，摘要字段缺失不改变结果。
-	}
-	checkResult.summary = "compile_check=passed, target=" + resolvedTarget +
-		", static=" + (options.staticCompile ? "true" : "false") +
-		", artifact_bytes=" + std::to_string(artifactBytes);
-	return checkResult;
-}
-
 Result Run(const std::filesystem::path& sourcePath, const PreparedOptions& options)
 {
 	Result result;
@@ -700,7 +481,9 @@ Result Run(const std::filesystem::path& sourcePath, const PreparedOptions& optio
 	const TemporaryDirectory temporaryDirectoryGuard(temporaryDirectory);
 	const std::filesystem::path artifactPath =
 		temporaryDirectory / (L"artifact" + Utf8PathToPath(ArtifactExtension(options.target)).wstring());
-	return RunToArtifact(sourcePath, artifactPath, options, temporaryDirectory);
+	return CompileToOutputWithEide(
+		sourcePath, artifactPath, options.eIdePath, options.target,
+		options.staticCompile, options.timeoutSeconds);
 }
 
 Result CompileToOutput(
@@ -708,13 +491,9 @@ Result CompileToOutput(
 	const std::filesystem::path& outputPath,
 	const PreparedOptions& options)
 {
-	Result result;
-	std::filesystem::path temporaryDirectory;
-	if (!CreateTemporaryDirectory(temporaryDirectory, result.error)) {
-		return result;
-	}
-	const TemporaryDirectory temporaryDirectoryGuard(temporaryDirectory);
-	return RunToArtifact(sourcePath, outputPath, options, temporaryDirectory);
+	return CompileToOutputWithEide(
+		sourcePath, outputPath, options.eIdePath, options.target,
+		options.staticCompile, options.timeoutSeconds);
 }
 
 }  // namespace autolinker_compile_check

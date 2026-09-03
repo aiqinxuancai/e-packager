@@ -201,10 +201,9 @@ e-packager compile-check MyApp.e
 # 回包时同时检查
 e-packager pack MyApp\ MyApp.e --compile-check
 
-# 显式指定 IDE 和 AutoLinker 路径
+# 显式指定 IDE 路径（IDE 的 lib 目录需启用 AutoLinker.fne）
 e-packager compile-check MyApp.e \
-  --eide "C:\path\to\IDE.exe" \
-  --autolinker-test "D:\AutoLinker\bin\fne_release\AutoLinkerTest.exe"
+  --eide "C:\path\to\IDE.exe"
 ```
 
 编译失败会输出 IDE 页面、行号和错误内容，且不会覆盖已有文件。

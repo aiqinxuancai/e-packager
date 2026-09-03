@@ -459,7 +459,7 @@ bin\Win32\Release\e-packager.exe compile <input.e|input-dir> <output.exe|output.
   -> output.exe / output.dll
 ```
 
-动态阶段仍需指定版本化的 IDE，因为黑月转换器的输入是 IDE 生成 PE 中的易代码段，而不是 `.e` 源码文本。e-packager 直接向 IDE 传递 `--autolinker-headless-compile`、`--autolinker-output`、`--autolinker-target`、`--autolinker-result` 和 `--autolinker-exit` 参数，因此 legacy-blackmoon 不再依赖 `AutoLinkerTest.exe` 或 `AutoLinkerText.exe`；IDE 的 `lib` 目录中仍必须启用匹配版本的 `AutoLinker.fne`。
+动态阶段仍需指定版本化的 IDE，因为黑月转换器的输入是 IDE 生成 PE 中的易代码段，而不是 `.e` 源码文本。e-packager 直接启动 IDE，并传递 `--autolinker-headless-compile`、`--autolinker-output`、`--autolinker-target`、`--autolinker-result` 和 `--autolinker-exit` 参数；IDE 的 `lib` 目录中仍必须启用匹配版本的 `AutoLinker.fne`。
 
 `--blackmoon-timeout <seconds>` 同时限制无头易代码阶段和最终 `LINK.EXE` 阶段，允许范围为 1 至 3600 秒。
 

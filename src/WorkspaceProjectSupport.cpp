@@ -365,7 +365,7 @@ std::string BuildAgentsMarkdown(
 			: L"- 当前目录暂未检测到 `lib/AutoLinker.fne`；如后续补入该文件，可直接使用下面的命令格式。\r\n") +
 		L"- 使用方法参考 `D:\\git\\AutoLinker`。\r\n"
 		L"\r\n"
-		L"legacy-blackmoon 会直接启动易语言主程序，不需要 AutoLinkerTest.exe：\r\n"
+		L"legacy-blackmoon 会直接启动易语言主程序：\r\n"
 		L"\r\n"
 		L"```powershell\r\n"
 		L"\"<从注册表获取到的易语言主程序路径>\" `\r\n"
@@ -378,17 +378,16 @@ std::string BuildAgentsMarkdown(
 		L"\r\n"
 		L"上面的直接参数方式由 `legacy-blackmoon` 内部使用；它要求易语言 IDE 的 `lib/AutoLinker.fne` 已启用。\r\n"
 		L"\r\n"
-		L"需要独立做 IDE 权威编译检查时，才使用 `AutoLinkerTest.exe`：\r\n"
+		L"需要独立做 IDE 权威编译检查时，直接启动易语言 IDE：\r\n"
 		L"\r\n"
 		L"```powershell\r\n"
 		L"tool\\e-packager.exe pack . .\\pack\\checked.e `\r\n"
 		L"  --compile-check `\r\n"
 		L"  --eide \"<易语言主程序路径>\" `\r\n"
-		L"  --autolinker-test \"D:\\git\\AutoLinker\\bin\\fne_release\\AutoLinkerTest.exe\" `\r\n"
 		L"  --compile-static --compile-timeout 120\r\n"
 		L"```\r\n"
 		L"\r\n"
-		L"`--eide` 省略时会尝试从 `E.Document` 注册表打开命令中发现主程序；`--autolinker-test` 省略时会尝试环境变量 `E_PACKAGER_AUTOLINKER_TEST`、程序同目录和 `PATH`。也可以用 `E_PACKAGER_EIDE` 提供 IDE 路径。编译失败不会覆盖已有封包输出。\r\n"
+		L"`--eide` 省略时会尝试从 `E_PACKAGER_EIDE` 或 `E.Document` 注册表打开命令中发现主程序。编译失败不会覆盖已有封包输出。\r\n"
 		L"\r\n";
 	std::wstring packOutputFileName = Utf8ToWide(options.defaultPackOutputFileName);
 	if (packOutputFileName.empty()) {
@@ -564,7 +563,7 @@ std::string BuildAgentsMarkdown(
 		<< L"- 只有行尾未使用的声明槽位可以省略；为了填写后面的属性、数组维数或说明而保留的中间空槽仍必须写逗号。`validate` 不会要求声明补齐全部尾槽。\r\n"
 		<< L"- 预检采用保守语义：类继承和访问权限、类实例方法调用边界、支持库或易模块重载及特殊命令、变体型及泛型类型流、窗口事件参数签名、全部隐式转换和特殊表达式尚未完整覆盖；依赖元数据缺失或语义无法确定时不会臆测报错。DLL 入口和运行期错误也不在检查范围内。因此 `errors=0` 只表示没有发现当前覆盖范围内的确定性错误，不等于 IDE 编译成功。\r\n"
 		<< L"- 新增或修改的可执行语句必须能够生成原生语义表达式，否则回包会失败，不会降级写入未检查的原始代码；未修改语句仍复用原生快照。\r\n"
-		<< L"- 需要 IDE 级别结论时，可在封包命令追加 `--compile-check --eide <e.exe> --autolinker-test <AutoLinkerTest.exe>`；编译失败不会覆盖已有目标文件。也可以使用 `compile-check <input.e>` 直接检查已有文件。\r\n"
+		<< L"- 需要 IDE 级别结论时，可在封包命令追加 `--compile-check --eide <e.exe>`；编译失败不会覆盖已有目标文件。也可以使用 `compile-check <input.e>` 直接检查已有文件。\r\n"
 		<< L"\r\n"
 		<< autoLinkerSection
 		<< L"## 代码格式要求\r\n"

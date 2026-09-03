@@ -8,7 +8,6 @@ namespace autolinker_compile_check {
 // AutoLinker 无头编译检查选项。
 struct Options {
 	std::filesystem::path eIdePath;
-	std::filesystem::path launcherPath;
 	std::string target = "auto";
 	bool staticCompile = false;
 	unsigned int timeoutSeconds = 120;
@@ -25,10 +24,10 @@ struct Result {
 	std::string error;
 };
 
-// 解析显式参数、环境变量和注册表中的工具路径。
+// 解析显式参数、环境变量和注册表中的 IDE 路径。
 bool Prepare(const Options& options, PreparedOptions& outOptions, std::string& outError);
 
-// 直接启动用户指定版本化 IDE 的 AutoLinker 无头编译入口，不需要 AutoLinkerTest.exe。
+// 直接启动用户指定版本化 IDE 的 AutoLinker 无头编译入口。
 Result CompileToOutputWithEide(
 	const std::filesystem::path& sourcePath,
 	const std::filesystem::path& outputPath,
@@ -38,10 +37,10 @@ Result CompileToOutputWithEide(
 	unsigned int timeoutSeconds,
 	const std::filesystem::path& projectSourcePath = {});
 
-// 调用 AutoLinkerTest 对指定易语言工程执行真实编译。
+// 直接启动 IDE 对指定易语言工程执行真实编译。
 Result Run(const std::filesystem::path& sourcePath, const PreparedOptions& options);
 
-// 调用 AutoLinkerTest 并保留指定输出文件，供后续编译方式消费原生 PE。
+// 直接启动 IDE 并保留指定输出文件，供后续编译方式消费原生 PE。
 Result CompileToOutput(
 	const std::filesystem::path& sourcePath,
 	const std::filesystem::path& outputPath,
