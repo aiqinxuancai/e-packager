@@ -1,6 +1,7 @@
 ﻿#pragma once
 
 #include "CompilerModel.h"
+#include "NativeWindowControl.h"
 
 namespace ecompiler {
 

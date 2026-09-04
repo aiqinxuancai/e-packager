@@ -1,6 +1,7 @@
 ﻿#include "CppEmitter.h"
 
 #include <Windows.h>
+#include "NativeWindowControl.h"
 #include "../PathHelper.h"
 
 #include <algorithm>
@@ -12,6 +13,7 @@
 #include <functional>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <optional>
 #include <queue>
 #include <sstream>
@@ -149,7 +151,9 @@ std::string RuntimeSourceUtf8(const char* source)
 const char* kRuntimeSource = R"CPP(
 #include <Windows.h>
 #include <algorithm>
+#include <commdlg.h>
 #include <commctrl.h>
+#include <olectl.h>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
@@ -160,10 +164,13 @@ const char* kRuntimeSource = R"CPP(
 #include <functional>
 #include <memory>
 #include <deque>
+#include <shellapi.h>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#pragma comment(lib,"oleaut32.lib")
 
 namespace ert {
 using EPointer = std::uintptr_t;
@@ -282,6 +289,7 @@ constexpr std::uint32_t T_DOUBLE=0x80000601u, T_BOOL=0x80000002u, T_DATE=0x80000
 constexpr std::uint32_t T_TEXT=0x80000004u, T_BIN=0x80000005u, T_SUB=0x80000006u, T_ARRAY=0x20000000u;
 constexpr std::uint32_t T_STATEMENT=0x80000008u;
 constexpr std::uint32_t T_VARIABLE=0x20000000u;
+constexpr std::uint32_t T_WINDOW_UNIT=0x70000001u;
 
 // Runtime notification ABI shared by support libraries and the generated host.
 enum : int {
@@ -1280,7 +1288,13 @@ public:
 		QueueMethod(startup->second);
 		for (const auto& form : program_.windows) {
 			for (const auto& event : form.events) QueueMethod(event.methodId);
-			for (const auto& control : form.controls) for (const auto& event : control.events) QueueMethod(event.methodId);
+			for (const auto& control : form.controls) {
+				// Keep the emitter defensive when a caller supplies a hand-built
+				// Program instead of going through BuildWindowModel().  Unsupported
+				// support-library units must never make their event handlers reachable.
+				if (!HasNativeWin32Class(control.typeName)) continue;
+				for (const auto& event : control.events) QueueMethod(event.methodId);
+			}
 		}
 		if (program_.buildDll) {
 			for (const Method& method : program_.methods) if (method.isPublic) QueueMethod(method.id);
@@ -1453,8 +1467,158 @@ private:
 	{
 		const WindowForm* form = WindowForMethod(method);
 		if (form == nullptr) return nullptr;
-		for (const auto& control : form->controls) if (control.name == name) return &control;
+		for (const auto& control : form->controls)
+			if (HasNativeWin32Class(control.typeName) && control.name == name) return &control;
 		return nullptr;
+	}
+
+	std::optional<std::uint32_t> WindowTargetId(const Method& method, const std::string& name) const
+	{
+		if (const auto* control = WindowControlByName(method, name)) return control->id;
+		if (const auto* form = WindowForMethod(method)) {
+			if (name == form->name || name == form->className) return form->id;
+		}
+		return std::nullopt;
+	}
+
+	std::optional<std::string> WindowMemberOperation(
+		const Method& method,
+		const e2txt::SourceExpressionNode& receiver,
+		const std::string& name) const
+	{
+		if (receiver.kind != e2txt::SourceExpressionKind::Name) return std::nullopt;
+		const auto* control = WindowControlByName(method, receiver.text);
+		const auto* form = WindowForMethod(method);
+		if (control == nullptr && (form == nullptr || (receiver.text != form->name && receiver.text != form->className))) return std::nullopt;
+		const auto matches = [&name](const std::initializer_list<const char*> aliases) {
+			return std::any_of(aliases.begin(), aliases.end(), [&name](const char* alias) { return name == alias; });
+		};
+		// These commands are supplied by the core window type and are shared by
+		// forms and ordinary controls.  Keep them here instead of duplicating
+		// aliases in every control-specific branch below.
+		if (matches({ "取窗口句柄", "GetHWnd" })) return "GetHWnd";
+		if (matches({ "销毁", "destroy", "Destroy" })) return "Destroy";
+		if (matches({ "获取焦点", "SetFocus" })) return "SetFocus";
+		if (matches({ "可有焦点", "IsFocus" })) return "IsFocus";
+		if (matches({ "取用户区宽度", "GetClientWidth" })) return "GetClientWidth";
+		if (matches({ "取用户区高度", "GetClientHeight" })) return "GetClientHeight";
+		if (matches({ "禁止重画", "LockWindowUpdate" })) return "LockWindowUpdate";
+		if (matches({ "允许重画", "UnlockWindowUpdate" })) return "UnlockWindowUpdate";
+		if (matches({ "重画", "invalidate", "Invalidate" })) return "Invalidate";
+		if (matches({ "部分重画", "InvalidateRect" })) return "InvalidateRect";
+		if (matches({ "取消重画", "validate", "Validate" })) return "Validate";
+		if (matches({ "刷新显示", "UpdateWindow" })) return "UpdateWindow";
+		if (matches({ "移动", "move", "Move" })) return "Move";
+		if (matches({ "调整层次", "ZOrder" })) return "ZOrder";
+		if (matches({ "发送信息", "SendMessage" })) return "SendMessage";
+		if (matches({ "投递信息", "PostMessage" })) return "PostMessage";
+		if (matches({ "弹出菜单", "PopupMenu" })) return "PopupMenu";
+		if (matches({ "激活", "Activate" })) return "Activate";
+		if (matches({ "置托盘图标", "SetTrayIcon" })) return "SetTrayIcon";
+		if (matches({ "弹出托盘菜单", "PopupTrayMenu" })) return "PopupTrayMenu";
+		if (matches({ "置父窗口", "SetParentWnd" })) return "SetParentWnd";
+		if (matches({ "取标记组件", "GetSpecTagUnit" })) return "GetSpecTagUnit";
+		if (matches({ "置外形图片", "SetShapePic" })) return "SetShapePic";
+		if (control == nullptr) return std::nullopt;
+		if (control->typeName == "画板") {
+			if (matches({ "取设备句柄", "GetHDC" })) return "GetHDC";
+			if (matches({ "取点", "GetPixel" })) return "GetPixel";
+			if (matches({ "画点", "SetPixel" })) return "SetPixel";
+			if (matches({ "画直线", "LineTo" })) return "LineTo";
+			if (matches({ "画椭圆", "ellipse", "Ellipse" })) return "Ellipse";
+			if (matches({ "画弧线", "ArcTo", "Arc" })) return "ArcTo";
+			if (matches({ "画弦", "chord", "Chord" })) return "Chord";
+			if (matches({ "画饼", "pie", "Pie" })) return "Pie";
+			if (matches({ "画矩形", "DrawRect" })) return "DrawRect";
+			if (matches({ "填充矩形", "FillRect" })) return "FillRect";
+			if (matches({ "画圆角矩形", "RoundRect" })) return "RoundRect";
+			if (matches({ "翻转矩形区", "InvertRect" })) return "InvertRect";
+			if (matches({ "清除", "cls", "Clear" })) return "CanvasClear";
+			if (matches({ "画渐变矩形", "DrawJBRect" })) return "GradientRect";
+			if (matches({ "画图片", "DrawPic" })) return "DrawPic";
+			if (matches({ "取图片宽度", "GetPicWidth" })) return "GetPicWidth";
+			if (matches({ "取图片高度", "GetPicHeight" })) return "GetPicHeight";
+			if (matches({ "复制", "copy", "Copy" })) return "CopyCanvas";
+			if (matches({ "画多边形", "polygon", "Polygon" })) return "Polygon";
+			if (matches({ "置写出位置", "SetWritePos" })) return "SetWritePos";
+			if (matches({ "写文本行", "print", "Print" })) return "PrintLine";
+			if (matches({ "滚动写行", "sprint", "ScrollPrint" })) return "ScrollPrint";
+			if (matches({ "取图片", "GetPic" })) return "GetCanvasPic";
+			if (matches({ "单位转换", "UnitCnv" })) return "UnitCnv";
+			if (matches({ "写出", "write", "Write" })) return "Write";
+			if (matches({ "定位写出", "say", "Say" })) return "Say";
+			if (matches({ "取宽度", "GetWidth" })) return "CanvasGetWidth";
+			if (matches({ "取高度", "GetHeight" })) return "CanvasGetHeight";
+		}
+		if (control->typeName == "编辑框" && matches({ "加入文本", "AddText" })) return "AddText";
+		if (control->typeName == "标签" && matches({ "调用反馈事件", "SendLabelMsg" })) return "SendLabelMsg";
+		if (control->typeName == "超级链接框" && matches({ "跳转", "goto", "Goto" })) return "Goto";
+		if (control->typeName == "选择夹" && matches({ "取子夹数目", "GetCount" })) return "GetTabCount";
+		if (control->typeName == "选择夹" && matches({ "取子夹名称", "GetName" })) return "GetTabName";
+		if (control->typeName == "选择夹" && matches({ "置子夹名称", "SetName" })) return "SetTabName";
+		const bool listLike = control->typeName == "列表框" || control->typeName == "选择列表框";
+		const bool itemList = listLike || control->typeName == "组合框";
+		if (!itemList) return std::nullopt;
+		if (matches({ "取顶端可见项目", "GetTopIndex" })) return "GetTopIndex";
+		if (matches({ "置顶端可见项目", "SetTopIndex" })) return "SetTopIndex";
+		if (matches({ "取项目数", "GetCount" })) return "GetCount";
+		if (matches({ "取项目数值", "GetItemData" })) return "GetItemData";
+		if (matches({ "置项目数值", "SetItemData" })) return "SetItemData";
+		if (matches({ "取项目文本", "GetItemText" })) return "GetItemText";
+		if (matches({ "置项目文本", "SetItemtext", "SetItemText" })) return "SetItemText";
+		if (matches({ "加入项目", "AddString" })) return "AddString";
+		if (matches({ "插入项目", "InsertString" })) return "InsertString";
+		if (matches({ "删除项目", "DeleteString" })) return "DeleteString";
+		if (matches({ "清空", "clear", "Clear" })) return "Clear";
+		if (matches({ "选择", "SelItem" })) return "SelItem";
+		if (control->typeName != "列表框") {
+			if (control->typeName == "选择列表框") {
+				if (matches({ "是否被选中", "IsChecked" })) return "IsChecked";
+				if (matches({ "选中项目", "SetCheck" })) return "SetCheck";
+				if (matches({ "是否被允许", "IsEnabled" })) return "IsEnabled";
+				if (matches({ "允许", "enable", "Enable" })) return "Enable";
+			}
+			return std::nullopt;
+		}
+		if (matches({ "取已选择项目数", "GetSelCount" })) return "GetSelCount";
+		if (matches({ "取所有被选择项目", "GetSelItems" })) return "GetSelItems";
+		if (matches({ "是否被选择", "IsSelected" })) return "IsSelected";
+		if (matches({ "选择项目", "select", "Select" })) return "SelectItem";
+		if (matches({ "取焦点项目", "GetCaretIndex" })) return "GetCaretIndex";
+		if (matches({ "置焦点项目", "SetCaretIndex" })) return "SetCaretIndex";
+		return std::nullopt;
+	}
+
+	TypeRef WindowMemberReturnType(const std::string& operation) const
+	{
+		if (operation == "GetHWnd" || operation == "GetClientWidth" || operation == "GetClientHeight" || operation == "SendMessage")
+			return { kTypeInt, false, true };
+		if (operation == "GetHDC" || operation == "GetPixel") return { kTypeInt, false, true };
+		if (operation == "GetSpecTagUnit") return { kTypeWindowUnit, false, true };
+		if (operation == "IsFocus") return { kTypeBool, false, true };
+		if (operation == "SetShapePic") return { kTypeBool, false, true };
+		if (operation == "OpenDialog") return { kTypeBool, false, true };
+		if (operation == "Destroy" || operation == "SetFocus" || operation == "LockWindowUpdate" ||
+			operation == "UnlockWindowUpdate" || operation == "Invalidate" || operation == "InvalidateRect" ||
+			operation == "Validate" || operation == "UpdateWindow" || operation == "Move" || operation == "ZOrder" ||
+			operation == "PostMessage" || operation == "PopupMenu" || operation == "Activate" || operation == "SetTrayIcon" || operation == "PopupTrayMenu" || operation == "SetParentWnd")
+			return { kTypeNull, false, true };
+		if (operation == "GetItemText" || operation == "GetTabName") return { kTypeText, false, true };
+		if (operation == "GetSelItems") return { kTypeInt, true, true };
+		if (operation == "AddText" || operation == "Clear" || operation == "Goto" || operation == "DrawPic" || operation == "CopyCanvas") return { kTypeNull, false, true };
+		if (operation == "SetPixel" || operation == "LineTo" || operation == "Ellipse" || operation == "ArcTo" ||
+			operation == "Chord" || operation == "Pie" || operation == "DrawRect" || operation == "FillRect" ||
+			operation == "RoundRect" || operation == "InvertRect" || operation == "CanvasClear" || operation == "Polygon" ||
+			operation == "SetWritePos" || operation == "PrintLine" || operation == "ScrollPrint" || operation == "Write" || operation == "Say") return { kTypeNull, false, true };
+		if (operation == "CanvasGetWidth" || operation == "CanvasGetHeight" || operation == "GetPicWidth" || operation == "GetPicHeight" || operation == "UnitCnv") return { kTypeInt, false, true };
+		if (operation == "GetCanvasPic") return { kTypeBinary, false, true };
+		if (operation == "SendLabelMsg") return { kTypeInt, false, true };
+		if (operation == "SetTopIndex" || operation == "SetItemData" || operation == "SetItemText" ||
+			operation == "DeleteString" || operation == "IsSelected" || operation == "SelectItem" ||
+			operation == "SetCaretIndex" || operation == "IsChecked" || operation == "SetCheck" ||
+			operation == "IsEnabled" || operation == "Enable" || operation == "SetTabName")
+			return { kTypeBool, false, true };
+		return { kTypeInt, false, true };
 	}
 
 	bool IsWindowRootProperty(const Method& method, const std::string& name) const
@@ -1643,9 +1807,53 @@ private:
 			std::string property;
 			if (const auto* control = WindowPropertyTarget(method, node, property)) {
 				(void)control;
-				return property == "选中" || property == "可视" || property == "禁止"
-					? TypeRef { kTypeBool, false, true }
-					: TypeRef { kTypeText, false, true };
+				if (property == "选中" || property == "可视" || property == "禁止" || property == "单选")
+					return { kTypeBool, false, true };
+				if (property == "今天" || property == "最小日期" || property == "最大日期" ||
+					property == "首选择日" || property == "尾选择日")
+					return { kTypeDateTime, false, true };
+				if (property == "现行选中项" || property == "位置" ||
+					property == "现行子夹" || property == "起始选择位置" ||
+					property == "被选择字符数" || property == "最大文本长度" ||
+					property == "最大允许长度" || property == "类型" ||
+					property == "行间距" || property == "滚动条" ||
+					property == "最小位置" || property == "最大位置" || property == "页改变值" ||
+					property == "行改变值" || property == "单位刻度值" || property == "首选择位置" ||
+					property == "选择长度" || property == "最多选择天数" || property == "滚动月数" ||
+					property == "开始星期首日" || property == "外形" || property == "线条效果" ||
+					property == "线型" || property == "线宽" || property == "显示方式" ||
+					property == "左边" || property == "顶边" || property == "边框" ||
+					property == "方向" || property == "附件类型" || property == "调节器方式" ||
+					property == "调节器底限值" || property == "调节器上限值" ||
+					property == "刻度类型" || property == "表头方向" ||
+					property == "对齐方式" || property == "滚动条" ||
+					property == "宽度" || property == "高度" || property == "画板宽度" || property == "画板高度" || property == "字体大小" ||
+					property == "渐变背景方式" || property == "渐变边框宽度" ||
+					property == "播放次数" || property == "取子夹数目")
+					return { kTypeInt, false, true };
+				if (property == "隐藏选择" || property == "是否允许多行" ||
+					property == "自动排序" || property == "允许选择多项" ||
+					property == "隐藏自身" || property == "可停留焦点" || property == "允许编辑" ||
+					property == "允许多行表头" || property == "是否填充背景" ||
+					property == "允许选择多天" || property == "不显示今天" || property == "不圈注今天" ||
+					property == "显示星期序号" || property == "允许选择" || property == "自动重画" ||
+					property == "按钮形式" || property == "平面" || property == "选中" ||
+					property == "标题居左" ||
+					property == "居中播放" || property == "透明背景" || property == "播放动画" ||
+					property == "加粗" || property == "倾斜" || property == "删除线" || property == "下划线" ||
+					property == "允许透明" || property == "通常" || property == "存档" ||
+					property == "只读" || property == "系统" || property == "隐藏" || property == "热点跟踪")
+					return { kTypeBool, false, true };
+				if (property == "文本颜色" || property == "背景颜色" || property == "内背景颜色" ||
+					property == "标题颜色" || property == "标题背景颜色" || property == "非本月颜色" ||
+					property == "颜色" ||
+					property == "线条颜色" || property == "填充颜色" || property == "画笔颜色" ||
+					property == "刷子颜色" || property == "文本背景颜色" || property == "渐变边框颜色1" ||
+					property == "渐变边框颜色2" || property == "渐变边框颜色3" || property == "渐变背景颜色1" ||
+					property == "渐变背景颜色2" || property == "渐变背景颜色3")
+					return { kTypeInt, false, true };
+				if (property == "图片" || property == "底图" || property == "鼠标指针") return { kTypeBinary, false, true };
+				return { kTypeText, false, true };
 			}
 			if (node.children.front()->kind == Kind::Name && !node.children.front()->text.empty() && node.children.front()->text.front() == '#') {
 				const auto constant = program_.constants.find(node.children.front()->text + "." + node.text);
@@ -1681,6 +1889,8 @@ private:
 				}
 			}
 			else if (callee.kind == Kind::Member && !callee.children.empty()) {
+				if (const auto operation = WindowMemberOperation(method, *callee.children.front(), callee.text))
+					return WindowMemberReturnType(*operation);
 				if (const Method* member = ResolveMemberMethod(Infer(method, *callee.children.front()), callee.text, count)) return member->returnType;
 				if (const auto command = ResolveMemberCommand(Infer(method, *callee.children.front()), callee.text, count))
 					return { program_.NormalizeLibraryType(command->libraryIndex, command->command->returnType), (command->command->state & kCommandReturnsArray) != 0, true };
@@ -2175,6 +2385,16 @@ private:
 			return EmitFneCall(method, *binding, node, nullptr);
 		}
 		if (callee.kind == Kind::Member && !callee.children.empty()) {
+			if (const auto operation = WindowMemberOperation(method, *callee.children.front(), callee.text)) {
+				const auto targetId = WindowTargetId(method, callee.children.front()->text);
+				if (!targetId) { Fail(method.sourceFile + ": unknown_window_target:" + callee.children.front()->text); return "Empty()"; }
+				std::string arguments = "{";
+				for (std::size_t index = 1; index < node.children.size(); ++index)
+					arguments += EmitExpression(method, *node.children[index]) + ',';
+				arguments += '}';
+				return "WindowInvokeMember(" + std::to_string(*targetId) + "u," +
+					EscapeCppString(*operation) + ",std::vector<Value>" + arguments + ")";
+			}
 			const TypeRef receiverType = Infer(method, *callee.children.front());
 			if (const Method* member = ResolveMemberMethod(receiverType, callee.text, argumentCount)) {
 				if (argumentCount > member->parameters.size()) { Fail("too_many_member_method_arguments:" + callee.text); return "Empty()"; }
@@ -2594,16 +2814,178 @@ private:
 		if (program_.windows.empty()) return;
 		prefix << R"CPP(
 namespace ecompiler_window_host {
-struct Unit { unsigned int id; unsigned int form; HWND hwnd; HWND parent; int tabOwner; int tabPage; };
-struct Form { unsigned int id; HWND hwnd; bool escapeCloses; bool canMove; bool firstActivated; };
+struct Unit {
+    unsigned int id=0; unsigned int form=0; HWND hwnd=nullptr; HWND parent=nullptr; int tabOwner=0; int tabPage=-1; const char* type=nullptr;
+    std::wstring tag;
+    // 选择列表框的勾选状态不等同于 Win32 LISTBOX 的焦点/选择状态。
+    std::vector<unsigned char> checkStates;
+    std::vector<unsigned char> checkEnabled;
+    bool checkOnlyOne=false;
+    bool hasTextColor=false;
+    bool hasBackColor=false;
+    COLORREF textColor=RGB(0,0,0);
+    COLORREF backColor=RGB(255,255,255);
+    HBRUSH backBrush=nullptr;
+    int spinDirection=0;
+    int writeX=0;
+    int writeY=0;
+    int drawUnit=0;
+    COLORREF color=RGB(0,0,0);
+    bool hasColor=false;
+    bool allowTransparent=false;
+    std::wstring path;
+    std::wstring filePattern;
+    std::wstring hyperlinkTarget;
+    int hyperlinkType=0;
+    int driveType=0;
+    bool allowNormal=true;
+    bool allowArchive=true;
+    bool allowReadOnly=true;
+    bool allowSystem=true;
+    bool allowHidden=true;
+    bool fileAllowMultiple=false;
+    bool hasMinDate=false;
+    bool hasMaxDate=false;
+    SYSTEMTIME minDate{};
+    SYSTEMTIME maxDate{};
+    int scrollMin=0;
+    int scrollMax=100;
+    int scrollPage=10;
+    int scrollLine=1;
+    bool allowTrack=true;
+    bool dateAllowEdit=true;
+    int tabHeaderWay=0;
+    bool tabMultiLine=false;
+    bool tabFillBack=true;
+    COLORREF tabBackColor=RGB(255,255,255);
+    int progressDrawMode=0;
+    int trackTickStyle=0;
+    int trackTickFreq=0;
+    bool trackAllowSel=false;
+    bool removeDuplicates=false;
+    COLORREF monthColors[6]{};
+    unsigned char monthColorSet[6]{};
+    UINT timerPeriod=0;
+    int dialogType=0;
+    std::wstring dialogFileName;
+    std::wstring dialogFilter;
+    std::wstring dialogInitialDir;
+    std::wstring dialogDefExt;
+     std::wstring dialogCaption;
+     bool hideSelection=false;
+     int inputMode=0;
+     int convertMode=0;
+     int spinMode=0;
+     int spinMin=0;
+     int spinMax=100;
+     int borderStyle=1;
+     int horizontalAlign=0;
+     int verticalAlign=0;
+     int shape=0;
+     int shapeEffect=0;
+     int lineStyle=1;
+     int lineWidth=1;
+     COLORREF lineColor=RGB(0,0,0);
+     COLORREF fillColor=RGB(255,255,255);
+     bool hasLineColor=false;
+     bool hasFillColor=false;
+     int penStyle=1;
+     int drawRop2=R2_COPYPEN;
+     int penWidth=0;
+     COLORREF penColor=RGB(0,0,0);
+     COLORREF brushColor=RGB(255,255,255);
+     COLORREF textBackColor=RGB(255,255,255);
+     int brushStyle=0;
+     bool autoRedraw=false;
+     int backPicMode=0;
+     bool enterToNext=false;
+     bool f1OpenHelp=false;
+     std::wstring helpFileName;
+     int helpContext=0;
+     bool hitMove=false;
+     bool topmost=false;
+     int imageDrawMode=0;
+     bool playImage=true;
+     std::wstring imageFileName;
+     bool imageCenter=false;
+     bool imageTransparent=false;
+     int imagePlayCount=0;
+    bool visited=false;
+    bool hyperlinkHot=false;
+    bool hyperlinkTrack=true;
+    COLORREF visitedColor=RGB(128,0,128);
+    COLORREF hotColor=RGB(0,0,255);
+    std::wstring passwordChar=L"*";
+    HFONT font=nullptr;
+    std::wstring fontName=L"SimSun";
+    int fontSize=9;
+    bool fontBold=false;
+    bool fontItalic=false;
+    bool fontStrikeOut=false;
+    bool fontUnderline=false;
+    int labelEffect=0;
+    int gradientBorderWidth=0;
+    COLORREF gradientBorderColor[3]{};
+    unsigned char gradientBorderColorSet[3]{};
+    int gradientBackMode=0;
+    COLORREF gradientBackColor[3]{};
+    unsigned char gradientBackColorSet[3]{};
+    bool labelWordWrap=false;
+    bool labelUnderline=false;
+    std::vector<unsigned char> imageData;
+    bool dialogCreatePrompt=false;
+    bool dialogFileMustExist=true;
+    bool dialogOverwritePrompt=true;
+    bool dialogPathMustExist=true;
+    bool dialogNoChangeDir=false;
+    int dialogFilterIndex=0;
+    COLORREF dialogFontColor=RGB(0,0,0);
+    bool dialogFontBold=false;
+    bool dialogFontItalic=false;
+    bool dialogFontStrikeOut=false;
+    bool dialogFontUnderline=false;
+    std::wstring dialogFontName;
+    int dialogFontSize=0;
+    int dialogHelpCommand=0;
+    int dialogHelpContext=0;
+    std::unordered_map<std::string,Value> properties;
+    std::vector<unsigned char> cursorData;
+    HCURSOR cursor=nullptr;
+};
+struct Form {
+    unsigned int id=0; HWND hwnd=nullptr; bool escapeCloses=false; bool canMove=true; bool firstActivated=false;
+    bool enterToNext=false; bool f1OpenHelp=false; bool hitMove=false; bool topmost=false;
+    bool showInTaskbar=true; bool keepTitleBarActive=false; int border=2; int position=0;
+    bool controlButtons=true; bool maximizeButton=true; bool minimizeButton=true; int shape=0; int backPicMode=0; int playCount=2;
+    DWORD idleSince=0;
+    bool hasBackColor=false; COLORREF backColor=RGB(255,255,255);
+    std::wstring helpFileName; int helpContext=0; std::wstring backPicFile; std::vector<unsigned char> backPicData; HICON icon=nullptr;
+    NOTIFYICONDATAW tray{}; HICON trayIcon=nullptr; bool trayRegistered=false;
+    std::unordered_map<std::string,Value> properties;
+};
 struct XmlAttribute { const char* name; const char* value; };
-struct Spec { unsigned int id; unsigned int form; unsigned int parent; int left; int top; int width; int height; bool visible; bool disabled; bool tabStop; int tabOwner; int tabPage; int tabPageCount; const char* type; const char* text; const XmlAttribute* attributes; std::size_t attributeCount; const char* const* items; std::size_t itemCount; const int* itemValues; std::size_t itemValueCount; };
+struct Spec { unsigned int id; unsigned int form; unsigned int parent; int left; int top; int width; int height; bool visible; bool disabled; bool tabStop; int tabOwner; int tabPage; int tabPageCount; int tabCurrentPage; const char* type; const char* text; const XmlAttribute* attributes; std::size_t attributeCount; const char* const* items; std::size_t itemCount; const int* itemValues; std::size_t itemValueCount; const unsigned char* itemChecked; std::size_t itemCheckedCount; const unsigned char* itemEnabled; std::size_t itemEnabledCount; };
 static std::vector<Unit> units;
 static std::vector<Form> forms;
 static std::unordered_set<HWND> mouseInside;
+static HWND lockedWindow=nullptr;
+static HWND activePaintWindow=nullptr;
+static HDC activePaintDC=nullptr;
 static HINSTANCE instance=GetModuleHandleW(nullptr);
 static HFONT defaultFont=nullptr;
 static bool initializing=false;
+static constexpr UINT trayMessage=WM_APP+0x5E;
+static HCURSOR CursorFromBytes(const std::vector<unsigned char>& bytes) {
+    if(bytes.empty())return nullptr;
+    HICON icon=CreateIconFromResourceEx(const_cast<BYTE*>(reinterpret_cast<const BYTE*>(bytes.data())),static_cast<DWORD>(bytes.size()),TRUE,0x00030000,0,0,LR_DEFAULTSIZE);
+    return icon==nullptr?nullptr:static_cast<HCURSOR>(icon);
+}
+static void ReplaceUnitCursor(Unit& unit,const std::vector<unsigned char>& bytes) {
+    HCURSOR cursor=CursorFromBytes(bytes);
+    if(!bytes.empty()&&cursor==nullptr)return;
+    if(unit.cursor!=nullptr)DestroyCursor(unit.cursor);
+    unit.cursor=cursor;unit.cursorData=bytes;
+}
 static std::wstring Wide(const char* value) {
     if(value==nullptr||*value==0)return {};
     const int length=MultiByteToWideChar(CP_ACP,0,value,-1,nullptr,0);
@@ -2706,6 +3088,8 @@ enum NativeEventKind : unsigned int {
     native_tray=32,
     native_mouse_enter=33,
     native_mouse_leave=34,
+    native_check_changed=35,
+    native_feedback=36,
 };
 static Value InvokeEvent(unsigned int methodId,std::vector<Value> values) {
     switch(methodId) {
@@ -2725,6 +3109,7 @@ static Value InvokeEvent(unsigned int methodId,std::vector<Value> values) {
 				prefix << "return method_" << event.methodId << "(std::move(callArgs),nullptr);}\n";
 			}
 			for (const auto& control : form.controls) {
+				if (!HasNativeWin32Class(control.typeName)) continue;
 				for (const auto& event : control.events) {
 					if (!eventMethods.insert(event.methodId).second) continue;
 					prefix << "    case " << event.methodId << "u:{std::vector<Arg> callArgs;";
@@ -2744,76 +3129,255 @@ static Value InvokeEvent(unsigned int methodId,std::vector<Value> values) {
     }
 }
 static bool Dispatch(unsigned int unit,unsigned int trigger,int nativeCode,std::vector<Value> values,Value* result=nullptr) {
+    bool handled=false;
 )CPP";
 		for (const auto& form : program_.windows) {
 			for (const auto& event : form.events) {
 				const unsigned int triggerCode = static_cast<unsigned int>(event.trigger);
-				prefix << "    if(unit==" << form.id << "u&&((trigger==" << triggerCode << "u&&" << triggerCode << "u!=0u)||(trigger==0u&&nativeCode==" << event.index << "))){if(result!=nullptr)*result=InvokeEvent(" << event.methodId << "u,std::move(values));else (void)InvokeEvent(" << event.methodId << "u,std::move(values));return true;}\n";
+				prefix << "    if(unit==" << form.id << "u&&((trigger==" << triggerCode << "u&&" << triggerCode << "u!=0u)||(trigger==0u&&nativeCode==" << event.index << "))){if(result!=nullptr)*result=InvokeEvent(" << event.methodId << "u,values);else (void)InvokeEvent(" << event.methodId << "u,values);handled=true;}\n";
 			}
 			for (const auto& control : form.controls) {
+				if (!HasNativeWin32Class(control.typeName)) continue;
 				for (const auto& event : control.events) {
 					const unsigned int triggerCode = static_cast<unsigned int>(event.trigger);
-					prefix << "    if(unit==" << control.id << "u&&((trigger==" << triggerCode << "u&&" << triggerCode << "u!=0u)||(trigger==0u&&nativeCode==" << event.index << "))){if(result!=nullptr)*result=InvokeEvent(" << event.methodId << "u,std::move(values));else (void)InvokeEvent(" << event.methodId << "u,std::move(values));return true;}\n";
+					prefix << "    if(unit==" << control.id << "u&&((trigger==" << triggerCode << "u&&" << triggerCode << "u!=0u)||(trigger==0u&&nativeCode==" << event.index << "))){if(result!=nullptr)*result=InvokeEvent(" << event.methodId << "u,values);else (void)InvokeEvent(" << event.methodId << "u,values);handled=true;}\n";
 				}
 			}
 		}
-		prefix << R"CPP(
-    return false;
+        prefix << R"CPP(
+    return handled;
 }
 static unsigned int UnitIdFromWindow(HWND window) {
     return window==nullptr?0u:static_cast<unsigned int>(GetDlgCtrlID(window));
 }
-static unsigned int CommandEventKind(unsigned int notification) {
-    switch(notification) {
-    case BN_CLICKED:return native_clicked;
-    case CBN_DROPDOWN:return native_drop_down;
-    case CBN_CLOSEUP:return native_list_closed;
-    case CBN_SELCHANGE:return native_selection_changed;
-    case CBN_DBLCLK:return native_double_clicked;
-    case CBN_EDITCHANGE:return native_changed;
-    case CBN_SELENDOK:return native_selection_changed;
-    case EN_CHANGE:return native_changed;
-    case EN_SETFOCUS:return native_focus_gained;
-    case EN_KILLFOCUS:return native_focus_lost;
-    default:return native_unknown;
+static Unit* UnitFromWindow(HWND window);
+static unsigned int CommandEventKind(HWND source,unsigned int notification) {
+    const Unit* unit=UnitFromWindow(source);
+    const bool pathSelection=unit!=nullptr&&unit->type!=nullptr&&
+        (std::strcmp(unit->type,"file")==0||std::strcmp(unit->type,"directory")==0||std::strcmp(unit->type,"drive")==0);
+    wchar_t className[32]{};
+    GetClassNameW(source,className,static_cast<int>(std::size(className)));
+    if(lstrcmpiW(className,L"LISTBOX")==0) {
+        switch(notification) {
+        case LBN_SELCHANGE:return pathSelection?native_changed:native_selection_changed;
+        case LBN_DBLCLK:return native_double_clicked;
+        default:return native_unknown;
+        }
     }
+    if(lstrcmpiW(className,L"COMBOBOX")==0) {
+        switch(notification) {
+        case CBN_DROPDOWN:return native_drop_down;
+        case CBN_CLOSEUP:return native_list_closed;
+        case CBN_SELCHANGE:case CBN_SELENDOK:return pathSelection?native_changed:native_selection_changed;
+        case CBN_DBLCLK:return native_double_clicked;
+        case CBN_EDITCHANGE:return native_changed;
+        default:return native_unknown;
+        }
+    }
+    if(lstrcmpiW(className,L"EDIT")==0) {
+        switch(notification) {
+        case EN_CHANGE:return native_changed;
+        case EN_SETFOCUS:return native_focus_gained;
+        case EN_KILLFOCUS:return native_focus_lost;
+        default:return native_unknown;
+        }
+    }
+    if(lstrcmpiW(className,L"BUTTON")==0 && notification==BN_CLICKED)return native_clicked;
+    if(lstrcmpiW(className,L"STATIC")==0) {
+        if(notification==STN_CLICKED)return native_clicked;
+        if(notification==STN_DBLCLK)return native_double_clicked;
+    }
+    return native_unknown;
 }
-static void DispatchNative(HWND source,unsigned int trigger,int nativeCode,std::vector<Value> values={}) {
-    if(initializing||source==nullptr)return;
+static bool DispatchNative(HWND source,unsigned int trigger,int nativeCode,std::vector<Value> values={}) {
+    if(initializing||source==nullptr)return false;
     const unsigned int unit=UnitIdFromWindow(source);
-    if(unit!=0)Dispatch(unit,trigger,nativeCode,std::move(values));
+    return unit!=0&&Dispatch(unit,trigger,nativeCode,std::move(values));
 }
 static bool DispatchNativeResult(HWND source,unsigned int trigger,int nativeCode,std::vector<Value> values,Value* result) {
     if(initializing||source==nullptr)return false;
     const unsigned int unit=UnitIdFromWindow(source);
     return unit!=0&&Dispatch(unit,trigger,nativeCode,std::move(values),result);
 }
+static Unit* UnitFromWindow(HWND window) {
+    for(auto& unit:units)if(unit.hwnd==window)return &unit;
+    return nullptr;
+}
+static bool IsCheckList(HWND window) {
+    const Unit* unit=UnitFromWindow(window);
+    return unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"checklist")==0;
+}
+static void EnsureCheckState(Unit& unit,std::size_t count) {
+    if(unit.checkStates.size()<count)unit.checkStates.resize(count,0);
+    else if(unit.checkStates.size()>count)unit.checkStates.resize(count);
+    if(unit.checkEnabled.size()<count)unit.checkEnabled.resize(count,1);
+    else if(unit.checkEnabled.size()>count)unit.checkEnabled.resize(count);
+}
+static bool SetCheckState(HWND window,int index,bool state,bool notify=true) {
+    Unit* unit=UnitFromWindow(window);
+    if(unit==nullptr||unit->type==nullptr||std::strcmp(unit->type,"checklist")!=0||index<0)return false;
+    const int count=static_cast<int>(SendMessageW(window,LB_GETCOUNT,0,0));
+    if(index>=count)return false;
+    EnsureCheckState(*unit,static_cast<std::size_t>(count));
+    if(!unit->checkEnabled[static_cast<std::size_t>(index)])return false;
+    if(unit->checkOnlyOne&&state)for(std::size_t item=0;item<unit->checkStates.size();++item)unit->checkStates[item]=item==static_cast<std::size_t>(index)?1:0;
+    else unit->checkStates[static_cast<std::size_t>(index)]=state?1:0;
+    InvalidateRect(window,nullptr,TRUE);
+    if(notify&&!initializing)DispatchNative(window,native_check_changed,0);
+    return true;
+}
+static int CheckItemAtPoint(HWND window,LPARAM lParam) {
+    POINT point{static_cast<short>(LOWORD(lParam)),static_cast<short>(HIWORD(lParam))};
+    const LRESULT result=SendMessageW(window,LB_ITEMFROMPOINT,0,MAKELPARAM(point.x,point.y));
+    return HIWORD(result)!=0? -1 : static_cast<int>(LOWORD(result));
+}
+static int CheckItemFromKey(HWND window) {
+    const LRESULT caret=SendMessageW(window,LB_GETCARETINDEX,0,0);
+    return caret<0||caret>static_cast<LRESULT>((std::numeric_limits<int>::max)())?-1:static_cast<int>(caret);
+}
+static HBRUSH UnitBackBrush(Unit& unit) {
+    if(unit.backBrush==nullptr)unit.backBrush=CreateSolidBrush(unit.backColor);
+    return unit.backBrush;
+}
+static bool IsDirectChild(HWND parent,HWND child);
+static bool ClassEquals(HWND window,const wchar_t* expected);
+static LRESULT RouteControlColor(HWND parent,UINT message,WPARAM wParam,LPARAM lParam) {
+    HWND source=reinterpret_cast<HWND>(lParam);
+    HWND target=source;
+    if(!IsDirectChild(parent,source)) {
+        HWND owner=GetParent(source);
+        if(owner==nullptr||!IsDirectChild(parent,owner)||!ClassEquals(owner,L"COMBOBOX"))return (std::numeric_limits<LRESULT>::min)();
+        target=owner;
+    }
+    Unit* unit=UnitFromWindow(target);
+    if(unit==nullptr||(!unit->hasTextColor&&!unit->hasBackColor))return (std::numeric_limits<LRESULT>::min)();
+    HDC dc=reinterpret_cast<HDC>(wParam);
+    if(unit->hasTextColor)SetTextColor(dc,unit->textColor);
+    if(unit->hasBackColor){SetBkColor(dc,unit->backColor);return reinterpret_cast<LRESULT>(UnitBackBrush(*unit));}
+    SetBkMode(dc,TRANSPARENT);
+    return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH));
+}
+static bool DrawCheckListItem(const DRAWITEMSTRUCT& item) {
+    if(item.CtlType!=ODT_LISTBOX||item.hwndItem==nullptr||!IsCheckList(item.hwndItem))return false;
+    Unit* unit=UnitFromWindow(item.hwndItem);
+    if(unit==nullptr)return false;
+    EnsureCheckState(*unit,static_cast<std::size_t>(SendMessageW(item.hwndItem,LB_GETCOUNT,0,0)));
+    const bool selected=(item.itemState&ODS_SELECTED)!=0;
+    const bool enabled= item.itemID<unit->checkEnabled.size() && unit->checkEnabled[item.itemID]!=0;
+    const bool checked= item.itemID<unit->checkStates.size() && unit->checkStates[item.itemID]!=0;
+    FillRect(item.hDC,&item.rcItem,GetSysColorBrush(selected?COLOR_HIGHLIGHT:COLOR_WINDOW));
+    SetBkMode(item.hDC,TRANSPARENT);
+    SetTextColor(item.hDC,enabled?(selected?GetSysColor(COLOR_HIGHLIGHTTEXT):GetSysColor(COLOR_WINDOWTEXT)):GetSysColor(COLOR_GRAYTEXT));
+    RECT checkRect=item.rcItem; checkRect.left+=2; checkRect.top+=(item.rcItem.bottom-item.rcItem.top-14)/2; checkRect.right=checkRect.left+14; checkRect.bottom=checkRect.top+14;
+    UINT state=DFCS_BUTTONCHECK|(checked?DFCS_CHECKED:0)|(enabled?0:DFCS_INACTIVE);
+    DrawFrameControl(item.hDC,&checkRect,DFC_BUTTON,state);
+    wchar_t text[4096]{};
+    if(item.itemID!=static_cast<UINT>(-1))SendMessageW(item.hwndItem,LB_GETTEXT,item.itemID,reinterpret_cast<LPARAM>(text));
+    RECT textRect=item.rcItem; textRect.left=checkRect.right+4;
+    DrawTextW(item.hDC,text,-1,&textRect,DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
+    if(item.itemState&ODS_FOCUS)DrawFocusRect(item.hDC,&item.rcItem);
+    return true;
+}
 static bool IsDirectChild(HWND parent,HWND child) {
     return parent!=nullptr&&child!=nullptr&&GetParent(child)==parent;
 }
 static void UpdateTabVisibility(unsigned int tabId);
+static bool PaintUnitSurface(HWND window,HDC dc);
 static LRESULT RouteChildNotification(HWND parent,UINT message,WPARAM wParam,LPARAM lParam) {
     constexpr LRESULT not_routed=(std::numeric_limits<LRESULT>::min)();
+    if(message==WM_MEASUREITEM) {
+        const auto* measure=reinterpret_cast<const MEASUREITEMSTRUCT*>(lParam);
+        if(measure==nullptr||measure->CtlType!=ODT_LISTBOX)return not_routed;
+        HWND source=GetDlgItem(parent,measure->CtlID);
+        if(source==nullptr||!IsCheckList(source))return not_routed;
+        auto* mutableMeasure=const_cast<MEASUREITEMSTRUCT*>(measure);
+        mutableMeasure->itemHeight=20;
+        return 0;
+    }
+    if(message==WM_DRAWITEM) {
+        const auto* draw=reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+        if(draw!=nullptr&&DrawCheckListItem(*draw))return 0;
+        return not_routed;
+    }
+    if(message==WM_CTLCOLORLISTBOX||message==WM_CTLCOLOREDIT||message==WM_CTLCOLORSTATIC||
+       message==WM_CTLCOLORBTN||message==WM_CTLCOLORSCROLLBAR) {
+        const LRESULT color=RouteControlColor(parent,message,wParam,lParam);
+        if(color!=not_routed)return color;
+        return not_routed;
+    }
     if(message==WM_COMMAND) {
         HWND source=reinterpret_cast<HWND>(lParam);
-        if(!IsDirectChild(parent,source))return not_routed;
-        DispatchNative(source,CommandEventKind(HIWORD(wParam)),static_cast<int>(HIWORD(wParam)));
+        HWND target=source;
+        if(!IsDirectChild(parent,source)) {
+            HWND owner=GetParent(source);
+            if(owner==nullptr||!IsDirectChild(parent,owner)||!ClassEquals(owner,L"COMBOBOX"))return not_routed;
+            target=owner;
+        }
+        const unsigned int notification=HIWORD(wParam);
+        if(notification==BN_CLICKED) {
+            if(Unit* unit=UnitFromWindow(target);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"color")==0) {
+                COLORREF customColors[16]{};
+                // lCustData is LPARAM (an integer-sized field), not a pointer.
+                // Use zero explicitly so generated x86/x64 code is accepted by MSVC.
+                CHOOSECOLORW chooser{sizeof(CHOOSECOLORW),parent,nullptr,unit->hasColor?unit->color:RGB(0,0,0),customColors,CC_FULLOPEN|CC_RGBINIT,0,nullptr,nullptr};
+                if(ChooseColorW(&chooser)!=FALSE) { unit->color=chooser.rgbResult;unit->hasColor=true;InvalidateRect(target,nullptr,TRUE);DispatchNative(target,native_changed,0); }
+                return 0;
+            }
+        }
+        // A combo box sends notifications from its child EDIT control for
+        // editable text changes.  The public events belong to the combo box,
+        // so classify using the logical target rather than the nested source.
+        const unsigned int eventKind=CommandEventKind(target,notification);
+        DispatchNative(target,eventKind,static_cast<int>(notification));
+        // BUTTON controls used as check/radio boxes expose two independent
+        // EasyLanguage events: the click and the checked-state transition.
+        // Win32 reports both through BN_CLICKED, so synthesize the latter
+        // after the click without changing ordinary push-button behavior.
+        if(notification==BN_CLICKED) {
+            if(const Unit* unit=UnitFromWindow(target);unit!=nullptr&&unit->type!=nullptr&&
+               (std::strcmp(unit->type,"checkbox")==0||std::strcmp(unit->type,"radio")==0))
+                DispatchNative(target,native_check_changed,static_cast<int>(notification),
+                    {Boolean(SendMessageW(target,BM_GETCHECK,0,0)==BST_CHECKED)});
+        }
         return 0;
     }
     if(message==WM_HSCROLL||message==WM_VSCROLL) {
         HWND source=reinterpret_cast<HWND>(lParam);
         if(!IsDirectChild(parent,source))return not_routed;
-        DispatchNative(source,native_position_changed,static_cast<int>(LOWORD(wParam)));
+        const Unit* unit=UnitFromWindow(source);
+        const int code=static_cast<int>(LOWORD(wParam));
+        if(unit==nullptr||unit->allowTrack||code!=SB_THUMBTRACK)DispatchNative(source,native_position_changed,code);
         return 0;
     }
     if(message==WM_NOTIFY) {
         const auto* header=reinterpret_cast<const NMHDR*>(lParam);
         if(header==nullptr||!IsDirectChild(parent,header->hwndFrom))return not_routed;
+        if(header->code==UDN_DELTAPOS) {
+            const auto* delta=reinterpret_cast<const NMUPDOWN*>(lParam);
+            // NMUPDOWN uses a negative delta for the up arrow and a positive
+            // delta for the down arrow.  The EasyLanguage event exposes the
+            // corresponding button value as +1 / -1.
+            const int button=delta==nullptr?0:(delta->iDelta<0?1:-1);
+            // 编辑框调节器的通知来自其伴随 UPDOWN 窗口，事件归属仍是
+            // 编辑框；独立“调节器”则没有 buddy，继续派发给自身。
+            HWND target=header->hwndFrom;
+            if(ClassEquals(header->hwndFrom,UPDOWN_CLASSW)) {
+                if(HWND buddy=reinterpret_cast<HWND>(SendMessageW(header->hwndFrom,UDM_GETBUDDY,0,0));buddy!=nullptr)
+                    target=buddy;
+            }
+            // 编辑框的“自动调节器”只修改数值；只有“手动调节器”
+            // 才暴露“调节钮被按下”事件参数。
+            if(const Unit* owner=UnitFromWindow(target);owner!=nullptr&&owner->type!=nullptr&&
+               std::strcmp(owner->type,"edit")==0&&owner->spinMode!=2)return 0;
+            DispatchNative(target,native_position_changed,static_cast<int>(header->code),{Integer(button)});
+            return 0;
+        }
         const unsigned int trigger=header->code==TCN_SELCHANGING?native_selection_changing:
             (header->code==TCN_SELCHANGE?native_selection_changed:
             (header->code==DTN_DATETIMECHANGE?native_changed:
+            (header->code==MCN_SELCHANGE?native_changed:
             (header->code==NM_DBLCLK?native_double_clicked:
-            (header->code==NM_CLICK?native_clicked:native_unknown))));
+            (header->code==NM_CLICK?native_clicked:native_unknown)))));
         if(trigger==native_selection_changed)UpdateTabVisibility(UnitIdFromWindow(header->hwndFrom));
         if(trigger==native_selection_changing) {
             Value result;
@@ -2827,14 +3391,14 @@ static LRESULT RouteChildNotification(HWND parent,UINT message,WPARAM wParam,LPA
 }
 static void RouteUnitInput(HWND source,UINT message,WPARAM wParam,LPARAM lParam) {
     switch(message) {
-    case WM_LBUTTONDBLCLK:DispatchNative(source,native_double_clicked,-1,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;
+    case WM_LBUTTONDBLCLK:{wchar_t className[32]{};GetClassNameW(source,className,static_cast<int>(std::size(className)));if(lstrcmpiW(className,L"LISTBOX")!=0&&lstrcmpiW(className,L"COMBOBOX")!=0&&lstrcmpiW(className,L"SysTabControl32")!=0)DispatchNative(source,native_double_clicked,-1,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;}
     case WM_LBUTTONDOWN:DispatchNative(source,native_mouse_down,0,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;
-    case WM_LBUTTONUP:DispatchNative(source,native_mouse_up,0,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;
+    case WM_LBUTTONUP:if(Unit* unit=UnitFromWindow(source);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"hyperlink")==0){unit->visited=true;InvalidateRect(source,nullptr,TRUE);}DispatchNative(source,native_mouse_up,0,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;
     case WM_RBUTTONDBLCLK:DispatchNative(source,native_double_clicked,-1,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;
     case WM_RBUTTONDOWN:DispatchNative(source,native_right_mouse_down,0,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;
     case WM_RBUTTONUP:DispatchNative(source,native_right_mouse_up,0,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;
-    case WM_MOUSEMOVE:if(BeginMouseTracking(source))DispatchNative(source,native_mouse_enter,0);DispatchNative(source,native_mouse_move,0,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;
-    case WM_MOUSELEAVE:EndMouseTracking(source);DispatchNative(source,native_mouse_leave,0);break;
+    case WM_MOUSEMOVE:if(BeginMouseTracking(source)){if(Unit* unit=UnitFromWindow(source);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"hyperlink")==0&&unit->hyperlinkTrack){unit->hyperlinkHot=true;InvalidateRect(source,nullptr,TRUE);}DispatchNative(source,native_mouse_enter,0);}DispatchNative(source,native_mouse_move,0,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam))),Integer(static_cast<unsigned int>(wParam))});break;
+    case WM_MOUSELEAVE:EndMouseTracking(source);if(Unit* unit=UnitFromWindow(source);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"hyperlink")==0){unit->hyperlinkHot=false;InvalidateRect(source,nullptr,TRUE);}DispatchNative(source,native_mouse_leave,0);break;
     case WM_MOVE:DispatchNative(source,native_moved,0,{Integer(static_cast<short>(LOWORD(lParam))),Integer(static_cast<short>(HIWORD(lParam)))});break;
     case WM_KEYDOWN:case WM_SYSKEYDOWN:DispatchNative(source,native_key_down,static_cast<int>(wParam),{Integer(static_cast<unsigned int>(wParam)),Integer(static_cast<unsigned int>(lParam))});break;
     case WM_KEYUP:case WM_SYSKEYUP:DispatchNative(source,native_key_up,static_cast<int>(wParam),{Integer(static_cast<unsigned int>(wParam)),Integer(static_cast<unsigned int>(lParam))});break;
@@ -2843,7 +3407,6 @@ static void RouteUnitInput(HWND source,UINT message,WPARAM wParam,LPARAM lParam)
     case WM_KILLFOCUS:DispatchNative(source,native_focus_lost,0);break;
     case WM_SHOWWINDOW:DispatchNative(source,wParam?native_shown:native_hidden,0);break;
     case WM_SIZE:DispatchNative(source,native_size_changed,0,{Integer(static_cast<unsigned int>(LOWORD(lParam))),Integer(static_cast<unsigned int>(HIWORD(lParam)))});break;
-    case WM_PAINT:DispatchNative(source,native_paint,0);break;
     case WM_TIMER:DispatchNative(source,native_timer,static_cast<int>(wParam));break;
     default:break;
     }
@@ -2851,6 +3414,33 @@ static void RouteUnitInput(HWND source,UINT message,WPARAM wParam,LPARAM lParam)
 static Form* FindFormRecord(HWND window) {
     for(auto& form:forms)if(form.hwnd==window)return &form;
     return nullptr;
+}
+static Form* OwnerForm(HWND window) {
+    if(Form* form=FindFormRecord(window))return form;
+    for(auto& form:forms)if(window!=nullptr&&IsChild(form.hwnd,window))return &form;
+    return nullptr;
+}
+static void RemoveTrayIcon(Form& form) {
+    if(form.trayRegistered){Shell_NotifyIconW(NIM_DELETE,&form.tray);form.trayRegistered=false;}
+    if(form.trayIcon!=nullptr){DestroyIcon(form.trayIcon);form.trayIcon=nullptr;}
+    form.tray={};
+}
+static bool SetTrayIcon(Form& form,const Value* value,const std::wstring& tip) {
+    RemoveTrayIcon(form);
+    if(value==nullptr||value->missing||value->text.empty())return true;
+    const std::wstring file=RuntimeWide(value->text);
+    HICON icon=static_cast<HICON>(LoadImageW(nullptr,file.c_str(),IMAGE_ICON,0,0,LR_LOADFROMFILE|LR_DEFAULTSIZE));
+    if(icon==nullptr)return false;
+    form.tray.cbSize=sizeof(NOTIFYICONDATAW);form.tray.hWnd=form.hwnd;form.tray.uID=form.id;form.tray.uFlags=NIF_ICON|NIF_MESSAGE|NIF_TIP;form.tray.uCallbackMessage=trayMessage;form.tray.hIcon=icon;
+    wcsncpy_s(form.tray.szTip,std::size(form.tray.szTip),tip.c_str(),_TRUNCATE);
+    if(!Shell_NotifyIconW(NIM_ADD,&form.tray)){DestroyIcon(icon);form.tray={};return false;}
+    form.trayIcon=icon;form.trayRegistered=true;return true;
+}
+static void PopupMenuAt(HWND owner,const Value* menu,const Value* xValue,const Value* yValue) {
+    if(owner==nullptr||menu==nullptr||menu->missing)return;
+    HMENU handle=reinterpret_cast<HMENU>(static_cast<ULONG_PTR>(ToInteger(*menu)));if(handle==nullptr)return;
+    POINT point{};GetCursorPos(&point);if(xValue!=nullptr&&!xValue->missing)point.x=static_cast<LONG>(ToInteger(*xValue));if(yValue!=nullptr&&!yValue->missing)point.y=static_cast<LONG>(ToInteger(*yValue));
+    SetForegroundWindow(owner);TrackPopupMenu(handle,TPM_RIGHTBUTTON,point.x,point.y,0,owner,nullptr);PostMessageW(owner,WM_NULL,0,0);
 }
 static unsigned int FormIdFromWindow(HWND window) {
     const Form* form=FindFormRecord(window);
@@ -2860,6 +3450,17 @@ static void DispatchFormNative(HWND window,unsigned int trigger,int nativeCode=0
     if(initializing||window==nullptr)return;
     const unsigned int form=FormIdFromWindow(window);
     if(form!=0)Dispatch(form,trigger,nativeCode,std::move(values));
+}
+static bool DispatchFormIdle(HWND window) {
+    if(initializing||window==nullptr)return false;
+    const unsigned int form=FormIdFromWindow(window);
+    if(form==0)return false;
+    Value result;
+    Form* record=FindFormRecord(window);
+    if(record==nullptr)return false;
+    if(record->idleSince==0)record->idleSince=GetTickCount();
+    const bool invoked=Dispatch(form,native_idle,0,{Integer(static_cast<unsigned int>(GetTickCount()-record->idleSince))},&result);
+    return invoked&&result.type==T_BOOL&&ToBool(result);
 }
 static bool DispatchFormClose(HWND window) {
     if(initializing||window==nullptr)return true;
@@ -2889,7 +3490,10 @@ static void RouteFormInput(HWND window,UINT message,WPARAM wParam,LPARAM lParam)
 }
 static LRESULT CALLBACK FormProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam) {
     if(message==WM_NCDESTROY)EndMouseTracking(window);
-    if(message==WM_COMMAND||message==WM_HSCROLL||message==WM_VSCROLL||message==WM_NOTIFY) {
+    if(message==WM_COMMAND||message==WM_HSCROLL||message==WM_VSCROLL||message==WM_NOTIFY||
+       message==WM_DRAWITEM||message==WM_MEASUREITEM||message==WM_CTLCOLORLISTBOX||
+       message==WM_CTLCOLOREDIT||message==WM_CTLCOLORSTATIC||message==WM_CTLCOLORBTN||
+       message==WM_CTLCOLORSCROLLBAR) {
         const LRESULT routed=RouteChildNotification(window,message,wParam,lParam);
         if(routed!=(std::numeric_limits<LRESULT>::min)())return routed;
     }
@@ -2912,16 +3516,40 @@ static LRESULT CALLBACK FormProc(HWND window,UINT message,WPARAM wParam,LPARAM l
             const Form* form=FindFormRecord(window);
             if(form!=nullptr&&form->escapeCloses){SendMessageW(window,WM_CLOSE,0,0);return 0;}
         }
+        if(wParam==VK_F1) {
+            const Form* form=FindFormRecord(window);
+            if(form!=nullptr&&form->f1OpenHelp) {
+                const std::wstring file=form->helpFileName.empty()?L"help.hlp":form->helpFileName;
+                ShellExecuteW(window,L"open",file.c_str(),nullptr,nullptr,SW_SHOWNORMAL);
+                return 0;
+            }
+        }
         RouteFormInput(window,message,wParam,lParam);
         break;
     case WM_SYSKEYDOWN:case WM_KEYUP:case WM_SYSKEYUP:case WM_CHAR:case WM_SYSCHAR:
     case WM_LBUTTONDBLCLK:case WM_LBUTTONDOWN:case WM_LBUTTONUP:case WM_RBUTTONDBLCLK:case WM_RBUTTONDOWN:case WM_RBUTTONUP:case WM_MOUSEMOVE:case WM_MOUSELEAVE:
         RouteFormInput(window,message,wParam,lParam);break;
     case WM_SHOWWINDOW:DispatchFormNative(window,wParam?native_shown:native_hidden);break;
-    case WM_PAINT:DispatchFormNative(window,native_paint);break;
-    case WM_TIMER:DispatchFormNative(window,native_timer,static_cast<int>(wParam));break;
+    case WM_ERASEBKGND: {
+        Form* form=FindFormRecord(window);
+        if(form!=nullptr&&form->hasBackColor) { RECT rect{};GetClientRect(window,&rect);HBRUSH brush=CreateSolidBrush(form->backColor);FillRect(reinterpret_cast<HDC>(wParam),&rect,brush);DeleteObject(brush);return 1; }
+        break;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT paint{}; HDC dc=BeginPaint(window,&paint); if(Form* form=FindFormRecord(window)){if(!form->backPicData.empty())PaintBitmap(window,dc,LoadPictureMemory(form->backPicData),form->backPicMode);}
+        activePaintWindow=window; activePaintDC=dc;
+        DispatchFormNative(window,native_paint);
+        activePaintDC=nullptr; activePaintWindow=nullptr; EndPaint(window,&paint); return 0;
+    }
+    case WM_TIMER:
+        if(wParam==0xE1D1u) { if(!DispatchFormIdle(window))KillTimer(window,0xE1D1u); return 0; }
+        DispatchFormNative(window,native_timer,static_cast<int>(wParam));break;
+    case trayMessage: {
+        const int operation=LOWORD(lParam)==WM_LBUTTONDBLCLK?2:(LOWORD(lParam)==WM_RBUTTONUP?3:1);
+        DispatchFormNative(window,native_tray,operation,{Integer(operation)});return 0;
+    }
     case WM_CLOSE:if(DispatchFormClose(window))DestroyWindow(window);return 0;
-    case WM_DESTROY:DispatchFormNative(window,native_destroyed);PostQuitMessage(0);return 0;
+    case WM_DESTROY:if(Form* form=FindFormRecord(window))RemoveTrayIcon(*form);DispatchFormNative(window,native_destroyed);PostQuitMessage(0);return 0;
     case WM_NCHITTEST: {
         const Form* form=FindFormRecord(window);
         const LRESULT hit=DefWindowProcW(window,message,wParam,lParam);
@@ -2932,23 +3560,82 @@ static LRESULT CALLBACK FormProc(HWND window,UINT message,WPARAM wParam,LPARAM l
     return DefWindowProcW(window,message,wParam,lParam);
 }
 static LRESULT CALLBACK UnitSubclassProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam,UINT_PTR,DWORD_PTR) {
-    if(message==WM_NCDESTROY)EndMouseTracking(window);
-    if(message==WM_COMMAND||message==WM_HSCROLL||message==WM_VSCROLL||message==WM_NOTIFY) {
+    if(message==WM_SETCURSOR) {
+        if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->cursor!=nullptr) { SetCursor(unit->cursor);return TRUE; }
+    }
+    if(message==WM_NCDESTROY) {
+        EndMouseTracking(window);
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->cursor!=nullptr) { DestroyCursor(unit->cursor);unit->cursor=nullptr; }
+    }
+    if(message==WM_CHAR) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"edit")==0) {
+            wchar_t ch=static_cast<wchar_t>(wParam);
+            if(unit->inputMode>=3&&ch>=32) {
+                const bool numeric=ch>=L'0'&&ch<=L'9';
+                const bool sign=(ch==L'-'||ch==L'+');
+                const bool decimal=(ch==L'.'||ch==L',');
+                const bool dateSep=(ch==L'/'||ch==L'-'||ch==L':'||ch==L' ');
+                const bool allow=unit->inputMode==3?(numeric||sign):(unit->inputMode<=10?(numeric||sign||decimal):(numeric||dateSep));
+                if(!allow)return 0;
+            }
+            if(unit->convertMode==1&&ch>=L'A'&&ch<=L'Z')ch=static_cast<wchar_t>(ch+L'a'-L'A');
+            else if(unit->convertMode==2&&ch>=L'a'&&ch<=L'z')ch=static_cast<wchar_t>(ch-L'a'+L'A');
+            if(ch!=static_cast<wchar_t>(wParam)) { RouteUnitInput(window,message,static_cast<WPARAM>(ch),lParam); return DefSubclassProc(window,message,static_cast<WPARAM>(ch),lParam); }
+        }
+    }
+    if(message==WM_COMMAND||message==WM_HSCROLL||message==WM_VSCROLL||message==WM_NOTIFY||
+       message==WM_DRAWITEM||message==WM_MEASUREITEM||message==WM_CTLCOLORLISTBOX||
+       message==WM_CTLCOLOREDIT||message==WM_CTLCOLORSTATIC||message==WM_CTLCOLORBTN||
+       message==WM_CTLCOLORSCROLLBAR) {
         const LRESULT routed=RouteChildNotification(window,message,wParam,lParam);
         if(routed!=(std::numeric_limits<LRESULT>::min)())return routed;
     }
-    RouteUnitInput(window,message,wParam,lParam);
-    return DefSubclassProc(window,message,wParam,lParam);
+    if(message==WM_PAINT) {
+        PAINTSTRUCT paint{}; HDC dc=BeginPaint(window,&paint); activePaintWindow=window; activePaintDC=dc;
+        const RECT& dirty=paint.rcPaint;
+        const bool painted=PaintUnitSurface(window,dc);
+        const bool handled=DispatchNative(window,native_paint,0,{Integer(dirty.left),Integer(dirty.top),Integer(dirty.right),Integer(dirty.bottom)});
+        activePaintDC=nullptr; activePaintWindow=nullptr; EndPaint(window,&paint);
+        if(painted||handled)return 0;
+    }
+    else RouteUnitInput(window,message,wParam,lParam);
+    const LRESULT result=DefSubclassProc(window,message,wParam,lParam);
+    if(IsCheckList(window)) {
+        if(message==WM_LBUTTONUP) {
+            const int index=CheckItemAtPoint(window,lParam);
+            if(index>=0) {
+                Unit* unit=UnitFromWindow(window);
+                EnsureCheckState(*unit,static_cast<std::size_t>(SendMessageW(window,LB_GETCOUNT,0,0)));
+                if(unit->checkEnabled[static_cast<std::size_t>(index)])SetCheckState(window,index,unit->checkStates[static_cast<std::size_t>(index)]==0);
+            }
+        }
+        else if(message==WM_KEYUP&&wParam==VK_SPACE) {
+            const int index=CheckItemFromKey(window);
+            if(index>=0) {
+                Unit* unit=UnitFromWindow(window);
+                EnsureCheckState(*unit,static_cast<std::size_t>(SendMessageW(window,LB_GETCOUNT,0,0)));
+                if(unit->checkEnabled[static_cast<std::size_t>(index)])SetCheckState(window,index,unit->checkStates[static_cast<std::size_t>(index)]==0);
+            }
+        }
+    }
+    return result;
 }
 static LRESULT CALLBACK PageProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam) {
-    if(message==WM_COMMAND||message==WM_HSCROLL||message==WM_VSCROLL||message==WM_NOTIFY) {
+    if(message==WM_ERASEBKGND) { HWND owner=GetParent(window);Unit* tab=UnitFromWindow(owner);if(tab!=nullptr&&tab->type!=nullptr&&std::strcmp(tab->type,"tab")==0&&tab->tabFillBack){RECT rect{};GetClientRect(window,&rect);HBRUSH brush=CreateSolidBrush(tab->tabBackColor);FillRect(reinterpret_cast<HDC>(wParam),&rect,brush);DeleteObject(brush);return 1;} }
+    if(message==WM_COMMAND||message==WM_HSCROLL||message==WM_VSCROLL||message==WM_NOTIFY||
+       message==WM_DRAWITEM||message==WM_MEASUREITEM||message==WM_CTLCOLORLISTBOX||
+       message==WM_CTLCOLOREDIT||message==WM_CTLCOLORSTATIC||message==WM_CTLCOLORBTN||
+       message==WM_CTLCOLORSCROLLBAR) {
         const LRESULT routed=RouteChildNotification(window,message,wParam,lParam);
         if(routed!=(std::numeric_limits<LRESULT>::min)())return routed;
     }
     return DefWindowProcW(window,message,wParam,lParam);
 }
 static LRESULT CALLBACK ContainerProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam) {
-    if(message==WM_COMMAND||message==WM_HSCROLL||message==WM_VSCROLL||message==WM_NOTIFY) {
+    if(message==WM_COMMAND||message==WM_HSCROLL||message==WM_VSCROLL||message==WM_NOTIFY||
+       message==WM_DRAWITEM||message==WM_MEASUREITEM||message==WM_CTLCOLORLISTBOX||
+       message==WM_CTLCOLOREDIT||message==WM_CTLCOLORSTATIC||
+       message==WM_CTLCOLORBTN||message==WM_CTLCOLORSCROLLBAR) {
         const LRESULT routed=RouteChildNotification(window,message,wParam,lParam);
         if(routed!=(std::numeric_limits<LRESULT>::min)())return routed;
     }
@@ -2983,6 +3670,422 @@ static bool XmlAttributeBoolean(const Spec& spec,const wchar_t* name,bool fallba
         ? true
         : (AttributeEquals(value,L"假")||std::strcmp(value,"0")==0||AttributeEquals(value,L"false") ? false : fallback);
 }
+static bool ClassEquals(HWND window,const wchar_t* expected);
+static std::wstring EnsureDirectoryPath(std::wstring path) {
+    if(path.empty()) { wchar_t buffer[MAX_PATH]{}; const DWORD length=GetCurrentDirectoryW(static_cast<DWORD>(std::size(buffer)),buffer); if(length>0&&length<std::size(buffer))path.assign(buffer,length); }
+    while(!path.empty()&&(path.back()==L'\\'||path.back()==L'/'))path.pop_back();
+    return path;
+}
+static void PopulateDriveList(HWND window,const Unit* unit=nullptr) {
+    if(window==nullptr)return;
+    SendMessageW(window,CB_RESETCONTENT,0,0);
+    const DWORD mask=GetLogicalDrives();
+    for(int index=0;index<26;++index)if((mask&(1u<<index))!=0) {
+        wchar_t drive[4]{static_cast<wchar_t>(L'A'+index),L':',L'\\',L'\0'};
+        const UINT driveKind=GetDriveTypeW(drive);
+        const bool accepted=unit==nullptr||unit->driveType==0||
+            (unit->driveType==1&&driveKind==DRIVE_REMOVABLE)||(unit->driveType==2&&driveKind==DRIVE_FIXED)||
+            (unit->driveType==3&&driveKind==DRIVE_CDROM)||(unit->driveType==4&&driveKind==DRIVE_REMOTE)||
+            (unit->driveType==5&&driveKind==DRIVE_RAMDISK);
+        if(accepted)SendMessageW(window,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(drive));
+    }
+}
+static bool FileAttributeAllowed(const WIN32_FIND_DATAW& data,const Spec& spec) {
+    const DWORD attributes=data.dwFileAttributes;
+    const bool special=(attributes&(FILE_ATTRIBUTE_HIDDEN|FILE_ATTRIBUTE_SYSTEM|FILE_ATTRIBUTE_READONLY|FILE_ATTRIBUTE_ARCHIVE))!=0;
+    if(!special&&!XmlAttributeBoolean(spec,L"通常",true))return false;
+    const auto allowed=[&spec](const wchar_t* name){const char* raw=XmlAttributeValue(spec,name);return raw==nullptr||XmlAttributeBoolean(spec,name,true);};
+    if((attributes&FILE_ATTRIBUTE_HIDDEN)!=0&&!allowed(L"隐藏"))return false;
+    if((attributes&FILE_ATTRIBUTE_SYSTEM)!=0&&!allowed(L"系统"))return false;
+    if((attributes&FILE_ATTRIBUTE_READONLY)!=0&&!allowed(L"只读"))return false;
+    if((attributes&FILE_ATTRIBUTE_ARCHIVE)!=0&&!allowed(L"存档"))return false;
+    return true;
+}
+static bool FileAttributeAllowed(const WIN32_FIND_DATAW& data,const Unit& unit) {
+    const DWORD attributes=data.dwFileAttributes;
+    const bool special=(attributes&(FILE_ATTRIBUTE_HIDDEN|FILE_ATTRIBUTE_SYSTEM|FILE_ATTRIBUTE_READONLY|FILE_ATTRIBUTE_ARCHIVE))!=0;
+    if(!special&&!unit.allowNormal)return false;
+    if((attributes&FILE_ATTRIBUTE_HIDDEN)!=0&&!unit.allowHidden)return false;
+    if((attributes&FILE_ATTRIBUTE_SYSTEM)!=0&&!unit.allowSystem)return false;
+    if((attributes&FILE_ATTRIBUTE_READONLY)!=0&&!unit.allowReadOnly)return false;
+    if((attributes&FILE_ATTRIBUTE_ARCHIVE)!=0&&!unit.allowArchive)return false;
+    if(unit.hasMinDate||unit.hasMaxDate) {
+        SYSTEMTIME modified{};
+        if(!FileTimeToSystemTime(&data.ftLastWriteTime,&modified))return false;
+        SYSTEMTIME minimum=unit.minDate,maximum=unit.maxDate;
+        FILETIME modifiedFt{},minimumFt{},maximumFt{};
+        if(!SystemTimeToFileTime(&modified,&modifiedFt))return false;
+        if(unit.hasMinDate&&SystemTimeToFileTime(&minimum,&minimumFt)&&CompareFileTime(&modifiedFt,&minimumFt)<0)return false;
+        if(unit.hasMaxDate&&SystemTimeToFileTime(&maximum,&maximumFt)&&CompareFileTime(&modifiedFt,&maximumFt)>0)return false;
+    }
+    return true;
+}
+static void PopulatePathList(HWND window,const Spec& spec,Unit& unit,const bool directories) {
+    if(window==nullptr)return;
+    unit.path=Wide(XmlAttributeValue(spec,L"目录") == nullptr ? "" : XmlAttributeValue(spec,L"目录"));
+    unit.path=EnsureDirectoryPath(unit.path);
+    unit.filePattern=Wide(XmlAttributeValue(spec,L"通配符") == nullptr ? "*.*" : XmlAttributeValue(spec,L"通配符"));
+    if(unit.filePattern.empty())unit.filePattern=L"*.*";
+    SendMessageW(window,LB_RESETCONTENT,0,0);
+    std::vector<std::wstring> patterns;
+    std::size_t begin=0;
+    while(begin<=unit.filePattern.size()) { const std::size_t end=unit.filePattern.find(L';',begin); const std::size_t length=end==std::wstring::npos?unit.filePattern.size()-begin:end-begin; if(length>0)patterns.emplace_back(unit.filePattern,begin,length); if(end==std::wstring::npos)break; begin=end+1; }
+    if(patterns.empty())patterns.push_back(L"*.*");
+    std::unordered_set<std::wstring> seen;
+    for(const auto& pattern:patterns) {
+        const std::wstring search=unit.path.empty()?pattern:(unit.path+L"\\"+pattern);
+        WIN32_FIND_DATAW data{}; HANDLE handle=FindFirstFileW(search.c_str(),&data); if(handle==INVALID_HANDLE_VALUE)continue;
+        do {
+            const std::wstring name=data.cFileName;
+            if(name==L"."||name==L".."||!FileAttributeAllowed(data,spec))continue;
+            const bool isDirectory=(data.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)!=0;
+            if(isDirectory!=directories)continue;
+            if(seen.insert(name).second)SendMessageW(window,LB_ADDSTRING,0,reinterpret_cast<LPARAM>(name.c_str()));
+        } while(FindNextFileW(handle,&data));
+        FindClose(handle);
+    }
+}
+static void PopulatePathListRuntime(HWND window,Unit& unit,const bool directories) {
+    if(window==nullptr)return;
+    unit.path=EnsureDirectoryPath(unit.path);
+    if(unit.filePattern.empty())unit.filePattern=L"*.*";
+    SendMessageW(window,LB_RESETCONTENT,0,0);
+    const std::wstring search=unit.path.empty()?unit.filePattern:(unit.path+L"\\"+unit.filePattern);
+    WIN32_FIND_DATAW data{}; HANDLE handle=FindFirstFileW(search.c_str(),&data); if(handle==INVALID_HANDLE_VALUE)return;
+    do {
+        const std::wstring name=data.cFileName;
+        if(name==L"."||name==L"..")continue;
+        const bool isDirectory=(data.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)!=0;
+        if(isDirectory==directories&&FileAttributeAllowed(data,unit))SendMessageW(window,LB_ADDSTRING,0,reinterpret_cast<LPARAM>(name.c_str()));
+    } while(FindNextFileW(handle,&data));
+    FindClose(handle);
+}
+static bool OleDateSystemTime(const double ole,SYSTEMTIME& result) {
+    if(ole==0.0||!std::isfinite(ole))return false;
+    SYSTEMTIME epoch{};epoch.wYear=1899;epoch.wMonth=12;epoch.wDay=30;
+    FILETIME epochFile{};
+    if(!SystemTimeToFileTime(&epoch,&epochFile))return false;
+    ULARGE_INTEGER epochTicks{};epochTicks.LowPart=epochFile.dwLowDateTime;epochTicks.HighPart=epochFile.dwHighDateTime;
+    const long double delta=static_cast<long double>(ole)*864000000000.0L;
+    const long double total=static_cast<long double>(epochTicks.QuadPart)+delta;
+    if(total<0.0L||total>static_cast<long double>((std::numeric_limits<ULONGLONG>::max)()))return false;
+    ULARGE_INTEGER ticks{};ticks.QuadPart=static_cast<ULONGLONG>(total<0.0L?total-0.5L:total+0.5L);
+    FILETIME file{};file.dwLowDateTime=ticks.LowPart;file.dwHighDateTime=ticks.HighPart;
+    return FileTimeToSystemTime(&file,&result)!=FALSE;
+}
+static bool XmlAttributeSystemTime(const Spec& spec,const wchar_t* name,SYSTEMTIME& result) {
+    const char* text=XmlAttributeValue(spec,name);
+    if(text==nullptr||*text==0)return false;
+    char* end=nullptr;
+    const double ole=std::strtod(text,&end);
+    if(end==text||*end!=0)return false;
+    return OleDateSystemTime(ole,result);
+}
+static double SystemTimeOleDate(const SYSTEMTIME& value) {
+    SYSTEMTIME epoch{};epoch.wYear=1899;epoch.wMonth=12;epoch.wDay=30;
+    FILETIME file{};FILETIME epochFile{};
+    if(!SystemTimeToFileTime(&value,&file)||!SystemTimeToFileTime(&epoch,&epochFile))return 0.0;
+    ULARGE_INTEGER ticks{};ticks.LowPart=file.dwLowDateTime;ticks.HighPart=file.dwHighDateTime;
+    ULARGE_INTEGER epochTicks{};epochTicks.LowPart=epochFile.dwLowDateTime;epochTicks.HighPart=epochFile.dwHighDateTime;
+    return static_cast<double>(static_cast<long double>(ticks.QuadPart)-static_cast<long double>(epochTicks.QuadPart))/864000000000.0;
+}
+static bool WindowDateValue(HWND window,SYSTEMTIME& result) {
+    if(ClassEquals(window,L"SysDateTimePick32"))return SendMessageW(window,DTM_GETSYSTEMTIME,0,reinterpret_cast<LPARAM>(&result))==GDT_VALID;
+    if(ClassEquals(window,L"SysMonthCal32")) {if(SendMessageW(window,MCM_GETCURSEL,0,reinterpret_cast<LPARAM>(&result))!=FALSE)return true;SYSTEMTIME range[2]{};if(SendMessageW(window,MCM_GETSELRANGE,0,reinterpret_cast<LPARAM>(range))!=FALSE){result=range[0];return true;}}
+    return false;
+}
+static bool SetWindowDateValue(HWND window,const SYSTEMTIME& value) {
+    if(ClassEquals(window,L"SysDateTimePick32"))return SendMessageW(window,DTM_SETSYSTEMTIME,GDT_VALID,reinterpret_cast<LPARAM>(&value))!=FALSE;
+    if(ClassEquals(window,L"SysMonthCal32")) {if(SendMessageW(window,MCM_SETCURSEL,0,reinterpret_cast<LPARAM>(&value))!=FALSE)return true;SYSTEMTIME range[2]{value,value};return SendMessageW(window,MCM_SETSELRANGE,0,reinterpret_cast<LPARAM>(range))!=FALSE;}
+    return false;
+}
+static std::wstring DialogFilterBuffer(const std::wstring& filter) {
+    std::wstring result=filter;
+    for(auto& value:result)if(value==L'|')value=L'\0';
+    if(result.empty()) {
+        result.append(L"所有文件");
+        result.push_back(L'\0');
+        result.append(L"*.*");
+    }
+    else if(result.back()!=L'\0')result.push_back(L'\0');
+    result.push_back(L'\0');
+    return result;
+}
+static bool OpenCommonDialog(HWND owner,Unit& unit) {
+    if(unit.dialogType==0||unit.dialogType==1) {
+        wchar_t fileName[32768]{};
+        if(!unit.dialogFileName.empty())wcsncpy_s(fileName,std::size(fileName),unit.dialogFileName.c_str(),_TRUNCATE);
+        std::wstring filter=DialogFilterBuffer(unit.dialogFilter);
+        OPENFILENAMEW dialog{sizeof(OPENFILENAMEW)};
+        dialog.hwndOwner=owner; dialog.lpstrFile=fileName; dialog.nMaxFile=static_cast<DWORD>(std::size(fileName));
+        dialog.lpstrFilter=filter.c_str(); dialog.nFilterIndex=static_cast<DWORD>((std::max)(1,unit.dialogFilterIndex+1));
+        dialog.lpstrInitialDir=unit.dialogInitialDir.empty()?nullptr:unit.dialogInitialDir.c_str();
+        dialog.lpstrDefExt=unit.dialogDefExt.empty()?nullptr:unit.dialogDefExt.c_str();
+        dialog.lpstrTitle=unit.dialogCaption.empty()?nullptr:unit.dialogCaption.c_str();
+        dialog.Flags=0;
+        if(unit.dialogType==0&&unit.dialogFileMustExist)dialog.Flags|=OFN_FILEMUSTEXIST;
+        if(unit.dialogType==0&&unit.dialogCreatePrompt)dialog.Flags|=OFN_CREATEPROMPT;
+        if(unit.dialogType==1&&unit.dialogOverwritePrompt)dialog.Flags|=OFN_OVERWRITEPROMPT;
+        if(unit.dialogPathMustExist)dialog.Flags|=OFN_PATHMUSTEXIST;
+        if(unit.dialogNoChangeDir)dialog.Flags|=OFN_NOCHANGEDIR;
+        const BOOL opened=unit.dialogType==0?GetOpenFileNameW(&dialog):GetSaveFileNameW(&dialog);
+        if(opened==FALSE)return false;
+        unit.dialogFileName=fileName;unit.dialogFilterIndex=static_cast<int>(dialog.nFilterIndex)-1;
+        return true;
+    }
+    if(unit.dialogType==2) {
+        LOGFONTW logFont{}; logFont.lfHeight=-12; logFont.lfCharSet=DEFAULT_CHARSET;logFont.lfWeight=unit.dialogFontBold?FW_BOLD:FW_NORMAL;logFont.lfItalic=unit.dialogFontItalic;logFont.lfStrikeOut=unit.dialogFontStrikeOut;logFont.lfUnderline=unit.dialogFontUnderline;
+        if(!unit.dialogFontName.empty())wcsncpy_s(logFont.lfFaceName,std::size(logFont.lfFaceName),unit.dialogFontName.c_str(),_TRUNCATE);
+        CHOOSEFONTW dialog{sizeof(CHOOSEFONTW)}; dialog.hwndOwner=owner; dialog.lpLogFont=&logFont;dialog.rgbColors=unit.dialogFontColor;
+        dialog.Flags=CF_SCREENFONTS|CF_EFFECTS|CF_INITTOLOGFONTSTRUCT;
+        if(ChooseFontW(&dialog)==FALSE)return false;
+        unit.dialogFontColor=dialog.rgbColors;unit.dialogFontBold=logFont.lfWeight>=FW_BOLD;unit.dialogFontItalic=logFont.lfItalic!=FALSE;unit.dialogFontStrikeOut=logFont.lfStrikeOut!=FALSE;unit.dialogFontUnderline=logFont.lfUnderline!=FALSE;unit.dialogFontName=logFont.lfFaceName;HDC dc=GetDC(owner);const int dpi=dc==nullptr?96:GetDeviceCaps(dc,LOGPIXELSY);if(dc!=nullptr)ReleaseDC(owner,dc);unit.dialogFontSize=MulDiv(-logFont.lfHeight,72,dpi);return true;
+    }
+    if(unit.dialogType==3) {
+        const std::wstring file=unit.dialogFileName.empty()?L"help.hlp":unit.dialogFileName;
+        const UINT command=unit.dialogHelpCommand==1?HELP_CONTEXT:unit.dialogHelpCommand==2?HELP_CONTEXTPOPUP:unit.dialogHelpCommand==3?HELP_QUIT:unit.dialogHelpCommand==4?HELP_HELPONHELP:unit.dialogHelpCommand==5?HELP_QUIT:HELP_FINDER;
+        return WinHelpW(owner,file.c_str(),command,static_cast<ULONG_PTR>(unit.dialogHelpContext))!=FALSE;
+    }
+    return false;
+}
+static HDC CurrentPaintDC(HWND window) {
+    return window!=nullptr&&window==activePaintWindow?activePaintDC:nullptr;
+}
+static const char* RawAttributeValue(const XmlAttribute* attributes,std::size_t count,const wchar_t* name) {
+    if(attributes==nullptr||name==nullptr)return nullptr;
+    for(std::size_t index=0;index<count;++index)
+        if(AttributeEquals(attributes[index].name,name))return attributes[index].value;
+    return nullptr;
+}
+static int RawAttributeInteger(const XmlAttribute* attributes,std::size_t count,const wchar_t* name,int fallback) {
+    const char* value=RawAttributeValue(attributes,count,name);if(value==nullptr||*value==0)return fallback;
+    char* end=nullptr;const long parsed=std::strtol(value,&end,10);return end==value||*end!=0?fallback:static_cast<int>(parsed);
+}
+static bool RawAttributeBoolean(const XmlAttribute* attributes,std::size_t count,const wchar_t* name,bool fallback) {
+    const char* value=RawAttributeValue(attributes,count,name);if(value==nullptr)return fallback;
+    return std::strcmp(value,"1")==0||AttributeEquals(value,L"真")||AttributeEquals(value,L"true")?true:
+        (std::strcmp(value,"0")==0||AttributeEquals(value,L"假")||AttributeEquals(value,L"false")?false:fallback);
+}
+static int Base64Value(unsigned char value) {
+    if(value>='A'&&value<='Z')return value-'A';if(value>='a'&&value<='z')return value-'a'+26;
+    if(value>='0'&&value<='9')return value-'0'+52;if(value=='+')return 62;if(value=='/')return 63;return -1;
+}
+static std::vector<unsigned char> DecodeBase64(const char* text) {
+    std::vector<unsigned char> result;if(text==nullptr||*text==0)return result;const std::size_t length=std::strlen(text);if((length&3)!=0)return result;
+    result.reserve(length/4*3);
+    for(std::size_t index=0;index<length;index+=4){const unsigned char c0=static_cast<unsigned char>(text[index]),c1=static_cast<unsigned char>(text[index+1]),c2=static_cast<unsigned char>(text[index+2]),c3=static_cast<unsigned char>(text[index+3]);const int a=Base64Value(c0),b=Base64Value(c1),c=c2=='='?0:Base64Value(c2),d=c3=='='?0:Base64Value(c3);if(a<0||b<0||c<0||d<0)return {};const unsigned int value=(static_cast<unsigned int>(a)<<18)|(static_cast<unsigned int>(b)<<12)|(static_cast<unsigned int>(c)<<6)|static_cast<unsigned int>(d);result.push_back(static_cast<unsigned char>(value>>16));if(c2!='=')result.push_back(static_cast<unsigned char>(value>>8));if(c3!='=')result.push_back(static_cast<unsigned char>(value));}
+    return result;
+}
+static int CanvasPenStyle(const int style) {
+    switch(style) {
+    case 0:return PS_NULL;
+    case 2:return PS_DASH;
+    case 3:return PS_DOT;
+    case 4:return PS_DASHDOT;
+    case 5:return PS_DASHDOTDOT;
+    case 6:return PS_INSIDEFRAME;
+    default:return PS_SOLID;
+    }
+}
+static int CanvasBrushStyle(const int style) {
+    switch(style) {
+    case 2:return HS_BDIAGONAL;
+    case 3:return HS_CROSS;
+    case 4:return HS_DIAGCROSS;
+    case 5:return HS_FDIAGONAL;
+    case 6:return HS_HORIZONTAL;
+    case 7:return HS_VERTICAL;
+    default:return -1;
+    }
+}
+static void PaintShape(HWND window, HDC dc, const Unit& unit) {
+    RECT rect{}; GetClientRect(window, &rect);
+    HPEN pen=CreatePen(unit.lineStyle==0?PS_NULL:CanvasPenStyle(unit.lineStyle), (std::max)(1,unit.lineWidth), unit.hasLineColor?unit.lineColor:RGB(0,0,0));
+    HBRUSH brush=unit.hasFillColor?CreateSolidBrush(unit.fillColor):static_cast<HBRUSH>(GetStockObject(NULL_BRUSH));
+    HGDIOBJ oldPen=pen?SelectObject(dc,pen):nullptr; HGDIOBJ oldBrush=brush?SelectObject(dc,brush):nullptr;
+    switch(unit.shape) {
+    case 1: { const LONG side=(std::min)(rect.right-rect.left,rect.bottom-rect.top); ::Rectangle(dc,rect.left,rect.top,rect.left+side,rect.top+side); break; }
+    case 2: ::Ellipse(dc,rect.left,rect.top,rect.right,rect.bottom); break;
+    case 3: { const LONG side=(std::min)(rect.right-rect.left,rect.bottom-rect.top); ::Ellipse(dc,rect.left,rect.top,rect.left+side,rect.top+side); break; }
+    case 4: ::RoundRect(dc,rect.left,rect.top,rect.right,rect.bottom,12,12); break;
+    case 5: { const LONG side=(std::min)(rect.right-rect.left,rect.bottom-rect.top); ::RoundRect(dc,rect.left,rect.top,rect.left+side,rect.top+side,12,12); break; }
+    case 6: MoveToEx(dc,rect.left,(rect.top+rect.bottom)/2,nullptr); LineTo(dc,rect.right,(rect.top+rect.bottom)/2); break;
+    case 7: MoveToEx(dc,(rect.left+rect.right)/2,rect.top,nullptr); LineTo(dc,(rect.left+rect.right)/2,rect.bottom); break;
+    default: ::Rectangle(dc,rect.left,rect.top,rect.right,rect.bottom); break;
+    }
+    if(oldPen)SelectObject(dc,oldPen); if(oldBrush)SelectObject(dc,oldBrush); if(pen)DeleteObject(pen); if(unit.hasFillColor&&brush)DeleteObject(brush);
+}
+static COLORREF BlendColor(COLORREF first,COLORREF second,int step,int total) {
+    if(total<=0)return first;
+    const int r=GetRValue(first)+(GetRValue(second)-GetRValue(first))*step/total;
+    const int g=GetGValue(first)+(GetGValue(second)-GetGValue(first))*step/total;
+    const int b=GetBValue(first)+(GetBValue(second)-GetBValue(first))*step/total;
+    return RGB((std::max)(0,(std::min)(255,r)),(std::max)(0,(std::min)(255,g)),(std::max)(0,(std::min)(255,b)));
+}
+static HBITMAP LoadPictureMemory(const std::vector<unsigned char>& bytes);
+static void PaintBitmap(HWND window,HDC dc,HBITMAP bitmap,int mode);
+static void PaintLabel(HWND window,HDC dc,const Unit& unit) {
+    RECT rect{};GetClientRect(window,&rect);
+    if(unit.gradientBackMode!=0&&unit.gradientBackColorSet[0]) {
+        const bool horizontal=unit.gradientBackMode==2||unit.gradientBackMode==6;
+        const int length=horizontal?(std::max)(1,rect.right):(std::max)(1,rect.bottom);
+        for(int i=0;i<length;++i) {
+            const int pos=(i*100)/(std::max)(1,length-1);
+            const COLORREF color=BlendColor(unit.gradientBackColor[0],unit.gradientBackColorSet[1]?unit.gradientBackColor[1]:unit.gradientBackColor[0],pos,100);
+            HBRUSH brush=CreateSolidBrush(color);RECT band=rect;
+            if(horizontal){band.left=i;band.right=i+1;}else{band.top=i;band.bottom=i+1;}
+            FillRect(dc,&band,brush);DeleteObject(brush);
+        }
+    } else {
+        HBRUSH brush=unit.hasBackColor?CreateSolidBrush(unit.backColor):static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));
+        FillRect(dc,&rect,brush);if(unit.hasBackColor)DeleteObject(brush);
+    }
+    if(!unit.imageData.empty()) { HBITMAP bitmap=LoadPictureMemory(unit.imageData); PaintBitmap(window,dc,bitmap,unit.backPicMode); }
+    std::wstring text(static_cast<std::size_t>(GetWindowTextLengthW(window)+1),L'\0');
+    GetWindowTextW(window,text.data(),static_cast<int>(text.size()));text.resize(std::wcslen(text.c_str()));
+    SetBkMode(dc,TRANSPARENT);SetTextColor(dc,unit.hasTextColor?unit.textColor:GetSysColor(COLOR_WINDOWTEXT));
+    UINT format=DT_NOPREFIX|(unit.labelWordWrap?DT_WORDBREAK:DT_SINGLELINE);
+    if(unit.horizontalAlign==1)format|=DT_CENTER;else if(unit.horizontalAlign==2)format|=DT_RIGHT;else format|=DT_LEFT;
+    if(!unit.labelWordWrap){if(unit.verticalAlign==1)format|=DT_VCENTER;else if(unit.verticalAlign==2)format|=DT_BOTTOM;}
+    DrawTextW(dc,text.c_str(),-1,&rect,format);
+    if(unit.gradientBorderWidth>0&&unit.gradientBorderColorSet[0]) {
+        const int width=(std::max)(1,unit.gradientBorderWidth);
+        const COLORREF color=unit.gradientBorderColor[0];
+        HPEN pen=CreatePen(PS_SOLID,width,color);
+        if(pen!=nullptr) {
+            HGDIOBJ old=SelectObject(dc,pen);
+            RECT border=rect;
+            const int half=width/2;
+            InflateRect(&border,-half,-half);
+            MoveToEx(dc,border.left,border.top,nullptr);LineTo(dc,border.right-1,border.top);
+            LineTo(dc,border.right-1,border.bottom-1);LineTo(dc,border.left,border.bottom-1);LineTo(dc,border.left,border.top);
+            SelectObject(dc,old);DeleteObject(pen);
+        }
+    }
+    if(unit.labelEffect==1||unit.labelEffect==2) { RECT border=rect;HPEN pen=CreatePen(PS_SOLID,1,unit.labelEffect==1?RGB(255,255,255):RGB(0,0,0));HGDIOBJ old=SelectObject(dc,pen);MoveToEx(dc,border.left,border.bottom-1,nullptr);LineTo(dc,border.right,border.bottom-1);LineTo(dc,border.right-1,border.top);SelectObject(dc,old);DeleteObject(pen); }
+}
+static void PaintHyperlink(HWND window,HDC dc,const Unit& unit) {
+    Unit styled=unit; styled.hasTextColor=true; styled.textColor=unit.hyperlinkHot?unit.hotColor:(unit.visited?unit.visitedColor:RGB(0,0,238)); styled.labelUnderline=true; PaintLabel(window,dc,styled);
+    RECT rect{};GetClientRect(window,&rect);HPEN pen=CreatePen(PS_SOLID,1,styled.textColor);if(pen!=nullptr){HGDIOBJ old=SelectObject(dc,pen);const int y=rect.bottom-2;MoveToEx(dc,rect.left,y,nullptr);LineTo(dc,rect.right,y);SelectObject(dc,old);DeleteObject(pen);}
+}
+static HBITMAP ClonePictureHandle(OLE_HANDLE handle) {
+    if(handle==0)return nullptr;
+    return static_cast<HBITMAP>(CopyImage(reinterpret_cast<HBITMAP>(static_cast<std::uintptr_t>(handle)),IMAGE_BITMAP,0,0,LR_CREATEDIBSECTION));
+}
+static HBITMAP LoadPictureMemory(const std::vector<unsigned char>& bytes) {
+    if(bytes.empty())return nullptr;
+    HGLOBAL memory=GlobalAlloc(GMEM_MOVEABLE,bytes.size());if(memory==nullptr)return nullptr;
+    void* target=GlobalLock(memory);if(target==nullptr){GlobalFree(memory);return nullptr;}std::memcpy(target,bytes.data(),bytes.size());GlobalUnlock(memory);
+    IStream* stream=nullptr;if(FAILED(CreateStreamOnHGlobal(memory,TRUE,&stream))) {GlobalFree(memory);return nullptr;}
+    IPicture* picture=nullptr;HBITMAP result=nullptr;
+    if(SUCCEEDED(OleLoadPicture(stream,static_cast<LONG>(bytes.size()),FALSE,IID_IPicture,reinterpret_cast<void**>(&picture)))&&picture!=nullptr){OLE_HANDLE handle=0;if(SUCCEEDED(picture->get_Handle(&handle)))result=ClonePictureHandle(handle);picture->Release();}
+    stream->Release();return result;
+}
+static HBITMAP LoadPicturePath(const std::wstring& path) {
+    if(path.empty())return nullptr;
+    HBITMAP bitmap=static_cast<HBITMAP>(LoadImageW(nullptr,path.c_str(),IMAGE_BITMAP,0,0,LR_LOADFROMFILE|LR_CREATEDIBSECTION));if(bitmap!=nullptr)return bitmap;
+    IPicture* picture=nullptr;HBITMAP result=nullptr;
+    if(SUCCEEDED(OleLoadPicturePath(const_cast<LPOLESTR>(path.c_str()),nullptr,0,0,IID_IPicture,reinterpret_cast<void**>(&picture)))&&picture!=nullptr){OLE_HANDLE handle=0;if(SUCCEEDED(picture->get_Handle(&handle)))result=ClonePictureHandle(handle);picture->Release();}
+    return result;
+}
+static void PaintBitmap(HWND window,HDC dc,HBITMAP bitmap,int mode) {
+    if(bitmap==nullptr)return;BITMAP info{};GetObjectW(bitmap,sizeof(info),&info);HDC source=CreateCompatibleDC(dc);if(source==nullptr){DeleteObject(bitmap);return;}HGDIOBJ old=SelectObject(source,bitmap);RECT rect{};GetClientRect(window,&rect);int x=0,y=0,w=info.bmWidth,h=info.bmHeight;if(mode==1){w=rect.right;h=rect.bottom;}else if(mode==2){x=(rect.right-w)/2;y=(rect.bottom-h)/2;}StretchBlt(dc,x,y,w,h,source,0,0,info.bmWidth,info.bmHeight,SRCCOPY);SelectObject(source,old);DeleteDC(source);DeleteObject(bitmap);
+}
+static void DrawBitmapAt(HDC dc,HBITMAP bitmap,int x,int y,int width,int height) {
+    if(dc==nullptr||bitmap==nullptr)return;
+    BITMAP info{};if(GetObjectW(bitmap,sizeof(info),&info)==0){DeleteObject(bitmap);return;}
+    HDC source=CreateCompatibleDC(dc);if(source==nullptr){DeleteObject(bitmap);return;}
+    HGDIOBJ old=SelectObject(source,bitmap);
+    const int drawWidth=width>0?width:info.bmWidth,drawHeight=height>0?height:info.bmHeight;
+    StretchBlt(dc,x,y,drawWidth,drawHeight,source,0,0,info.bmWidth,info.bmHeight,SRCCOPY);
+    SelectObject(source,old);DeleteDC(source);DeleteObject(bitmap);
+}
+static std::vector<unsigned char> BitmapToBytes(HBITMAP bitmap) {
+    std::vector<unsigned char> result; if(bitmap==nullptr)return result;
+    BITMAP info{};if(GetObjectW(bitmap,sizeof(info),&info)==0)return result;
+    HDC dc=GetDC(nullptr);if(dc==nullptr)return result;
+    BITMAPINFOHEADER header{};header.biSize=sizeof(header);header.biWidth=info.bmWidth;header.biHeight=-std::abs(info.bmHeight);header.biPlanes=1;header.biBitCount=32;header.biCompression=BI_RGB;
+    const std::size_t stride=static_cast<std::size_t>(info.bmWidth)*4u;const std::size_t imageSize=stride*static_cast<std::size_t>(std::abs(info.bmHeight));
+    std::vector<unsigned char> pixels(imageSize);if(GetDIBits(dc,bitmap,0,static_cast<UINT>(std::abs(info.bmHeight)),pixels.data(),reinterpret_cast<BITMAPINFO*>(&header),DIB_RGB_COLORS)==0){ReleaseDC(nullptr,dc);return result;}ReleaseDC(nullptr,dc);
+    BITMAPFILEHEADER file{};file.bfType=0x4D42;file.bfOffBits=sizeof(file)+sizeof(header);file.bfSize=file.bfOffBits+static_cast<DWORD>(pixels.size());result.resize(file.bfSize);std::memcpy(result.data(),&file,sizeof(file));std::memcpy(result.data()+sizeof(file),&header,sizeof(header));std::memcpy(result.data()+file.bfOffBits,pixels.data(),pixels.size());return result;
+}
+static void PaintImageFile(HWND window, HDC dc, const Unit& unit) {
+    HBITMAP bitmap=!unit.imageData.empty()?LoadPictureMemory(unit.imageData):LoadPicturePath(unit.imageFileName);
+    PaintBitmap(window,dc,bitmap,unit.imageDrawMode);
+}
+struct CanvasPaintGuard {
+    HDC dc=nullptr; HGDIOBJ oldPen=nullptr; HGDIOBJ oldBrush=nullptr; HPEN pen=nullptr; HBRUSH brush=nullptr;
+    CanvasPaintGuard(HDC target,Unit* unit):dc(target) {
+        if(dc==nullptr||unit==nullptr)return;
+        ::SetROP2(dc,unit->drawRop2>=1&&unit->drawRop2<=16?unit->drawRop2:R2_COPYPEN);
+        const int width=(std::max)(1,unit->penWidth);
+        pen=CreatePen(CanvasPenStyle(unit->penStyle),width,unit->penColor);
+        if(pen!=nullptr)oldPen=SelectObject(dc,pen);
+        const int hatch=CanvasBrushStyle(unit->brushStyle);
+        brush=hatch<0?CreateSolidBrush(unit->brushColor):CreateHatchBrush(hatch,unit->brushColor);
+        if(brush!=nullptr)oldBrush=SelectObject(dc,brush);
+        SetTextColor(dc,unit->textColor);SetBkColor(dc,unit->textBackColor);SetBkMode(dc,TRANSPARENT);
+    }
+    ~CanvasPaintGuard() {
+        if(dc==nullptr)return;
+        if(oldPen!=nullptr)SelectObject(dc,oldPen);if(oldBrush!=nullptr)SelectObject(dc,oldBrush);
+        if(pen!=nullptr)DeleteObject(pen);if(brush!=nullptr)DeleteObject(brush);
+    }
+};
+static bool PaintUnitSurface(HWND window,HDC dc) {
+    Unit* unit=UnitFromWindow(window);
+    if(unit==nullptr||unit->type==nullptr)return false;
+    if(std::strcmp(unit->type,"shape")==0) {
+        PaintShape(window,dc,*unit);
+        return true;
+    }
+    if(std::strcmp(unit->type,"image")==0) {
+        RECT rect{};GetClientRect(window,&rect);
+        HBRUSH background=unit->hasBackColor?CreateSolidBrush(unit->backColor):static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));
+        FillRect(dc,&rect,background);if(unit->hasBackColor)DeleteObject(background);
+        PaintImageFile(window,dc,*unit);
+        return true;
+    }
+    if(std::strcmp(unit->type,"label")==0) {
+        PaintLabel(window,dc,*unit);
+        return true;
+    }
+    if(std::strcmp(unit->type,"hyperlink")==0) {
+        PaintHyperlink(window,dc,*unit);
+        return true;
+    }
+    if(std::strcmp(unit->type,"canvas")==0) {
+        RECT rect{};GetClientRect(window,&rect);
+        HBRUSH background=unit->hasBackColor?CreateSolidBrush(unit->backColor):static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));
+        FillRect(dc,&rect,background);if(unit->hasBackColor)DeleteObject(background);
+        if(!unit->imageData.empty()) { HBITMAP bitmap=LoadPictureMemory(unit->imageData); PaintBitmap(window,dc,bitmap,unit->backPicMode); }
+        return true;
+    }
+    return false;
+}
+static bool SetDateRange(HWND window,const SYSTEMTIME* minimum,const SYSTEMTIME* maximum) {
+    if(!ClassEquals(window,L"SysDateTimePick32"))return false;
+    SYSTEMTIME range[2]{};DWORD flags=0;
+    if(minimum!=nullptr){range[0]=*minimum;flags|=GDTR_MIN;}
+    if(maximum!=nullptr){range[1]=*maximum;flags|=GDTR_MAX;}
+    return SendMessageW(window,DTM_SETRANGE,flags,reinterpret_cast<LPARAM>(range))!=FALSE;
+}
+static bool GetDateRange(HWND window,SYSTEMTIME* minimum,SYSTEMTIME* maximum) {
+    if(!ClassEquals(window,L"SysDateTimePick32"))return false;
+    SYSTEMTIME range[2]{};const LRESULT flags=SendMessageW(window,DTM_GETRANGE,0,reinterpret_cast<LPARAM>(range));
+    bool found=false;
+    if(minimum!=nullptr&&((flags&GDTR_MIN)!=0)){*minimum=range[0];found=true;}
+    if(maximum!=nullptr&&((flags&GDTR_MAX)!=0)){*maximum=range[1];found=true;}
+    return found;
+}
+static bool GetMonthRange(HWND window,SYSTEMTIME* minimum,SYSTEMTIME* maximum) {
+    if(!ClassEquals(window,L"SysMonthCal32"))return false;
+    SYSTEMTIME range[2]{};const LRESULT flags=SendMessageW(window,MCM_GETRANGE,0,reinterpret_cast<LPARAM>(range));
+    bool found=false;
+    if(minimum!=nullptr&&((flags&GDTR_MIN)!=0)){*minimum=range[0];found=true;}
+    if(maximum!=nullptr&&((flags&GDTR_MAX)!=0)){*maximum=range[1];found=true;}
+    return found;
+}
 static DWORD Style(const Spec& spec) {
     const char* type=spec.type;
     if(std::strcmp(type,"button")==0) {
@@ -3006,19 +4109,48 @@ static DWORD Style(const Spec& spec) {
     if(std::strcmp(type,"group")==0)return WS_CHILD|BS_GROUPBOX;
     if(std::strcmp(type,"edit")==0) {
         DWORD style=WS_CHILD|WS_BORDER|WS_TABSTOP|ES_LEFT;
-        if(XmlAttributeBoolean(spec,L"是否允许多行",false))style|=ES_MULTILINE|ES_AUTOVSCROLL|WS_VSCROLL;
+        if(XmlAttributeBoolean(spec,L"是否允许多行",false)) {
+            style|=ES_MULTILINE|ES_AUTOVSCROLL;
+            const int scrollBar=XmlAttributeInteger(spec,L"滚动条",2);
+            if(scrollBar==1||scrollBar==3)style|=WS_HSCROLL|ES_AUTOHSCROLL;
+            if(scrollBar==2||scrollBar==3)style|=WS_VSCROLL;
+        }
+        const int inputMode=XmlAttributeInteger(spec,L"输入方式",0);
+        if(inputMode==1)style|=ES_READONLY;
+        if(inputMode==2)style|=ES_PASSWORD;
+        const int align=XmlAttributeInteger(spec,L"对齐方式",0);
+        if(align==1)style=(style&~ES_LEFT)|ES_CENTER;
+        else if(align==2)style=(style&~ES_LEFT)|ES_RIGHT;
         return style;
     }
-    if(std::strcmp(type,"list")==0) {
+    if(std::strcmp(type,"list")==0||std::strcmp(type,"checklist")==0) {
         DWORD style=WS_CHILD|WS_BORDER|WS_TABSTOP|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT|WS_VSCROLL;
-        if(XmlAttributeBoolean(spec,L"允许选择多项",false))style|=LBS_MULTIPLESEL;
+        if(std::strcmp(type,"checklist")==0)style|=LBS_OWNERDRAWFIXED|LBS_HASSTRINGS;
+        if(XmlAttributeBoolean(spec,L"允许选择多项",false))style|=LBS_EXTENDEDSEL;
         if(XmlAttributeBoolean(spec,L"多列",false))style|=LBS_MULTICOLUMN;
+        if(XmlAttributeBoolean(spec,L"自动排序",false))style|=LBS_SORT;
         return style;
     }
     if(std::strcmp(type,"combo")==0) {
         const int comboType=XmlAttributeInteger(spec,L"类型",2);
-        const DWORD comboStyle=comboType==0?CBS_SIMPLE:(comboType==1?CBS_DROPDOWN:CBS_DROPDOWNLIST);
+        DWORD comboStyle=comboType==0?CBS_SIMPLE:(comboType==1?CBS_DROPDOWN:CBS_DROPDOWNLIST);
+        if(XmlAttributeBoolean(spec,L"自动排序",false))comboStyle|=CBS_SORT;
         return WS_CHILD|WS_TABSTOP|comboStyle|WS_VSCROLL;
+    }
+    if(std::strcmp(type,"drive")==0)return WS_CHILD|WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL;
+    if(std::strcmp(type,"directory")==0)return WS_CHILD|WS_BORDER|WS_TABSTOP|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT|WS_VSCROLL;
+    if(std::strcmp(type,"file")==0) {
+        DWORD style=WS_CHILD|WS_BORDER|WS_TABSTOP|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT|WS_VSCROLL;
+        if(XmlAttributeBoolean(spec,L"允许选择多项",false))style|=LBS_EXTENDEDSEL;
+        return style;
+    }
+    if(std::strcmp(type,"color")==0)return WS_CHILD|WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY;
+    if(std::strcmp(type,"hyperlink")==0)return WS_CHILD|SS_NOTIFY|SS_LEFT;
+    if(std::strcmp(type,"spin")==0) {
+        DWORD style=WS_CHILD|UDS_ARROWKEYS;
+        if(XmlAttributeBoolean(spec,L"热点跟踪",false))style|=UDS_HOTTRACK;
+        if(XmlAttributeInteger(spec,L"方向",0)==0)style|=UDS_HORZ;
+        return style;
     }
     if(std::strcmp(type,"tab")==0)return WS_CHILD|WS_CLIPSIBLINGS|WS_TABSTOP;
     if(std::strcmp(type,"progress")==0) {
@@ -3029,52 +4161,375 @@ static DWORD Style(const Spec& spec) {
     }
     if(std::strcmp(type,"hscroll")==0)return WS_CHILD|SBS_HORZ;
     if(std::strcmp(type,"vscroll")==0)return WS_CHILD|SBS_VERT;
-    if(std::strcmp(type,"date")==0)
-        return WS_CHILD|WS_TABSTOP|(XmlAttributeInteger(spec,L"附件类型",0)==1?DTS_UPDOWN:0);
+    if(std::strcmp(type,"date")==0) {
+        DWORD style=WS_CHILD|WS_TABSTOP;
+        if(XmlAttributeInteger(spec,L"附件类型",0)==1)style|=DTS_UPDOWN;
+        return style;
+    }
+    if(std::strcmp(type,"month")==0) {
+        DWORD style=WS_CHILD;
+        if(XmlAttributeBoolean(spec,L"允许选择多天",false))style|=MCS_MULTISELECT;
+        if(XmlAttributeBoolean(spec,L"不显示今天",false))style|=MCS_NOTODAY;
+        if(XmlAttributeBoolean(spec,L"不圈注今天",false))style|=MCS_NOTODAYCIRCLE;
+        if(XmlAttributeBoolean(spec,L"显示星期序号",false))style|=MCS_WEEKNUMBERS;
+        return style;
+    }
     if(std::strcmp(type,"label")==0||std::strcmp(type,"canvas")==0) {
         DWORD style=WS_CHILD|SS_NOTIFY;
         const int horizontal=XmlAttributeInteger(spec,L"横向对齐方式",0);
         style|=horizontal==1?SS_CENTER:(horizontal==2?SS_RIGHT:SS_LEFT);
+        if(std::strcmp(type,"label")==0&&!XmlAttributeBoolean(spec,L"是否自动折行",false))style|=SS_LEFTNOWORDWRAP;
         const int vertical=XmlAttributeInteger(spec,L"纵向对齐方式",0);
         if(vertical==1)style|=SS_CENTERIMAGE;
         return style;
     }
-    if(std::strcmp(type,"shape")==0)return WS_CHILD|SS_BLACKFRAME|SS_NOTIFY;
+    if(std::strcmp(type,"shape")==0||std::strcmp(type,"image")==0)return WS_CHILD|SS_NOTIFY;
+    if(std::strcmp(type,"animate")==0) {
+        DWORD style=WS_CHILD|ACS_AUTOPLAY;
+        if(XmlAttributeBoolean(spec,L"居中播放",false))style|=ACS_CENTER;
+        if(XmlAttributeBoolean(spec,L"透明背景",false))style|=ACS_TRANSPARENT;
+        return style;
+    }
     if(std::strcmp(type,"container")==0)return WS_CHILD|WS_CLIPSIBLINGS|WS_CLIPCHILDREN;
     if(std::strcmp(type,"unsupported")==0)return 0;
-    return WS_CHILD|WS_VISIBLE;
+    // Never manufacture a style for an unknown token.  The host-side model
+    // only emits the explicitly mapped native controls above.
+    return 0;
 }
 static const wchar_t* ClassName(const char* type) {
     if(strcmp(type,"button")==0||strcmp(type,"checkbox")==0||strcmp(type,"radio")==0||strcmp(type,"group")==0)return L"BUTTON";
     if(strcmp(type,"edit")==0)return L"EDIT";
-    if(strcmp(type,"list")==0)return L"LISTBOX";
+    if(strcmp(type,"list")==0||strcmp(type,"checklist")==0)return L"LISTBOX";
     if(strcmp(type,"combo")==0)return L"COMBOBOX";
+    if(strcmp(type,"drive")==0)return L"COMBOBOX";
+    if(strcmp(type,"directory")==0||strcmp(type,"file")==0)return L"LISTBOX";
+    if(strcmp(type,"color")==0)return L"BUTTON";
+    if(strcmp(type,"hyperlink")==0)return L"STATIC";
+    if(strcmp(type,"spin")==0)return UPDOWN_CLASSW;
     if(strcmp(type,"tab")==0)return L"SysTabControl32";
     if(strcmp(type,"progress")==0)return L"msctls_progress32";
     if(strcmp(type,"trackbar")==0)return L"msctls_trackbar32";
     if(strcmp(type,"hscroll")==0||strcmp(type,"vscroll")==0)return L"SCROLLBAR";
     if(strcmp(type,"date")==0)return L"SysDateTimePick32";
+    if(strcmp(type,"month")==0)return L"SysMonthCal32";
+    if(strcmp(type,"animate")==0)return ANIMATE_CLASSW;
+    if(strcmp(type,"image")==0)return L"STATIC";
     if(strcmp(type,"container")==0)return L"ecompiler_window_container";
     if(strcmp(type,"shape")==0||strcmp(type,"canvas")==0)return L"STATIC";
-    return L"STATIC";
+    return nullptr;
 }
+static HWND EditPart(HWND window);
 static void UpdateTabVisibility(unsigned int tabId) {
     const Unit* tab=FindUnit(tabId);
     if(tab==nullptr)return;
     const int page=static_cast<int>(SendMessageW(tab->hwnd,TCM_GETCURSEL,0,0));
     for(auto& item:units)if(item.tabOwner==static_cast<int>(tabId))ShowWindow(item.hwnd,item.tabPage==page?SW_SHOW:SW_HIDE);
 }
+static void SetWindowZOrder(HWND window,int order) {
+    if(window==nullptr)return;
+    HWND insertAfter=HWND_TOP;
+    UINT flags=SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE;
+    switch(order) {
+    case 2: insertAfter=HWND_BOTTOM; break;
+    case 3: insertAfter=HWND_TOPMOST; break;
+    case 4: insertAfter=HWND_NOTOPMOST; break;
+    default: break;
+    }
+    SetWindowPos(window,insertAfter,0,0,0,0,flags);
+}
+static void ApplyUnitFont(HWND window,Unit& unit) {
+    if(window==nullptr)return;
+    LOGFONTW logFont{};logFont.lfCharSet=DEFAULT_CHARSET;logFont.lfWeight=unit.fontBold?FW_BOLD:FW_NORMAL;logFont.lfItalic=unit.fontItalic?TRUE:FALSE;logFont.lfStrikeOut=unit.fontStrikeOut?TRUE:FALSE;logFont.lfUnderline=unit.fontUnderline?TRUE:FALSE;
+    std::wstring name=unit.fontName.empty()?L"SimSun":unit.fontName;wcsncpy_s(logFont.lfFaceName,std::size(logFont.lfFaceName),name.c_str(),_TRUNCATE);
+    HDC dc=GetDC(window);const int dpi=dc==nullptr?96:GetDeviceCaps(dc,LOGPIXELSY);if(dc!=nullptr)ReleaseDC(window,dc);logFont.lfHeight=-MulDiv((std::max)(1,unit.fontSize),dpi,72);
+    HFONT font=CreateFontIndirectW(&logFont);if(font==nullptr)return;if(unit.font!=nullptr)DeleteObject(unit.font);unit.font=font;SendMessageW(window,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
+}
+static LRESULT CALLBACK UnitSubclassProc(HWND,UINT,WPARAM,LPARAM,UINT_PTR,DWORD_PTR);
+static HWND EditSpinBuddy(HWND edit) {
+    HWND parent=edit==nullptr?nullptr:GetParent(edit); if(parent==nullptr)return nullptr;
+    for(HWND child=FindWindowExW(parent,nullptr,UPDOWN_CLASSW,nullptr);child!=nullptr;child=FindWindowExW(parent,child,UPDOWN_CLASSW,nullptr))
+        if(reinterpret_cast<HWND>(SendMessageW(child,UDM_GETBUDDY,0,0))==edit)return child;
+    return nullptr;
+}
+static void ConfigureEditSpin(HWND edit,Unit& unit,bool visible,bool disabled) {
+    if(edit==nullptr)return;
+    HWND spin=EditSpinBuddy(edit);
+    if(unit.spinMode==0) { if(spin!=nullptr)DestroyWindow(spin); return; }
+    if(spin==nullptr) {
+        DWORD style=WS_CHILD|(visible?WS_VISIBLE:0)|UDS_ARROWKEYS|UDS_ALIGNRIGHT;
+        if(unit.spinMode==1)style|=UDS_SETBUDDYINT;
+        spin=CreateWindowExW(0,UPDOWN_CLASSW,L"",style,0,0,0,0,GetParent(edit),nullptr,instance,nullptr);
+        if(spin==nullptr)return;
+        SendMessageW(spin,UDM_SETBUDDY,0,reinterpret_cast<LPARAM>(edit));
+        SetWindowSubclass(spin,UnitSubclassProc,static_cast<UINT_PTR>(unit.id),0);
+    } else {
+        LONG_PTR style=GetWindowLongPtrW(spin,GWL_STYLE); if(unit.spinMode==1)style|=UDS_SETBUDDYINT;else style&=~UDS_SETBUDDYINT;SetWindowLongPtrW(spin,GWL_STYLE,style);
+    }
+    SendMessageW(spin,UDM_SETRANGE32,unit.spinMin,unit.spinMax);
+    EnableWindow(spin,disabled?FALSE:TRUE); ShowWindow(spin,visible?SW_SHOW:SW_HIDE);
+    RECT rect{};GetWindowRect(edit,&rect);MapWindowPoints(nullptr,GetParent(edit),reinterpret_cast<POINT*>(&rect),2);
+    const int spinWidth=GetSystemMetrics(SM_CXVSCROLL);const int width=rect.right-rect.left;
+    if(width>spinWidth) { SetWindowPos(edit,nullptr,rect.left,rect.top,width-spinWidth,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE);rect.right-=spinWidth; }
+    SetWindowPos(spin,nullptr,rect.right,rect.top,spinWidth,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE);
+}
+static void SetWindowBorder(HWND window,int border) {
+    if(window==nullptr)return;LONG_PTR ex=GetWindowLongPtrW(window,GWL_EXSTYLE);ex&=~(WS_EX_CLIENTEDGE|WS_EX_STATICEDGE);LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE);style&=~WS_BORDER;
+    switch(border){case 1:case 3:ex|=WS_EX_CLIENTEDGE;break;case 2:case 4:ex|=WS_EX_STATICEDGE;break;case 5:style|=WS_BORDER;break;default:break;}
+    SetWindowLongPtrW(window,GWL_EXSTYLE,ex);SetWindowLongPtrW(window,GWL_STYLE,style);SetWindowPos(window,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_FRAMECHANGED);
+}
 static void ApplyAttributes(HWND window,const Spec& spec) {
     if(window==nullptr)return;
+    if(Unit* unit=UnitFromWindow(window);unit!=nullptr) {
+        unit->checkOnlyOne=XmlAttributeBoolean(spec,L"单选",unit->checkOnlyOne);
+        unit->driveType=XmlAttributeInteger(spec,L"类型",unit->driveType);
+        unit->allowNormal=XmlAttributeBoolean(spec,L"通常",unit->allowNormal);
+        unit->allowArchive=XmlAttributeBoolean(spec,L"存档",unit->allowArchive);
+        unit->allowReadOnly=XmlAttributeBoolean(spec,L"只读",unit->allowReadOnly);
+        unit->allowSystem=XmlAttributeBoolean(spec,L"系统",unit->allowSystem);
+        unit->allowHidden=XmlAttributeBoolean(spec,L"隐藏",unit->allowHidden);
+        unit->fileAllowMultiple=XmlAttributeBoolean(spec,L"允许选择多项",unit->fileAllowMultiple);
+        unit->allowTrack=XmlAttributeBoolean(spec,L"允许拖动跟踪",unit->allowTrack);
+        unit->dateAllowEdit=XmlAttributeBoolean(spec,L"允许编辑",unit->dateAllowEdit);
+        unit->tabHeaderWay=XmlAttributeInteger(spec,L"表头方向",unit->tabHeaderWay);
+        unit->tabMultiLine=XmlAttributeBoolean(spec,L"允许多行表头",unit->tabMultiLine);
+        unit->tabFillBack=XmlAttributeBoolean(spec,L"是否填充背景",unit->tabFillBack);
+        unit->tabBackColor=static_cast<COLORREF>(XmlAttributeInteger(spec,L"背景颜色",static_cast<int>(unit->tabBackColor)));
+        unit->progressDrawMode=XmlAttributeInteger(spec,L"显示方式",unit->progressDrawMode);
+        unit->trackTickStyle=XmlAttributeInteger(spec,L"刻度类型",unit->trackTickStyle);
+        unit->trackTickFreq=XmlAttributeInteger(spec,L"单位刻度值",unit->trackTickFreq);
+        unit->trackAllowSel=XmlAttributeBoolean(spec,L"允许选择",unit->trackAllowSel);
+        unit->removeDuplicates=XmlAttributeBoolean(spec,L"除去重复",unit->removeDuplicates);
+        unit->drawUnit=XmlAttributeInteger(spec,L"绘画单位",unit->drawUnit);
+        unit->hideSelection=XmlAttributeBoolean(spec,L"隐藏选择",unit->hideSelection);
+        unit->inputMode=XmlAttributeInteger(spec,L"输入方式",unit->inputMode);
+        unit->convertMode=XmlAttributeInteger(spec,L"转换方式",unit->convertMode);
+        unit->spinMode=XmlAttributeInteger(spec,L"调节器方式",unit->spinMode);
+        unit->spinMin=XmlAttributeInteger(spec,L"调节器底限值",unit->spinMin);
+        unit->spinMax=XmlAttributeInteger(spec,L"调节器上限值",unit->spinMax);
+        unit->borderStyle=XmlAttributeInteger(spec,L"边框",unit->borderStyle);
+        unit->horizontalAlign=XmlAttributeInteger(spec,L"横向对齐方式",unit->horizontalAlign);
+        unit->verticalAlign=XmlAttributeInteger(spec,L"纵向对齐方式",unit->verticalAlign);
+        unit->shape=XmlAttributeInteger(spec,L"外形",unit->shape);
+        unit->shapeEffect=XmlAttributeInteger(spec,L"线条效果",unit->shapeEffect);
+        unit->lineStyle=XmlAttributeInteger(spec,L"线型",unit->lineStyle);
+        unit->lineWidth=XmlAttributeInteger(spec,L"线宽",unit->lineWidth);
+        unit->penStyle=XmlAttributeInteger(spec,L"画笔类型",unit->penStyle);
+        unit->drawRop2=XmlAttributeInteger(spec,L"画出方式",unit->drawRop2);
+        unit->penWidth=XmlAttributeInteger(spec,L"画笔粗细",unit->penWidth);
+        unit->brushStyle=XmlAttributeInteger(spec,L"刷子类型",unit->brushStyle);
+        unit->autoRedraw=XmlAttributeBoolean(spec,L"自动重画",unit->autoRedraw);
+        unit->backPicMode=XmlAttributeInteger(spec,L"底图方式",unit->backPicMode);
+        unit->imageDrawMode=XmlAttributeInteger(spec,L"显示方式",unit->imageDrawMode);
+        unit->playImage=XmlAttributeBoolean(spec,L"播放动画",unit->playImage);
+        unit->imageFileName=Wide(XmlAttributeValue(spec,L"文件名") == nullptr ? "" : XmlAttributeValue(spec,L"文件名"));
+        unit->imageCenter=XmlAttributeBoolean(spec,L"居中播放",unit->imageCenter);
+        unit->imageTransparent=XmlAttributeBoolean(spec,L"透明背景",unit->imageTransparent);
+        unit->imagePlayCount=XmlAttributeInteger(spec,L"播放次数",unit->imagePlayCount);
+        unit->labelEffect=XmlAttributeInteger(spec,L"效果",unit->labelEffect);
+        unit->gradientBorderWidth=XmlAttributeInteger(spec,L"渐变边框宽度",unit->gradientBorderWidth);
+        for(int index=0;index<3;++index) {
+            std::wstring name=L"渐变边框颜色"+std::to_wstring(index+1);
+            const char* color=XmlAttributeValue(spec,name.c_str());
+            if(color!=nullptr&&std::strcmp(color,"#透明")!=0){unit->gradientBorderColor[index]=static_cast<COLORREF>(std::strtol(color,nullptr,10));unit->gradientBorderColorSet[index]=1;}
+            name=L"渐变背景颜色"+std::to_wstring(index+1); color=XmlAttributeValue(spec,name.c_str());
+            if(color!=nullptr&&std::strcmp(color,"#透明")!=0){unit->gradientBackColor[index]=static_cast<COLORREF>(std::strtol(color,nullptr,10));unit->gradientBackColorSet[index]=1;}
+        }
+        unit->gradientBackMode=XmlAttributeInteger(spec,L"渐变背景方式",unit->gradientBackMode);
+        unit->labelWordWrap=XmlAttributeBoolean(spec,L"是否自动折行",unit->labelWordWrap);
+        unit->visitedColor=static_cast<COLORREF>(XmlAttributeInteger(spec,L"访问后的颜色",static_cast<int>(unit->visitedColor)));
+        unit->hotColor=static_cast<COLORREF>(XmlAttributeInteger(spec,L"热点颜色",static_cast<int>(unit->hotColor)));
+        unit->enterToNext=XmlAttributeBoolean(spec,L"回车下移焦点",unit->enterToNext);
+        unit->f1OpenHelp=XmlAttributeBoolean(spec,L"F1键打开帮助",unit->f1OpenHelp);
+        unit->helpFileName=Wide(XmlAttributeValue(spec,L"帮助文件名") == nullptr ? "" : XmlAttributeValue(spec,L"帮助文件名"));
+        unit->helpContext=XmlAttributeInteger(spec,L"帮助标志值",unit->helpContext);
+        SYSTEMTIME minDate{},maxDate{};
+        unit->hasMinDate=XmlAttributeSystemTime(spec,L"最小日期",minDate); if(unit->hasMinDate)unit->minDate=minDate;
+        unit->hasMaxDate=XmlAttributeSystemTime(spec,L"最大日期",maxDate); if(unit->hasMaxDate)unit->maxDate=maxDate;
+        if(std::strcmp(spec.type,"dialog")==0) {
+            unit->dialogType=XmlAttributeInteger(spec,L"类型",0);
+            unit->dialogFileName=Wide(XmlAttributeValue(spec,L"文件名") == nullptr ? "" : XmlAttributeValue(spec,L"文件名"));
+            unit->dialogFilter=Wide(XmlAttributeValue(spec,L"过滤器") == nullptr ? "" : XmlAttributeValue(spec,L"过滤器"));
+            unit->dialogInitialDir=Wide(XmlAttributeValue(spec,L"初始目录") == nullptr ? "" : XmlAttributeValue(spec,L"初始目录"));
+            unit->dialogDefExt=Wide(XmlAttributeValue(spec,L"默认文件后缀") == nullptr ? "" : XmlAttributeValue(spec,L"默认文件后缀"));
+            unit->dialogCaption=Wide(XmlAttributeValue(spec,L"标题") == nullptr ? "" : XmlAttributeValue(spec,L"标题"));
+            unit->dialogFilterIndex=XmlAttributeInteger(spec,L"初始过滤器",0);
+            unit->dialogCreatePrompt=XmlAttributeBoolean(spec,L"创建时提示",false);
+            unit->dialogFileMustExist=XmlAttributeBoolean(spec,L"文件必须存在",true);
+            unit->dialogOverwritePrompt=XmlAttributeBoolean(spec,L"文件覆盖提示",true);
+            unit->dialogPathMustExist=XmlAttributeBoolean(spec,L"目录必须存在",true);
+            unit->dialogNoChangeDir=XmlAttributeBoolean(spec,L"不改变目录",false);
+            unit->dialogHelpCommand=XmlAttributeInteger(spec,L"帮助命令",0);
+            unit->dialogHelpContext=XmlAttributeInteger(spec,L"帮助标志值",0);
+            unit->dialogFontColor=static_cast<COLORREF>(XmlAttributeInteger(spec,L"字体颜色",static_cast<int>(unit->dialogFontColor)));
+            unit->dialogFontBold=XmlAttributeBoolean(spec,L"加粗",false);unit->dialogFontItalic=XmlAttributeBoolean(spec,L"倾斜",false);unit->dialogFontStrikeOut=XmlAttributeBoolean(spec,L"删除线",false);unit->dialogFontUnderline=XmlAttributeBoolean(spec,L"下划线",false);
+            const char* dialogFont=XmlAttributeValue(spec,L"字体名称");if(dialogFont!=nullptr)unit->dialogFontName=Wide(dialogFont);unit->dialogFontSize=XmlAttributeInteger(spec,L"字体大小",0);
+        }
+        const char* textColor=XmlAttributeValue(spec,L"文本颜色");
+        if(textColor!=nullptr) { unit->textColor=static_cast<COLORREF>(std::strtol(textColor,nullptr,10)); unit->hasTextColor=true; }
+        const char* backColor=XmlAttributeValue(spec,L"背景颜色");
+        if(backColor==nullptr) backColor=XmlAttributeValue(spec,L"画板背景色");
+        if(backColor!=nullptr) {
+            const long value=std::strtol(backColor,nullptr,10);
+            if(value!=-16777216L) { unit->backColor=static_cast<COLORREF>(value); unit->hasBackColor=true; }
+        }
+        const char* lineColor=XmlAttributeValue(spec,L"线条颜色");
+        if(lineColor!=nullptr) { unit->lineColor=static_cast<COLORREF>(std::strtol(lineColor,nullptr,10)); unit->hasLineColor=true; }
+        const char* fillColor=XmlAttributeValue(spec,L"填充颜色");
+        if(fillColor!=nullptr&&std::strcmp(fillColor,"#透明")!=0) { unit->fillColor=static_cast<COLORREF>(std::strtol(fillColor,nullptr,10)); unit->hasFillColor=true; }
+        const char* penColor=XmlAttributeValue(spec,L"画笔颜色");
+        if(penColor!=nullptr) unit->penColor=static_cast<COLORREF>(std::strtol(penColor,nullptr,10));
+        const char* brushColor=XmlAttributeValue(spec,L"刷子颜色");
+        if(brushColor!=nullptr) unit->brushColor=static_cast<COLORREF>(std::strtol(brushColor,nullptr,10));
+        const char* textBackColor=XmlAttributeValue(spec,L"文本背景颜色");
+        if(textBackColor!=nullptr&&std::strcmp(textBackColor,"#透明")!=0) unit->textBackColor=static_cast<COLORREF>(std::strtol(textBackColor,nullptr,10));
+        const char* fontName=XmlAttributeValue(spec,L"字体名称");if(fontName!=nullptr&&*fontName!=0)unit->fontName=Wide(fontName);
+        unit->fontSize=XmlAttributeInteger(spec,L"字体大小",unit->fontSize);
+        unit->fontBold=XmlAttributeBoolean(spec,L"加粗",unit->fontBold);
+        unit->fontItalic=XmlAttributeBoolean(spec,L"倾斜",unit->fontItalic);
+        unit->fontStrikeOut=XmlAttributeBoolean(spec,L"删除线",unit->fontStrikeOut);
+        unit->fontUnderline=XmlAttributeBoolean(spec,L"下划线",unit->fontUnderline);
+        if(fontName!=nullptr||XmlAttributeValue(spec,L"字体大小")!=nullptr||XmlAttributeValue(spec,L"加粗")!=nullptr||XmlAttributeValue(spec,L"倾斜")!=nullptr||XmlAttributeValue(spec,L"删除线")!=nullptr||XmlAttributeValue(spec,L"下划线")!=nullptr)ApplyUnitFont(window,*unit);
+        if(std::strcmp(spec.type,"shape")==0) {
+            unit->shape=XmlAttributeInteger(spec,L"外形",unit->shape);unit->shapeEffect=XmlAttributeInteger(spec,L"线条效果",unit->shapeEffect);unit->lineStyle=XmlAttributeInteger(spec,L"线型",unit->lineStyle);unit->lineWidth=(std::max)(1,XmlAttributeInteger(spec,L"线宽",unit->lineWidth));
+        }
+        const char* image=XmlAttributeValue(spec,L"图片");if(image!=nullptr)unit->imageData=DecodeBase64(image);
+        const char* cursorData=XmlAttributeValue(spec,L"鼠标指针");
+        if(cursorData!=nullptr)ReplaceUnitCursor(*unit,DecodeBase64(cursorData));
+        if(std::strcmp(spec.type,"animate")==0&&unit->imageFileName.size()>0) {
+            Animate_Open(window,unit->imageFileName.c_str());
+            if(unit->playImage)Animate_Play(window,0,-1,unit->imagePlayCount<0?static_cast<UINT>(-1):static_cast<UINT>(unit->imagePlayCount));else Animate_Stop(window);
+        }
+    }
     if(XmlAttributeBoolean(spec,L"选中",false))SendMessageW(window,BM_SETCHECK,BST_CHECKED,0);
     const int limit=XmlAttributeInteger(spec,L"最大文本长度",XmlAttributeInteger(spec,L"最大允许长度",0));
-    if(limit>0&&std::strcmp(spec.type,"edit")==0)SendMessageW(window,EM_SETLIMITTEXT,static_cast<WPARAM>(limit),0);
+    if(limit>0&&(std::strcmp(spec.type,"edit")==0||std::strcmp(spec.type,"combo")==0)) {
+        HWND edit=EditPart(window);SendMessageW(edit!=nullptr?edit:window,EM_SETLIMITTEXT,static_cast<WPARAM>(limit),0);
+    }
+    if(std::strcmp(spec.type,"edit")==0) {
+        const int inputMode=XmlAttributeInteger(spec,L"输入方式",0);
+        if(inputMode==2) {
+            const std::wstring password=Wide(XmlAttributeValue(spec,L"密码遮盖字符") == nullptr ? "*" : XmlAttributeValue(spec,L"密码遮盖字符"));
+            SendMessageW(window,EM_SETPASSWORDCHAR,password.empty()?L'*':password.front(),0);
+        }
+        if(inputMode==1)SendMessageW(window,EM_SETREADONLY,TRUE,0);
+        if(Unit* unit=UnitFromWindow(window)) {
+            unit->hideSelection=XmlAttributeBoolean(spec,L"隐藏选择",unit->hideSelection);
+            unit->convertMode=XmlAttributeInteger(spec,L"转换方式",unit->convertMode);
+            unit->spinMode=XmlAttributeInteger(spec,L"调节器方式",unit->spinMode);
+            unit->spinMin=XmlAttributeInteger(spec,L"调节器底限值",unit->spinMin);
+            unit->spinMax=XmlAttributeInteger(spec,L"调节器上限值",unit->spinMax);
+            const char* password=XmlAttributeValue(spec,L"密码遮盖字符");if(password!=nullptr)unit->passwordChar=Wide(password);
+        }
+        SetWindowBorder(window,XmlAttributeInteger(spec,L"边框",1));
+    }
+    // 易语言编辑框的自动/手动调节器是一个隐藏在编辑框右侧的原生
+    // UPDOWN buddy，而不是编辑框自身的窗口样式。创建后通过 UDM_SETBUDDY
+    // 绑定，通知路由再把 UDN_DELTAPOS 转发给编辑框事件。
+    if(std::strcmp(spec.type,"edit")==0) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->spinMode!=0&&
+           (GetWindowLongPtrW(window,GWL_STYLE)&ES_MULTILINE)==0) {
+            DWORD spinStyle=WS_CHILD|(spec.visible?WS_VISIBLE:0)|UDS_ARROWKEYS|UDS_ALIGNRIGHT;
+            if(unit->spinMode==1)spinStyle|=UDS_SETBUDDYINT;
+            HWND spin=CreateWindowExW(0,UPDOWN_CLASSW,L"",spinStyle,
+                0,0,0,0,GetParent(window),nullptr,instance,nullptr);
+            if(spin!=nullptr) {
+                SendMessageW(spin,UDM_SETBUDDY,0,reinterpret_cast<LPARAM>(window));
+                SendMessageW(spin,UDM_SETRANGE32,unit->spinMin,unit->spinMax);
+                SetWindowSubclass(spin,UnitSubclassProc,static_cast<UINT_PTR>(spec.id),0);
+                RECT editRect{};GetWindowRect(window,&editRect);MapWindowPoints(nullptr,GetParent(window),reinterpret_cast<POINT*>(&editRect),2);
+                const int spinWidth=GetSystemMetrics(SM_CXVSCROLL);
+                const int editWidth=editRect.right-editRect.left;
+                if(editWidth>spinWidth) {
+                    SetWindowPos(window,nullptr,editRect.left,editRect.top,editWidth-spinWidth,
+                        editRect.bottom-editRect.top,SWP_NOZORDER|SWP_NOACTIVATE);
+                    editRect.right-=spinWidth;
+                }
+                SetWindowPos(spin,nullptr,editRect.right,editRect.top,spinWidth,
+                    editRect.bottom-editRect.top,SWP_NOZORDER|SWP_NOACTIVATE);
+                if(spec.disabled)EnableWindow(spin,FALSE);
+            }
+        }
+    }
+    if(std::strcmp(spec.type,"date")==0) {
+        SYSTEMTIME value{};
+        if(XmlAttributeSystemTime(spec,L"今天",value))SendMessageW(window,DTM_SETSYSTEMTIME,GDT_VALID,reinterpret_cast<LPARAM>(&value));
+        SYSTEMTIME minimum{},maximum{};const bool hasMinimum=XmlAttributeSystemTime(spec,L"最小日期",minimum);const bool hasMaximum=XmlAttributeSystemTime(spec,L"最大日期",maximum);
+        if(hasMinimum||hasMaximum)SetDateRange(window,hasMinimum?&minimum:nullptr,hasMaximum?&maximum:nullptr);
+    }
+    if(std::strcmp(spec.type,"month")==0) {
+        SYSTEMTIME today{};
+        if(XmlAttributeSystemTime(spec,L"今天",today))SendMessageW(window,MCM_SETTODAY,0,reinterpret_cast<LPARAM>(&today));
+        SYSTEMTIME minimum{},maximum{};const bool hasMinimum=XmlAttributeSystemTime(spec,L"最小日期",minimum);const bool hasMaximum=XmlAttributeSystemTime(spec,L"最大日期",maximum);
+        if(hasMinimum||hasMaximum){SYSTEMTIME range[2]{minimum,maximum};SendMessageW(window,MCM_SETRANGE,(hasMinimum?GDTR_MIN:0)|(hasMaximum?GDTR_MAX:0),reinterpret_cast<LPARAM>(range));}
+        const int startOfWeek=XmlAttributeInteger(spec,L"开始星期首日",-1);if(startOfWeek>=0&&startOfWeek<=6)SendMessageW(window,MCM_SETFIRSTDAYOFWEEK,0,startOfWeek);
+        const int maxSelection=XmlAttributeInteger(spec,L"最多选择天数",0);if(maxSelection>0)SendMessageW(window,MCM_SETMAXSELCOUNT,maxSelection,0);
+        const int scrollRate=XmlAttributeInteger(spec,L"滚动月数",0);if(scrollRate>0)SendMessageW(window,MCM_SETMONTHDELTA,scrollRate,0);
+        const wchar_t* colors[]={L"背景颜色",L"文本颜色",L"标题背景颜色",L"标题颜色",L"内背景颜色",L"非本月颜色"};
+        if(Unit* unit=UnitFromWindow(window))for(int index=0;index<6;++index){const char* color=XmlAttributeValue(spec,colors[index]);if(color!=nullptr){unit->monthColors[index]=static_cast<COLORREF>(std::strtol(color,nullptr,10));unit->monthColorSet[index]=1;SendMessageW(window,MCM_SETCOLOR,index,unit->monthColors[index]);}}
+    }
+    if(std::strcmp(spec.type,"list")==0||std::strcmp(spec.type,"checklist")==0||std::strcmp(spec.type,"combo")==0) {
+        const int extra=XmlAttributeInteger(spec,L"行间距",0);
+        if(extra>0) {
+            if(std::strcmp(spec.type,"list")==0||std::strcmp(spec.type,"checklist")==0) {
+                const int height=static_cast<int>(SendMessageW(window,LB_GETITEMHEIGHT,0,0));
+                if(height>0) {
+                    const int count=static_cast<int>(SendMessageW(window,LB_GETCOUNT,0,0));
+                    for(int index=0;index<count;++index)SendMessageW(window,LB_SETITEMHEIGHT,static_cast<WPARAM>(index),height+extra);
+                }
+            }
+            else {
+                const int height=static_cast<int>(SendMessageW(window,CB_GETITEMHEIGHT,0,0));
+                if(height>0) {
+                    SendMessageW(window,CB_SETITEMHEIGHT,static_cast<WPARAM>(-1),height+extra);
+                    const int count=static_cast<int>(SendMessageW(window,CB_GETCOUNT,0,0));
+                    for(int index=0;index<count;++index)SendMessageW(window,CB_SETITEMHEIGHT,static_cast<WPARAM>(index),height+extra);
+                }
+            }
+        }
+    }
+    if(std::strcmp(spec.type,"drive")==0) {
+        PopulateDriveList(window,UnitFromWindow(window));
+        const char* value=XmlAttributeValue(spec,L"驱动器");
+        if(value!=nullptr&&*value!=0) {
+            std::wstring drive=Wide(value); if(drive.size()==1)drive+=L":"; if(drive.size()==2)drive+=L"\\";
+            const LRESULT index=SendMessageW(window,CB_FINDSTRINGEXACT,static_cast<WPARAM>(-1),reinterpret_cast<LPARAM>(drive.c_str()));
+            if(index>=0)SendMessageW(window,CB_SETCURSEL,index,0);
+        }
+        if(SendMessageW(window,CB_GETCURSEL,0,0)<0&&SendMessageW(window,CB_GETCOUNT,0,0)>0)SendMessageW(window,CB_SETCURSEL,0,0);
+    }
+    if(std::strcmp(spec.type,"directory")==0||std::strcmp(spec.type,"file")==0) {
+        if(Unit* unit=UnitFromWindow(window))PopulatePathList(window,spec,*unit,std::strcmp(spec.type,"directory")==0);
+    }
+    if(std::strcmp(spec.type,"color")==0) {
+        if(Unit* unit=UnitFromWindow(window)) {
+            const char* value=XmlAttributeValue(spec,L"颜色");
+            if(value!=nullptr&&*value!=0&&std::strcmp(value,"#透明")!=0) { unit->color=static_cast<COLORREF>(std::strtol(value,nullptr,10));unit->hasColor=true; }
+        }
+    }
+    if(std::strcmp(spec.type,"hyperlink")==0) {
+        if(Unit* unit=UnitFromWindow(window)) {
+            unit->hyperlinkType=XmlAttributeInteger(spec,L"类型",0);
+            const wchar_t* property=unit->hyperlinkType==0?L"电子信箱地址":L"Internet地址";
+            const char* value=XmlAttributeValue(spec,property);
+            unit->hyperlinkTarget=Wide(value==nullptr?"":value);
+        }
+    }
+    if(std::strcmp(spec.type,"spin")==0) {
+        const int minimum=XmlAttributeInteger(spec,L"调节器底限值",0);
+        const int maximum=XmlAttributeInteger(spec,L"调节器上限值",100);
+        SendMessageW(window,UDM_SETRANGE32,minimum,maximum);
+        const int position=XmlAttributeInteger(spec,L"位置",minimum);
+        SendMessageW(window,UDM_SETPOS32,0,position);
+    }
     if(std::strcmp(spec.type,"progress")==0) {
         const int minimum=XmlAttributeInteger(spec,L"最小位置",0);
         const int maximum=XmlAttributeInteger(spec,L"最大位置",100);
         const int position=XmlAttributeInteger(spec,L"位置",minimum);
         SendMessageW(window,PBM_SETRANGE32,minimum,maximum);
         SendMessageW(window,PBM_SETPOS,position,0);
+        LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE);
+        if(XmlAttributeInteger(spec,L"显示方式",0)==1)style|=PBS_SMOOTH;else style&=~PBS_SMOOTH;
+        SetWindowLongPtrW(window,GWL_STYLE,style);
     }
     if(std::strcmp(spec.type,"trackbar")==0) {
         const int minimum=XmlAttributeInteger(spec,L"最小位置",0);
@@ -3083,28 +4538,66 @@ static void ApplyAttributes(HWND window,const Spec& spec) {
         SendMessageW(window,TBM_SETRANGE,TRUE,MAKELONG(minimum,maximum));
         SendMessageW(window,TBM_SETPAGESIZE,0,XmlAttributeInteger(spec,L"页改变值",5));
         SendMessageW(window,TBM_SETLINESIZE,0,XmlAttributeInteger(spec,L"行改变值",1));
+        const int tickFrequency=XmlAttributeInteger(spec,L"单位刻度值",0);
+        if(tickFrequency>0)SendMessageW(window,TBM_SETTICFREQ,tickFrequency,0);
+        if(XmlAttributeBoolean(spec,L"允许选择",false)) {
+            const int selectionStart=XmlAttributeInteger(spec,L"首选择位置",minimum);
+            const int selectionLength=XmlAttributeInteger(spec,L"选择长度",0);
+            SendMessageW(window,TBM_SETSELSTART,TRUE,selectionStart);
+            SendMessageW(window,TBM_SETSELEND,TRUE,selectionStart+selectionLength);
+        }
         SendMessageW(window,TBM_SETPOS,TRUE,position);
+        LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE); style&=~(TBS_AUTOTICKS|TBS_NOTICKS|TBS_TOP|TBS_BOTTOM|TBS_BOTH);
+        const int tickStyle=XmlAttributeInteger(spec,L"刻度类型",0);
+        if(tickStyle==0)style|=TBS_NOTICKS; else if(tickStyle==1)style|=TBS_TOP; else if(tickStyle==2)style|=TBS_BOTTOM; else style|=TBS_BOTH;
+        SetWindowLongPtrW(window,GWL_STYLE,style); SetWindowPos(window,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);
     }
     if(std::strcmp(spec.type,"hscroll")==0||std::strcmp(spec.type,"vscroll")==0) {
+        if(Unit* unit=UnitFromWindow(window)){unit->scrollMin=XmlAttributeInteger(spec,L"最小位置",0);unit->scrollMax=XmlAttributeInteger(spec,L"最大位置",100);unit->scrollPage=XmlAttributeInteger(spec,L"页改变值",10);unit->scrollLine=XmlAttributeInteger(spec,L"行改变值",1);}
+        const Unit* unit=UnitFromWindow(window);
         SCROLLINFO info{sizeof(SCROLLINFO),SIF_RANGE|SIF_PAGE|SIF_POS,
-            XmlAttributeInteger(spec,L"最小位置",0),XmlAttributeInteger(spec,L"最大位置",100),
-            static_cast<UINT>(XmlAttributeInteger(spec,L"页改变值",10)),
+            unit==nullptr?0:unit->scrollMin,unit==nullptr?100:unit->scrollMax,
+            static_cast<UINT>(unit==nullptr?10:unit->scrollPage),
             XmlAttributeInteger(spec,L"位置",0),0};
         SetScrollInfo(window,SB_CTL,&info,TRUE);
+    }
+    if(std::strcmp(spec.type,"date")==0) {
+        if(Unit* unit=UnitFromWindow(window)) {
+            unit->dateAllowEdit=XmlAttributeBoolean(spec,L"允许编辑",unit->dateAllowEdit);
+            if(HWND child=FindWindowExW(window,nullptr,L"Edit",nullptr))SendMessageW(child,EM_SETREADONLY,unit->dateAllowEdit?FALSE:TRUE,0);
+            SetWindowBorder(window,XmlAttributeInteger(spec,L"边框",unit->borderStyle));
+        }
     }
 }
 static void ApplyStructuredData(HWND window,const Spec& spec) {
     if(window==nullptr)return;
-    if(std::strcmp(spec.type,"list")==0) {
+    if(std::strcmp(spec.type,"list")==0||std::strcmp(spec.type,"checklist")==0) {
+        std::vector<LRESULT> actualIndexes;
+        actualIndexes.reserve(spec.itemCount);
         for(std::size_t index=0;index<spec.itemCount;++index) {
+            if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->removeDuplicates&&SendMessageW(window,LB_FINDSTRINGEXACT,static_cast<WPARAM>(-1),reinterpret_cast<LPARAM>(Wide(spec.items[index]).c_str()))>=0) { actualIndexes.push_back(-1); continue; }
             const LRESULT item=SendMessageW(window,LB_ADDSTRING,0,reinterpret_cast<LPARAM>(Wide(spec.items[index]).c_str()));
+            actualIndexes.push_back(item);
             if(index<spec.itemValueCount&&item>=0)SendMessageW(window,LB_SETITEMDATA,item,spec.itemValues[index]);
+        }
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(spec.type,"checklist")==0) {
+            EnsureCheckState(*unit,spec.itemCount);
+            for(std::size_t index=0;index<spec.itemCount;++index) {
+                const LRESULT item=index<actualIndexes.size()?actualIndexes[index]:-1;
+                if(item<0)continue;
+                const std::size_t slot=static_cast<std::size_t>(item);
+                if(slot>=unit->checkStates.size())continue;
+                if(index<spec.itemCheckedCount)unit->checkStates[slot]=spec.itemChecked[index]?1:0;
+                if(index<spec.itemEnabledCount)unit->checkEnabled[slot]=spec.itemEnabled[index]?1:0;
+            }
+            InvalidateRect(window,nullptr,TRUE);
         }
         const int selected=XmlAttributeInteger(spec,L"现行选中项",-1);
         if(selected>=0)SendMessageW(window,LB_SETCURSEL,selected,0);
     }
     else if(std::strcmp(spec.type,"combo")==0) {
         for(std::size_t index=0;index<spec.itemCount;++index) {
+            if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->removeDuplicates&&SendMessageW(window,CB_FINDSTRINGEXACT,static_cast<WPARAM>(-1),reinterpret_cast<LPARAM>(Wide(spec.items[index]).c_str()))>=0)continue;
             const LRESULT item=SendMessageW(window,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(Wide(spec.items[index]).c_str()));
             if(index<spec.itemValueCount&&item>=0)SendMessageW(window,CB_SETITEMDATA,item,spec.itemValues[index]);
         }
@@ -3112,6 +4605,7 @@ static void ApplyStructuredData(HWND window,const Spec& spec) {
         if(selected>=0)SendMessageW(window,CB_SETCURSEL,selected,0);
     }
 }
+static void StoreSpecProperties(std::unordered_map<std::string,Value>& store,const XmlAttribute* attributes,std::size_t count);
 static void CreateUnit(const Spec& spec) {
     if(strcmp(spec.type,"unsupported")==0)return;
     HWND parent=nullptr;
@@ -3119,20 +4613,415 @@ static void CreateUnit(const Spec& spec) {
     else parent=FindUnit(spec.parent)==nullptr?nullptr:FindUnit(spec.parent)->hwnd;
     if(parent==nullptr)return;
     DWORD style=Style(spec);
+    const wchar_t* className=ClassName(spec.type);
+    if(style==0||className==nullptr)return;
     if(!spec.tabStop)style&=~WS_TABSTOP;
     if(spec.visible)style|=WS_VISIBLE;
     const DWORD exStyle=strcmp(spec.type,"container")==0?WS_EX_TRANSPARENT:0;
-    HWND window=CreateWindowExW(exStyle,ClassName(spec.type),Wide(spec.text).c_str(),style,
+    HWND window=CreateWindowExW(exStyle,className,Wide(spec.text).c_str(),style,
         spec.left,spec.top,spec.width,spec.height,parent,reinterpret_cast<HMENU>(static_cast<UINT_PTR>(spec.id)),instance,nullptr);
     if(window==nullptr)return;
     ApplyDefaultFont(window);
     SetWindowSubclass(window,UnitSubclassProc,static_cast<UINT_PTR>(spec.id),0);
-    ApplyAttributes(window,spec);
+    Unit initialUnit;
+    initialUnit.id=spec.id; initialUnit.form=spec.form; initialUnit.hwnd=window; initialUnit.parent=parent;
+    initialUnit.tabOwner=spec.tabOwner; initialUnit.tabPage=spec.tabPage; initialUnit.type=spec.type;
+    initialUnit.tag=Wide(XmlAttributeValue(spec,L"标记") == nullptr ? "" : XmlAttributeValue(spec,L"标记"));
+    initialUnit.checkOnlyOne=XmlAttributeBoolean(spec,L"单选",false);
+    initialUnit.removeDuplicates=XmlAttributeBoolean(spec,L"除去重复",false);
+    units.push_back(std::move(initialUnit));
+    if(Unit* stored=UnitFromWindow(window))StoreSpecProperties(stored->properties,spec.attributes,spec.attributeCount);
     ApplyStructuredData(window,spec);
+    ApplyAttributes(window,spec);
+    if(std::strcmp(spec.type,"timer")==0) {
+        if(Unit* unit=UnitFromWindow(window)) {
+            const int period=XmlAttributeInteger(spec,L"时钟周期",0);
+            unit->timerPeriod=period>0?static_cast<UINT>(period):0;
+            if(unit->timerPeriod!=0)SetTimer(window,spec.id,unit->timerPeriod,nullptr);
+        }
+        ShowWindow(window,SW_HIDE);
+    }
     SetWindowPos(window,nullptr,spec.left,spec.top,spec.width,spec.height,SWP_NOZORDER|SWP_NOACTIVATE);
     if(!spec.visible)ShowWindow(window,SW_HIDE);
     if(spec.disabled)EnableWindow(window,FALSE);
-    units.push_back(Unit{spec.id,spec.form,window,parent,spec.tabOwner,spec.tabPage});
+    if(strcmp(spec.type,"tab")==0&&XmlAttributeBoolean(spec,L"隐藏自身",false))ShowWindow(window,SW_HIDE);
+}
+static bool ClassEquals(HWND window,const wchar_t* expected);
+static HWND WindowById(unsigned int id);
+static void SetText(HWND window,const Value& value);
+static Value TextFromWide(const std::wstring& wide) {
+    if(wide.empty())return Text("");
+    const int bytes=WideCharToMultiByte(CP_ACP,0,wide.data(),static_cast<int>(wide.size()),nullptr,0,nullptr,nullptr);
+    std::string result(static_cast<std::size_t>((std::max)(bytes,0)),'\0');
+    if(bytes>0)WideCharToMultiByte(CP_ACP,0,wide.data(),static_cast<int>(wide.size()),result.data(),bytes,nullptr,nullptr);
+    return Text(std::move(result));
+}
+static std::wstring WindowTextW(HWND window) {
+    int length=GetWindowTextLengthW(window);
+    std::wstring value(static_cast<std::size_t>((std::max)(length,0)+1),L'\0');
+    if(length>0)GetWindowTextW(window,value.data(),length+1);
+    value.resize(static_cast<std::size_t>((std::max)(length,0)));
+    return value;
+}
+static Value WindowTextValue(HWND window) {
+    return TextFromWide(WindowTextW(window));
+}
+static HWND EditPart(HWND window) {
+    if(ClassEquals(window,L"EDIT"))return window;
+    if(!ClassEquals(window,L"COMBOBOX"))return nullptr;
+    return FindWindowExW(window,nullptr,L"EDIT",nullptr);
+}
+static int CurrentSelection(HWND window);
+static bool WindowGeometry(HWND window,int& left,int& top,int& width,int& height);
+static Value WindowInvokeMember(unsigned int id,const char* operation,std::vector<Value> args) {
+    HWND window=WindowById(id);
+    if(window==nullptr||operation==nullptr)return Empty();
+    const bool combo=ClassEquals(window,L"COMBOBOX");
+    const bool list=ClassEquals(window,L"LISTBOX");
+    const bool tab=ClassEquals(window,L"SysTabControl32");
+    const bool checklist=IsCheckList(window);
+    const auto argInt=[&](std::size_t index,int fallback=0){return index<args.size()?static_cast<int>(ToInteger(args[index])):fallback;};
+    const auto argText=[&](std::size_t index){return index<args.size()?Wide(ToText(args[index]).c_str()):std::wstring();};
+    const auto argProvided=[&](std::size_t index){return index<args.size()&&!args[index].missing;};
+    const auto listCount=[&](){return static_cast<int>(list||checklist?SendMessageW(window,LB_GETCOUNT,0,0):(combo?SendMessageW(window,CB_GETCOUNT,0,0):-1));};
+    const auto ensureListState=[&](){if(checklist)if(Unit* unit=UnitFromWindow(window))EnsureCheckState(*unit,static_cast<std::size_t>((std::max)(listCount(),0)));};
+    const auto insertListState=[&](int index){if(!checklist)return;Unit* unit=UnitFromWindow(window);if(unit==nullptr)return;const int count=listCount();const std::size_t previousCount=static_cast<std::size_t>((std::max)(0,count-1));if(unit->checkStates.size()!=previousCount)unit->checkStates.resize(previousCount,0);if(unit->checkEnabled.size()!=previousCount)unit->checkEnabled.resize(previousCount,1);const std::size_t slot=static_cast<std::size_t>((std::max)(0,(std::min)(index,static_cast<int>(previousCount))));unit->checkStates.insert(unit->checkStates.begin()+static_cast<std::ptrdiff_t>(slot),0);unit->checkEnabled.insert(unit->checkEnabled.begin()+static_cast<std::ptrdiff_t>(slot),1);};
+    const auto eraseListState=[&](int index){if(!checklist)return;Unit* unit=UnitFromWindow(window);if(unit==nullptr)return;const int count=listCount();const std::size_t previousCount=static_cast<std::size_t>((std::max)(0,count+1));if(unit->checkStates.size()!=previousCount)unit->checkStates.resize(previousCount,0);if(unit->checkEnabled.size()!=previousCount)unit->checkEnabled.resize(previousCount,1);if(index>=0&&static_cast<std::size_t>(index)<unit->checkStates.size()){unit->checkStates.erase(unit->checkStates.begin()+index);unit->checkEnabled.erase(unit->checkEnabled.begin()+index);}};
+    if(operation==std::string("GetHWnd"))return Integer(static_cast<long long>(reinterpret_cast<std::uintptr_t>(window)));
+    if(operation==std::string("Destroy")) {
+        const bool form=ClassEquals(window,L"ecompiler_window_form");
+        if(form&&!argInt(0,0))SendMessageW(window,WM_CLOSE,0,0); else DestroyWindow(window);
+        return Empty();
+    }
+    if(operation==std::string("SetFocus")) {
+        HWND target=window;
+        if(ClassEquals(window,L"ecompiler_window_form")) {
+            HWND child=GetNextDlgTabItem(window,nullptr,FALSE);
+            if(child!=nullptr)target=child;
+        }
+        ::SetFocus(target);
+        return Empty();
+    }
+    if(operation==std::string("IsFocus")) {
+        const HWND focus=GetFocus();
+        return Boolean(focus==window||(ClassEquals(window,L"ecompiler_window_form")&&focus!=nullptr&&IsChild(window,focus)));
+    }
+    if(operation==std::string("GetClientWidth")||operation==std::string("GetClientHeight")) {
+        RECT rect{};GetClientRect(window,&rect);
+        return Integer(operation==std::string("GetClientWidth")?rect.right-rect.left:rect.bottom-rect.top);
+    }
+    if(operation==std::string("LockWindowUpdate")) { LockWindowUpdate(window);lockedWindow=window;return Empty(); }
+    if(operation==std::string("UnlockWindowUpdate")) { if(lockedWindow==window||window==nullptr){LockWindowUpdate(nullptr);lockedWindow=nullptr;}return Empty(); }
+    if(operation==std::string("Invalidate")) { InvalidateRect(window,nullptr,TRUE);return Empty(); }
+    if(operation==std::string("InvalidateRect")) {
+        RECT rect{argInt(0),argInt(1),argInt(0)+argInt(2),argInt(1)+argInt(3)};
+        InvalidateRect(window,&rect,TRUE);return Empty();
+    }
+    if(operation==std::string("Validate")) { ValidateRect(window,nullptr);return Empty(); }
+    if(operation==std::string("UpdateWindow")) { ::UpdateWindow(window);return Empty(); }
+    if(operation==std::string("Move")) {
+        int left=0,top=0,width=0,height=0;
+        if(WindowGeometry(window,left,top,width,height)) {
+            if(argProvided(0))left=argInt(0);
+            if(argProvided(1))top=argInt(1);
+            if(argProvided(2)&&argInt(2,-1)!=-1)width=(std::max)(0,argInt(2));
+            if(argProvided(3)&&argInt(3,-1)!=-1)height=(std::max)(0,argInt(3));
+            if(GetParent(window)==nullptr) {
+                RECT client{0,0,width,height};
+                AdjustWindowRectEx(&client,static_cast<DWORD>(GetWindowLongW(window,GWL_STYLE)),FALSE,static_cast<DWORD>(GetWindowLongW(window,GWL_EXSTYLE)));
+                SetWindowPos(window,nullptr,left,top,client.right-client.left,client.bottom-client.top,SWP_NOZORDER|SWP_NOACTIVATE);
+            } else SetWindowPos(window,nullptr,left,top,width,height,SWP_NOZORDER|SWP_NOACTIVATE);
+        }
+        return Empty();
+    }
+    if(operation==std::string("ZOrder")) { SetWindowZOrder(window,argInt(0,1));return Empty(); }
+    if(operation==std::string("SendMessage"))return Integer(static_cast<long long>(SendMessageW(window,static_cast<UINT>(argInt(0)),static_cast<WPARAM>(argInt(1)),static_cast<LPARAM>(argInt(2)))));
+    if(operation==std::string("PostMessage")) { PostMessageW(window,static_cast<UINT>(argInt(0)),static_cast<WPARAM>(argInt(1)),static_cast<LPARAM>(argInt(2)));return Empty(); }
+    if(operation==std::string("PopupMenu")) { PopupMenuAt(OwnerForm(window)!=nullptr?OwnerForm(window)->hwnd:window,args.size()>0?&args[0]:nullptr,args.size()>1?&args[1]:nullptr,args.size()>2?&args[2]:nullptr);return Empty(); }
+    if(operation==std::string("Activate")) { if(ClassEquals(window,L"ecompiler_window_form"))SetForegroundWindow(window);else ::SetFocus(window);return Empty(); }
+    if(operation==std::string("SetTrayIcon")) { Form* form=OwnerForm(window); if(form!=nullptr){const std::wstring tip=args.size()>1?argText(1):std::wstring();(void)SetTrayIcon(*form,args.empty()?nullptr:&args[0],tip);}return Empty(); }
+    if(operation==std::string("PopupTrayMenu")) { Form* form=OwnerForm(window);if(form!=nullptr)PopupMenuAt(form->hwnd,args.empty()?nullptr:&args[0],nullptr,nullptr);return Empty(); }
+    if(operation==std::string("SetParentWnd")) {
+        HWND parent=nullptr;
+        if(!args.empty()&&!args[0].missing) {
+            const unsigned int targetId=static_cast<unsigned int>(ToInteger(args[0]));
+            parent=WindowById(targetId);
+            if(parent==nullptr)parent=reinterpret_cast<HWND>(static_cast<std::uintptr_t>(ToInteger(args[0])));
+        }
+        if(parent!=nullptr&&parent!=window)SetParent(window,parent);
+        return Empty();
+    }
+    if(operation==std::string("GetSpecTagUnit")) {
+        const long long wanted=argInt(0);
+        const unsigned int formId=UnitFromWindow(window)!=nullptr?UnitFromWindow(window)->form:0u;
+        for(const auto& item:units) {
+            if(formId!=0u&&item.form!=formId)continue;
+            wchar_t* end=nullptr;const long long value=std::wcstoll(item.tag.c_str(),&end,10);
+            if(end!=item.tag.c_str()&&*end==L'\0'&&value==wanted)return Integer(static_cast<long long>(item.id),T_WINDOW_UNIT);
+        }
+        return Empty();
+    }
+	if(operation==std::string("SetShapePic"))return Boolean(false);
+	if(operation==std::string("OpenDialog")) {
+		Unit* unit=UnitFromWindow(window);
+		if(unit==nullptr||unit->type==nullptr||std::strcmp(unit->type,"dialog")!=0)return Boolean(false);
+		HWND owner=GetParent(window);
+		if(owner==nullptr)owner=window;
+		return Boolean(OpenCommonDialog(owner,*unit));
+	}
+	if(operation==std::string("GetHDC")) {
+		return Integer(static_cast<long long>(reinterpret_cast<std::uintptr_t>(CurrentPaintDC(window))));
+	}
+	if(operation==std::string("DrawPic")) {
+		HDC dc=CurrentPaintDC(window);
+		if(dc!=nullptr&&!args.empty()) {
+			HBITMAP bitmap=nullptr;
+			if(!args[0].bytes.empty()) bitmap=LoadPictureMemory(args[0].bytes);
+			else if(args[0].type==T_INT||args[0].type==T_BOOL||args[0].type==T_FLOAT)
+				bitmap=ClonePictureHandle(static_cast<OLE_HANDLE>(static_cast<std::uintptr_t>(ToInteger(args[0]))));
+			if(bitmap!=nullptr)DrawBitmapAt(dc,bitmap,argInt(1),argInt(2),argInt(3),argInt(4));
+		}
+		return Empty();
+	}
+	if(operation==std::string("GetCanvasPic")) {
+		HDC dc=CurrentPaintDC(window);if(dc==nullptr)return Bytes({});
+		RECT rect{};GetClientRect(window,&rect);const int width=(std::max)(0,rect.right),height=(std::max)(0,rect.bottom);if(width==0||height==0)return Bytes({});
+		HDC memory=CreateCompatibleDC(dc);HBITMAP bitmap=CreateCompatibleBitmap(dc,width,height);if(memory==nullptr||bitmap==nullptr){if(memory!=nullptr)DeleteDC(memory);if(bitmap!=nullptr)DeleteObject(bitmap);return Bytes({});}
+		HGDIOBJ old=SelectObject(memory,bitmap);BitBlt(memory,0,0,width,height,dc,0,0,SRCCOPY);SelectObject(memory,old);DeleteDC(memory);std::vector<unsigned char> bytes=BitmapToBytes(bitmap);DeleteObject(bitmap);return Bytes(std::move(bytes));
+	}
+	if(operation==std::string("CopyCanvas")) {
+		HDC dc=CurrentPaintDC(window);if(dc!=nullptr){RECT client{};GetClientRect(window,&client);const int x=argInt(0),y=argInt(1),width=argProvided(2)?argInt(2):client.right-x,height=argProvided(3)?argInt(3):client.bottom-y;if(width>0&&height>0){HDC memory=CreateCompatibleDC(dc);HBITMAP bitmap=CreateCompatibleBitmap(dc,width,height);if(memory!=nullptr&&bitmap!=nullptr){HGDIOBJ old=SelectObject(memory,bitmap);BitBlt(memory,0,0,width,height,dc,x,y,SRCCOPY);SelectObject(memory,old);DeleteDC(memory);if(OpenClipboard(window)!=FALSE){EmptyClipboard();SetClipboardData(CF_BITMAP,bitmap);CloseClipboard();}else DeleteObject(bitmap);}else{if(memory!=nullptr)DeleteDC(memory);if(bitmap!=nullptr)DeleteObject(bitmap);}}}
+		return Empty();
+	}
+	if(operation==std::string("GetPicWidth")||operation==std::string("GetPicHeight")) {
+		// The core's image number is an opaque handle.  Ask the classic runtime
+		// for its bitmap and query the dimensions when that ABI is available.
+		const HBITMAP bitmap=reinterpret_cast<HBITMAP>(static_cast<std::uintptr_t>(BlackMoonFuncForeLibNotifySys(1003,static_cast<EPointer>(argInt(0)),0)));
+		if(bitmap==nullptr)return Integer(0);
+		BITMAP info{};GetObjectW(bitmap,sizeof(info),&info);DeleteObject(bitmap);
+		return Integer(operation==std::string("GetPicWidth")?info.bmWidth:info.bmHeight);
+	}
+	if(operation==std::string("UnitCnv")) {
+		Unit* unit=UnitFromWindow(window);const int value=argInt(0);const int kind=argInt(1);if(unit==nullptr||kind<1||kind>4)return Integer(value);if(unit->drawUnit==0)return Integer(value);HDC dc=GetDC(window);if(dc==nullptr)return Integer(value);const int dpiX=GetDeviceCaps(dc,LOGPIXELSX),dpiY=GetDeviceCaps(dc,LOGPIXELSY);ReleaseDC(window,dc);const double scale=(kind==1||kind==3)?(unit->drawUnit==1?dpiX/254.0:(unit->drawUnit==2?dpiX/2540.0:(unit->drawUnit==3?dpiX/100.0:(unit->drawUnit==4?dpiX/1000.0:dpiX/1440.0)))):(unit->drawUnit==1?dpiY/254.0:(unit->drawUnit==2?dpiY/2540.0:(unit->drawUnit==3?dpiY/100.0:(unit->drawUnit==4?dpiY/1000.0:dpiY/1440.0))));const bool pixelToUnit=kind==3||kind==4;return Integer(static_cast<long long>(pixelToUnit?value/scale:value*scale));
+	}
+	if(operation==std::string("GetPixel")) {
+		HDC dc=CurrentPaintDC(window); if(dc==nullptr)return Integer(-1);
+		return Integer(static_cast<long long>(GetPixel(dc,argInt(0),argInt(1))));
+	}
+	if(operation==std::string("CanvasClear")) {
+		if(HDC dc=CurrentPaintDC(window);dc!=nullptr){RECT client{};GetClientRect(window,&client);const int left=argProvided(0)?argInt(0):0;const int top=argProvided(1)?argInt(1):0;const int width=argProvided(2)?argInt(2):client.right-left;const int height=argProvided(3)?argInt(3):client.bottom-top;RECT rect{left,top,left+(std::max)(0,width),top+(std::max)(0,height)};Unit* unit=UnitFromWindow(window);HBRUSH brush=unit!=nullptr?CreateSolidBrush(unit->hasBackColor?unit->backColor:RGB(255,255,255)):static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));FillRect(dc,&rect,brush);if(unit!=nullptr)DeleteObject(brush);if(unit!=nullptr){unit->writeX=left;unit->writeY=top;}}
+		return Empty();
+	}
+	if(operation==std::string("SetPixel")) {
+		HDC dc=CurrentPaintDC(window); if(dc!=nullptr)SetPixel(dc,argInt(0),argInt(1),static_cast<COLORREF>(argInt(2)));
+		return Empty();
+	}
+	if(operation==std::string("GradientRect")) {
+		HDC dc=CurrentPaintDC(window);if(dc!=nullptr){const int left=argInt(0),top=argInt(1),width=(std::max)(0,argInt(2)),height=(std::max)(0,argInt(3));const int direction=argInt(4,2);const COLORREF first=static_cast<COLORREF>(argInt(5)),second=static_cast<COLORREF>(argInt(6));const int steps=(std::max)(1,(direction==1||direction==5)?height:width);for(int step=0;step<steps;++step){const double ratio=steps<=1?0.0:static_cast<double>(step)/static_cast<double>(steps-1);const BYTE r=static_cast<BYTE>(GetRValue(first)+(GetRValue(second)-GetRValue(first))*ratio);const BYTE g=static_cast<BYTE>(GetGValue(first)+(GetGValue(second)-GetGValue(first))*ratio);const BYTE b=static_cast<BYTE>(GetBValue(first)+(GetBValue(second)-GetBValue(first))*ratio);HBRUSH brush=CreateSolidBrush(RGB(r,g,b));RECT rect{left,top,left+width,top+height};if(direction==1||direction==5){rect.top=top+(height*step)/steps;rect.bottom=top+(height*(step+1))/steps;}else{rect.left=left+(width*step)/steps;rect.right=left+(width*(step+1))/steps;}FillRect(dc,&rect,brush);DeleteObject(brush);}}
+		return Empty();
+	}
+	if(operation==std::string("LineTo")) {
+		HDC dc=CurrentPaintDC(window); if(dc!=nullptr){CanvasPaintGuard guard(dc,UnitFromWindow(window));MoveToEx(dc,argInt(0),argInt(1),nullptr);::LineTo(dc,argInt(2),argInt(3));}
+		return Empty();
+	}
+	if(operation==std::string("Ellipse")) {
+		HDC dc=CurrentPaintDC(window); if(dc!=nullptr){CanvasPaintGuard guard(dc,UnitFromWindow(window));::Ellipse(dc,argInt(0),argInt(1),argInt(2),argInt(3));}
+		return Empty();
+	}
+	if(operation==std::string("ArcTo")||operation==std::string("Chord")||operation==std::string("Pie")) {
+		HDC dc=CurrentPaintDC(window); if(dc!=nullptr){CanvasPaintGuard guard(dc,UnitFromWindow(window));const int left=argInt(0),top=argInt(1),right=argInt(2),bottom=argInt(3),sx=argInt(4),sy=argInt(5),ex=argInt(6),ey=argInt(7);if(operation==std::string("ArcTo"))Arc(dc,left,top,right,bottom,sx,sy,ex,ey);else if(operation==std::string("Chord"))Chord(dc,left,top,right,bottom,sx,sy,ex,ey);else Pie(dc,left,top,right,bottom,sx,sy,ex,ey);}
+		return Empty();
+	}
+	if(operation==std::string("DrawRect")) {
+		HDC dc=CurrentPaintDC(window); if(dc!=nullptr){CanvasPaintGuard guard(dc,UnitFromWindow(window));::Rectangle(dc,argInt(0),argInt(1),argInt(2),argInt(3));}
+		return Empty();
+	}
+	if(operation==std::string("FillRect")) {
+		HDC dc=CurrentPaintDC(window); if(dc!=nullptr){RECT rect{argInt(0),argInt(1),argInt(2),argInt(3)};Unit* unit=UnitFromWindow(window);HBRUSH brush=unit!=nullptr?CreateSolidBrush(unit->hasBackColor?unit->backColor:RGB(255,255,255)):static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));::FillRect(dc,&rect,brush);if(unit!=nullptr)DeleteObject(brush);}
+		return Empty();
+	}
+	if(operation==std::string("RoundRect")) {
+		HDC dc=CurrentPaintDC(window); if(dc!=nullptr){CanvasPaintGuard guard(dc,UnitFromWindow(window));::RoundRect(dc,argInt(0),argInt(1),argInt(2),argInt(3),argInt(4),argInt(5,argInt(4)));}
+		return Empty();
+	}
+	if(operation==std::string("InvertRect")) {
+		HDC dc=CurrentPaintDC(window); if(dc!=nullptr){RECT rect{argInt(0),argInt(1),argInt(2),argInt(3)};::InvertRect(dc,&rect);}
+		return Empty();
+	}
+	if(operation==std::string("Polygon")) {
+		HDC dc=CurrentPaintDC(window); if(dc!=nullptr&&!args.empty()&&args[0].declaredArray){std::vector<POINT> points;points.reserve(args[0].elements.size()/2);for(std::size_t i=0;i+1<args[0].elements.size();i+=2)points.push_back(POINT{static_cast<LONG>(ToInteger(args[0].elements[i])),static_cast<LONG>(ToInteger(args[0].elements[i+1]))});if(!points.empty())::Polygon(dc,points.data(),static_cast<int>(points.size()));}
+		return Empty();
+	}
+	if(operation==std::string("SetWritePos")||operation==std::string("Write")||operation==std::string("PrintLine")||operation==std::string("ScrollPrint")||operation==std::string("Say")||operation==std::string("CanvasGetWidth")||operation==std::string("CanvasGetHeight")) {
+		Unit* unit=UnitFromWindow(window); if(unit==nullptr)return operation==std::string("CanvasGetWidth")||operation==std::string("CanvasGetHeight")?Integer(0):Empty();
+		HDC dc=CurrentPaintDC(window);
+		if(operation==std::string("SetWritePos")){if(argProvided(0))unit->writeX=argInt(0);if(argProvided(1))unit->writeY=argInt(1);return Empty();}
+		if(operation==std::string("CanvasGetWidth")||operation==std::string("CanvasGetHeight")){SIZE size{};const std::wstring text=argText(0);if(dc!=nullptr)GetTextExtentPoint32W(dc,text.c_str(),static_cast<int>(text.size()),&size);return Integer(operation==std::string("CanvasGetWidth")?size.cx:size.cy);}
+		const std::wstring text=args.empty()?std::wstring():argText(operation==std::string("Say")?2:0);
+		if(dc!=nullptr){int x=unit->writeX,y=unit->writeY;if(operation==std::string("Say")){if(argProvided(0))x=argInt(0);if(argProvided(1))y=argInt(1);}TextOutW(dc,x,y,text.c_str(),static_cast<int>(text.size()));SIZE size{};GetTextExtentPoint32W(dc,text.c_str(),static_cast<int>(text.size()),&size);if(operation==std::string("PrintLine")||operation==std::string("ScrollPrint")){unit->writeX=0;unit->writeY+=size.cy;}else if(operation==std::string("Write")){unit->writeX=x+size.cx;unit->writeY=y;}}
+		return Empty();
+	}
+    if(operation==std::string("AddText")) {
+        HWND edit=EditPart(window); if(edit==nullptr)edit=window;
+        const std::wstring text=argText(0); SendMessageW(edit,EM_SETSEL,static_cast<WPARAM>(-1),static_cast<LPARAM>(-1));
+        SendMessageW(edit,EM_REPLACESEL,FALSE,reinterpret_cast<LPARAM>(text.c_str())); return Empty();
+    }
+    if(operation==std::string("Goto")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&!unit->hyperlinkTarget.empty())
+            (void)ShellExecuteW(window,L"open",unit->hyperlinkTarget.c_str(),nullptr,nullptr,SW_SHOWNORMAL);
+        return Empty();
+    }
+    if(operation==std::string("SendLabelMsg")) {
+        std::vector<Value> values;
+        values.push_back(args.size()>0?Integer(ToInteger(args[0])):Integer(0));
+        values.push_back(args.size()>1?Integer(ToInteger(args[1])):Integer(0));
+        const bool waitForResult=args.size()<3||ToBool(args[2]);
+        if(waitForResult) { Value result; if(DispatchNativeResult(window,native_feedback,0,std::move(values),&result))return Integer(ToInteger(result)); }
+        else DispatchNative(window,native_feedback,0,std::move(values));
+        return Integer(0);
+    }
+    if(operation==std::string("GetTabCount"))return Integer(TabCtrl_GetItemCount(window));
+    if(operation==std::string("GetTabName")&&tab) {
+        TCITEMW item{}; wchar_t buffer[4096]{}; item.mask=TCIF_TEXT; item.pszText=buffer; item.cchTextMax=static_cast<int>(std::size(buffer));
+        const int index=argInt(0)-1; return index>=0&&TabCtrl_GetItem(window,index,&item)?TextFromWide(buffer):Text("");
+    }
+    if(operation==std::string("SetTabName")&&tab) { TCITEMW item{}; std::wstring text=argText(1); item.mask=TCIF_TEXT; item.pszText=text.data(); return Boolean(argInt(0)>0&&TabCtrl_SetItem(window,argInt(0)-1,&item)!=FALSE); }
+    if(operation==std::string("GetTopIndex"))return Integer(combo?SendMessageW(window,CB_GETTOPINDEX,0,0):(list||checklist?SendMessageW(window,LB_GETTOPINDEX,0,0):-1));
+    if(operation==std::string("SetTopIndex"))return Boolean((combo?SendMessageW(window,CB_SETTOPINDEX,argInt(0),0):(list||checklist?SendMessageW(window,LB_SETTOPINDEX,argInt(0),0):LB_ERR))!=CB_ERR);
+    if(operation==std::string("GetCount"))return Integer(tab?TabCtrl_GetItemCount(window):listCount());
+    if(operation==std::string("GetItemData"))return Integer(combo?SendMessageW(window,CB_GETITEMDATA,argInt(0),0):(list||checklist?SendMessageW(window,LB_GETITEMDATA,argInt(0),0):-1));
+    if(operation==std::string("SetItemData"))return Boolean((combo?SendMessageW(window,CB_SETITEMDATA,argInt(0),argInt(1)):(list||checklist?SendMessageW(window,LB_SETITEMDATA,argInt(0),argInt(1)):LB_ERR))!=LB_ERR);
+    if(operation==std::string("GetItemText")) {
+        const int index=argInt(0); int length=combo?SendMessageW(window,CB_GETLBTEXTLEN,index,0):((list||checklist)?SendMessageW(window,LB_GETTEXTLEN,index,0):-1); if(index<0||length<0)return Text("");
+        std::wstring text(static_cast<std::size_t>(length+1),L'\0');
+        const LRESULT copied=combo?SendMessageW(window,CB_GETLBTEXT,index,reinterpret_cast<LPARAM>(text.data())):
+            ((list||checklist)?SendMessageW(window,LB_GETTEXT,index,reinterpret_cast<LPARAM>(text.data())):LB_ERR);
+        if(copied<0)return Text("");
+        text.resize(std::wcslen(text.c_str())); const int bytes=WideCharToMultiByte(CP_ACP,0,text.data(),static_cast<int>(text.size()),nullptr,0,nullptr,nullptr); std::string result(static_cast<std::size_t>((std::max)(bytes,0)),'\0'); if(bytes>0)WideCharToMultiByte(CP_ACP,0,text.data(),static_cast<int>(text.size()),result.data(),bytes,nullptr,nullptr); return Text(std::move(result));
+    }
+    if(operation==std::string("SetItemText")) {
+        const int index=argInt(0); std::wstring text=argText(1); if(index<0||index>=listCount())return Boolean(false);
+        // Replacing an item is implemented as delete/insert because Win32 has
+        // no set-text message for list boxes.  Preserve the selection for all
+        // single-selection list-like controls, not only check lists.
+        const int selected=CurrentSelection(window);
+        Unit* unit=checklist?UnitFromWindow(window):nullptr;
+        std::vector<unsigned char> savedStates; std::vector<unsigned char> savedEnabled;
+        unsigned char replacedChecked=0; unsigned char replacedEnabled=1;
+        if(unit!=nullptr){ensureListState();savedStates=unit->checkStates;savedEnabled=unit->checkEnabled;
+            if(static_cast<std::size_t>(index)<savedStates.size())replacedChecked=savedStates[static_cast<std::size_t>(index)];
+            if(static_cast<std::size_t>(index)<savedEnabled.size())replacedEnabled=savedEnabled[static_cast<std::size_t>(index)];}
+        const auto itemTextAt=[&](int itemIndex) {
+            const int length=combo?static_cast<int>(SendMessageW(window,CB_GETLBTEXTLEN,itemIndex,0)):static_cast<int>(SendMessageW(window,LB_GETTEXTLEN,itemIndex,0));
+            if(itemIndex<0||length<0)return std::wstring();
+            std::wstring result(static_cast<std::size_t>(length+1),L'\0');
+            const LRESULT copied=combo?SendMessageW(window,CB_GETLBTEXT,itemIndex,reinterpret_cast<LPARAM>(result.data())):SendMessageW(window,LB_GETTEXT,itemIndex,reinterpret_cast<LPARAM>(result.data()));
+            if(copied<0)return std::wstring();
+            result.resize(std::wcslen(result.c_str()));
+            return result;
+        };
+        const std::wstring oldText=itemTextAt(index);
+        const LRESULT oldData=combo?SendMessageW(window,CB_GETITEMDATA,index,0):SendMessageW(window,LB_GETITEMDATA,index,0);
+        const LRESULT removed=combo?SendMessageW(window,CB_DELETESTRING,index,0):SendMessageW(window,LB_DELETESTRING,index,0);
+        if(removed==CB_ERR)return Boolean(false);
+        std::vector<unsigned char> remainingStates=savedStates;
+        std::vector<unsigned char> remainingEnabled=savedEnabled;
+        if(unit!=nullptr){
+            if(static_cast<std::size_t>(index)<remainingStates.size())remainingStates.erase(remainingStates.begin()+index);
+            if(static_cast<std::size_t>(index)<remainingEnabled.size())remainingEnabled.erase(remainingEnabled.begin()+index);
+            unit->checkStates=remainingStates;unit->checkEnabled=remainingEnabled;
+        }
+        const LRESULT inserted=combo?SendMessageW(window,CB_INSERTSTRING,index,reinterpret_cast<LPARAM>(text.c_str())):SendMessageW(window,LB_INSERTSTRING,index,reinterpret_cast<LPARAM>(text.c_str()));
+        if(inserted<0){
+            // Best-effort rollback keeps the original item and its metadata if
+            // the replacement allocation fails.
+            const LRESULT restored=combo?SendMessageW(window,CB_INSERTSTRING,index,reinterpret_cast<LPARAM>(oldText.c_str())):SendMessageW(window,LB_INSERTSTRING,index,reinterpret_cast<LPARAM>(oldText.c_str()));
+            if(restored>=0&&oldData!=CB_ERR)(void)(combo?SendMessageW(window,CB_SETITEMDATA,restored,oldData):SendMessageW(window,LB_SETITEMDATA,restored,oldData));
+            if(unit!=nullptr){unit->checkStates=savedStates;unit->checkEnabled=savedEnabled;InvalidateRect(window,nullptr,TRUE);}
+            return Boolean(false);
+        }
+        if(oldData!=CB_ERR)(void)(combo?SendMessageW(window,CB_SETITEMDATA,inserted,oldData):SendMessageW(window,LB_SETITEMDATA,inserted,oldData));
+        if(checklist){
+            // `inserted` is the actual index.  This matters for LBS_SORT and
+            // CBS_SORT, where the requested index is only a hint.
+            const int count=listCount(); const int slot=static_cast<int>(inserted);
+            const std::size_t insertSlot=static_cast<std::size_t>((std::max)(0,(std::min)(slot,count-1)));
+            unit->checkStates=std::move(remainingStates);unit->checkEnabled=std::move(remainingEnabled);
+            unit->checkStates.insert(unit->checkStates.begin()+static_cast<std::ptrdiff_t>(insertSlot),replacedChecked);
+            unit->checkEnabled.insert(unit->checkEnabled.begin()+static_cast<std::ptrdiff_t>(insertSlot),replacedEnabled);
+            int selectedAfterDelete=selected;
+            if(selected==index)selectedAfterDelete=-1; else if(selected>index)--selectedAfterDelete;
+            if(selectedAfterDelete>=0&&insertSlot<=static_cast<std::size_t>(selectedAfterDelete))++selectedAfterDelete;
+            if(selected==index)selectedAfterDelete=slot;
+            if(selectedAfterDelete>=0)SendMessageW(window,LB_SETCURSEL,selectedAfterDelete,0);
+            InvalidateRect(window,nullptr,TRUE);
+        }
+        else if(selected>=0) {
+            int selectedAfterDelete=selected;
+            if(selected==index)selectedAfterDelete=-1; else if(selected>index)--selectedAfterDelete;
+            if(selectedAfterDelete>=0&&inserted<=selectedAfterDelete)++selectedAfterDelete;
+            if(selected==index)selectedAfterDelete=static_cast<int>(inserted);
+            if(combo)SendMessageW(window,CB_SETCURSEL,selectedAfterDelete,0);
+            else if(list&&((GetWindowLongPtrW(window,GWL_STYLE)&(LBS_MULTIPLESEL|LBS_EXTENDEDSEL))==0))SendMessageW(window,LB_SETCURSEL,selectedAfterDelete,0);
+        }
+        return Boolean(true);
+    }
+    if(operation==std::string("AddString")) { std::wstring text=argText(0); if(Unit* u=UnitFromWindow(window);u!=nullptr&&u->removeDuplicates&&((combo&&SendMessageW(window,CB_FINDSTRINGEXACT,-1,reinterpret_cast<LPARAM>(text.c_str()))>=0)||((list||checklist)&&SendMessageW(window,LB_FINDSTRINGEXACT,-1,reinterpret_cast<LPARAM>(text.c_str()))>=0)))return Integer(-1); const LRESULT item=combo?SendMessageW(window,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(text.c_str())):((list||checklist)?SendMessageW(window,LB_ADDSTRING,0,reinterpret_cast<LPARAM>(text.c_str())):LB_ERR); if(item>=0&&args.size()>1)(void)(combo?SendMessageW(window,CB_SETITEMDATA,item,argInt(1)):SendMessageW(window,LB_SETITEMDATA,item,argInt(1))); if(item>=0&&checklist){insertListState(static_cast<int>(item));InvalidateRect(window,nullptr,TRUE);} return Integer(item); }
+    if(operation==std::string("InsertString")) { const int index=argInt(0); std::wstring text=argText(1); if(Unit* u=UnitFromWindow(window);u!=nullptr&&u->removeDuplicates&&((combo&&SendMessageW(window,CB_FINDSTRINGEXACT,-1,reinterpret_cast<LPARAM>(text.c_str()))>=0)||((list||checklist)&&SendMessageW(window,LB_FINDSTRINGEXACT,-1,reinterpret_cast<LPARAM>(text.c_str()))>=0)))return Integer(-1); const LRESULT item=combo?SendMessageW(window,CB_INSERTSTRING,index,reinterpret_cast<LPARAM>(text.c_str())):((list||checklist)?SendMessageW(window,LB_INSERTSTRING,index,reinterpret_cast<LPARAM>(text.c_str())):LB_ERR); if(item>=0&&args.size()>2)(void)(combo?SendMessageW(window,CB_SETITEMDATA,item,argInt(2)):SendMessageW(window,LB_SETITEMDATA,item,argInt(2))); if(item>=0&&checklist){insertListState(static_cast<int>(item));InvalidateRect(window,nullptr,TRUE);} return Integer(item); }
+    if(operation==std::string("DeleteString")){const int index=argInt(0);const LRESULT result=combo?SendMessageW(window,CB_DELETESTRING,index,0):((list||checklist)?SendMessageW(window,LB_DELETESTRING,index,0):LB_ERR);if(result!=CB_ERR&&checklist){eraseListState(index);InvalidateRect(window,nullptr,TRUE);}return Boolean(result!=CB_ERR);}
+    if(operation==std::string("Clear")){(void)(combo?SendMessageW(window,CB_RESETCONTENT,0,0):((list||checklist)?SendMessageW(window,LB_RESETCONTENT,0,0):0));if(checklist)if(Unit* unit=UnitFromWindow(window)){unit->checkStates.clear();unit->checkEnabled.clear();}return Empty();}
+    if(operation==std::string("SelItem")){const std::wstring wanted=argText(0);if(list&&!checklist&&(GetWindowLongPtrW(window,GWL_STYLE)&(LBS_MULTIPLESEL|LBS_EXTENDEDSEL))!=0)return Integer(-1);const int count=listCount();for(int i=0;i<count;++i){int length=combo?SendMessageW(window,CB_GETLBTEXTLEN,i,0):SendMessageW(window,LB_GETTEXTLEN,i,0);std::wstring text(static_cast<std::size_t>((std::max)(length,0)+1),L'\0');(void)(combo?SendMessageW(window,CB_GETLBTEXT,i,reinterpret_cast<LPARAM>(text.data())):SendMessageW(window,LB_GETTEXT,i,reinterpret_cast<LPARAM>(text.data())));if(text.rfind(wanted,0)==0){(void)(combo?SendMessageW(window,CB_SETCURSEL,i,0):SendMessageW(window,LB_SETCURSEL,i,0));return Integer(i);}}return Integer(-1);}
+    if(operation==std::string("GetCaretIndex")) {
+        if(!list&&!checklist)return Integer(-1);
+        const LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE);
+        if((style&(LBS_MULTIPLESEL|LBS_EXTENDEDSEL))==0)return Integer(SendMessageW(window,LB_GETCURSEL,0,0));
+        return Integer(SendMessageW(window,LB_GETCARETINDEX,0,0));
+    }
+    if(operation==std::string("SetCaretIndex")) {
+        if(!list&&!checklist)return Boolean(false);
+        const LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE);
+        if((style&(LBS_MULTIPLESEL|LBS_EXTENDEDSEL))==0)return Boolean(SendMessageW(window,LB_SETCURSEL,argInt(0),0)!=LB_ERR);
+        return Boolean(SendMessageW(window,LB_SETCARETINDEX,argInt(0),TRUE)!=FALSE);
+    }
+    if(operation==std::string("GetSelCount"))return Integer(list&&!checklist?SendMessageW(window,LB_GETSELCOUNT,0,0):-1);
+    if(operation==std::string("GetSelItems")) {
+        if(!list||checklist)return MakeVar(T_INT,true,false);
+        const int count=static_cast<int>(SendMessageW(window,LB_GETSELCOUNT,0,0));
+        Value result=MakeVar(T_INT,true,false);
+        if(count<=0)return result;
+        result.dimensions={count}; result.elements.reserve(static_cast<std::size_t>(count));
+        std::vector<int> indexes(static_cast<std::size_t>(count));
+        if(SendMessageW(window,LB_GETSELITEMS,count,reinterpret_cast<LPARAM>(indexes.data()))==LB_ERR)return result;
+        for(const int index:indexes)result.elements.push_back(Integer(index,T_INT));
+        return result;
+    }
+    if(operation==std::string("IsSelected"))return Boolean(list&&!checklist&&SendMessageW(window,LB_GETSEL,argInt(0),0)>0);
+    if(operation==std::string("SelectItem")) {
+        const bool state=ToBool(args.size()>1?args[1]:Boolean(true));
+        if(checklist)return Boolean(SendMessageW(window,LB_SETCURSEL,state?argInt(0):-1,0)!=LB_ERR);
+        if(!list)return Boolean(false);
+        const LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE);
+        if((style&(LBS_MULTIPLESEL|LBS_EXTENDEDSEL))!=0)return Boolean(SendMessageW(window,LB_SETSEL,state,argInt(0))!=LB_ERR);
+        if(!state)return Boolean(SendMessageW(window,LB_SETCURSEL,-1,0)!=LB_ERR);
+        return Boolean(SendMessageW(window,LB_SETCURSEL,argInt(0),0)!=LB_ERR);
+    }
+    if(operation==std::string("IsChecked")) {
+        if(!checklist)return Boolean(false);
+        Unit* unit=UnitFromWindow(window);const int index=argInt(0);if(unit==nullptr||index<0)return Boolean(false);ensureListState();return Boolean(index<static_cast<int>(unit->checkStates.size())&&unit->checkStates[static_cast<std::size_t>(index)]!=0);
+    }
+    if(operation==std::string("SetCheck")) {
+        if(!checklist)return Boolean(false);
+        return Boolean(SetCheckState(window,argInt(0),ToBool(args.size()>1?args[1]:Boolean(true))));
+    }
+    if(operation==std::string("IsEnabled")) {
+        if(!checklist)return Boolean(false);
+        Unit* unit=UnitFromWindow(window);const int index=argInt(0);if(unit==nullptr||index<0)return Boolean(false);ensureListState();return Boolean(index<static_cast<int>(unit->checkEnabled.size())&&unit->checkEnabled[static_cast<std::size_t>(index)]!=0);
+    }
+    if(operation==std::string("Enable")) {
+        if(!checklist)return Boolean(false);
+        Unit* unit=UnitFromWindow(window);const int index=argInt(0);if(unit==nullptr||index<0)return Boolean(false);const int count=listCount();if(index>=count)return Boolean(false);ensureListState();unit->checkEnabled[static_cast<std::size_t>(index)]=ToBool(args.size()>1?args[1]:Boolean(true))?1:0;InvalidateRect(window,nullptr,TRUE);return Boolean(true);
+    }
+    return Empty();
 }
 static void SetText(HWND window,const Value& value) { const std::wstring text=Wide(ToText(value).c_str()); SetWindowTextW(window,text.c_str()); }
 static bool PropertyEquals(const char* property,const wchar_t* expected) {
@@ -3143,24 +5032,83 @@ static HWND WindowById(unsigned int id) {
     if(window==nullptr)if(const auto* unit=FindUnit(id))window=unit->hwnd;
     return window;
 }
+static Value SpecPropertyValue(const char* raw) {
+    if(raw==nullptr)return Empty();
+    if(std::strcmp(raw,"1")==0||AttributeEquals(raw,L"真")||AttributeEquals(raw,L"true"))return Boolean(true);
+    if(std::strcmp(raw,"0")==0||AttributeEquals(raw,L"假")||AttributeEquals(raw,L"false"))return Boolean(false);
+    char* end=nullptr; const long long integer=_strtoi64(raw,&end,10);
+    if(end!=raw&&*end=='\0')return Integer(integer);
+    end=nullptr; const double number=std::strtod(raw,&end);
+    if(end!=raw&&*end=='\0')return Number(number);
+    return Text(raw);
+}
+static void StoreSpecProperties(std::unordered_map<std::string,Value>& store,const XmlAttribute* attributes,std::size_t count) {
+    if(attributes==nullptr)return;
+    for(std::size_t index=0;index<count;++index)if(attributes[index].name!=nullptr)store[attributes[index].name]=SpecPropertyValue(attributes[index].value);
+}
+static std::unordered_map<std::string,Value>* PropertyStore(unsigned int id) {
+    if(Form* form=FindFormRecord(WindowById(id)))return &form->properties;
+    if(Unit* unit=FindUnit(id))return &unit->properties;
+    return nullptr;
+}
 static bool ClassEquals(HWND window,const wchar_t* expected) {
     wchar_t actual[64]{};
-    return window!=nullptr&&GetClassNameW(window,actual,static_cast<int>(std::size(actual)))>0&&std::wcscmp(actual,expected)==0;
+    return window!=nullptr&&GetClassNameW(window,actual,static_cast<int>(std::size(actual)))>0&&lstrcmpiW(actual,expected)==0;
 }
 static int CurrentSelection(HWND window) {
-    if(ClassEquals(window,L"LISTBOX"))return static_cast<int>(SendMessageW(window,LB_GETCURSEL,0,0));
+    if(ClassEquals(window,L"LISTBOX")) {
+        const LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE);
+        // Multi-select list boxes still have a logical current (caret) item.
+        // LB_GETCURSEL is documented to return -1 for them, which used to
+        // leak into 易语言的“现行选中项” property.  Report the caret item
+        // instead, while retaining -1 when no item has focus.
+        if((style&(LBS_MULTIPLESEL|LBS_EXTENDEDSEL))!=0) {
+            const LRESULT caret=SendMessageW(window,LB_GETCARETINDEX,0,0);
+            return caret>=0&&caret<=static_cast<LRESULT>((std::numeric_limits<int>::max)())
+                ? static_cast<int>(caret) : -1;
+        }
+        return static_cast<int>(SendMessageW(window,LB_GETCURSEL,0,0));
+    }
     if(ClassEquals(window,L"COMBOBOX"))return static_cast<int>(SendMessageW(window,CB_GETCURSEL,0,0));
     return -1;
 }
 static int CurrentPosition(HWND window) {
     if(ClassEquals(window,L"msctls_progress32"))return static_cast<int>(SendMessageW(window,PBM_GETPOS,0,0));
     if(ClassEquals(window,L"msctls_trackbar32"))return static_cast<int>(SendMessageW(window,TBM_GETPOS,0,0));
+    if(ClassEquals(window,UPDOWN_CLASSW)) {
+        BOOL ok=FALSE;
+        const LRESULT value=SendMessageW(window,UDM_GETPOS32,0,reinterpret_cast<LPARAM>(&ok));
+        return ok?static_cast<int>(value):0;
+    }
     if(ClassEquals(window,L"SCROLLBAR")) {
         SCROLLINFO info{sizeof(SCROLLINFO),SIF_POS,0,0,0,0,0};
         GetScrollInfo(window,SB_CTL,&info);
         return info.nPos;
     }
     return 0;
+}
+static int CanvasDimension(HWND window,const Unit& unit,bool height) {
+    RECT client{};
+    if(window==nullptr||GetClientRect(window,&client)==FALSE)return 0;
+    const int pixels=height?(std::max)(0,static_cast<int>(client.bottom)):(std::max)(0,static_cast<int>(client.right));
+    if(unit.drawUnit==0)return pixels;
+    HDC dc=GetDC(window);
+    if(dc==nullptr)return pixels;
+    const int dpi=GetDeviceCaps(dc,height?LOGPIXELSY:LOGPIXELSX);
+    ReleaseDC(window,dc);
+    if(dpi<=0)return pixels;
+    const double unitsPerPixel=unit.drawUnit==1?254.0/dpi:unit.drawUnit==2?2540.0/dpi:unit.drawUnit==3?100.0/dpi:unit.drawUnit==4?1000.0/dpi:1440.0/dpi;
+    return static_cast<int>(std::llround(pixels*unitsPerPixel));
+}
+static int TrackSelectionStart(HWND window) {
+    if(!ClassEquals(window,L"msctls_trackbar32"))return 0;
+    return static_cast<int>(SendMessageW(window,TBM_GETSELSTART,0,0));
+}
+static int TrackSelectionLength(HWND window) {
+    if(!ClassEquals(window,L"msctls_trackbar32"))return 0;
+    const int start=static_cast<int>(SendMessageW(window,TBM_GETSELSTART,0,0));
+    const int end=static_cast<int>(SendMessageW(window,TBM_GETSELEND,0,0));
+    return end-start;
 }
 static void SetPosition(HWND window,int position) {
     if(ClassEquals(window,L"msctls_progress32"))SendMessageW(window,PBM_SETPOS,position,0);
@@ -3204,13 +5152,198 @@ static void SetWindowGeometry(HWND window,const char* property,const Value& valu
 static Value GetProperty(unsigned int id,const char* property) {
     HWND window=WindowById(id);
     if(window==nullptr)return Empty();
+    if(Form* form=FindFormRecord(window)) {
+        if(PropertyEquals(property,L"\u53ef\u5426\u79fb\u52a8"))return Boolean(form->canMove);
+        if(PropertyEquals(property,L"\u56de\u8f66\u4e0b\u79fb\u7126\u70b9"))return Boolean(form->enterToNext);
+        if(PropertyEquals(property,L"Esc\u952e\u5173\u95ed"))return Boolean(form->escapeCloses);
+        if(PropertyEquals(property,L"F1\u952e\u6253\u5f00\u5e2e\u52a9"))return Boolean(form->f1OpenHelp);
+        if(PropertyEquals(property,L"\u5e2e\u52a9\u6587\u4ef6\u540d"))return TextFromWide(form->helpFileName);
+        if(PropertyEquals(property,L"\u5e2e\u52a9\u6807\u5fd7\u503c"))return Integer(form->helpContext);
+        if(PropertyEquals(property,L"\u968f\u610f\u79fb\u52a8"))return Boolean(form->hitMove);
+        if(PropertyEquals(property,L"\u603b\u5728\u6700\u524d"))return Boolean(form->topmost);
+        if(PropertyEquals(property,L"\u5728\u4efb\u52a1\u6761\u4e2d\u663e\u793a"))return Boolean(form->showInTaskbar);
+        if(PropertyEquals(property,L"\u8fb9\u6846"))return Integer(form->border);
+        if(PropertyEquals(property,L"\u4f4d\u7f6e"))return Integer(form->position);
+        if(PropertyEquals(property,L"\u63a7\u5236\u6309\u94ae"))return Boolean(form->controlButtons);
+        if(PropertyEquals(property,L"\u6700\u5927\u5316\u6309\u94ae"))return Boolean(form->maximizeButton);
+        if(PropertyEquals(property,L"\u6700\u5c0f\u5316\u6309\u94ae"))return Boolean(form->minimizeButton);
+        if(PropertyEquals(property,L"\u4fdd\u6301\u6807\u9898\u6761\u6fc0\u6d3b"))return Boolean(form->keepTitleBarActive);
+        if(PropertyEquals(property,L"\u5e95\u8272"))return Integer(static_cast<long long>(form->hasBackColor?form->backColor:GetSysColor(COLOR_WINDOW)));
+        if(PropertyEquals(property,L"\u5e95\u56fe"))return Bytes(form->backPicData);
+        if(PropertyEquals(property,L"\u5916\u5f62"))return Integer(form->shape);
+        if(PropertyEquals(property,L"\u5e95\u56fe\u65b9\u5f0f"))return Integer(form->backPicMode);
+        if(PropertyEquals(property,L"\u64ad\u653e\u6b21\u6570"))return Integer(form->playCount);
+    }
     if(PropertyEquals(property,L"\u6807\u9898")||PropertyEquals(property,L"\u5185\u5bb9")){
-        wchar_t buffer[4096]{};GetWindowTextW(window,buffer,static_cast<int>(std::size(buffer)));int size=WideCharToMultiByte(CP_ACP,0,buffer,-1,nullptr,0,nullptr,nullptr);std::string text(size>0?size-1:0,'\0');if(size>1)WideCharToMultiByte(CP_ACP,0,buffer,-1,text.data(),size,nullptr,nullptr);return Text(std::move(text));
+        HWND edit=PropertyEquals(property,L"\u5185\u5bb9")?EditPart(window):nullptr;
+        return WindowTextValue(edit!=nullptr?edit:window);
     }
     if(PropertyEquals(property,L"\u53ef\u89c6"))return Boolean(IsWindowVisible(window)!=FALSE);
     if(PropertyEquals(property,L"\u7981\u6b62"))return Boolean(IsWindowEnabled(window)==FALSE);
+    if(PropertyEquals(property,L"\u6807\u8bb0"))if(const Unit* unit=UnitFromWindow(window))return TextFromWide(unit->tag);
+    if(PropertyEquals(property,L"\u9f20\u6807\u6307\u9488"))if(const Unit* unit=UnitFromWindow(window))return Bytes(unit->cursorData);
+    if(const Unit* unit=UnitFromWindow(window)) {
+        if(PropertyEquals(property,L"\u5b57\u4f53\u540d\u79f0"))return TextFromWide(unit->fontName);
+        if(PropertyEquals(property,L"\u5b57\u4f53\u5927\u5c0f"))return Integer(unit->fontSize);
+        if(PropertyEquals(property,L"\u52a0\u7c97"))return Boolean(unit->fontBold);
+        if(PropertyEquals(property,L"\u503e\u659c"))return Boolean(unit->fontItalic);
+        if(PropertyEquals(property,L"\u5220\u9664\u7ebf"))return Boolean(unit->fontStrikeOut);
+        if(PropertyEquals(property,L"\u4e0b\u5212\u7ebf"))return Boolean(unit->fontUnderline);
+        if(PropertyEquals(property,L"\u8fb9\u6846"))return Integer(unit->borderStyle);
+        if(PropertyEquals(property,L"\u6a2a\u5411\u5bf9\u9f50\u65b9\u5f0f"))return Integer(unit->horizontalAlign);
+        if(PropertyEquals(property,L"\u7eb5\u5411\u5bf9\u9f50\u65b9\u5f0f"))return Integer(unit->verticalAlign);
+    }
+    if(PropertyEquals(property,L"\u5bc6\u7801\u906e\u76d6\u5b57\u7b26"))if(const Unit* unit=UnitFromWindow(window))return TextFromWide(unit->passwordChar);
+    if(PropertyEquals(property,L"\u53ef\u505c\u7559\u7126\u70b9"))return Boolean((GetWindowLongPtrW(window,GWL_STYLE)&WS_TABSTOP)!=0);
+    if(PropertyEquals(property,L"\u9690\u85cf\u9009\u62e9"))if(HWND edit=EditPart(window))if(const Unit* unit=UnitFromWindow(window))return Boolean(unit->hideSelection);
+    if(PropertyEquals(property,L"\u662f\u5426\u5141\u8bb8\u591a\u884c"))if(HWND edit=EditPart(window))return Boolean((GetWindowLongPtrW(edit,GWL_STYLE)&ES_MULTILINE)!=0);
+    if(PropertyEquals(property,L"\u8f93\u5165\u65b9\u5f0f"))if(const Unit* unit=UnitFromWindow(window))return Integer(unit->inputMode);
+    if(PropertyEquals(property,L"\u8f6c\u6362\u65b9\u5f0f"))if(const Unit* unit=UnitFromWindow(window))return Integer(unit->convertMode);
+    if(PropertyEquals(property,L"\u5bf9\u9f50\u65b9\u5f0f"))if(const Unit* unit=UnitFromWindow(window))return Integer(unit->horizontalAlign);
+    if(PropertyEquals(property,L"\u6eda\u52a8\u6761"))if(const Unit* unit=UnitFromWindow(window)){const LONG_PTR style=GetWindowLongPtrW(EditPart(window)!=nullptr?EditPart(window):window,GWL_STYLE);return Integer((style&WS_HSCROLL?1:0)|(style&WS_VSCROLL?2:0));}
+    if(PropertyEquals(property,L"\u8c03\u8282\u5668\u65b9\u5f0f"))if(const Unit* unit=UnitFromWindow(window))return Integer(unit->spinMode);
+    if(PropertyEquals(property,L"\u8c03\u8282\u5668\u5e95\u9650\u503c"))if(const Unit* unit=UnitFromWindow(window))return Integer(unit->spinMin);
+    if(PropertyEquals(property,L"\u8c03\u8282\u5668\u4e0a\u9650\u503c"))if(const Unit* unit=UnitFromWindow(window))return Integer(unit->spinMax);
+    if(PropertyEquals(property,L"\u5141\u8bb8\u9009\u62e9\u591a\u9879")&&(ClassEquals(window,L"LISTBOX")||ClassEquals(window,L"COMBOBOX")))return Boolean((GetWindowLongPtrW(window,GWL_STYLE)&(LBS_MULTIPLESEL|LBS_EXTENDEDSEL))!=0);
+    if(PropertyEquals(property,L"\u81ea\u52a8\u6392\u5e8f")&&(ClassEquals(window,L"LISTBOX")||ClassEquals(window,L"COMBOBOX")))return Boolean((GetWindowLongPtrW(window,GWL_STYLE)&(ClassEquals(window,L"LISTBOX")?LBS_SORT:CBS_SORT))!=0);
+    if(PropertyEquals(property,L"\u591a\u5217")&&ClassEquals(window,L"LISTBOX"))return Boolean((GetWindowLongPtrW(window,GWL_STYLE)&LBS_MULTICOLUMN)!=0);
     if(PropertyEquals(property,L"\u9009\u4e2d"))return Boolean(SendMessageW(window,BM_GETCHECK,0,0)==BST_CHECKED);
     if(PropertyEquals(property,L"\u73b0\u884c\u9009\u4e2d\u9879"))return Integer(CurrentSelection(window));
+    if(PropertyEquals(property,L"\u4f4d\u7f6e")&&ClassEquals(window,UPDOWN_CLASSW))return Integer(CurrentPosition(window));
+    if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr) {
+        if(std::strcmp(unit->type,"timer")==0&&PropertyEquals(property,L"\u65f6\u949f\u5468\u671f"))return Integer(unit->timerPeriod);
+        if(std::strcmp(unit->type,"drive")==0&&PropertyEquals(property,L"\u9a71\u52a8\u5668"))return WindowTextValue(window);
+        if(std::strcmp(unit->type,"drive")==0&&PropertyEquals(property,L"\u7c7b\u578b"))return Integer(unit->driveType);
+        if((std::strcmp(unit->type,"directory")==0||std::strcmp(unit->type,"file")==0)&&PropertyEquals(property,L"\u76ee\u5f55"))return TextFromWide(unit->path);
+        if(std::strcmp(unit->type,"file")==0) {
+            if(PropertyEquals(property,L"\u901a\u5e38"))return Boolean(unit->allowNormal);
+            if(PropertyEquals(property,L"\u5b58\u6863"))return Boolean(unit->allowArchive);
+            if(PropertyEquals(property,L"\u53ea\u8bfb"))return Boolean(unit->allowReadOnly);
+            if(PropertyEquals(property,L"\u7cfb\u7edf"))return Boolean(unit->allowSystem);
+            if(PropertyEquals(property,L"\u9690\u85cf"))return Boolean(unit->allowHidden);
+            if(PropertyEquals(property,L"\u5141\u8bb8\u9009\u62e9\u591a\u9879"))return Boolean((GetWindowLongPtrW(window,GWL_STYLE)&(LBS_MULTIPLESEL|LBS_EXTENDEDSEL))!=0);
+            if(PropertyEquals(property,L"\u6700\u5c0f\u65e5\u671f"))return unit->hasMinDate?Number(SystemTimeOleDate(unit->minDate)):Number(0.0);
+            if(PropertyEquals(property,L"\u6700\u5927\u65e5\u671f"))return unit->hasMaxDate?Number(SystemTimeOleDate(unit->maxDate)):Number(0.0);
+        }
+        if(std::strcmp(unit->type,"file")==0&&PropertyEquals(property,L"\u88ab\u9009\u62e9\u6587\u4ef6")) {
+            const int count=static_cast<int>(SendMessageW(window,LB_GETCOUNT,0,0)); const LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE); std::wstring result;
+            for(int index=0;index<count;++index) {
+                if((style&(LBS_MULTIPLESEL|LBS_EXTENDEDSEL))!=0&&SendMessageW(window,LB_GETSEL,index,0)<=0)continue;
+                if((style&(LBS_MULTIPLESEL|LBS_EXTENDEDSEL))==0&&index!=CurrentSelection(window))continue;
+                const int length=static_cast<int>(SendMessageW(window,LB_GETTEXTLEN,index,0)); if(length<0)continue; std::wstring item(static_cast<std::size_t>(length+1),L'\0'); SendMessageW(window,LB_GETTEXT,index,reinterpret_cast<LPARAM>(item.data())); item.resize(std::wcslen(item.c_str())); if(!result.empty())result+=L';'; result+=item;
+            }
+            return TextFromWide(result);
+        }
+        if(std::strcmp(unit->type,"color")==0&&PropertyEquals(property,L"\u989c\u8272"))return Integer(static_cast<long long>(unit->hasColor?unit->color:0));
+        if(std::strcmp(unit->type,"color")==0&&PropertyEquals(property,L"\u5141\u8bb8\u900f\u660e"))return Boolean(unit->allowTransparent);
+        if(std::strcmp(unit->type,"hyperlink")==0) {
+            if(PropertyEquals(property,L"\u7c7b\u578b"))return Integer(unit->hyperlinkType);
+            if(PropertyEquals(property,L"\u7535\u5b50\u90ae\u7bb1\u5730\u5740")&&unit->hyperlinkType==0)return TextFromWide(unit->hyperlinkTarget);
+            if(PropertyEquals(property,L"Internet\u5730\u5740")&&unit->hyperlinkType!=0)return TextFromWide(unit->hyperlinkTarget);
+        }
+    }
+    if(PropertyEquals(property,L"\u73b0\u884c\u5b50\u5939")&&ClassEquals(window,L"SysTabControl32"))return Integer(SendMessageW(window,TCM_GETCURSEL,0,0));
+    if(PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e")||PropertyEquals(property,L"\u6700\u5927\u4f4d\u7f6e")) {
+        if(ClassEquals(window,L"msctls_progress32")) { PBRANGE range{};SendMessageW(window,PBM_GETRANGE,TRUE,reinterpret_cast<LPARAM>(&range));return Integer(PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e")?range.iLow:range.iHigh); }
+        if(ClassEquals(window,L"msctls_trackbar32"))return Integer(PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e")?SendMessageW(window,TBM_GETRANGEMIN,0,0):SendMessageW(window,TBM_GETRANGEMAX,0,0));
+        if(ClassEquals(window,L"SCROLLBAR")) { SCROLLINFO info{sizeof(SCROLLINFO),SIF_RANGE,0,0,0,0,0};GetScrollInfo(window,SB_CTL,&info);return Integer(PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e")?info.nMin:info.nMax); }
+    }
+    if(PropertyEquals(property,L"\u9875\u6539\u53d8\u503c")||PropertyEquals(property,L"\u884c\u6539\u53d8\u503c")) {
+        if(ClassEquals(window,L"msctls_trackbar32"))return Integer(PropertyEquals(property,L"\u9875\u6539\u53d8\u503c")?SendMessageW(window,TBM_GETPAGESIZE,0,0):SendMessageW(window,TBM_GETLINESIZE,0,0));
+        if(ClassEquals(window,L"SCROLLBAR"))if(const Unit* unit=UnitFromWindow(window))return Integer(PropertyEquals(property,L"\u9875\u6539\u53d8\u503c")?unit->scrollPage:unit->scrollLine);
+    }
+    if(PropertyEquals(property,L"\u5141\u8bb8\u62d6\u52a8\u8ddf\u8e2a"))if(const Unit* unit=UnitFromWindow(window))return Boolean(unit->allowTrack);
+    if(PropertyEquals(property,L"\u5141\u8bb8\u7f16\u8f91"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"date")==0)return Boolean(unit->dateAllowEdit);
+    if(PropertyEquals(property,L"\u8868\u5934\u65b9\u5411"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"tab")==0)return Integer(unit->tabHeaderWay);
+    if(PropertyEquals(property,L"\u5141\u8bb8\u591a\u884c\u8868\u5934"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"tab")==0)return Boolean(unit->tabMultiLine);
+    if(PropertyEquals(property,L"\u662f\u5426\u586b\u5145\u80cc\u666f"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"tab")==0)return Boolean(unit->tabFillBack);
+    if(PropertyEquals(property,L"\u9690\u85cf\u81ea\u8eab"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"tab")==0)return Boolean(!IsWindowVisible(window));
+    if(PropertyEquals(property,L"\u523b\u5ea6\u7c7b\u578b"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"trackbar")==0)return Integer(unit->trackTickStyle);
+    if(PropertyEquals(property,L"\u5355\u4f4d\u523b\u5ea6\u503c"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"trackbar")==0)return Integer(unit->trackTickFreq);
+    if(PropertyEquals(property,L"\u5141\u8bb8\u9009\u62e9"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"trackbar")==0)return Boolean(unit->trackAllowSel);
+    if(PropertyEquals(property,L"\u663e\u793a\u65b9\u5f0f"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"progress")==0)return Integer(unit->progressDrawMode);
+    if(PropertyEquals(property,L"\u65b9\u5411"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&(std::strcmp(unit->type,"spin")==0||std::strcmp(unit->type,"progress")==0||std::strcmp(unit->type,"trackbar")==0)){const LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE);return Integer(std::strcmp(unit->type,"spin")==0?((style&UDS_HORZ)!=0?0:1):((style&(std::strcmp(unit->type,"progress")==0?PBS_VERTICAL:TBS_VERT))!=0?1:0));}
+    if(PropertyEquals(property,L"\u5c45\u4e2d\u64ad\u653e"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"animate")==0)return Boolean(unit->imageCenter);
+    if(PropertyEquals(property,L"\u900f\u660e\u80cc\u666f"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"animate")==0)return Boolean(unit->imageTransparent);
+    if(PropertyEquals(property,L"\u64ad\u653e\u52a8\u753b"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"image")==0)return Boolean(unit->playImage);
+    if(PropertyEquals(property,L"\u9664\u53bb\u91cd\u590d"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&(std::strcmp(unit->type,"list")==0||std::strcmp(unit->type,"checklist")==0||std::strcmp(unit->type,"combo")==0))return Boolean(unit->removeDuplicates);
+    if(PropertyEquals(property,L"\u6309\u94ae\u5f62\u5f0f"))return Boolean((GetWindowLongPtrW(window,GWL_STYLE)&BS_PUSHLIKE)!=0);
+    if(PropertyEquals(property,L"\u5e73\u9762"))return Boolean((GetWindowLongPtrW(window,GWL_STYLE)&BS_FLAT)!=0);
+    if(PropertyEquals(property,L"\u6807\u9898\u5c45\u5de6"))return Boolean((GetWindowLongPtrW(window,GWL_STYLE)&BS_LEFT)!=0);
+    if(PropertyEquals(property,L"\u6700\u5927\u5141\u8bb8\u957f\u5ea6")) { HWND edit=EditPart(window);if(edit!=nullptr)return Integer(SendMessageW(edit,EM_GETLIMITTEXT,0,0)); }
+    if(PropertyEquals(property,L"\u4eca\u5929")){SYSTEMTIME date{};if(WindowDateValue(window,date))return Number(SystemTimeOleDate(date));return Number(0.0);}
+    if(PropertyEquals(property,L"\u6700\u5c0f\u65e5\u671f")){SYSTEMTIME date{};if(GetDateRange(window,&date,nullptr)||GetMonthRange(window,&date,nullptr))return Number(SystemTimeOleDate(date));return Number(0.0);}
+    if(PropertyEquals(property,L"\u6700\u5927\u65e5\u671f")){SYSTEMTIME date{};if(GetDateRange(window,nullptr,&date)||GetMonthRange(window,nullptr,&date))return Number(SystemTimeOleDate(date));return Number(0.0);}
+    if(PropertyEquals(property,L"\u9996\u9009\u62e9\u65e5")||PropertyEquals(property,L"\u5c3e\u9009\u62e9\u65e5")){if(ClassEquals(window,L"SysMonthCal32")){SYSTEMTIME range[2]{};SendMessageW(window,MCM_GETSELRANGE,0,reinterpret_cast<LPARAM>(range));return Number(SystemTimeOleDate(range[PropertyEquals(property,L"\u5c3e\u9009\u62e9\u65e5")?1:0]));}return Number(0.0);}
+    if(PropertyEquals(property,L"\u9996\u9009\u62e9\u4f4d\u7f6e"))return Integer(TrackSelectionStart(window));
+    if(PropertyEquals(property,L"\u9009\u62e9\u957f\u5ea6"))return Integer(TrackSelectionLength(window));
+    if(PropertyEquals(property,L"\u6700\u591a\u9009\u62e9\u5929\u6570")&&ClassEquals(window,L"SysMonthCal32"))return Integer(SendMessageW(window,MCM_GETMAXSELCOUNT,0,0));
+    if(PropertyEquals(property,L"\u6eda\u52a8\u6708\u6570")&&ClassEquals(window,L"SysMonthCal32"))return Integer(SendMessageW(window,MCM_GETMONTHDELTA,0,0));
+    if(PropertyEquals(property,L"\u5f00\u59cb\u661f\u671f\u9996\u65e5")&&ClassEquals(window,L"SysMonthCal32"))return Integer(LOWORD(SendMessageW(window,MCM_GETFIRSTDAYOFWEEK,0,0)));
+    if(PropertyEquals(property,L"\u4e0d\u663e\u793a\u4eca\u5929")&&ClassEquals(window,L"SysMonthCal32"))return Boolean((GetWindowLongPtrW(window,GWL_STYLE)&MCS_NOTODAY)!=0);
+    if(PropertyEquals(property,L"\u4e0d\u5708\u6ce8\u4eca\u5929")&&ClassEquals(window,L"SysMonthCal32"))return Boolean((GetWindowLongPtrW(window,GWL_STYLE)&MCS_NOTODAYCIRCLE)!=0);
+    if(PropertyEquals(property,L"\u663e\u793a\u661f\u671f\u5e8f\u53f7")&&ClassEquals(window,L"SysMonthCal32"))return Boolean((GetWindowLongPtrW(window,GWL_STYLE)&MCS_WEEKNUMBERS)!=0);
+    if(PropertyEquals(property,L"\u5141\u8bb8\u9009\u62e9\u591a\u5929")&&ClassEquals(window,L"SysMonthCal32"))return Boolean((GetWindowLongPtrW(window,GWL_STYLE)&MCS_MULTISELECT)!=0);
+    if(ClassEquals(window,L"SysMonthCal32")) {
+        int colorIndex=-1;
+        if(PropertyEquals(property,L"\u6587\u672c\u989c\u8272"))colorIndex=MCSC_TEXT;
+        else if(PropertyEquals(property,L"\u80cc\u666f\u989c\u8272")||PropertyEquals(property,L"\u5185\u80cc\u666f\u989c\u8272"))colorIndex=MCSC_MONTHBK;
+        else if(PropertyEquals(property,L"\u6807\u9898\u989c\u8272"))colorIndex=MCSC_TITLETEXT;
+        else if(PropertyEquals(property,L"\u6807\u9898\u80cc\u666f\u989c\u8272"))colorIndex=MCSC_TITLEBK;
+        else if(PropertyEquals(property,L"\u975e\u672c\u6708\u989c\u8272"))colorIndex=MCSC_TRAILINGTEXT;
+        if(colorIndex>=0)return Integer(static_cast<long long>(SendMessageW(window,MCM_GETCOLOR,colorIndex,0)));
+    }
+    if(PropertyEquals(property,L"\u6587\u672c\u989c\u8272"))if(const Unit* unit=UnitFromWindow(window))return Integer(static_cast<long long>(unit->hasTextColor?unit->textColor:GetSysColor(COLOR_WINDOWTEXT)));
+    if((PropertyEquals(property,L"\u80cc\u666f\u989c\u8272")||PropertyEquals(property,L"\u753b\u677f\u80cc\u666f\u8272")))if(const Unit* unit=UnitFromWindow(window))return Integer(static_cast<long long>(unit->type!=nullptr&&std::strcmp(unit->type,"tab")==0?unit->tabBackColor:(unit->hasBackColor?unit->backColor:GetSysColor(COLOR_WINDOW))));
+    if(PropertyEquals(property,L"\u663e\u793a\u65b9\u5f0f"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"progress")!=0)return Integer(unit->imageDrawMode);
+    if(PropertyEquals(property,L"\u6548\u679c"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"label")==0)return Integer(unit->labelEffect);
+    if(PropertyEquals(property,L"\u6e10\u53d8\u80cc\u666f\u65b9\u5f0f"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"label")==0)return Integer(unit->gradientBackMode);
+    if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"label")==0) {
+        if(PropertyEquals(property,L"\u6e10\u53d8\u8fb9\u6846\u5bbd\u5ea6"))return Integer(unit->gradientBorderWidth);
+        for(int index=0;index<3;++index) {
+            if(PropertyEquals(property,(L"\u6e10\u53d8\u8fb9\u6846\u989c\u8272"+std::to_wstring(index+1)).c_str()))return Integer(unit->gradientBorderColor[index]);
+            if(PropertyEquals(property,(L"\u6e10\u53d8\u80cc\u666f\u989c\u8272"+std::to_wstring(index+1)).c_str()))return Integer(unit->gradientBackColor[index]);
+        }
+    }
+    if(PropertyEquals(property,L"\u662f\u5426\u81ea\u52a8\u6298\u884c"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"label")==0)return Boolean(unit->labelWordWrap);
+    if(PropertyEquals(property,L"\u6587\u4ef6\u540d"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"animate")==0)return TextFromWide(unit->imageFileName);
+    if(PropertyEquals(property,L"\u64ad\u653e"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"animate")==0)return Boolean(unit->playImage);
+    if(PropertyEquals(property,L"\u64ad\u653e\u6b21\u6570"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"animate")==0)return Integer(unit->imagePlayCount);
+    if(PropertyEquals(property,L"\u5916\u5f62"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"shape")==0)return Integer(unit->shape);
+    if(PropertyEquals(property,L"\u7ebf\u6761\u6548\u679c"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"shape")==0)return Integer(unit->shapeEffect);
+    if(PropertyEquals(property,L"\u7ebf\u578b"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"shape")==0)return Integer(unit->lineStyle);
+    if(PropertyEquals(property,L"\u7ebf\u5bbd"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"shape")==0)return Integer(unit->lineWidth);
+    if(PropertyEquals(property,L"\u7ebf\u6761\u989c\u8272"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"shape")==0)return Integer(unit->lineColor);
+    if(PropertyEquals(property,L"\u586b\u5145\u989c\u8272"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"shape")==0)return Integer(unit->fillColor);
+    if(PropertyEquals(property,L"\u56fe\u7247")||PropertyEquals(property,L"\u5e95\u56fe"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&(std::strcmp(unit->type,"image")==0||std::strcmp(unit->type,"label")==0||std::strcmp(unit->type,"canvas")==0))return Bytes(unit->imageData);
+    if(PropertyEquals(property,L"\u5355\u9009"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&IsCheckList(window))return Boolean(unit->checkOnlyOne);
+    if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"hyperlink")==0) {
+        if(PropertyEquals(property,L"\u8bbf\u95ee\u540e\u7684\u989c\u8272"))return Integer(unit->visitedColor);
+        if(PropertyEquals(property,L"\u70ed\u70b9\u989c\u8272"))return Integer(unit->hotColor);
+        if(PropertyEquals(property,L"\u70ed\u70b9\u8ddf\u8e2a"))return Boolean(unit->hyperlinkTrack);
+    }
+    if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"canvas")==0) {
+        if(PropertyEquals(property,L"\u81ea\u52a8\u91cd\u753b"))return Boolean(unit->autoRedraw);
+        if(PropertyEquals(property,L"\u7ed8\u753b\u5355\u4f4d"))return Integer(unit->drawUnit);
+        if(PropertyEquals(property,L"\u753b\u7b14\u7c7b\u578b"))return Integer(unit->penStyle);
+        if(PropertyEquals(property,L"\u753b\u51fa\u65b9\u5f0f"))return Integer(unit->drawRop2);
+        if(PropertyEquals(property,L"\u753b\u7b14\u7c97\u7ec6"))return Integer(unit->penWidth);
+        if(PropertyEquals(property,L"\u5237\u5b50\u7c7b\u578b"))return Integer(unit->brushStyle);
+        if(PropertyEquals(property,L"\u753b\u7b14\u989c\u8272"))return Integer(unit->penColor);
+        if(PropertyEquals(property,L"\u5237\u5b50\u989c\u8272"))return Integer(unit->brushColor);
+        if(PropertyEquals(property,L"\u6587\u672c\u80cc\u666f\u989c\u8272"))return Integer(unit->textBackColor);
+        if(PropertyEquals(property,L"\u5e95\u56fe\u65b9\u5f0f"))return Integer(unit->backPicMode);
+        if(PropertyEquals(property,L"\u753b\u677f\u5bbd\u5ea6"))return Integer(CanvasDimension(window,*unit,false));
+        if(PropertyEquals(property,L"\u753b\u677f\u9ad8\u5ea6"))return Integer(CanvasDimension(window,*unit,true));
+    }
+    HWND edit=EditPart(window);
+    if(edit!=nullptr&&PropertyEquals(property,L"\u8d77\u59cb\u9009\u62e9\u4f4d\u7f6e")) { DWORD start=0,end=0;SendMessageW(edit,EM_GETSEL,reinterpret_cast<WPARAM>(&start),reinterpret_cast<LPARAM>(&end));return Integer(start); }
+    if(edit!=nullptr&&PropertyEquals(property,L"\u88ab\u9009\u62e9\u5b57\u7b26\u6570")) { DWORD start=0,end=0;SendMessageW(edit,EM_GETSEL,reinterpret_cast<WPARAM>(&start),reinterpret_cast<LPARAM>(&end));return Integer(static_cast<int>(end-start)); }
+    if(edit!=nullptr&&PropertyEquals(property,L"\u88ab\u9009\u62e9\u6587\u672c")) {
+        DWORD start=0,end=0;SendMessageW(edit,EM_GETSEL,reinterpret_cast<WPARAM>(&start),reinterpret_cast<LPARAM>(&end));
+        const std::wstring text=WindowTextW(edit); if(start>end||start>text.size())return Text("");
+        end=(std::min<DWORD>)(end,static_cast<DWORD>(text.size())); return TextFromWide(text.substr(start,end-start));
+    }
     if(PropertyEquals(property,L"\u4f4d\u7f6e"))return Integer(CurrentPosition(window));
     int left=0,top=0,width=0,height=0;
     if(PropertyEquals(property,L"\u5de6\u8fb9")||PropertyEquals(property,L"\u9876\u8fb9")||
@@ -3221,18 +5354,325 @@ static Value GetProperty(unsigned int id,const char* property) {
         if(PropertyEquals(property,L"\u5bbd\u5ea6"))return Integer(width);
         return Integer(height);
     }
+    if(const auto* store=PropertyStore(id)){const auto it=store->find(property==nullptr?std::string():std::string(property));if(it!=store->end())return it->second;}
     return Empty();
 }
 static void SetProperty(unsigned int id,const char* property,const Value& value) {
     HWND window=WindowById(id);
     if(window==nullptr)return;
-    if(PropertyEquals(property,L"\u6807\u9898")||PropertyEquals(property,L"\u5185\u5bb9"))SetText(window,value);
+    if(auto* store=PropertyStore(id);store!=nullptr&&property!=nullptr) (*store)[property]=value;
+    if(Form* form=FindFormRecord(window)) {
+        if(PropertyEquals(property,L"\u63a7\u5236\u6309\u94ae")||PropertyEquals(property,L"\u6700\u5927\u5316\u6309\u94ae")||PropertyEquals(property,L"\u6700\u5c0f\u5316\u6309\u94ae")||PropertyEquals(property,L"\u8fb9\u6846")) {
+            if(PropertyEquals(property,L"\u63a7\u5236\u6309\u94ae"))form->controlButtons=ToBool(value);
+            else if(PropertyEquals(property,L"\u6700\u5927\u5316\u6309\u94ae"))form->maximizeButton=ToBool(value);
+            else if(PropertyEquals(property,L"\u6700\u5c0f\u5316\u6309\u94ae"))form->minimizeButton=ToBool(value);
+            else form->border=static_cast<int>(ToInteger(value));
+            const LONG_PTR style=FormStyle(form->border,form->controlButtons,form->maximizeButton,form->minimizeButton);
+            SetWindowLongPtrW(window,GWL_STYLE,style);SetWindowPos(window,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_FRAMECHANGED);return;
+        }
+        if(PropertyEquals(property,L"\u4f4d\u7f6e")){form->position=static_cast<int>(ToInteger(value));if(form->position==2)ShowWindow(window,SW_MINIMIZE);else if(form->position==3)ShowWindow(window,SW_MAXIMIZE);else {ShowWindow(window,SW_RESTORE);PlaceForm(window,0,0,form->position);}return;}
+        if(PropertyEquals(property,L"\u5728\u4efb\u52a1\u6761\u4e2d\u663e\u793a")){form->showInTaskbar=ToBool(value);LONG_PTR ex=GetWindowLongPtrW(window,GWL_EXSTYLE);if(form->showInTaskbar)ex&=~WS_EX_TOOLWINDOW;else ex|=WS_EX_TOOLWINDOW;SetWindowLongPtrW(window,GWL_EXSTYLE,ex);SetWindowPos(window,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_FRAMECHANGED);return;}
+        if(PropertyEquals(property,L"\u53ef\u5426\u79fb\u52a8")){form->canMove=ToBool(value);return;}
+        if(PropertyEquals(property,L"\u56de\u8f66\u4e0b\u79fb\u7126\u70b9")){form->enterToNext=ToBool(value);return;}
+        if(PropertyEquals(property,L"Esc\u952e\u5173\u95ed")){form->escapeCloses=ToBool(value);return;}
+        if(PropertyEquals(property,L"F1\u952e\u6253\u5f00\u5e2e\u52a9")){form->f1OpenHelp=ToBool(value);return;}
+        if(PropertyEquals(property,L"\u5e2e\u52a9\u6587\u4ef6\u540d")){form->helpFileName=Wide(ToText(value).c_str());return;}
+        if(PropertyEquals(property,L"\u5e2e\u52a9\u6807\u5fd7\u503c")){form->helpContext=static_cast<int>(ToInteger(value));return;}
+        if(PropertyEquals(property,L"\u968f\u610f\u79fb\u52a8")){form->hitMove=ToBool(value);return;}
+        if(PropertyEquals(property,L"\u603b\u5728\u6700\u524d")){form->topmost=ToBool(value);SetWindowPos(window,form->topmost?HWND_TOPMOST:HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);return;}
+        if(PropertyEquals(property,L"\u4fdd\u6301\u6807\u9898\u6761\u6fc0\u6d3b")){form->keepTitleBarActive=ToBool(value);return;}
+        if(PropertyEquals(property,L"\u5e95\u8272")){form->backColor=static_cast<COLORREF>(ToInteger(value));form->hasBackColor=true;InvalidateRect(window,nullptr,TRUE);return;}
+        if(PropertyEquals(property,L"\u5e95\u56fe")){form->backPicData=value.bytes;InvalidateRect(window,nullptr,TRUE);return;}
+        if(PropertyEquals(property,L"\u5e95\u56fe\u65b9\u5f0f")){form->backPicMode=static_cast<int>(ToInteger(value));InvalidateRect(window,nullptr,TRUE);return;}
+        if(PropertyEquals(property,L"\u5916\u5f62")){form->shape=static_cast<int>(ToInteger(value));InvalidateRect(window,nullptr,TRUE);return;}
+    }
+    if(PropertyEquals(property,L"\u6807\u9898")||PropertyEquals(property,L"\u5185\u5bb9")) {
+        HWND edit=PropertyEquals(property,L"\u5185\u5bb9")?EditPart(window):nullptr;
+        SetText(edit!=nullptr?edit:window,value);
+    }
+    else if(PropertyEquals(property,L"\u5b57\u4f53\u540d\u79f0")||PropertyEquals(property,L"\u5b57\u4f53\u5927\u5c0f")||PropertyEquals(property,L"\u52a0\u7c97")||PropertyEquals(property,L"\u503e\u659c")||PropertyEquals(property,L"\u5220\u9664\u7ebf")||PropertyEquals(property,L"\u4e0b\u5212\u7ebf")) {
+        if(Unit* unit=UnitFromWindow(window)) {
+            if(PropertyEquals(property,L"\u5b57\u4f53\u540d\u79f0"))unit->fontName=Wide(ToText(value).c_str());
+            else if(PropertyEquals(property,L"\u5b57\u4f53\u5927\u5c0f"))unit->fontSize=(std::max)(1,static_cast<int>(ToInteger(value)));
+            else if(PropertyEquals(property,L"\u52a0\u7c97"))unit->fontBold=ToBool(value);
+            else if(PropertyEquals(property,L"\u503e\u659c"))unit->fontItalic=ToBool(value);
+            else if(PropertyEquals(property,L"\u5220\u9664\u7ebf"))unit->fontStrikeOut=ToBool(value);
+            else unit->fontUnderline=ToBool(value);
+            ApplyUnitFont(window,*unit);
+        }
+    }
+    else if(PropertyEquals(property,L"\u8fb9\u6846"))if(Unit* unit=UnitFromWindow(window)){unit->borderStyle=static_cast<int>(ToInteger(value));SetWindowBorder(window,unit->borderStyle);}
+    else if(PropertyEquals(property,L"\u6a2a\u5411\u5bf9\u9f50\u65b9\u5f0f")||PropertyEquals(property,L"\u7eb5\u5411\u5bf9\u9f50\u65b9\u5f0f"))if(Unit* unit=UnitFromWindow(window)){if(PropertyEquals(property,L"\u6a2a\u5411\u5bf9\u9f50\u65b9\u5f0f"))unit->horizontalAlign=static_cast<int>(ToInteger(value));else unit->verticalAlign=static_cast<int>(ToInteger(value));InvalidateRect(window,nullptr,TRUE);}
     else if(PropertyEquals(property,L"\u53ef\u89c6"))ShowWindow(window,ToInteger(value)?SW_SHOW:SW_HIDE);
+    else if(PropertyEquals(property,L"\u9690\u85cf\u81ea\u8eab")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"tab")==0)
+            ShowWindow(window,ToBool(value)?SW_HIDE:SW_SHOW);
+    }
     else if(PropertyEquals(property,L"\u7981\u6b62"))EnableWindow(window,ToInteger(value)?FALSE:TRUE);
+    else if(PropertyEquals(property,L"\u6807\u8bb0"))if(Unit* unit=UnitFromWindow(window))unit->tag=Wide(ToText(value).c_str());
+    else if(PropertyEquals(property,L"\u9f20\u6807\u6307\u9488"))if(Unit* unit=UnitFromWindow(window)) { ReplaceUnitCursor(*unit,value.bytes); SetCursor(unit->cursor!=nullptr?unit->cursor:LoadCursorW(nullptr,IDC_ARROW)); }
+    else if(PropertyEquals(property,L"\u9690\u85cf\u9009\u62e9"))if(Unit* unit=UnitFromWindow(window)){unit->hideSelection=ToBool(value);if(HWND edit=EditPart(window))SendMessageW(edit,0x043Fu,unit->hideSelection,FALSE);}
+    else if(PropertyEquals(property,L"\u5bc6\u7801\u906e\u76d6\u5b57\u7b26"))if(Unit* unit=UnitFromWindow(window)){unit->passwordChar=Wide(ToText(value).c_str());if(HWND edit=EditPart(window))SendMessageW(edit,EM_SETPASSWORDCHAR,unit->passwordChar.empty()?L'*':unit->passwordChar.front(),0);}
+    else if(PropertyEquals(property,L"\u8f93\u5165\u65b9\u5f0f"))if(Unit* unit=UnitFromWindow(window)){unit->inputMode=static_cast<int>(ToInteger(value));if(HWND edit=EditPart(window)){const int mode=unit->inputMode;SendMessageW(edit,EM_SETREADONLY,mode==1,0);if(mode==2)SendMessageW(edit,EM_SETPASSWORDCHAR,L'*',0);else SendMessageW(edit,EM_SETPASSWORDCHAR,0,0);}}
+    else if(PropertyEquals(property,L"\u5bf9\u9f50\u65b9\u5f0f"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"edit")==0){unit->horizontalAlign=static_cast<int>(ToInteger(value));HWND edit=EditPart(window);LONG_PTR style=GetWindowLongPtrW(edit!=nullptr?edit:window,GWL_STYLE);style&=~(ES_LEFT|ES_CENTER|ES_RIGHT);style|=unit->horizontalAlign==1?ES_CENTER:(unit->horizontalAlign==2?ES_RIGHT:ES_LEFT);SetWindowLongPtrW(edit!=nullptr?edit:window,GWL_STYLE,style);InvalidateRect(edit!=nullptr?edit:window,nullptr,TRUE);}
+    else if(PropertyEquals(property,L"\u8c03\u8282\u5668\u5e95\u9650\u503c")||PropertyEquals(property,L"\u8c03\u8282\u5668\u4e0a\u9650\u503c")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"spin")==0) {
+            if(PropertyEquals(property,L"\u8c03\u8282\u5668\u5e95\u9650\u503c"))unit->spinMin=static_cast<int>(ToInteger(value));
+            else unit->spinMax=static_cast<int>(ToInteger(value));
+            if(unit->spinMin>unit->spinMax)std::swap(unit->spinMin,unit->spinMax);
+            SendMessageW(window,UDM_SETRANGE32,unit->spinMin,unit->spinMax);
+        }
+    }
+    else if(PropertyEquals(property,L"\u6eda\u52a8\u6761"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"edit")==0){const int mode=static_cast<int>(ToInteger(value));HWND edit=EditPart(window);LONG_PTR style=GetWindowLongPtrW(edit!=nullptr?edit:window,GWL_STYLE);if(mode==1||mode==3)style|=WS_HSCROLL;else style&=~WS_HSCROLL;if(mode==2||mode==3)style|=WS_VSCROLL;else style&=~WS_VSCROLL;SetWindowLongPtrW(edit!=nullptr?edit:window,GWL_STYLE,style);SetWindowPos(edit!=nullptr?edit:window,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);}
+    else if(PropertyEquals(property,L"\u8f6c\u6362\u65b9\u5f0f"))if(Unit* unit=UnitFromWindow(window))unit->convertMode=static_cast<int>(ToInteger(value));
+    else if(PropertyEquals(property,L"\u662f\u5426\u5141\u8bb8\u591a\u884c")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"edit")==0) {
+            HWND edit=EditPart(window); if(edit==nullptr)edit=window;
+            LONG_PTR style=GetWindowLongPtrW(edit,GWL_STYLE);
+            if(ToBool(value))style|=ES_MULTILINE|ES_AUTOVSCROLL;
+            else style&=~(ES_MULTILINE|ES_AUTOVSCROLL|ES_AUTOHSCROLL);
+            SetWindowLongPtrW(edit,GWL_STYLE,style);
+            SetWindowPos(edit,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);
+            InvalidateRect(edit,nullptr,TRUE);
+        }
+    }
+    else if(PropertyEquals(property,L"\u8c03\u8282\u5668\u65b9\u5f0f"))if(Unit* unit=UnitFromWindow(window)) { unit->spinMode=(std::clamp)(static_cast<int>(ToInteger(value)),0,2); if(std::strcmp(unit->type,"edit")==0)ConfigureEditSpin(window,*unit,IsWindowVisible(window)!=FALSE,IsWindowEnabled(window)==FALSE); }
+    else if(PropertyEquals(property,L"\u6700\u5927\u5141\u8bb8\u957f\u5ea6")||PropertyEquals(property,L"\u6700\u5927\u6587\u672c\u957f\u5ea6")) { if(HWND edit=EditPart(window);edit!=nullptr)SendMessageW(edit,EM_SETLIMITTEXT,static_cast<WPARAM>((std::max)(0,static_cast<int>(ToInteger(value)))),0); }
+    else if(PropertyEquals(property,L"\u53ef\u505c\u7559\u7126\u70b9")) { LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE); if(ToBool(value))style|=WS_TABSTOP;else style&=~WS_TABSTOP; SetWindowLongPtrW(window,GWL_STYLE,style); }
+    else if(PropertyEquals(property,L"\u81ea\u52a8\u6392\u5e8f")&&(ClassEquals(window,L"LISTBOX")||ClassEquals(window,L"COMBOBOX"))) { LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE); const LONG_PTR bit=ClassEquals(window,L"LISTBOX")?LBS_SORT:CBS_SORT; if(ToBool(value))style|=bit;else style&=~bit; SetWindowLongPtrW(window,GWL_STYLE,style); }
+    else if(PropertyEquals(property,L"\u591a\u5217")&&ClassEquals(window,L"LISTBOX")) { LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE); if(ToBool(value))style|=LBS_MULTICOLUMN;else style&=~LBS_MULTICOLUMN; SetWindowLongPtrW(window,GWL_STYLE,style); }
+    else if(PropertyEquals(property,L"\u5141\u8bb8\u9009\u62e9\u591a\u9879")&&ClassEquals(window,L"LISTBOX")) { LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE); style&=~(LBS_MULTIPLESEL|LBS_EXTENDEDSEL); if(ToBool(value))style|=LBS_EXTENDEDSEL; SetWindowLongPtrW(window,GWL_STYLE,style); if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"file")==0){unit->fileAllowMultiple=ToBool(value);PopulatePathListRuntime(window,*unit,false);} }
     else if(PropertyEquals(property,L"\u9009\u4e2d"))SendMessageW(window,BM_SETCHECK,ToInteger(value)?BST_CHECKED:BST_UNCHECKED,0);
+    else if(PropertyEquals(property,L"\u9a71\u52a8\u5668")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"drive")==0) {
+            std::wstring drive=Wide(ToText(value).c_str()); if(drive.size()==1)drive+=L":"; if(drive.size()==2)drive+=L"\\";
+            const LRESULT index=SendMessageW(window,CB_FINDSTRINGEXACT,static_cast<WPARAM>(-1),reinterpret_cast<LPARAM>(drive.c_str())); if(index>=0)SendMessageW(window,CB_SETCURSEL,index,0);
+        }
+    }
+    else if(PropertyEquals(property,L"\u76ee\u5f55")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&(std::strcmp(unit->type,"directory")==0||std::strcmp(unit->type,"file")==0)) { unit->path=Wide(ToText(value).c_str()); PopulatePathListRuntime(window,*unit,std::strcmp(unit->type,"directory")==0); }
+    }
+    else if(PropertyEquals(property,L"\u901a\u914d\u7b26")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"file")==0) { unit->filePattern=Wide(ToText(value).c_str()); PopulatePathListRuntime(window,*unit,false); }
+    }
+    else if(PropertyEquals(property,L"\u989c\u8272")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"color")==0) { unit->color=static_cast<COLORREF>(ToInteger(value));unit->hasColor=true;InvalidateRect(window,nullptr,TRUE);DispatchNative(window,native_changed,0); }
+    }
+    else if(PropertyEquals(property,L"\u65f6\u949f\u5468\u671f")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"timer")==0) {
+            KillTimer(window,id); const int period=static_cast<int>(ToInteger(value)); unit->timerPeriod=period>0?static_cast<UINT>(period):0;
+            if(unit->timerPeriod!=0)SetTimer(window,id,unit->timerPeriod,nullptr);
+        }
+    }
+    else if(PropertyEquals(property,L"\u5141\u8bb8\u62d6\u52a8\u8ddf\u8e2a")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&(std::strcmp(unit->type,"hscroll")==0||std::strcmp(unit->type,"vscroll")==0))unit->allowTrack=ToBool(value);
+    }
+    else if(PropertyEquals(property,L"\u5141\u8bb8\u7f16\u8f91")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"date")==0) {
+            unit->dateAllowEdit=ToBool(value);
+            if(HWND child=FindWindowExW(window,nullptr,L"Edit",nullptr))SendMessageW(child,EM_SETREADONLY,unit->dateAllowEdit?FALSE:TRUE,0);
+        }
+    }
+    else if(PropertyEquals(property,L"\u8868\u5934\u65b9\u5411")||PropertyEquals(property,L"\u5141\u8bb8\u591a\u884c\u8868\u5934")||PropertyEquals(property,L"\u662f\u5426\u586b\u5145\u80cc\u666f")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"tab")==0) {
+            if(PropertyEquals(property,L"\u8868\u5934\u65b9\u5411"))unit->tabHeaderWay=static_cast<int>(ToInteger(value));
+            else if(PropertyEquals(property,L"\u5141\u8bb8\u591a\u884c\u8868\u5934"))unit->tabMultiLine=ToBool(value);
+            else unit->tabFillBack=ToBool(value);
+            LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE);style&=~(TCS_BOTTOM|TCS_VERTICAL|TCS_MULTILINE);
+            if(unit->tabHeaderWay==1)style|=TCS_BOTTOM;else if(unit->tabHeaderWay==2)style|=TCS_VERTICAL;else if(unit->tabHeaderWay==3)style|=TCS_VERTICAL|TCS_RIGHT;
+            if(unit->tabMultiLine)style|=TCS_MULTILINE;
+            SetWindowLongPtrW(window,GWL_STYLE,style);SetWindowPos(window,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);InvalidateRect(window,nullptr,TRUE);
+        }
+    }
+    else if(PropertyEquals(property,L"\u523b\u5ea6\u7c7b\u578b")||PropertyEquals(property,L"\u5355\u4f4d\u523b\u5ea6\u503c")||PropertyEquals(property,L"\u5141\u8bb8\u9009\u62e9")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"trackbar")==0) {
+            if(PropertyEquals(property,L"\u523b\u5ea6\u7c7b\u578b"))unit->trackTickStyle=static_cast<int>(ToInteger(value));
+            else if(PropertyEquals(property,L"\u5355\u4f4d\u523b\u5ea6\u503c"))unit->trackTickFreq=(std::max)(0,static_cast<int>(ToInteger(value)));
+            else { unit->trackAllowSel=ToBool(value); if(!unit->trackAllowSel)SendMessageW(window,TBM_CLEARSEL,TRUE,0); }
+            LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE);style&=~(TBS_AUTOTICKS|TBS_NOTICKS|TBS_TOP|TBS_BOTTOM|TBS_BOTH);
+            if(unit->trackTickStyle==0)style|=TBS_NOTICKS;else if(unit->trackTickStyle==1)style|=TBS_TOP;else if(unit->trackTickStyle==2)style|=TBS_BOTTOM;else style|=TBS_BOTH;
+            SetWindowLongPtrW(window,GWL_STYLE,style);if(unit->trackTickFreq>0)SendMessageW(window,TBM_SETTICFREQ,unit->trackTickFreq,0);SetWindowPos(window,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);InvalidateRect(window,nullptr,TRUE);
+        }
+    }
+    else if(PropertyEquals(property,L"\u663e\u793a\u65b9\u5f0f")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"progress")==0) {unit->progressDrawMode=static_cast<int>(ToInteger(value));LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE);if(unit->progressDrawMode==1)style|=PBS_SMOOTH;else style&=~PBS_SMOOTH;SetWindowLongPtrW(window,GWL_STYLE,style);SetWindowPos(window,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);}
+    }
+    else if(PropertyEquals(property,L"\u65b9\u5411"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&(std::strcmp(unit->type,"spin")==0||std::strcmp(unit->type,"progress")==0||std::strcmp(unit->type,"trackbar")==0)){LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE);if(std::strcmp(unit->type,"spin")==0){style&=~UDS_HORZ;if(ToInteger(value)==0)style|=UDS_HORZ;}else if(std::strcmp(unit->type,"progress")==0){if(ToInteger(value)!=0)style|=PBS_VERTICAL;else style&=~PBS_VERTICAL;}else{if(ToInteger(value)!=0)style|=TBS_VERT;else style&=~TBS_VERT;}SetWindowLongPtrW(window,GWL_STYLE,style);SetWindowPos(window,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);}
+    else if(PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e")||PropertyEquals(property,L"\u6700\u5927\u4f4d\u7f6e")||PropertyEquals(property,L"\u4f4d\u7f6e")||PropertyEquals(property,L"\u9875\u6539\u53d8\u503c")||PropertyEquals(property,L"\u884c\u6539\u53d8\u503c")||PropertyEquals(property,L"\u9996\u9009\u62e9\u4f4d\u7f6e")||PropertyEquals(property,L"\u9009\u62e9\u957f\u5ea6")) {
+        const int number=static_cast<int>(ToInteger(value));
+        if(ClassEquals(window,UPDOWN_CLASSW)&&PropertyEquals(property,L"\u4f4d\u7f6e"))SendMessageW(window,UDM_SETPOS32,0,number);
+        else if(ClassEquals(window,L"msctls_progress32")) { if(PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e")||PropertyEquals(property,L"\u6700\u5927\u4f4d\u7f6e")){PBRANGE range{};SendMessageW(window,PBM_GETRANGE,TRUE,reinterpret_cast<LPARAM>(&range));if(PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e"))range.iLow=number;else range.iHigh=number;SendMessageW(window,PBM_SETRANGE32,range.iLow,range.iHigh);}else if(PropertyEquals(property,L"\u4f4d\u7f6e"))SendMessageW(window,PBM_SETPOS,number,0); }
+        else if(ClassEquals(window,L"msctls_trackbar32")) { if(PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e"))SendMessageW(window,TBM_SETRANGEMIN,TRUE,number);else if(PropertyEquals(property,L"\u6700\u5927\u4f4d\u7f6e"))SendMessageW(window,TBM_SETRANGEMAX,TRUE,number);else if(PropertyEquals(property,L"\u4f4d\u7f6e"))SendMessageW(window,TBM_SETPOS,TRUE,number);else if(PropertyEquals(property,L"\u9875\u6539\u53d8\u503c"))SendMessageW(window,TBM_SETPAGESIZE,0,number);else if(PropertyEquals(property,L"\u884c\u6539\u53d8\u503c"))SendMessageW(window,TBM_SETLINESIZE,0,number);else {const int start=PropertyEquals(property,L"\u9996\u9009\u62e9\u4f4d\u7f6e")?number:static_cast<int>(SendMessageW(window,TBM_GETSELSTART,0,0));const int length=PropertyEquals(property,L"\u9009\u62e9\u957f\u5ea6")?number:static_cast<int>(SendMessageW(window,TBM_GETSELEND,0,0))-start;SendMessageW(window,TBM_SETSELSTART,TRUE,start);SendMessageW(window,TBM_SETSELEND,TRUE,start+(std::max)(0,length));} }
+        else if(ClassEquals(window,L"SCROLLBAR")) { Unit* unit=UnitFromWindow(window);if(unit!=nullptr){if(PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e"))unit->scrollMin=number;else if(PropertyEquals(property,L"\u6700\u5927\u4f4d\u7f6e"))unit->scrollMax=number;else if(PropertyEquals(property,L"\u9875\u6539\u53d8\u503c"))unit->scrollPage=number;else if(PropertyEquals(property,L"\u884c\u6539\u53d8\u503c"))unit->scrollLine=number;else if(PropertyEquals(property,L"\u4f4d\u7f6e"))SetScrollPos(window,SB_CTL,number,TRUE);SCROLLINFO info{sizeof(SCROLLINFO),SIF_RANGE|SIF_PAGE|SIF_POS,unit->scrollMin,unit->scrollMax,static_cast<UINT>(unit->scrollPage),number,0};SetScrollInfo(window,SB_CTL,&info,TRUE);}} }
+    else if(PropertyEquals(property,L"\u9664\u53bb\u91cd\u590d"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&(std::strcmp(unit->type,"list")==0||std::strcmp(unit->type,"checklist")==0||std::strcmp(unit->type,"combo")==0))unit->removeDuplicates=ToBool(value);
+    else if(PropertyEquals(property,L"\u5c45\u4e2d\u64ad\u653e")||PropertyEquals(property,L"\u900f\u660e\u80cc\u666f"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"animate")==0){if(PropertyEquals(property,L"\u5c45\u4e2d\u64ad\u653e"))unit->imageCenter=ToBool(value);else unit->imageTransparent=ToBool(value);LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE);style&=~(ACS_CENTER|ACS_TRANSPARENT);if(unit->imageCenter)style|=ACS_CENTER;if(unit->imageTransparent)style|=ACS_TRANSPARENT;SetWindowLongPtrW(window,GWL_STYLE,style);SetWindowPos(window,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);}
+    else if(PropertyEquals(property,L"\u64ad\u653e\u52a8\u753b"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"image")==0){unit->playImage=ToBool(value);}
+    else if(PropertyEquals(property,L"\u6309\u94ae\u5f62\u5f0f")||PropertyEquals(property,L"\u5e73\u9762")||PropertyEquals(property,L"\u6807\u9898\u5c45\u5de6")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&(std::strcmp(unit->type,"checkbox")==0||std::strcmp(unit->type,"radio")==0)) {
+            LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE);
+            const LONG_PTR bit=PropertyEquals(property,L"\u6309\u94ae\u5f62\u5f0f")?BS_PUSHLIKE:(PropertyEquals(property,L"\u5e73\u9762")?BS_FLAT:BS_LEFT);
+            if(ToBool(value))style|=bit;else style&=~bit;
+            SetWindowLongPtrW(window,GWL_STYLE,style);SetWindowPos(window,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);InvalidateRect(window,nullptr,TRUE);
+        }
+    }
+    else if(PropertyEquals(property,L"\u5141\u8bb8\u900f\u660e")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"color")==0)unit->allowTransparent=ToBool(value);
+    }
+    else if(PropertyEquals(property,L"\u8bbf\u95ee\u540e\u7684\u989c\u8272")||PropertyEquals(property,L"\u70ed\u70b9\u989c\u8272")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"hyperlink")==0) { if(PropertyEquals(property,L"\u8bbf\u95ee\u540e\u7684\u989c\u8272"))unit->visitedColor=static_cast<COLORREF>(ToInteger(value)); else unit->hotColor=static_cast<COLORREF>(ToInteger(value)); InvalidateRect(window,nullptr,TRUE); }
+    }
+    else if(PropertyEquals(property,L"\u56fe\u7247")||PropertyEquals(property,L"\u5e95\u56fe")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&(std::strcmp(unit->type,"image")==0||std::strcmp(unit->type,"label")==0||std::strcmp(unit->type,"canvas")==0)) { unit->imageData=value.bytes; InvalidateRect(window,nullptr,TRUE); }
+    }
+    else if(PropertyEquals(property,L"\u81ea\u52a8\u91cd\u753b")||PropertyEquals(property,L"\u7ed8\u753b\u5355\u4f4d")||PropertyEquals(property,L"\u753b\u7b14\u7c7b\u578b")||PropertyEquals(property,L"\u753b\u51fa\u65b9\u5f0f")||PropertyEquals(property,L"\u753b\u7b14\u7c97\u7ec6")||PropertyEquals(property,L"\u5237\u5b50\u7c7b\u578b")||PropertyEquals(property,L"\u753b\u7b14\u989c\u8272")||PropertyEquals(property,L"\u5237\u5b50\u989c\u8272")||PropertyEquals(property,L"\u6587\u672c\u80cc\u666f\u989c\u8272")||PropertyEquals(property,L"\u5e95\u56fe\u65b9\u5f0f")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"canvas")==0) {
+            if(PropertyEquals(property,L"\u81ea\u52a8\u91cd\u753b"))unit->autoRedraw=ToBool(value);
+            else if(PropertyEquals(property,L"\u7ed8\u753b\u5355\u4f4d"))unit->drawUnit=static_cast<int>(ToInteger(value));
+            else if(PropertyEquals(property,L"\u753b\u7b14\u7c7b\u578b"))unit->penStyle=static_cast<int>(ToInteger(value));
+            else if(PropertyEquals(property,L"\u753b\u51fa\u65b9\u5f0f"))unit->drawRop2=static_cast<int>(ToInteger(value));
+            else if(PropertyEquals(property,L"\u753b\u7b14\u7c97\u7ec6"))unit->penWidth=(std::max)(0,static_cast<int>(ToInteger(value)));
+            else if(PropertyEquals(property,L"\u5237\u5b50\u7c7b\u578b"))unit->brushStyle=static_cast<int>(ToInteger(value));
+            else if(PropertyEquals(property,L"\u753b\u7b14\u989c\u8272"))unit->penColor=static_cast<COLORREF>(ToInteger(value));
+            else if(PropertyEquals(property,L"\u5237\u5b50\u989c\u8272"))unit->brushColor=static_cast<COLORREF>(ToInteger(value));
+            else if(PropertyEquals(property,L"\u6587\u672c\u80cc\u666f\u989c\u8272"))unit->textBackColor=static_cast<COLORREF>(ToInteger(value));
+            else unit->backPicMode=static_cast<int>(ToInteger(value));
+            InvalidateRect(window,nullptr,TRUE);
+        }
+    }
+    else if(PropertyEquals(property,L"\u6e10\u53d8\u8fb9\u6846\u5bbd\u5ea6")||PropertyEquals(property,L"\u6e10\u53d8\u8fb9\u6846\u989c\u82721")||PropertyEquals(property,L"\u6e10\u53d8\u8fb9\u6846\u989c\u82722")||PropertyEquals(property,L"\u6e10\u53d8\u8fb9\u6846\u989c\u82723")||PropertyEquals(property,L"\u6e10\u53d8\u80cc\u666f\u989c\u82721")||PropertyEquals(property,L"\u6e10\u53d8\u80cc\u666f\u989c\u82722")||PropertyEquals(property,L"\u6e10\u53d8\u80cc\u666f\u989c\u82723")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"label")==0) {
+            if(PropertyEquals(property,L"\u6e10\u53d8\u8fb9\u6846\u5bbd\u5ea6"))unit->gradientBorderWidth=(std::max)(0,static_cast<int>(ToInteger(value)));
+            else for(int index=0;index<3;++index) {
+                const std::wstring borderName=L"渐变边框颜色"+std::to_wstring(index+1), backName=L"渐变背景颜色"+std::to_wstring(index+1);
+                if(PropertyEquals(property,borderName.c_str())) { unit->gradientBorderColor[index]=static_cast<COLORREF>(ToInteger(value));unit->gradientBorderColorSet[index]=1; }
+                if(PropertyEquals(property,backName.c_str())) { unit->gradientBackColor[index]=static_cast<COLORREF>(ToInteger(value));unit->gradientBackColorSet[index]=1; }
+            }
+            InvalidateRect(window,nullptr,TRUE);
+        }
+    }
+    else if(PropertyEquals(property,L"\u7c7b\u578b")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"hyperlink")==0)unit->hyperlinkType=static_cast<int>(ToInteger(value));
+        else if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"drive")==0) { unit->driveType=static_cast<int>(ToInteger(value)); PopulateDriveList(window,unit); }
+        else if(ClassEquals(window,L"COMBOBOX")) { const int type=static_cast<int>(ToInteger(value)); LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE); style&=~CBS_SIMPLE; style&=~CBS_DROPDOWN; style&=~CBS_DROPDOWNLIST; style|=(type==0?CBS_SIMPLE:(type==1?CBS_DROPDOWN:CBS_DROPDOWNLIST)); SetWindowLongPtrW(window,GWL_STYLE,style); }
+    }
+    else if(PropertyEquals(property,L"\u9644\u4ef6\u7c7b\u578b")&&ClassEquals(window,L"SysDateTimePick32")) {
+        LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE); if(ToInteger(value)==1)style|=DTS_UPDOWN;else style&=~DTS_UPDOWN;SetWindowLongPtrW(window,GWL_STYLE,style);SetWindowPos(window,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);
+    }
+    else if(PropertyEquals(property,L"\u70ed\u70b9\u8ddf\u8e2a")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"hyperlink")==0){unit->hyperlinkTrack=ToBool(value);if(!unit->hyperlinkTrack)unit->hyperlinkHot=false;InvalidateRect(window,nullptr,TRUE);}
+    }
+    else if(PropertyEquals(property,L"\u7535\u5b50\u90ae\u7bb1\u5730\u5740")||PropertyEquals(property,L"Internet\u5730\u5740")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"hyperlink")==0)unit->hyperlinkTarget=Wide(ToText(value).c_str());
+    }
+    else if(PropertyEquals(property,L"\u663e\u793a\u65b9\u5f0f"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"progress")!=0){unit->imageDrawMode=static_cast<int>(ToInteger(value));InvalidateRect(window,nullptr,TRUE);}
+    else if(PropertyEquals(property,L"\u5e95\u56fe\u65b9\u5f0f"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&& (std::strcmp(unit->type,"label")==0||std::strcmp(unit->type,"canvas")==0)){unit->backPicMode=static_cast<int>(ToInteger(value));InvalidateRect(window,nullptr,TRUE);}
+    else if(PropertyEquals(property,L"\u6548\u679c"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"label")==0){unit->labelEffect=static_cast<int>(ToInteger(value));InvalidateRect(window,nullptr,TRUE);}
+    else if(PropertyEquals(property,L"\u6e10\u53d8\u80cc\u666f\u65b9\u5f0f"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"label")==0){unit->gradientBackMode=static_cast<int>(ToInteger(value));InvalidateRect(window,nullptr,TRUE);}
+    else if(PropertyEquals(property,L"\u662f\u5426\u81ea\u52a8\u6298\u884c"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"label")==0){unit->labelWordWrap=ToBool(value);InvalidateRect(window,nullptr,TRUE);}
+    else if(PropertyEquals(property,L"\u6587\u4ef6\u540d"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"animate")==0){unit->imageFileName=Wide(ToText(value).c_str());Animate_Open(window,unit->imageFileName.c_str());if(unit->playImage)Animate_Play(window,0,-1,unit->imagePlayCount<0?static_cast<UINT>(-1):static_cast<UINT>(unit->imagePlayCount));}
+    else if(PropertyEquals(property,L"\u64ad\u653e"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"animate")==0){unit->playImage=ToBool(value);if(unit->playImage)Animate_Play(window,0,-1,unit->imagePlayCount<0?static_cast<UINT>(-1):static_cast<UINT>(unit->imagePlayCount));else Animate_Stop(window);}
+    else if(PropertyEquals(property,L"\u64ad\u653e\u6b21\u6570"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"animate")==0){unit->imagePlayCount=static_cast<int>(ToInteger(value));}
+    else if(PropertyEquals(property,L"\u5916\u5f62")||PropertyEquals(property,L"\u7ebf\u6761\u6548\u679c")||PropertyEquals(property,L"\u7ebf\u578b")||PropertyEquals(property,L"\u7ebf\u5bbd")||PropertyEquals(property,L"\u7ebf\u6761\u989c\u8272")||PropertyEquals(property,L"\u586b\u5145\u989c\u8272"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"shape")==0){if(PropertyEquals(property,L"\u5916\u5f62"))unit->shape=static_cast<int>(ToInteger(value));else if(PropertyEquals(property,L"\u7ebf\u6761\u6548\u679c"))unit->shapeEffect=static_cast<int>(ToInteger(value));else if(PropertyEquals(property,L"\u7ebf\u578b"))unit->lineStyle=static_cast<int>(ToInteger(value));else if(PropertyEquals(property,L"\u7ebf\u5bbd"))unit->lineWidth=(std::max)(1,static_cast<int>(ToInteger(value)));else if(PropertyEquals(property,L"\u7ebf\u6761\u989c\u8272")){unit->lineColor=static_cast<COLORREF>(ToInteger(value));unit->hasLineColor=true;}else{unit->fillColor=static_cast<COLORREF>(ToInteger(value));unit->hasFillColor=true;}InvalidateRect(window,nullptr,TRUE);}
+    else if(PropertyEquals(property,L"\u6587\u672c\u989c\u8272")) {
+        if(ClassEquals(window,L"SysMonthCal32"))SendMessageW(window,MCM_SETCOLOR,MCSC_TEXT,static_cast<COLORREF>(ToInteger(value)));
+        else if(Unit* unit=UnitFromWindow(window)){unit->textColor=static_cast<COLORREF>(ToInteger(value));unit->hasTextColor=true;InvalidateRect(window,nullptr,TRUE);}
+    }
+    else if(PropertyEquals(property,L"\u80cc\u666f\u989c\u8272")||PropertyEquals(property,L"\u753b\u677f\u80cc\u666f\u8272")) {
+        if(ClassEquals(window,L"SysMonthCal32"))SendMessageW(window,MCM_SETCOLOR,MCSC_MONTHBK,static_cast<COLORREF>(ToInteger(value)));
+        else if(Unit* unit=UnitFromWindow(window)){if(unit->type!=nullptr&&std::strcmp(unit->type,"tab")==0){unit->tabBackColor=static_cast<COLORREF>(ToInteger(value));unit->tabFillBack=true;}else{if(unit->backBrush!=nullptr){DeleteObject(unit->backBrush);unit->backBrush=nullptr;}unit->backColor=static_cast<COLORREF>(ToInteger(value));unit->hasBackColor=true;}InvalidateRect(window,nullptr,TRUE);}
+    }
+    else if(PropertyEquals(property,L"\u5185\u80cc\u666f\u989c\u8272")||PropertyEquals(property,L"\u6807\u9898\u989c\u8272")||PropertyEquals(property,L"\u6807\u9898\u80cc\u666f\u989c\u8272")||PropertyEquals(property,L"\u975e\u672c\u6708\u989c\u8272")) {
+        if(ClassEquals(window,L"SysMonthCal32")) {
+            const int colorIndex=PropertyEquals(property,L"\u6807\u9898\u989c\u8272")?MCSC_TITLETEXT:(PropertyEquals(property,L"\u6807\u9898\u80cc\u666f\u989c\u8272")?MCSC_TITLEBK:(PropertyEquals(property,L"\u975e\u672c\u6708\u989c\u8272")?MCSC_TRAILINGTEXT:MCSC_MONTHBK));
+            SendMessageW(window,MCM_SETCOLOR,colorIndex,static_cast<COLORREF>(ToInteger(value)));
+        }
+    }
+    else if(PropertyEquals(property,L"\u901a\u5e38")||PropertyEquals(property,L"\u5b58\u6863")||PropertyEquals(property,L"\u53ea\u8bfb")||PropertyEquals(property,L"\u7cfb\u7edf")||PropertyEquals(property,L"\u9690\u85cf")) {
+        if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"file")==0) {
+            const bool enabled=ToBool(value); if(PropertyEquals(property,L"\u901a\u5e38"))unit->allowNormal=enabled; else if(PropertyEquals(property,L"\u5b58\u6863"))unit->allowArchive=enabled; else if(PropertyEquals(property,L"\u53ea\u8bfb"))unit->allowReadOnly=enabled; else if(PropertyEquals(property,L"\u7cfb\u7edf"))unit->allowSystem=enabled; else unit->allowHidden=enabled;
+            PopulatePathListRuntime(window,*unit,false);
+        }
+    }
+    else if(PropertyEquals(property,L"\u5355\u9009")&&IsCheckList(window)) {
+        if(Unit* unit=UnitFromWindow(window))unit->checkOnlyOne=ToBool(value);
+    }
     else if(PropertyEquals(property,L"\u73b0\u884c\u9009\u4e2d\u9879")) {
-        if(ClassEquals(window,L"LISTBOX"))SendMessageW(window,LB_SETCURSEL,ToInteger(value),0);
+        if(ClassEquals(window,L"LISTBOX")) {
+            const LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE);
+            if((style&(LBS_MULTIPLESEL|LBS_EXTENDEDSEL))==0)SendMessageW(window,LB_SETCURSEL,ToInteger(value),0);
+        }
         else if(ClassEquals(window,L"COMBOBOX"))SendMessageW(window,CB_SETCURSEL,ToInteger(value),0);
+    }
+    else if(PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e")||PropertyEquals(property,L"\u6700\u5927\u4f4d\u7f6e")) {
+        const int valueInt=static_cast<int>(ToInteger(value));
+        if(ClassEquals(window,L"msctls_progress32")) { PBRANGE range{};SendMessageW(window,PBM_GETRANGE,TRUE,reinterpret_cast<LPARAM>(&range)); const int minimum=PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e")?valueInt:range.iLow; const int maximum=PropertyEquals(property,L"\u6700\u5927\u4f4d\u7f6e")?valueInt:range.iHigh;SendMessageW(window,PBM_SETRANGE32,minimum,maximum); }
+        else if(ClassEquals(window,L"msctls_trackbar32")) { const int minimum=PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e")?valueInt:static_cast<int>(SendMessageW(window,TBM_GETRANGEMIN,0,0)); const int maximum=PropertyEquals(property,L"\u6700\u5927\u4f4d\u7f6e")?valueInt:static_cast<int>(SendMessageW(window,TBM_GETRANGEMAX,0,0));SendMessageW(window,TBM_SETRANGE,TRUE,MAKELONG(minimum,maximum)); }
+        else if(ClassEquals(window,L"SCROLLBAR"))if(Unit* unit=UnitFromWindow(window)){if(PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e"))unit->scrollMin=valueInt;else unit->scrollMax=valueInt;SCROLLINFO info{sizeof(SCROLLINFO),SIF_RANGE|SIF_PAGE|SIF_POS,unit->scrollMin,unit->scrollMax,static_cast<UINT>(unit->scrollPage),0,0};GetScrollInfo(window,SB_CTL,&info);info.nMin=unit->scrollMin;info.nMax=unit->scrollMax;SetScrollInfo(window,SB_CTL,&info,TRUE);}
+    }
+    else if(PropertyEquals(property,L"\u9875\u6539\u53d8\u503c")||PropertyEquals(property,L"\u884c\u6539\u53d8\u503c")) {
+        const int valueInt=(std::max)(0,static_cast<int>(ToInteger(value)));
+        if(ClassEquals(window,L"msctls_trackbar32"))SendMessageW(window,PropertyEquals(property,L"\u9875\u6539\u53d8\u503c")?TBM_SETPAGESIZE:TBM_SETLINESIZE,0,valueInt);
+        else if(ClassEquals(window,L"SCROLLBAR"))if(Unit* unit=UnitFromWindow(window)){if(PropertyEquals(property,L"\u9875\u6539\u53d8\u503c"))unit->scrollPage=valueInt;else unit->scrollLine=valueInt;}
+    }
+    else if(PropertyEquals(property,L"\u73b0\u884c\u5b50\u5939")&&ClassEquals(window,L"SysTabControl32")) {
+        const int selected=static_cast<int>(ToInteger(value));
+        const int count=TabCtrl_GetItemCount(window);
+        if(selected>=0&&selected<count) {
+            Value result;
+            if(!DispatchNativeResult(window,native_selection_changing,TCN_SELCHANGING,{},&result) || result.type!=T_BOOL || ToBool(result)) {
+                const int old=static_cast<int>(SendMessageW(window,TCM_GETCURSEL,0,0));
+                SendMessageW(window,TCM_SETCURSEL,selected,0);
+                if(old!=selected) { UpdateTabVisibility(id);DispatchNative(window,native_selection_changed,TCN_SELCHANGE); }
+            }
+        }
+    }
+    else if(PropertyEquals(property,L"\u4eca\u5929")) {
+        SYSTEMTIME date{};if(OleDateSystemTime(ToNumber(value),date))SetWindowDateValue(window,date);
+    }
+    else if(PropertyEquals(property,L"\u6700\u5c0f\u65e5\u671f")||PropertyEquals(property,L"\u6700\u5927\u65e5\u671f")) {
+        if(ClassEquals(window,L"SysDateTimePick32")) {
+            SYSTEMTIME date{};if(OleDateSystemTime(ToNumber(value),date)) {
+                SYSTEMTIME oldMinimum{},oldMaximum{};GetDateRange(window,&oldMinimum,&oldMaximum);
+                SetDateRange(window,PropertyEquals(property,L"\u6700\u5c0f\u65e5\u671f")?&date:&oldMinimum,PropertyEquals(property,L"\u6700\u5927\u65e5\u671f")?&date:&oldMaximum);
+            }
+        }
+        else if(ClassEquals(window,L"SysMonthCal32")) {
+            SYSTEMTIME date{};if(OleDateSystemTime(ToNumber(value),date)) {
+                SYSTEMTIME range[2]{};SendMessageW(window,MCM_GETRANGE,0,reinterpret_cast<LPARAM>(range));
+                const bool minimum=PropertyEquals(property,L"\u6700\u5c0f\u65e5\u671f");range[minimum?0:1]=date;
+                SendMessageW(window,MCM_SETRANGE,minimum?GDTR_MIN:GDTR_MAX,reinterpret_cast<LPARAM>(range));
+            }
+        }
+        else if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"file")==0) {
+            SYSTEMTIME date{}; if(OleDateSystemTime(ToNumber(value),date)) { if(PropertyEquals(property,L"\u6700\u5c0f\u65e5\u671f")){unit->hasMinDate=true;unit->minDate=date;}else{unit->hasMaxDate=true;unit->maxDate=date;} PopulatePathListRuntime(window,*unit,false); }
+        }
+    }
+    else if(PropertyEquals(property,L"\u9996\u9009\u62e9\u65e5")||PropertyEquals(property,L"\u5c3e\u9009\u62e9\u65e5")) {
+        if(ClassEquals(window,L"SysMonthCal32")) {
+            SYSTEMTIME date{};if(OleDateSystemTime(ToNumber(value),date)) {SYSTEMTIME range[2]{};SendMessageW(window,MCM_GETSELRANGE,0,reinterpret_cast<LPARAM>(range));range[PropertyEquals(property,L"\u5c3e\u9009\u62e9\u65e5")?1:0]=date;SendMessageW(window,MCM_SETSELRANGE,0,reinterpret_cast<LPARAM>(range));}
+        }
+    }
+    else if(PropertyEquals(property,L"\u9996\u9009\u62e9\u4f4d\u7f6e"))SendMessageW(window,TBM_SETSELSTART,TRUE,ToInteger(value));
+    else if(PropertyEquals(property,L"\u9009\u62e9\u957f\u5ea6"))SendMessageW(window,TBM_SETSELEND,TRUE,TrackSelectionStart(window)+static_cast<int>(ToInteger(value)));
+    else if(PropertyEquals(property,L"\u6700\u591a\u9009\u62e9\u5929\u6570")&&ClassEquals(window,L"SysMonthCal32"))SendMessageW(window,MCM_SETMAXSELCOUNT,ToInteger(value),0);
+    else if(PropertyEquals(property,L"\u6eda\u52a8\u6708\u6570")&&ClassEquals(window,L"SysMonthCal32"))SendMessageW(window,MCM_SETMONTHDELTA,ToInteger(value),0);
+    else if(PropertyEquals(property,L"\u5f00\u59cb\u661f\u671f\u9996\u65e5")&&ClassEquals(window,L"SysMonthCal32"))SendMessageW(window,MCM_SETFIRSTDAYOFWEEK,0,ToInteger(value));
+    else if(PropertyEquals(property,L"\u5141\u8bb8\u9009\u62e9\u591a\u5929")&&ClassEquals(window,L"SysMonthCal32")) { LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE); if(ToBool(value))style|=MCS_MULTISELECT;else style&=~MCS_MULTISELECT; SetWindowLongPtrW(window,GWL_STYLE,style); }
+    else if(ClassEquals(window,L"SysMonthCal32")&&PropertyEquals(property,L"\u4e0d\u663e\u793a\u4eca\u5929")) { LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE); if(ToBool(value))style|=MCS_NOTODAY;else style&=~MCS_NOTODAY; SetWindowLongPtrW(window,GWL_STYLE,style); }
+    else if(ClassEquals(window,L"SysMonthCal32")&&PropertyEquals(property,L"\u4e0d\u5708\u6ce8\u4eca\u5929")) { LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE); if(ToBool(value))style|=MCS_NOTODAYCIRCLE;else style&=~MCS_NOTODAYCIRCLE; SetWindowLongPtrW(window,GWL_STYLE,style); }
+    else if(ClassEquals(window,L"SysMonthCal32")&&PropertyEquals(property,L"\u663e\u793a\u661f\u671f\u5e8f\u53f7")) { LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE); if(ToBool(value))style|=MCS_WEEKNUMBERS;else style&=~MCS_WEEKNUMBERS; SetWindowLongPtrW(window,GWL_STYLE,style); }
+    else if(ClassEquals(window,L"SysMonthCal32")&&PropertyEquals(property,L"\u6807\u9898\u989c\u8272"))SendMessageW(window,MCM_SETCOLOR,MCSC_TITLETEXT,static_cast<COLORREF>(ToInteger(value)));
+    else if(ClassEquals(window,L"SysMonthCal32")&&PropertyEquals(property,L"\u6807\u9898\u80cc\u666f\u989c\u8272"))SendMessageW(window,MCM_SETCOLOR,MCSC_TITLEBK,static_cast<COLORREF>(ToInteger(value)));
+    else if(ClassEquals(window,L"SysMonthCal32")&&PropertyEquals(property,L"\u5185\u80cc\u666f\u8272"))SendMessageW(window,MCM_SETCOLOR,MCSC_MONTHBK,static_cast<COLORREF>(ToInteger(value)));
+    else if(ClassEquals(window,L"SysMonthCal32")&&PropertyEquals(property,L"\u975e\u672c\u6708\u989c\u8272"))SendMessageW(window,MCM_SETCOLOR,MCSC_TRAILINGTEXT,static_cast<COLORREF>(ToInteger(value)));
+    else if(PropertyEquals(property,L"\u8d77\u59cb\u9009\u62e9\u4f4d\u7f6e")) {
+        HWND edit=EditPart(window); if(edit!=nullptr) { DWORD start=0,end=0;SendMessageW(edit,EM_GETSEL,reinterpret_cast<WPARAM>(&start),reinterpret_cast<LPARAM>(&end));const int position=static_cast<int>(ToInteger(value));SendMessageW(edit,EM_SETSEL,position<0?-1:position,position<0?-1:static_cast<int>(end)); }
+    }
+    else if(PropertyEquals(property,L"\u88ab\u9009\u62e9\u5b57\u7b26\u6570")) {
+        HWND edit=EditPart(window); if(edit!=nullptr) { DWORD start=0,end=0;SendMessageW(edit,EM_GETSEL,reinterpret_cast<WPARAM>(&start),reinterpret_cast<LPARAM>(&end));const int length=static_cast<int>(ToInteger(value));SendMessageW(edit,EM_SETSEL,start,length<0?-1:static_cast<int>(start)+length); }
+    }
+    else if(PropertyEquals(property,L"\u88ab\u9009\u62e9\u6587\u672c")) {
+        HWND edit=EditPart(window); if(edit!=nullptr) { const std::wstring text=Wide(ToText(value).c_str());SendMessageW(edit,EM_REPLACESEL,TRUE,reinterpret_cast<LPARAM>(text.c_str())); }
     }
     else if(PropertyEquals(property,L"\u4f4d\u7f6e"))SetPosition(window,static_cast<int>(ToInteger(value)));
     else if(PropertyEquals(property,L"\u5de6\u8fb9")||PropertyEquals(property,L"\u9876\u8fb9")||
@@ -3241,28 +5681,19 @@ static void SetProperty(unsigned int id,const char* property,const Value& value)
 )CPP";
 		bool hasSpecs = false;
 		const auto typeToken = [](const std::string& type) {
-			if (type == "标签") return "label";
-			if (type == "按钮") return "button";
-			if (type == "选择框") return "checkbox";
-			if (type == "单选框") return "radio";
-			if (type == "分组框") return "group";
-			if (type == "编辑框") return "edit";
-			if (type == "列表框") return "list";
-			if (type == "组合框") return "combo";
-			if (type == "选择夹") return "tab";
-			if (type == "进度条") return "progress";
-			if (type == "滑块条") return "trackbar";
-			if (type == "横向滚动条") return "hscroll";
-			if (type == "纵向滚动条") return "vscroll";
-			if (type == "日期框") return "date";
-			if (type == "图片框" || type == "影像框") return "container";
-			if (type == "外形框") return "shape";
-			if (type == "画板") return "canvas";
-			if (type == "图形按钮") return "button";
-			return "unsupported";
+			const std::string_view token = NativeWindowControlToken(type);
+			return token.empty() ? "unsupported" : token.data();
 		};
 		for (const auto& form : program_.windows) {
+			if (!form.attributes.empty()) {
+				prefix << "static const XmlAttribute xml_form_attributes_" << form.id << "[]={";
+				for (const auto& [name, value] : form.attributes) {
+					prefix << "{" << EscapeCppString(name) << "," << EscapeCppString(value) << "},";
+				}
+				prefix << "};\n";
+			}
 			for (const auto& control : form.controls) {
+				if (!HasNativeWin32Class(control.typeName)) continue;
 				if (!control.attributes.empty()) {
 					prefix << "static const XmlAttribute xml_attributes_" << control.id << "[]={";
 					for (const auto& [name, value] : control.attributes) {
@@ -3280,30 +5711,41 @@ static void SetProperty(unsigned int id,const char* property,const Value& value)
 					for (const int value : control.itemValues) prefix << value << ",";
 					prefix << "};\n";
 				}
+				if (control.itemCheckedDefined && !control.itemChecked.empty()) {
+					prefix << "static const unsigned char xml_item_checked_" << control.id << "[]={";
+					for (const bool value : control.itemChecked) prefix << (value ? "1" : "0") << ",";
+					prefix << "};\n";
+				}
+				if (control.itemEnabledDefined && !control.itemEnabled.empty()) {
+					prefix << "static const unsigned char xml_item_enabled_" << control.id << "[]={";
+					for (const bool value : control.itemEnabled) prefix << (value ? "1" : "0") << ",";
+					prefix << "};\n";
+				}
 			}
 		}
 		prefix << "static const Spec specs[]={\n";
 		for (const auto& form : program_.windows) {
 			for (const auto& control : form.controls) {
+				if (!HasNativeWin32Class(control.typeName)) continue;
 				const char* token = typeToken(control.typeName);
-				// There is no reliable Win32 class for an unknown support-library
-				// unit.  Do not turn an unsupported leaf into a visible STATIC;
-				// retain unknown units only when they provide a real parent for
-				// supported nested controls.
-				if (std::strcmp(token, "unsupported") == 0) {
-					if (control.children.empty()) continue;
-					token = "container";
-				}
+				// Only controls with an explicit native Win32 mapping are emitted.
+				// Unknown support-library units (including provider/database/grid
+				// controls) must not be fabricated as STATIC or container windows.
+				if (std::strcmp(token, "unsupported") == 0) continue;
 				hasSpecs = true;
 				const std::string attributes = control.attributes.empty() ? "nullptr" : "xml_attributes_" + std::to_string(control.id);
 				const std::string items = control.listItemsDefined && !control.listItems.empty()
 					? "xml_items_" + std::to_string(control.id) : "nullptr";
 				const std::string itemValues = control.itemValuesDefined && !control.itemValues.empty()
 					? "xml_item_values_" + std::to_string(control.id) : "nullptr";
-				prefix << "{" << control.id << "u," << form.id << "u," << control.parentId << "u," << control.left << "," << control.top << "," << control.width << "," << control.height << "," << (control.visible ? "true" : "false") << "," << (control.disabled ? "true" : "false") << "," << (control.tabStop ? "true" : "false") << "," << control.tabOwner << "," << control.tabPage << "," << control.tabPageTitles.size() << "," << EscapeCppString(token) << "," << EscapeCppString(control.text) << "," << attributes << "," << control.attributes.size() << "," << items << "," << (control.listItemsDefined ? control.listItems.size() : 0) << "," << itemValues << "," << (control.itemValuesDefined ? control.itemValues.size() : 0) << "},\n";
+				const std::string itemChecked = control.itemCheckedDefined && !control.itemChecked.empty()
+					? "xml_item_checked_" + std::to_string(control.id) : "nullptr";
+				const std::string itemEnabled = control.itemEnabledDefined && !control.itemEnabled.empty()
+					? "xml_item_enabled_" + std::to_string(control.id) : "nullptr";
+				prefix << "{" << control.id << "u," << form.id << "u," << control.parentId << "u," << control.left << "," << control.top << "," << control.width << "," << control.height << "," << (control.visible ? "true" : "false") << "," << (control.disabled ? "true" : "false") << "," << (control.tabStop ? "true" : "false") << "," << control.tabOwner << "," << control.tabPage << "," << control.tabPageTitles.size() << "," << control.tabCurrentPage << "," << EscapeCppString(token) << "," << EscapeCppString(control.text) << "," << attributes << "," << control.attributes.size() << "," << items << "," << (control.listItemsDefined ? control.listItems.size() : 0) << "," << itemValues << "," << (control.itemValuesDefined ? control.itemValues.size() : 0) << "," << itemChecked << "," << (control.itemCheckedDefined ? control.itemChecked.size() : 0) << "," << itemEnabled << "," << (control.itemEnabledDefined ? control.itemEnabled.size() : 0) << "},\n";
 			}
 		}
-		if (!hasSpecs) prefix << "{0u,0u,0u,0,0,0,0,false,false,false,0,-1,0,\"unsupported\",\"\",nullptr,0,nullptr,0,nullptr,0},\n";
+		if (!hasSpecs) prefix << "{0u,0u,0u,0,0,0,0,false,false,false,0,-1,0,0,\"unsupported\",\"\",nullptr,0,nullptr,0,nullptr,0,nullptr,0,nullptr,0},\n";
 		prefix << R"CPP(};
 static void Initialize() {
     initializing=true;
@@ -3312,37 +5754,42 @@ static void Initialize() {
     WNDCLASSW containerClass{};containerClass.hInstance=instance;containerClass.lpfnWndProc=ContainerProc;containerClass.hCursor=LoadCursorW(nullptr,MAKEINTRESOURCEW(IDC_ARROW));containerClass.lpszClassName=L"ecompiler_window_container";RegisterClassW(&containerClass);
 )CPP";
 		for (const auto& form : program_.windows) {
-			prefix << "    DWORD formStyle_" << form.id << "=FormStyle(" << form.border << "," << (form.controlButtons ? "true" : "false") << "," << (form.maximizeButton ? "true" : "false") << "," << (form.minimizeButton ? "true" : "false") << ");DWORD formExStyle_" << form.id << "=FormExtendedStyle(" << (form.showInTaskbar ? "true" : "false") << ");RECT formRect_" << form.id << "{0,0," << form.width << "," << form.height << "};AdjustWindowRectEx(&formRect_" << form.id << ",formStyle_" << form.id << ",FALSE,formExStyle_" << form.id << ");HWND form_" << form.id << "=CreateWindowExW(formExStyle_" << form.id << ",L\"ecompiler_window_form\",Wide(" << EscapeCppString(form.title) << ").c_str(),formStyle_" << form.id << "," << form.left << "," << form.top << ",formRect_" << form.id << ".right-formRect_" << form.id << ".left,formRect_" << form.id << ".bottom-formRect_" << form.id << ".top,nullptr,nullptr,instance,nullptr);if(form_" << form.id << "==nullptr)return;ApplyDefaultFont(form_" << form.id << ");forms.push_back(Form{" << form.id << "u,form_" << form.id << "," << (form.escapeCloses ? "true" : "false") << "," << (form.canMove ? "true" : "false") << ",false});PlaceForm(form_" << form.id << "," << form.left << "," << form.top << "," << form.position << ");if(" << (form.topmost ? "true" : "false") << ")SetWindowPos(form_" << form.id << ",HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);if(" << (form.disabled ? "true" : "false") << ")EnableWindow(form_" << form.id << ",FALSE);\n";
+			prefix << "    DWORD formStyle_" << form.id << "=FormStyle(" << form.border << "," << (form.controlButtons ? "true" : "false") << "," << (form.maximizeButton ? "true" : "false") << "," << (form.minimizeButton ? "true" : "false") << ");DWORD formExStyle_" << form.id << "=FormExtendedStyle(" << (form.showInTaskbar ? "true" : "false") << ");RECT formRect_" << form.id << "{0,0," << form.width << "," << form.height << "};AdjustWindowRectEx(&formRect_" << form.id << ",formStyle_" << form.id << ",FALSE,formExStyle_" << form.id << ");HWND form_" << form.id << "=CreateWindowExW(formExStyle_" << form.id << ",L\"ecompiler_window_form\",Wide(" << EscapeCppString(form.title) << ").c_str(),formStyle_" << form.id << "," << form.left << "," << form.top << ",formRect_" << form.id << ".right-formRect_" << form.id << ".left,formRect_" << form.id << ".bottom-formRect_" << form.id << ".top,nullptr,nullptr,instance,nullptr);if(form_" << form.id << "==nullptr)return;ApplyDefaultFont(form_" << form.id << ");forms.push_back(Form{" << form.id << "u,form_" << form.id << "," << (form.escapeCloses ? "true" : "false") << "," << (form.canMove ? "true" : "false") << ",false});if(auto* stored=FindFormRecord(form_" << form.id << ")){stored->enterToNext=" << (form.enterToNext ? "true" : "false") << ";stored->f1OpenHelp=" << (form.f1OpenHelp ? "true" : "false") << ";stored->hitMove=" << (form.hitMove ? "true" : "false") << ";stored->topmost=" << (form.topmost ? "true" : "false") << ";stored->keepTitleBarActive=" << (form.keepTitleBarActive ? "true" : "false") << ";stored->showInTaskbar=" << (form.showInTaskbar ? "true" : "false") << ";stored->border=" << form.border << ";stored->controlButtons=" << (form.controlButtons ? "true" : "false") << ";stored->maximizeButton=" << (form.maximizeButton ? "true" : "false") << ";stored->minimizeButton=" << (form.minimizeButton ? "true" : "false") << ";stored->shape=" << form.shape << ";stored->hasBackColor=" << (form.hasBackColor ? "true" : "false") << ";stored->backColor=static_cast<COLORREF>(" << form.backColor << ");stored->helpFileName=Wide(" << EscapeCppString(form.helpFileName) << ");stored->helpContext=" << form.helpContext << ";StoreSpecProperties(stored->properties," << (form.attributes.empty() ? "nullptr" : "xml_form_attributes_" + std::to_string(form.id)) << "," << form.attributes.size() << ");}PlaceForm(form_" << form.id << "," << form.left << "," << form.top << "," << form.position << ");if(" << (form.topmost ? "true" : "false") << ")SetWindowPos(form_" << form.id << ",HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);if(" << (form.disabled ? "true" : "false") << ")EnableWindow(form_" << form.id << ",FALSE);\n";
 		}
 		prefix << R"CPP(    constexpr std::size_t count=sizeof(specs)/sizeof(specs[0]);
     for(std::size_t pass=0;pass<count+1;++pass)for(const auto& spec:specs)if(spec.id!=0&&spec.tabOwner==0&&FindUnit(spec.id)==nullptr&& (spec.parent==0||FindUnit(spec.parent)!=nullptr))CreateUnit(spec);
 )CPP";
 		for (const auto& form : program_.windows) {
 			for (const auto& control : form.controls) {
-				if (control.typeName != "选择夹") continue;
+				if (!HasNativeWin32Class(control.typeName) || control.typeName != "选择夹") continue;
 				for (std::size_t page = 0; page < control.tabPageTitles.size(); ++page) {
 				prefix << "    if(auto* tab_" << control.id << "=FindUnit(" << control.id << "u)){TCITEMW item_" << control.id << "_" << page << "{};item_" << control.id << "_" << page << ".mask=TCIF_TEXT;std::wstring title_" << control.id << "_" << page << "=Wide(" << EscapeCppString(control.tabPageTitles[page]) << ");item_" << control.id << "_" << page << ".pszText=title_" << control.id << "_" << page << ".data();TabCtrl_InsertItem(tab_" << control.id << "->hwnd," << page << ",&item_" << control.id << "_" << page << ");}\n";
 				}
+				prefix << "    if(auto* tab_" << control.id << "=FindUnit(" << control.id << "u)){const int tab_count_" << control.id << "=TabCtrl_GetItemCount(tab_" << control.id << "->hwnd);const int tab_page_" << control.id << "=" << control.tabCurrentPage << ";if(tab_count_" << control.id << ">0)TabCtrl_SetCurSel(tab_" << control.id << "->hwnd,(std::max)(0,(std::min)(tab_page_" << control.id << ",tab_count_" << control.id << "-1)));}\n";
 			}
 		}
 		prefix << R"CPP(    for(std::size_t pass=0;pass<count+1;++pass)for(const auto& spec:specs)if(spec.id!=0&&spec.tabOwner!=0&&FindUnit(spec.id)==nullptr&& (spec.parent==0||FindUnit(spec.parent)!=nullptr))CreateUnit(spec);
 )CPP";
 		for (const auto& form : program_.windows) {
 			for (const auto& control : form.controls) {
-				if (control.typeName != "选择夹") continue;
+				if (!HasNativeWin32Class(control.typeName) || control.typeName != "选择夹") continue;
 				prefix << "    UpdateTabVisibility(" << control.id << "u);\n";
 			}
 		}
 		for (const auto& form : program_.windows) {
 			prefix << "    Dispatch(" << form.id << "u,native_created,0,{});\n";
 			const char* showCommand = !form.visible ? "SW_HIDE" : (form.position == 2 ? "SW_MINIMIZE" : (form.position == 3 ? "SW_MAXIMIZE" : "SW_SHOW"));
-			prefix << "    ShowWindow(form_" << form.id << "," << showCommand << ");UpdateWindow(form_" << form.id << ");\n";
+			const bool hasIdle = std::any_of(form.events.begin(), form.events.end(), [](const WindowEventBinding& event) { return event.trigger == WindowEventTrigger::Idle; });
+			prefix << "    ShowWindow(form_" << form.id << "," << showCommand << ");UpdateWindow(form_" << form.id << ");";
+			if (hasIdle) prefix << "if(auto* idleForm=FindFormRecord(form_" << form.id << ")){idleForm->idleSince=GetTickCount();SetTimer(form_" << form.id << ",0xE1D1u,50,nullptr);} ";
+			prefix << "\n";
 		}
 		prefix << "    initializing=false;\n";
 		prefix << R"CPP(}
 }
 static ert::Value WindowGetProperty(unsigned int id,const char* property){return ecompiler_window_host::GetProperty(id,property);}
 static void WindowSetProperty(unsigned int id,const char* property,const ert::Value& value){ecompiler_window_host::SetProperty(id,property,value);}
+static ert::Value WindowInvokeMember(unsigned int id,const char* operation,std::vector<ert::Value> args){return ecompiler_window_host::WindowInvokeMember(id,operation,std::move(args));}
 static void EWindowInitialize(){ecompiler_window_host::Initialize();}
 )CPP";
 	}
@@ -3374,6 +5821,7 @@ static void EWindowInitialize(){ecompiler_window_host::Initialize();}
 		if (!program_.windows.empty()) {
 			prefix << "static ert::Value WindowGetProperty(unsigned int,const char*);\n";
 			prefix << "static void WindowSetProperty(unsigned int,const char*,const ert::Value&);\n";
+			prefix << "static ert::Value WindowInvokeMember(unsigned int,const char*,std::vector<ert::Value>);\n";
 		}
 		prefix << declarations_.str() << body_.str();
 		EmitWindowRuntime(prefix);

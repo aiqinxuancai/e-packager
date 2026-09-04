@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cctype>
 #include <cstring>
 #include <iostream>
 #include <string_view>
@@ -39,6 +40,74 @@ std::int32_t IntAttribute(const e2txt::SimpleXmlNode& node, const char* name, co
 	return parsed.ec == std::errc() && parsed.ptr == value.data() + value.size() ? result : fallback;
 }
 
+bool ContainsAsciiInsensitive(const std::string& value, const std::string_view needle)
+{
+	if (needle.empty()) return true;
+	for (std::size_t start = 0; start + needle.size() <= value.size(); ++start) {
+		bool matched = true;
+		for (std::size_t index = 0; index < needle.size(); ++index) {
+			const unsigned char left = static_cast<unsigned char>(value[start + index]);
+			const unsigned char right = static_cast<unsigned char>(needle[index]);
+			if (std::tolower(left) != std::tolower(right)) {
+				matched = false;
+				break;
+			}
+		}
+		if (matched) return true;
+	}
+	return false;
+}
+
+bool NameContains(const std::string& value, const std::string_view text)
+{
+	return value.find(text) != std::string::npos;
+}
+
+bool IsCheckCollection(const e2txt::FormControlPropertyCollection& collection)
+{
+	return NameContains(collection.definition.name, "选中") ||
+		NameContains(collection.definition.name, "选择状态") ||
+		ContainsAsciiInsensitive(collection.definition.englishName, "check") ||
+		ContainsAsciiInsensitive(collection.definition.englishName, "checked");
+}
+
+bool IsEnabledCollection(const e2txt::FormControlPropertyCollection& collection)
+{
+	return NameContains(collection.definition.name, "允许") ||
+		NameContains(collection.definition.name, "允许状态") ||
+		ContainsAsciiInsensitive(collection.definition.englishName, "enable") ||
+		ContainsAsciiInsensitive(collection.definition.englishName, "enabled");
+}
+
+bool IsItemValueCollection(const e2txt::FormControlPropertyCollection& collection)
+{
+	return NameContains(collection.definition.name, "项目数值") ||
+		ContainsAsciiInsensitive(collection.definition.englishName, "itemdata") ||
+		ContainsAsciiInsensitive(collection.definition.englishName, "itemvalue");
+}
+
+bool IsTabTitleCollection(const e2txt::FormControlPropertyCollection& collection)
+{
+	return NameContains(collection.definition.name, "子夹") ||
+		ContainsAsciiInsensitive(collection.definition.englishName, "tab") ||
+		ContainsAsciiInsensitive(collection.definition.englishName, "page");
+}
+
+bool CollectionBooleanValue(
+	const e2txt::FormControlPropertyCollection& collection,
+	const std::size_t index,
+	const bool fallback)
+{
+	if (collection.kind == e2txt::FormControlPropertyCollectionKind::Integer) {
+		return index < collection.integerValues.size() && collection.integerValues[index] != 0;
+	}
+	if (index >= collection.textValues.size()) return fallback;
+	const std::string& value = collection.textValues[index];
+	return value == "真" || value == "1" || ContainsAsciiInsensitive(value, "true")
+		? true
+		: (value == "假" || value == "0" || ContainsAsciiInsensitive(value, "false") ? false : fallback);
+}
+
 bool BoolAttribute(const e2txt::SimpleXmlNode& node, const char* name, const bool fallback)
 {
 	const std::string value = Attribute(node, name);
@@ -62,7 +131,9 @@ WindowEventTrigger ClassifyEvent(
 		? nodeName : nodeName.substr(0, separator);
 	const bool isWindow = typeName == "窗口";
 	if (name == "创建完毕") return WindowEventTrigger::Created;
-	if (name.find("关闭") != std::string::npos) return WindowEventTrigger::Closing;
+	// Only the form's close-query events use "关闭".  A combo/list close
+	// notification is a separate event and must be classified below.
+	if (isWindow && name.find("关闭") != std::string::npos) return WindowEventTrigger::Closing;
 	if (name.find("销毁") != std::string::npos) return WindowEventTrigger::Destroyed;
 	if (name.find("尺寸") != std::string::npos || name.find("大小") != std::string::npos) return WindowEventTrigger::SizeChanged;
 	if (name == "位置被改变") return isWindow ? WindowEventTrigger::Moved : WindowEventTrigger::PositionChanged;
@@ -72,6 +143,7 @@ WindowEventTrigger ClassifyEvent(
 	if (name == "失去焦点") return WindowEventTrigger::FocusLost;
 	if (name == "被单击") return WindowEventTrigger::Clicked;
 	if (name == "列表项被选择" || name == "子夹被改变") return WindowEventTrigger::SelectionChanged;
+	if (name == "选中状态被改变") return WindowEventTrigger::CheckChanged;
 	if (name == "被双击") return WindowEventTrigger::DoubleClicked;
 	if (name == "将弹出列表") return WindowEventTrigger::DropDown;
 	if (name == "列表被关闭") return WindowEventTrigger::ListClosed;
@@ -85,6 +157,7 @@ WindowEventTrigger ClassifyEvent(
 	if (name == "托盘事件") return WindowEventTrigger::Tray;
 	if (name == "鼠标进入") return WindowEventTrigger::MouseEnter;
 	if (name == "鼠标离开") return WindowEventTrigger::MouseLeave;
+	if (name == "反馈事件") return WindowEventTrigger::Feedback;
 	if (name == "现行选中项被改变" || name == "选择被改变") return WindowEventTrigger::SelectionChanged;
 	if (name == "选择日期被改变" || name == "编辑内容被改变") return WindowEventTrigger::Changed;
 	if (name == "双击选择") return WindowEventTrigger::DoubleClicked;
@@ -120,7 +193,13 @@ WindowEventTrigger ClassifyEvent(
 		if (index == 2) return WindowEventTrigger::SelectionChanged;
 	}
 	if ((typeName == "列表框" || typeName == "选择列表框") && index == 0) return WindowEventTrigger::SelectionChanged;
-	if ((typeName == "列表框" || typeName == "选择列表框") && index == 1) return WindowEventTrigger::DoubleClicked;
+	if (typeName == "列表框" && index == 1) return WindowEventTrigger::DoubleClicked;
+	// 选择列表框 exposes a separate check-state event between selection
+	// change and double-click.  The Win32 listbox reports both through the
+	// selection notification, so use the same trigger and let the dispatcher
+	// invoke the bound handler consistently.
+	if (typeName == "选择列表框" && index == 1) return WindowEventTrigger::CheckChanged;
+	if (typeName == "选择列表框" && index == 2) return WindowEventTrigger::DoubleClicked;
 	if (typeName == "组合框") {
 		if (index == 0) return WindowEventTrigger::SelectionChanged;
 		if (index == 1) return WindowEventTrigger::Changed;
@@ -146,35 +225,89 @@ void ReadStructuredChildren(
 	// type or to a fixed support-library property name.
 	for (const auto& child : node.children) {
 		if (child.name.find('.') == std::string::npos) continue;
+		// These nodes are structural, rather than generic collection properties.
+		// In particular, a tab page contains ordinary controls whose 标题
+		// attributes must never be interpreted as tab header text.
+		if (child.name == node.name + ".事件" ||
+			child.name == node.name + ".子夹管理" ||
+			child.name == node.name + ".子夹") continue;
 		bool textCollection = false;
 		bool integerCollection = false;
-		bool tabTextCollection = false;
+		bool checkedCollection = false;
+		bool enabledCollection = false;
 		for (const auto& item : child.children) {
 			if (item.attributes.contains("数值")) integerCollection = true;
+			if (item.attributes.contains("选中") || item.attributes.contains("选择状态")) checkedCollection = true;
+			if (item.attributes.contains("允许") || item.attributes.contains("允许状态")) enabledCollection = true;
 			if (item.attributes.contains("文本") || item.attributes.contains("标题") ||
 				item.attributes.contains("值")) {
 				textCollection = true;
-				if (item.attributes.contains("标题")) tabTextCollection = true;
 			}
 		}
-		if (textCollection && !integerCollection) {
-			if (tabTextCollection) {
-				for (const auto& item : child.children) {
-					if (item.attributes.contains("标题")) control.tabPageTitles.push_back(Attribute(item, "标题"));
-				}
+		if (checkedCollection && !textCollection && !integerCollection) {
+			control.itemCheckedDefined = true;
+			for (const auto& item : child.children) {
+				if (item.attributes.contains("选中")) control.itemChecked.push_back(BoolAttribute(item, "选中", false));
+				else control.itemChecked.push_back(BoolAttribute(item, "选择状态", false));
 			}
-			else {
-			control.listItemsDefined = true;
+			continue;
+		}
+		if (enabledCollection && !textCollection && !integerCollection) {
+			control.itemEnabledDefined = true;
+			for (const auto& item : child.children) {
+				if (item.attributes.contains("允许")) control.itemEnabled.push_back(BoolAttribute(item, "允许", true));
+				else control.itemEnabled.push_back(BoolAttribute(item, "允许状态", true));
+			}
+			continue;
+		}
+		// A list item's text, value, and check state may be serialized in the
+		// same node.  Decode each field independently so one field cannot make
+		// the whole collection disappear.
+		if (textCollection) {
+			if (!control.listItemsDefined) {
+				control.listItemsDefined = true;
 				for (const auto& item : child.children) {
 					if (item.attributes.contains("文本")) control.listItems.push_back(Attribute(item, "文本"));
 					else if (item.attributes.contains("值")) control.listItems.push_back(Attribute(item, "值"));
+					else if (item.attributes.contains("标题")) control.listItems.push_back(Attribute(item, "标题"));
 				}
 			}
+			if (control.typeName == "选择列表框") {
+				if (checkedCollection && !control.itemCheckedDefined) {
+					control.itemCheckedDefined = true;
+					for (const auto& item : child.children) control.itemChecked.push_back(
+						item.attributes.contains("选中") ? BoolAttribute(item, "选中", false) : BoolAttribute(item, "选择状态", false));
+				}
+				if (enabledCollection && !control.itemEnabledDefined) {
+					control.itemEnabledDefined = true;
+					for (const auto& item : child.children) control.itemEnabled.push_back(
+						item.attributes.contains("允许") ? BoolAttribute(item, "允许", true) : BoolAttribute(item, "允许状态", true));
+				}
+			}
+			if (integerCollection && !control.itemValuesDefined) {
+				control.itemValuesDefined = true;
+				for (const auto& item : child.children) {
+					if (item.attributes.contains("数值")) control.itemValues.push_back(IntAttribute(item, "数值", 0));
+				}
+			}
+			continue;
 		}
-		else if (integerCollection && !textCollection) {
-			control.itemValuesDefined = true;
-			for (const auto& item : child.children) {
-				if (item.attributes.contains("数值")) control.itemValues.push_back(IntAttribute(item, "数值", 0));
+		if (integerCollection) {
+			// The names are the only reliable discriminator for state arrays in
+			// old XML bundles where the custom collection type is not published.
+			if (checkedCollection && control.typeName == "选择列表框" && !control.itemCheckedDefined) {
+				control.itemCheckedDefined = true;
+				for (const auto& item : child.children) control.itemChecked.push_back(IntAttribute(item, "数值", 0) != 0);
+			}
+			else if (enabledCollection && control.typeName == "选择列表框" && !control.itemEnabledDefined) {
+				control.itemEnabledDefined = true;
+				for (const auto& item : child.children) control.itemEnabled.push_back(IntAttribute(item, "数值", 1) != 0);
+			}
+			else if (!control.itemValuesDefined) {
+				control.itemValuesDefined = true;
+				for (const auto& item : child.children) {
+					if (item.attributes.contains("数值")) control.itemValues.push_back(IntAttribute(item, "数值", 0));
+				}
 			}
 		}
 	}
@@ -321,6 +454,10 @@ bool ReadControl(
 	const std::int32_t tabPage)
 {
 	if (node.name.find('.') != std::string::npos) return true;
+	if (!HasNativeWin32Class(node.name)) {
+		outId = 0;
+		return true;
+	}
 	WindowControl control;
 	control.id = nextId++;
 	control.parentId = parentId;
@@ -339,6 +476,9 @@ bool ReadControl(
 	control.tabIndex = IntAttribute(node, "停留顺序", 0);
 	control.tabOwner = tabOwner;
 	control.tabPage = tabPage;
+	if (control.typeName == "选择夹") {
+		control.tabCurrentPage = IntAttribute(node, "现行子夹", 0);
+	}
 	control.extensionData = DecodeBase64(Attribute(node, "扩展属性数据"));
 	ReadStructuredChildren(node, control);
 	e2txt::FormControlPropertySemanticData semantic;
@@ -355,43 +495,143 @@ bool ReadControl(
 		}
 	}
 	for (const auto& collection : semantic.collections) {
-		if (collection.kind == e2txt::FormControlPropertyCollectionKind::Integer) {
+		const bool checkCollection = IsCheckCollection(collection);
+		const bool enabledCollection = IsEnabledCollection(collection);
+		if (control.typeName == "选择列表框" && checkCollection) {
+			if (!control.itemCheckedDefined) {
+				const std::size_t count = collection.kind == e2txt::FormControlPropertyCollectionKind::Integer
+					? collection.integerValues.size() : collection.textValues.size();
+				control.itemChecked.resize(count, false);
+				for (std::size_t index = 0; index < count; ++index)
+					control.itemChecked[index] = CollectionBooleanValue(collection, index, false);
+				control.itemCheckedDefined = true;
+			}
+			continue;
+		}
+		if (control.typeName == "选择列表框" && enabledCollection) {
+			if (!control.itemEnabledDefined) {
+				const std::size_t count = collection.kind == e2txt::FormControlPropertyCollectionKind::Integer
+					? collection.integerValues.size() : collection.textValues.size();
+				control.itemEnabled.resize(count, true);
+				for (std::size_t index = 0; index < count; ++index)
+					control.itemEnabled[index] = CollectionBooleanValue(collection, index, true);
+				control.itemEnabledDefined = true;
+			}
+			continue;
+		}
+		if (control.typeName == "选择夹" && collection.kind == e2txt::FormControlPropertyCollectionKind::Text &&
+			(collection.textValues.empty() || IsTabTitleCollection(collection))) {
+			if (control.tabPageTitles.empty()) control.tabPageTitles = collection.textValues;
+			continue;
+		}
+		if ((control.typeName == "列表框" || control.typeName == "选择列表框" || control.typeName == "组合框") &&
+			collection.kind == e2txt::FormControlPropertyCollectionKind::Integer &&
+			(IsItemValueCollection(collection) || !control.itemValuesDefined)) {
 			if (!control.itemValuesDefined) {
 				control.itemValues = collection.integerValues;
 				control.itemValuesDefined = true;
 			}
+			continue;
 		}
-		else if (!control.listItemsDefined && control.tabPageTitles.empty()) {
+		if ((control.typeName == "列表框" || control.typeName == "选择列表框" || control.typeName == "组合框") &&
+			collection.kind == e2txt::FormControlPropertyCollectionKind::Text && !control.listItemsDefined) {
 			control.listItems = collection.textValues;
 			control.listItemsDefined = true;
 		}
 	}
 	ReadEvents(node, control.typeName + ".事件", program, ownerName, control.events);
 	const std::int32_t currentId = static_cast<std::int32_t>(control.id);
-	std::int32_t tabPageIndex = 0;
+	std::vector<const e2txt::SimpleXmlNode*> tabPages;
+	const std::string tabPageNodeName = control.typeName + ".子夹";
+	const std::string tabManagerNodeName = control.typeName + ".子夹管理";
+	std::size_t tabHeaderCount = 0;
+	std::size_t explicitPageCount = 0;
+	for (const auto& child : node.children) {
+		if (child.name == tabPageNodeName) {
+			tabPages.push_back(&child);
+			const std::int32_t index = IntAttribute(child, "索引", -1);
+			if (index >= 0) explicitPageCount = (std::max)(explicitPageCount, static_cast<std::size_t>(index) + 1);
+		}
+		if (child.name == tabManagerNodeName) {
+			for (const auto& header : child.children) {
+				if (header.name != "子夹") continue;
+				++tabHeaderCount;
+				const std::int32_t index = IntAttribute(header, "索引", -1);
+				if (index >= 0) explicitPageCount = (std::max)(explicitPageCount, static_cast<std::size_t>(index) + 1);
+			}
+		}
+	}
+	if (control.typeName == "选择夹") {
+		// All page-bearing representations share one zero-based index space.  An
+		// explicit sparse index (for example page 3 with no page 2 node) must
+		// still create the intervening empty page so later pages keep their names
+		// and controls when the tab is switched back and forth.
+		const std::size_t pageCount = (std::max)(explicitPageCount,
+			(std::max)(tabPages.size(), (std::max)(tabHeaderCount, control.tabPageTitles.size())));
+		if (pageCount > 0) {
+			control.tabPageBreak = !tabPages.empty();
+			control.tabPageTitles.resize(pageCount);
+		}
+		else {
+			control.tabPageTitles.clear();
+		}
+	}
+	if (!tabPages.empty()) {
+		control.tabPageBreak = true;
+		// Page groups are authoritative for child ownership; header metadata can
+		// contain additional empty pages, which must still remain addressable.
+	}
 	for (const auto& child : node.children) {
 		if (child.name.find('.') != std::string::npos) {
-			if (child.name == control.typeName + ".子夹管理") {
+			if (child.name == tabManagerNodeName) {
+				std::vector<std::string> titles = control.tabPageTitles;
+				std::vector<bool> assigned(titles.size(), false);
+				std::size_t fallbackIndex = 0;
 				for (const auto& tabHeader : child.children) {
-					if (tabHeader.name == "子夹") control.tabPageTitles.push_back(Attribute(tabHeader, "标题"));
+					if (tabHeader.name != "子夹" || titles.empty()) continue;
+					std::int32_t index = IntAttribute(tabHeader, "索引", -1);
+					if (index < 0 || static_cast<std::size_t>(index) >= titles.size() || assigned[static_cast<std::size_t>(index)]) {
+						while (fallbackIndex < assigned.size() && assigned[fallbackIndex]) ++fallbackIndex;
+						if (fallbackIndex >= assigned.size()) continue;
+						index = static_cast<std::int32_t>(fallbackIndex);
+					}
+					const auto slot = static_cast<std::size_t>(index);
+					const std::string title = Attribute(tabHeader, "标题");
+					if (!title.empty() || titles[slot].empty()) titles[slot] = title;
+					assigned[slot] = true;
+					if (slot == fallbackIndex) ++fallbackIndex;
 				}
+				control.tabPageTitles = std::move(titles);
 				continue;
-			}
-			if (child.name == control.typeName + ".子夹") {
-				control.tabPageBreak = true;
-				// 每个“选择夹.子夹”节点就是一个页面，页面中的控件直接挂在该节点下。
-				for (const auto& pageChild : child.children) {
-					std::int32_t childId = 0;
-					if (!ReadControl(pageChild, program, currentId, formId, ownerName, nextId, form, childId, currentId, tabPageIndex)) return false;
-					if (childId != 0) control.children.push_back(childId);
-				}
-				++tabPageIndex;
 			}
 			continue;
 		}
 		std::int32_t childId = 0;
 		if (!ReadControl(child, program, currentId, formId, ownerName, nextId, form, childId, tabOwner, tabPage)) return false;
 		if (childId != 0) control.children.push_back(childId);
+	}
+	if (control.typeName == "选择夹") {
+		// Read page controls in their own groups after ordinary child nodes so
+		// each control receives the correct tabOwner/tabPage metadata.
+		const std::size_t pageCount = control.tabPageTitles.size();
+		std::vector<bool> usedPage(pageCount, false);
+		std::size_t fallbackPage = 0;
+		for (const auto* pageNode : tabPages) {
+			std::int32_t pageIndex = IntAttribute(*pageNode, "索引", -1);
+			if (pageIndex < 0 || static_cast<std::size_t>(pageIndex) >= pageCount || usedPage[static_cast<std::size_t>(pageIndex)]) {
+				while (fallbackPage < usedPage.size() && usedPage[fallbackPage]) ++fallbackPage;
+				if (fallbackPage >= usedPage.size()) continue;
+				pageIndex = static_cast<std::int32_t>(fallbackPage);
+			}
+			const auto page = static_cast<std::size_t>(pageIndex);
+			usedPage[page] = true;
+			if (page == fallbackPage) ++fallbackPage;
+			for (const auto& pageChild : pageNode->children) {
+				std::int32_t childId = 0;
+				if (!ReadControl(pageChild, program, currentId, formId, ownerName, nextId, form, childId, currentId, pageIndex)) return false;
+				if (childId != 0) control.children.push_back(childId);
+			}
+		}
 	}
 	form.controls.push_back(std::move(control));
 	outId = currentId;
@@ -461,7 +701,25 @@ bool BuildWindowModel(Program& program, std::string& outError)
 		form.maximizeButton = BoolAttribute(root, "最大化按钮", true);
 		form.minimizeButton = BoolAttribute(root, "最小化按钮", true);
 		form.canMove = BoolAttribute(root, "可否移动", true);
-		form.topmost = BoolAttribute(root, "总在最前", false);
+		form.enterToNext = BoolAttribute(root, "回车下移焦点", false);
+		form.f1OpenHelp = BoolAttribute(root, "F1键打开帮助", false);
+		form.helpFileName = Attribute(root, "帮助文件名");
+		form.helpContext = IntAttribute(root, "帮助标志值", 0);
+	form.hitMove = BoolAttribute(root, "随意移动", false);
+	form.topmost = BoolAttribute(root, "总在最前", false);
+	form.keepTitleBarActive = BoolAttribute(root, "保持标题条激活", false);
+	form.shape = IntAttribute(root, "外形", 0);
+	const std::string formBackColor = Attribute(root, "底色");
+	if (!formBackColor.empty()) {
+		std::int32_t parsedValue = 0;
+		const auto parsed = std::from_chars(formBackColor.data(), formBackColor.data() + formBackColor.size(), parsedValue);
+		if (parsed.ec == std::errc() && parsed.ptr == formBackColor.data() + formBackColor.size()) {
+			form.backColor = parsedValue;
+			form.hasBackColor = true;
+		}
+	}
+	form.backPicMode = IntAttribute(root, "底图方式", 0);
+		form.playCount = IntAttribute(root, "播放次数", 2);
 		form.showInTaskbar = BoolAttribute(root, "在任务条中显示", true);
 		form.escapeCloses = BoolAttribute(root, "Esc键关闭", false);
 		form.attributes = CopyAttributes(root);

@@ -195,6 +195,10 @@ enum class WindowEventTrigger {
 	Tray,
 	MouseEnter,
 	MouseLeave,
+	// 选择列表框的勾选状态变化；普通列表框没有此独立事件。
+	CheckChanged,
+	// 标签等控件用于把消息转交给用户事件处理器。
+	Feedback,
 };
 
 // 窗口 XML 中的事件绑定及其运行时触发类别。
@@ -239,10 +243,17 @@ struct WindowControl {
 	bool tabPageBreak = false;
 	std::int32_t tabOwner = 0;
 	std::int32_t tabPage = -1;
+	// 选择夹设计期当前页；子控件的 tabPage 仍表示所属页索引。
+	std::int32_t tabCurrentPage = 0;
 	std::vector<std::string> tabPageTitles;
 	std::vector<std::pair<std::string, std::string>> attributes;
 	std::vector<std::string> listItems;
 	std::vector<std::int32_t> itemValues;
+	// 选择列表框的项目状态与普通列表框选择状态分开保存。
+	std::vector<bool> itemChecked;
+	std::vector<bool> itemEnabled;
+	bool itemCheckedDefined = false;
+	bool itemEnabledDefined = false;
 	bool listItemsDefined = false;
 	bool itemValuesDefined = false;
 	std::vector<std::uint8_t> extensionData;
@@ -269,7 +280,18 @@ struct WindowForm {
 	bool maximizeButton = true;
 	bool minimizeButton = true;
 	bool canMove = true;
+	bool enterToNext = false;
+	bool f1OpenHelp = false;
+	std::string helpFileName;
+	std::int32_t helpContext = 0;
+	bool hitMove = false;
 	bool topmost = false;
+	bool keepTitleBarActive = false;
+	std::int32_t shape = 0;
+	std::int32_t backColor = 0;
+	bool hasBackColor = false;
+	std::int32_t backPicMode = 0;
+	std::int32_t playCount = 2;
 	bool showInTaskbar = true;
 	bool escapeCloses = false;
 	std::vector<std::pair<std::string, std::string>> attributes;

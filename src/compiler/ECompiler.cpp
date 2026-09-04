@@ -1198,9 +1198,20 @@ bool Compile(
 	}
 	const std::filesystem::path staticLibrary = coreRoots.staticLibraryDirectory.empty()
 		? productRoot / L"static_lib" : coreRoots.staticLibraryDirectory;
-	const std::filesystem::path vc6RuntimeLibrary = productRoot / L"linker" / L"VC6linker" / L"Lib" / L"MSVCRT.LIB";
-	const std::filesystem::path mfcLibrary = vcLibrary / L"NAFXCW.LIB";
 	const bool useLegacyX86Runtime = !targetX64 && !usesModernCoreAdapter;
+	std::filesystem::path vc6RuntimeLibrary = productRoot / L"linker" / L"VC6linker" / L"Lib" / L"MSVCRT.LIB";
+	std::filesystem::path mfcLibrary = vcLibrary / L"NAFXCW.LIB";
+	if (useLegacyX86Runtime && !options.eDirectory.empty()) {
+		const std::filesystem::path eRoot = AbsolutePath(options.eDirectory);
+		const std::vector<std::pair<std::filesystem::path, std::filesystem::path>> legacyCandidates = {
+			{eRoot / L"linker" / L"VC6linker" / L"Lib" / L"MSVCRT.LIB", eRoot / L"linker" / L"VC6linker" / L"MFC" / L"Lib" / L"NAFXCW.LIB"},
+			{eRoot / L"linker" / L"VC2022Linker" / L"lib" / L"msvcrt.lib", eRoot / L"linker" / L"VC2022Linker" / L"lib" / L"NAFXCW.LIB"},
+			{eRoot / L"BlackMoon" / L"lib" / L"MSVCRT.LIB", eRoot / L"BlackMoon" / L"lib" / L"NAFXCW.LIB"},
+		};
+		for (const auto& [runtimeCandidate, mfcCandidate] : legacyCandidates) {
+			if (IsRegularFile(runtimeCandidate) && IsRegularFile(mfcCandidate)) { vc6RuntimeLibrary = runtimeCandidate; mfcLibrary = mfcCandidate; break; }
+		}
+	}
 	if (useLegacyX86Runtime) {
 		for (const std::filesystem::path& required : { mfcLibrary }) {
 			if (!IsRegularFile(required)) {
@@ -1217,6 +1228,12 @@ bool Compile(
 	std::vector<std::filesystem::path> dependencyDirectories = {
 		staticLibrary, vcLibrary, program.inputRoot, program.inputRoot / L"elib",
 	};
+	if (!options.eDirectory.empty()) {
+		const std::filesystem::path eRoot = AbsolutePath(options.eDirectory);
+		dependencyDirectories.push_back(eRoot / L"static_lib");
+		dependencyDirectories.push_back(eRoot / L"BlackMoon");
+		dependencyDirectories.push_back(eRoot / L"BlackMoon" / L"lib");
+	}
 	for (const auto& directory : supportLibrarySearchDirectories) dependencyDirectories.push_back(directory);
 	for (const auto& library : program.libraries) {
 		if (!library.metadata.filePath.empty()) dependencyDirectories.push_back(library.metadata.filePath.parent_path());
@@ -1277,12 +1294,23 @@ bool Compile(
 		// notification table.  They are archive-level dependencies, independent
 		// of which individual source command is used.
 		for (const auto& fileName : { L"odbcdb_static.lib", L"mp3_static.lib" }) {
-			const std::filesystem::path dependency = staticLibrary / fileName;
+			std::filesystem::path dependency = staticLibrary / fileName;
+			if (!IsRegularFile(dependency) && !options.eDirectory.empty()) {
+				const std::filesystem::path candidate = AbsolutePath(options.eDirectory) / L"static_lib" / fileName;
+				if (IsRegularFile(candidate)) dependency = candidate;
+			}
 			if (!IsRegularFile(dependency)) {
 				result.message = "core_runtime_dependency_not_found:" + PathToUtf8(dependency);
 				return false;
 			}
 			AppendUniquePath(supportLibraries, dependency);
+		}
+		if (!options.eDirectory.empty()) {
+			const std::filesystem::path eRoot = AbsolutePath(options.eDirectory);
+			for (const auto& directory : {eRoot / L"BlackMoon" / L"lib", eRoot / L"linker" / L"VC6linker" / L"Lib"}) {
+				const std::filesystem::path dao = FindLibraryArtifact({directory}, "DAOUUID.LIB");
+				if (!dao.empty()) { AppendUniquePath(supportLibraries, dao); break; }
+			}
 		}
 	}
 	std::vector<std::wstring> linkerArguments;
@@ -1326,6 +1354,12 @@ bool Compile(
 		}
 	}
 	for (const auto& directory : systemLibraryDirectories) linkerArguments.push_back(L"/LIBPATH:" + Quote(directory));
+	// Legacy FNE archives carry default-library directives such as LIBCIMT and
+	// DAOUUID.  Their companion archives live beside the EasyLanguage runtime,
+	// so expose every validated dependency directory to LINK as well.
+	for (const auto& directory : dependencyDirectories) {
+		if (!directory.empty() && std::filesystem::is_directory(directory)) linkerArguments.push_back(L"/LIBPATH:" + Quote(directory));
+	}
 	for (const auto& library : { modernRuntimeLibrary, modernCppRuntimeLibrary, modernVcruntimeLibrary, modernUcrtLibrary }) {
 		linkerArguments.push_back(Quote(library));
 	}

@@ -1385,17 +1385,57 @@ bool EncodeStructuredProperty(
 	return EncodeLengthPrefixedStringArray(textValues, utf8, outData);
 }
 
+bool ContainsAsciiInsensitive(const std::string& value, const std::string_view needle)
+{
+	if (needle.empty()) return true;
+	for (std::size_t start = 0; start + needle.size() <= value.size(); ++start) {
+		bool matched = true;
+		for (std::size_t index = 0; index < needle.size(); ++index) {
+			const unsigned char left = static_cast<unsigned char>(value[start + index]);
+			const unsigned char right = static_cast<unsigned char>(needle[index]);
+			if (std::tolower(left) != std::tolower(right)) {
+				matched = false;
+				break;
+			}
+		}
+		if (matched) return true;
+	}
+	return false;
+}
+
+bool CollectionDefinitionSuggestsInteger(const FormControlPropertyDefinition& definition)
+{
+	if (definition.name.find("数值") != std::string::npos ||
+		definition.name.find("选中") != std::string::npos ||
+		definition.name.find("允许") != std::string::npos ||
+		definition.name.find("状态") != std::string::npos) {
+		return true;
+	}
+	return ContainsAsciiInsensitive(definition.englishName, "itemdata") ||
+		ContainsAsciiInsensitive(definition.englishName, "itemvalue") ||
+		ContainsAsciiInsensitive(definition.englishName, "checked") ||
+		ContainsAsciiInsensitive(definition.englishName, "enabled");
+}
+
 bool TryInferCollectionKind(
 	const FormControlPropertyValue& value,
 	FormControlPropertyCollectionKind& outKind)
 {
 	if (value.kind != FormControlPropertyValueKind::Binary || value.binaryValue.empty()) return false;
 	std::vector<std::string> strings;
+	std::vector<std::int32_t> integers;
+	// A raw integer array can begin with bytes that look like a valid string
+	// count.  Prefer the representation indicated by the published property
+	// definition before falling back to shape-based probing.
+	if (CollectionDefinitionSuggestsInteger(value.definition) &&
+		DecodeInt32Array(value.binaryValue, integers)) {
+		outKind = FormControlPropertyCollectionKind::Integer;
+		return true;
+	}
 	if (DecodeLengthPrefixedStringArray(value.binaryValue, false, strings)) {
 		outKind = FormControlPropertyCollectionKind::Text;
 		return true;
 	}
-	std::vector<std::int32_t> integers;
 	if (DecodeInt32Array(value.binaryValue, integers)) {
 		outKind = FormControlPropertyCollectionKind::Integer;
 		return true;
