@@ -164,17 +164,59 @@ std::filesystem::path AbsolutePath(const std::filesystem::path& path)
 	return error ? path : absolute;
 }
 
+bool ToolchainPathGreater(const std::filesystem::path& left, const std::filesystem::path& right);
+
 std::filesystem::path LatestVersionDirectory(const std::filesystem::path& root)
 {
 	std::error_code error;
 	std::vector<std::filesystem::path> directories;
 	for (const auto& entry : std::filesystem::directory_iterator(root, error)) {
+		error.clear();
 		if (entry.is_directory(error)) directories.push_back(entry.path());
 	}
-	std::sort(directories.begin(), directories.end(), [](const auto& left, const auto& right) {
-		return left.filename().wstring() > right.filename().wstring();
-	});
+	std::sort(directories.begin(), directories.end(), ToolchainPathGreater);
 	return directories.empty() ? std::filesystem::path() : directories.front();
+}
+
+bool ToolchainPathGreater(const std::filesystem::path& left, const std::filesystem::path& right)
+{
+	const auto components = [](const std::filesystem::path& path) {
+		std::vector<unsigned long long> values;
+		unsigned long long value = 0;
+		bool inNumber = false;
+		for (const wchar_t character : path.filename().wstring()) {
+			if (character >= L'0' && character <= L'9') {
+				value = value * 10 + static_cast<unsigned long long>(character - L'0');
+				inNumber = true;
+			}
+			else if (inNumber) {
+				values.push_back(value); value = 0; inNumber = false;
+			}
+		}
+		if (inNumber) values.push_back(value);
+		return values;
+	};
+	const auto leftVersion = components(left);
+	const auto rightVersion = components(right);
+	if (leftVersion != rightVersion) return leftVersion > rightVersion;
+	return left.wstring() > right.wstring();
+}
+
+void AppendUniquePath(std::vector<std::filesystem::path>& paths, const std::filesystem::path& path)
+{
+	if (path.empty()) return;
+	const std::filesystem::path absolute = AbsolutePath(path);
+	for (const auto& existing : paths) {
+		if (_wcsicmp(existing.c_str(), absolute.c_str()) == 0) return;
+	}
+	paths.push_back(absolute);
+}
+
+std::filesystem::path EnvironmentPath(const wchar_t* name)
+{
+	wchar_t value[32768]{};
+	const DWORD length = GetEnvironmentVariableW(name, value, static_cast<DWORD>(std::size(value)));
+	return length == 0 || length >= std::size(value) ? std::filesystem::path() : std::filesystem::path(value);
 }
 
 bool IsVcToolsDirectory(const std::filesystem::path& directory)
@@ -184,17 +226,98 @@ bool IsVcToolsDirectory(const std::filesystem::path& directory)
 		std::filesystem::is_directory(directory / L"lib");
 }
 
+bool HasCompilerForArchitecture(const std::filesystem::path& vcTools, const TargetArchitecture architecture)
+{
+	const std::filesystem::path target = architecture == TargetArchitecture::X64 ? L"x64" : L"x86";
+	return IsRegularFile(vcTools / L"bin" / L"Hostx64" / target / L"cl.exe") ||
+		IsRegularFile(vcTools / L"bin" / L"Hostx86" / target / L"cl.exe");
+}
+
 std::filesystem::path NormalizeVcToolsDirectory(const std::filesystem::path& configured)
 {
 	if (configured.empty()) return {};
 	const std::filesystem::path root = AbsolutePath(configured);
 	if (IsVcToolsDirectory(root)) return root;
-	const std::filesystem::path latest = LatestVersionDirectory(root);
-	return IsVcToolsDirectory(latest) ? latest : std::filesystem::path();
+	const std::vector<std::filesystem::path> roots = {
+		root,
+		root / L"VC" / L"Tools" / L"MSVC",
+		root / L"Tools" / L"MSVC",
+		root / L"MSVC",
+	};
+	for (const auto& candidateRoot : roots) {
+		if (IsVcToolsDirectory(candidateRoot)) return candidateRoot;
+		const std::filesystem::path latest = LatestVersionDirectory(candidateRoot);
+		if (IsVcToolsDirectory(latest)) return latest;
+	}
+	return {};
+}
+
+void AddVisualStudioRegistryInstances(std::vector<std::filesystem::path>& candidates)
+{
+	for (const REGSAM view : { KEY_WOW64_64KEY, KEY_WOW64_32KEY }) {
+		HKEY instances = nullptr;
+		if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+			L"SOFTWARE\\Microsoft\\VisualStudio\\Setup\\Instances", 0,
+			KEY_READ | view, &instances) != ERROR_SUCCESS) continue;
+		for (DWORD index = 0;; ++index) {
+			wchar_t instanceName[256]{};
+			DWORD instanceNameLength = static_cast<DWORD>(std::size(instanceName));
+			if (RegEnumKeyExW(instances, index, instanceName, &instanceNameLength,
+				nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+			HKEY instance = nullptr;
+			if (RegOpenKeyExW(instances, instanceName, 0, KEY_READ, &instance) != ERROR_SUCCESS) continue;
+			wchar_t installationPath[32768]{};
+			DWORD type = 0;
+			DWORD length = sizeof(installationPath);
+			if (RegQueryValueExW(instance, L"installationPath", nullptr, &type,
+				reinterpret_cast<BYTE*>(installationPath), &length) == ERROR_SUCCESS &&
+				type == REG_SZ && installationPath[0] != L'\0') {
+				AppendUniquePath(candidates, installationPath);
+			}
+			RegCloseKey(instance);
+		}
+		RegCloseKey(instances);
+	}
+}
+
+void AddVisualStudioFilesystemRoots(std::vector<std::filesystem::path>& roots)
+{
+	for (const wchar_t* variable : { L"ProgramFiles", L"ProgramW6432", L"ProgramFiles(x86)" }) {
+		const std::filesystem::path programFiles = EnvironmentPath(variable);
+		if (!programFiles.empty()) AppendUniquePath(roots, programFiles / L"Microsoft Visual Studio");
+	}
+	AppendUniquePath(roots, L"C:\\Program Files\\Microsoft Visual Studio");
+	AppendUniquePath(roots, L"C:\\Program Files (x86)\\Microsoft Visual Studio");
+}
+
+void AddVisualStudioToolchainCandidates(std::vector<std::filesystem::path>& candidates)
+{
+	std::vector<std::filesystem::path> roots;
+	AddVisualStudioRegistryInstances(roots);
+	for (const wchar_t* variable : { L"VSINSTALLDIR", L"VCINSTALLDIR", L"VCToolsInstallDir" })
+		AppendUniquePath(roots, EnvironmentPath(variable));
+	std::vector<std::filesystem::path> filesystemRoots;
+	AddVisualStudioFilesystemRoots(filesystemRoots);
+	for (const auto& root : filesystemRoots) {
+		std::error_code error;
+		for (const auto& version : std::filesystem::directory_iterator(root, error)) {
+			error.clear();
+			if (!version.is_directory(error)) continue;
+			for (const auto& edition : std::filesystem::directory_iterator(version.path(), error)) {
+				error.clear();
+				if (edition.is_directory(error)) AppendUniquePath(roots, edition.path());
+			}
+		}
+	}
+	for (const auto& root : roots) {
+		const std::filesystem::path normalized = NormalizeVcToolsDirectory(root);
+		if (!normalized.empty()) AppendUniquePath(candidates, normalized);
+	}
 }
 
 bool SelectWindowsSdk(
 	const std::filesystem::path& configured,
+	const TargetArchitecture architecture,
 	std::filesystem::path& sdkRoot,
 	std::filesystem::path& versionedInclude)
 {
@@ -202,7 +325,15 @@ bool SelectWindowsSdk(
 	versionedInclude.clear();
 	if (configured.empty()) return false;
 	const std::filesystem::path root = AbsolutePath(configured);
-	if (IsRegularFile(root / L"um" / L"windows.h")) {
+	const std::filesystem::path machine = architecture == TargetArchitecture::X64 ? L"x64" : L"x86";
+	const auto usableVersion = [&](const std::filesystem::path& include) {
+		if (!IsRegularFile(include / L"um" / L"windows.h")) return false;
+		const std::filesystem::path base = include.parent_path().parent_path();
+		const std::filesystem::path version = include.filename();
+		return IsRegularFile(base / L"Lib" / version / L"um" / machine / L"kernel32.lib") &&
+			IsRegularFile(base / L"bin" / version / machine / L"rc.exe");
+	};
+	if (usableVersion(root)) {
 		versionedInclude = root;
 		sdkRoot = root.parent_path().parent_path();
 		return true;
@@ -217,8 +348,20 @@ bool SelectWindowsSdk(
 		includeRoot = root;
 	}
 	if (includeRoot.empty()) return false;
-	versionedInclude = LatestVersionDirectory(includeRoot);
-	return IsRegularFile(versionedInclude / L"um" / L"windows.h");
+	std::error_code error;
+	std::vector<std::filesystem::path> versions;
+	for (const auto& entry : std::filesystem::directory_iterator(includeRoot, error)) {
+		error.clear();
+		if (entry.is_directory(error)) versions.push_back(entry.path());
+	}
+	std::sort(versions.begin(), versions.end(), ToolchainPathGreater);
+	for (const auto& version : versions) {
+		if (usableVersion(version)) {
+			versionedInclude = version;
+			return true;
+		}
+	}
+	return false;
 }
 
 bool DiscoverBuildEnvironment(
@@ -245,43 +388,61 @@ bool DiscoverBuildEnvironment(
 		vcTools = NormalizeVcToolsDirectory(std::filesystem::path(configured));
 	}
 	if (vcTools.empty() || !std::filesystem::is_directory(vcTools)) {
-		std::error_code filesystemError;
 		std::vector<std::filesystem::path> candidates;
-		for (const auto& visualStudioRoot : {
-			std::filesystem::path(L"C:\\Program Files\\Microsoft Visual Studio"),
-			std::filesystem::path(L"C:\\Program Files (x86)\\Microsoft Visual Studio")
-		}) {
-			for (const auto& version : std::filesystem::directory_iterator(visualStudioRoot, filesystemError)) {
-				if (!version.is_directory(filesystemError)) continue;
-				for (const auto& edition : std::filesystem::directory_iterator(version.path(), filesystemError)) {
-					if (!edition.is_directory(filesystemError)) continue;
-					const auto candidate = NormalizeVcToolsDirectory(edition.path() / L"VC" / L"Tools" / L"MSVC");
-					if (!candidate.empty()) candidates.push_back(candidate);
+		AddVisualStudioToolchainCandidates(candidates);
+		if (!candidates.empty()) {
+			std::sort(candidates.begin(), candidates.end(), ToolchainPathGreater);
+			for (const auto& candidate : candidates) {
+				if (HasCompilerForArchitecture(candidate, architecture)) {
+					vcTools = candidate;
+					break;
 				}
 			}
-		}
-		if (!candidates.empty()) {
-			std::sort(candidates.begin(), candidates.end(), std::greater<>());
-			vcTools = candidates.front();
+			if (vcTools.empty()) vcTools = candidates.front();
 		}
 	}
 	std::filesystem::path windowsSdkRoot;
 	std::filesystem::path windowsKit;
 	if (!configuredWindowsSdkDirectory.empty() &&
-		!SelectWindowsSdk(configuredWindowsSdkDirectory, windowsSdkRoot, windowsKit)) {
+		!SelectWindowsSdk(configuredWindowsSdkDirectory, architecture, windowsSdkRoot, windowsKit)) {
 		error = "windows_sdk_directory_invalid:" + PathToUtf8(AbsolutePath(configuredWindowsSdkDirectory));
 		return false;
 	}
 	wchar_t sdkDirectory[MAX_PATH * 4]{};
+	if (windowsKit.empty()) {
+		std::filesystem::path sdkVersion = EnvironmentPath(L"WindowsSDKVersion");
+		while (!sdkVersion.empty() && (sdkVersion.wstring().back() == L'\\' || sdkVersion.wstring().back() == L'/'))
+			sdkVersion = sdkVersion.parent_path();
+		const std::filesystem::path configuredRoot = EnvironmentPath(L"WindowsSdkDir");
+		if (!sdkVersion.empty() && !configuredRoot.empty())
+			SelectWindowsSdk(configuredRoot / L"Include" / sdkVersion.filename(), architecture, windowsSdkRoot, windowsKit);
+	}
 	if (windowsKit.empty() && GetEnvironmentVariableW(L"WindowsSdkDir", sdkDirectory, std::size(sdkDirectory)) > 0) {
-		SelectWindowsSdk(std::filesystem::path(sdkDirectory), windowsSdkRoot, windowsKit);
+		SelectWindowsSdk(std::filesystem::path(sdkDirectory), architecture, windowsSdkRoot, windowsKit);
+	}
+	if (windowsKit.empty()) {
+		std::vector<std::filesystem::path> sdkCandidates;
+		for (const REGSAM view : { KEY_WOW64_64KEY, KEY_WOW64_32KEY }) {
+			HKEY roots = nullptr;
+			if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows Kits\\Installed Roots", 0,
+				KEY_READ | view, &roots) != ERROR_SUCCESS) continue;
+			for (const wchar_t* valueName : { L"KitsRoot10", L"KitsRoot81" }) {
+				wchar_t value[32768]{}; DWORD type = 0; DWORD length = sizeof(value);
+				if (RegQueryValueExW(roots, valueName, nullptr, &type, reinterpret_cast<BYTE*>(value), &length) == ERROR_SUCCESS &&
+					type == REG_SZ && value[0] != L'\0') AppendUniquePath(sdkCandidates, value);
+			}
+			RegCloseKey(roots);
+		}
+		for (const auto& candidate : sdkCandidates) {
+			if (SelectWindowsSdk(candidate, architecture, windowsSdkRoot, windowsKit)) break;
+		}
 	}
 	if (windowsKit.empty()) {
 		for (const auto& candidate : {
 			std::filesystem::path(L"C:\\Program Files (x86)\\Windows Kits\\10"),
 			std::filesystem::path(L"C:\\Program Files\\Windows Kits\\10")
 		}) {
-			if (SelectWindowsSdk(candidate, windowsSdkRoot, windowsKit)) break;
+			if (SelectWindowsSdk(candidate, architecture, windowsSdkRoot, windowsKit)) break;
 		}
 	}
 	if (vcTools.empty() || windowsKit.empty()) {
@@ -797,13 +958,6 @@ std::filesystem::path FindLibraryArtifact(
 		}
 	}
 	return {};
-}
-
-void AppendUniquePath(std::vector<std::filesystem::path>& paths, const std::filesystem::path& path)
-{
-	if (path.empty()) return;
-	for (const auto& existing : paths) if (existing.lexically_normal() == path.lexically_normal()) return;
-	paths.push_back(path);
 }
 
 void AppendSupportLibraryDirectories(
