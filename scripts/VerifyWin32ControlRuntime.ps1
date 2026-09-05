@@ -5,7 +5,7 @@ param(
     [string]$AdapterRoot = "D:\\git\\BlackMoonKernelStaticLib\\adapter",
     [int]$StartupSeconds = 3,
     [ValidateRange(1, 10)][int]$RepeatCount = 3,
-    [string]$X64Project = "eproj\\e-window-exe-new-proj.e",
+    [string]$X64Project = "eproj\\e-window-exe-full-x64.e",
     [ValidateRange(0, 60000)][int]$AutoCloseMilliseconds = 0,
     [switch]$PropertyProbe,
     [switch]$MemberProbe,
