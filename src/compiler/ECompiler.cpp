@@ -336,15 +336,39 @@ bool DiscoverBuildEnvironment(
 
 bool WriteUtf8Source(const std::filesystem::path& path, const std::string& text, std::string& error)
 {
+	// CppEmitter is built with the legacy execution charset so that escaped
+	// 易语言 text literals remain CP936 at runtime.  Its raw generated-runtime
+	// snippets therefore also arrive here as CP936 bytes.  The generated file
+	// is compiled as UTF-8, so normalize those bytes before writing; otherwise
+	// wide literals such as L"目录" become mojibake (Ŀ¼) and the corresponding
+	// properties are never applied.
+	std::string utf8Text;
+	if (!text.empty()) {
+		const int wideLength = MultiByteToWideChar(936, MB_ERR_INVALID_CHARS,
+			text.data(), static_cast<int>(text.size()), nullptr, 0);
+		if (wideLength > 0) {
+			std::wstring wide(static_cast<std::size_t>(wideLength), L'\0');
+			MultiByteToWideChar(936, MB_ERR_INVALID_CHARS, text.data(),
+				static_cast<int>(text.size()), wide.data(), wideLength);
+			const int utf8Length = WideCharToMultiByte(CP_UTF8, 0, wide.data(),
+				wideLength, nullptr, 0, nullptr, nullptr);
+			if (utf8Length > 0) {
+				utf8Text.resize(static_cast<std::size_t>(utf8Length));
+				WideCharToMultiByte(CP_UTF8, 0, wide.data(), wideLength,
+					utf8Text.data(), utf8Length, nullptr, nullptr);
+			}
+		}
+	}
+	if (utf8Text.empty() && !text.empty()) utf8Text = text;
 	std::ofstream output(path, std::ios::binary | std::ios::trunc);
 	if (!output) {
 		error = "open_generated_source_failed:" + PathToUtf8(path);
 		return false;
 	}
 	output.write("\xEF\xBB\xBF", 3);
-	for (std::size_t index = 0; index < text.size(); ++index) {
-		if (text[index] == '\n' && (index == 0 || text[index - 1] != '\r')) output.put('\r');
-		output.put(text[index]);
+	for (std::size_t index = 0; index < utf8Text.size(); ++index) {
+		if (utf8Text[index] == '\n' && (index == 0 || utf8Text[index - 1] != '\r')) output.put('\r');
+		output.put(utf8Text[index]);
 	}
 	if (!output.good()) {
 		error = "write_generated_source_failed:" + PathToUtf8(path);

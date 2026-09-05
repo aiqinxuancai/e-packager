@@ -424,7 +424,11 @@ bool ReadPropertyData(
 		program.bundle.sourcePath,
 		libraries,
 		program.supportLibrarySearchDirectories,
-		program.targetArchitecture == TargetArchitecture::X64);
+		// An explicitly selected adapter search root is authoritative for both
+		// architectures.  Restricting only x64 allowed x86 projects to reload
+		// a persisted e5.6 absolute path before the adapter FNE, producing a
+		// different property ABI and spurious CREATE_UNIT failures.
+		!program.supportLibrarySearchDirectories.empty());
 	std::vector<e2txt::FormControlPropertyValue> values;
 	if (!codec.Decode(dataType, extensionData, formId, unitId, values, outError, outSemantic)) return false;
 	for (const auto& value : values) {
@@ -490,7 +494,8 @@ bool ReadControl(
 		if (!propertyDecoded) {
 			// Keep diagnostics ASCII-safe: the CLI may be running under CP936,
 			// while control names are UTF-8 and would otherwise appear garbled.
-			std::cerr << "window property decode failed: data_type=" << typeCode
+			std::cerr << "window property decode failed: unit_id=" << control.id
+				<< " data_type=" << typeCode
 				<< " " << propertyError << "\n";
 		}
 	}
@@ -714,8 +719,10 @@ bool BuildWindowModel(Program& program, std::string& outError)
 		std::int32_t parsedValue = 0;
 		const auto parsed = std::from_chars(formBackColor.data(), formBackColor.data() + formBackColor.size(), parsedValue);
 		if (parsed.ec == std::errc() && parsed.ptr == formBackColor.data() + formBackColor.size()) {
+			// 易语言的 -16777216 表示“未指定/使用系统底色”，不是 RGB(0,0,0)。
+			// 保留 hasBackColor=false，避免独立窗口客户区被错误刷成纯黑。
 			form.backColor = parsedValue;
-			form.hasBackColor = true;
+			form.hasBackColor = parsedValue != -16777216;
 		}
 	}
 	form.backPicMode = IntAttribute(root, "底图方式", 0);

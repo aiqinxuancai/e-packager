@@ -162,10 +162,12 @@ const char* kRuntimeSource = R"CPP(
 #include <cwchar>
 #include <cstring>
 #include <functional>
+#include <iomanip>
 #include <memory>
 #include <deque>
 #include <shellapi.h>
 #include <string>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -403,10 +405,11 @@ static double ToNumber(const Value& value) {
 static std::string ToText(const Value& value);
 static std::wstring RuntimeWide(const std::string& text) {
     if(text.empty())return {};
-    const int length=MultiByteToWideChar(CP_ACP,0,text.c_str(),-1,nullptr,0);
+    // 易语言文本和生成的字节串使用 CP936，不随宿主系统 CP_ACP 改变。
+    const int length=MultiByteToWideChar(936,0,text.c_str(),-1,nullptr,0);
     if(length<=1)return {};
     std::wstring result(static_cast<std::size_t>(length),L'\0');
-    MultiByteToWideChar(CP_ACP,0,text.c_str(),-1,result.data(),length);
+    MultiByteToWideChar(936,0,text.c_str(),-1,result.data(),length);
     result.resize(static_cast<std::size_t>(length-1));
     return result;
 }
@@ -2816,7 +2819,9 @@ private:
 namespace ecompiler_window_host {
 struct Unit {
     unsigned int id=0; unsigned int form=0; HWND hwnd=nullptr; HWND parent=nullptr; int tabOwner=0; int tabPage=-1; const char* type=nullptr;
+    std::wstring logicalName;
     std::wstring tag;
+    std::wstring text;
     // 选择列表框的勾选状态不等同于 Win32 LISTBOX 的焦点/选择状态。
     std::vector<unsigned char> checkStates;
     std::vector<unsigned char> checkEnabled;
@@ -2909,7 +2914,12 @@ struct Unit {
      std::wstring imageFileName;
      bool imageCenter=false;
      bool imageTransparent=false;
-     int imagePlayCount=0;
+    int imagePlayCount=0;
+    int buttonType=0;
+    int comboType=2;
+    int comboTextLimit=0;
+    int lineSpacing=1;
+    int dateAttachType=0;
     bool visited=false;
     bool hyperlinkHot=false;
     bool hyperlinkTrack=true;
@@ -2917,7 +2927,7 @@ struct Unit {
     COLORREF hotColor=RGB(0,0,255);
     std::wstring passwordChar=L"*";
     HFONT font=nullptr;
-    std::wstring fontName=L"SimSun";
+    std::wstring fontName;
     int fontSize=9;
     bool fontBold=false;
     bool fontItalic=false;
@@ -2964,7 +2974,7 @@ struct Form {
     std::unordered_map<std::string,Value> properties;
 };
 struct XmlAttribute { const char* name; const char* value; };
-struct Spec { unsigned int id; unsigned int form; unsigned int parent; int left; int top; int width; int height; bool visible; bool disabled; bool tabStop; int tabOwner; int tabPage; int tabPageCount; int tabCurrentPage; const char* type; const char* text; const XmlAttribute* attributes; std::size_t attributeCount; const char* const* items; std::size_t itemCount; const int* itemValues; std::size_t itemValueCount; const unsigned char* itemChecked; std::size_t itemCheckedCount; const unsigned char* itemEnabled; std::size_t itemEnabledCount; };
+struct Spec { unsigned int id; unsigned int form; unsigned int parent; int left; int top; int width; int height; bool visible; bool disabled; bool tabStop; int tabOwner; int tabPage; int tabPageCount; int tabCurrentPage; const char* name; const char* type; const char* text; const XmlAttribute* attributes; std::size_t attributeCount; const char* const* items; std::size_t itemCount; const int* itemValues; std::size_t itemValueCount; const unsigned char* itemChecked; std::size_t itemCheckedCount; const unsigned char* itemEnabled; std::size_t itemEnabledCount; };
 static std::vector<Unit> units;
 static std::vector<Form> forms;
 static std::unordered_set<HWND> mouseInside;
@@ -2974,6 +2984,9 @@ static HDC activePaintDC=nullptr;
 static HINSTANCE instance=GetModuleHandleW(nullptr);
 static HFONT defaultFont=nullptr;
 static bool initializing=false;
+static bool probingProperties=false;
+static bool probingMembers=false;
+static bool probingEvents=false;
 static constexpr UINT trayMessage=WM_APP+0x5E;
 static HCURSOR CursorFromBytes(const std::vector<unsigned char>& bytes) {
     if(bytes.empty())return nullptr;
@@ -2988,24 +3001,76 @@ static void ReplaceUnitCursor(Unit& unit,const std::vector<unsigned char>& bytes
 }
 static std::wstring Wide(const char* value) {
     if(value==nullptr||*value==0)return {};
-    const int length=MultiByteToWideChar(CP_ACP,0,value,-1,nullptr,0);
+    // Generated literals are emitted as CP936 bytes (/execution-charset:.936),
+    // independent of the host process' active ANSI code page.
+    const int length=MultiByteToWideChar(936,0,value,-1,nullptr,0);
     if(length<=1)return {};
     std::wstring result(static_cast<std::size_t>(length),L'\0');
-    MultiByteToWideChar(CP_ACP,0,value,-1,result.data(),length);
+    MultiByteToWideChar(936,0,value,-1,result.data(),length);
     result.resize(static_cast<std::size_t>(length-1));
     return result;
 }
 static HFONT DefaultFont() {
     if(defaultFont!=nullptr)return defaultFont;
-    // 易语言核心控件的空“字体”属性使用宋体 9 磅；固定这个默认值，
-    // 避免宿主系统的现代 UI 字体把控件度量和 IDE 拉开差异。
-    defaultFont=CreateFontW(-12,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
-        OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,DEFAULT_QUALITY,DEFAULT_PITCH|FF_DONTCARE,L"SimSun");
+    // 易语言窗口控件的空“字体”属性使用宋体（9 磅）。不能直接沿用
+    // Windows 当前消息字体：在新系统上它通常是 Segoe UI，中文再走
+    // 回退字体后会导致自绘标签与原生控件出现字形、字宽不一致。
+    // 显式字体属性仍会在 ApplyUnitFont 中覆盖此默认值。
+    // E's default font is 9 points.  Convert points through the actual
+    // display DPI instead of assuming the process is running at 96 DPI;
+    // otherwise a 125/150% scaled desktop produces clipped or uneven glyphs.
+    int dpi=96;
+    if(HDC screen=GetDC(nullptr)) {
+        const int detected=GetDeviceCaps(screen,LOGPIXELSY);
+        if(detected>0)dpi=detected;
+        ReleaseDC(nullptr,screen);
+    }
+    const int height=-MulDiv(9,dpi,72);
+    defaultFont=CreateFontW(height,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,
+        GB2312_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,DEFAULT_QUALITY,
+        DEFAULT_PITCH|FF_DONTCARE,L"SimSun");
     if(defaultFont==nullptr)defaultFont=static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
     return defaultFont;
 }
+static BOOL CALLBACK ApplyFontToChildProc(HWND child,LPARAM parameter) {
+    HFONT font=reinterpret_cast<HFONT>(parameter);
+    if(child!=nullptr&&font!=nullptr)SendMessageW(child,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
+    return TRUE;
+}
+static void ApplyFontTree(HWND window,HFONT font) {
+    if(window==nullptr||font==nullptr)return;
+    SendMessageW(window,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
+    // Combo/date controls create an internal EDIT child.  WM_SETFONT sent to
+    // the outer control is not guaranteed to propagate, so explicitly apply
+    // the same font to every descendant to avoid mixed glyphs and sizes.
+    EnumChildWindows(window,ApplyFontToChildProc,reinterpret_cast<LPARAM>(font));
+}
 static void ApplyDefaultFont(HWND window) {
-    if(window!=nullptr)SendMessageW(window,WM_SETFONT,reinterpret_cast<WPARAM>(DefaultFont()),TRUE);
+    ApplyFontTree(window,DefaultFont());
+}
+static const char* XmlAttributeValue(const Spec& spec,const wchar_t* name);
+static std::wstring InitialCaption(const Spec& spec) {
+    if(spec.text!=nullptr&&*spec.text!=0)return Wide(spec.text);
+    // Some older form serializers leave Spec.text empty and keep the
+    // initial caption/content in the attribute table.  Native controls do
+    // not know about that table, so resolve the equivalent fields before
+    // CreateWindowExW.  Do not synthesize text for controls whose empty
+    // caption is meaningful (lists, scrollbars, calendars, etc.).
+    if(spec.attributes!=nullptr) {
+        const bool captionControl=std::strcmp(spec.type,"button")==0||
+            std::strcmp(spec.type,"checkbox")==0||std::strcmp(spec.type,"radio")==0||
+            std::strcmp(spec.type,"group")==0||std::strcmp(spec.type,"label")==0||
+            std::strcmp(spec.type,"hyperlink")==0||std::strcmp(spec.type,"edit")==0||
+            std::strcmp(spec.type,"combo")==0;
+        if(captionControl) {
+            const wchar_t* names[]={L"标题",L"内容",L"文本"};
+            for(const wchar_t* name:names) {
+                const char* value=XmlAttributeValue(spec,name);
+                if(value!=nullptr&&*value!=0)return Wide(value);
+            }
+        }
+    }
+    return {};
 }
 static void TrackMouse(HWND window) {
     if(window==nullptr)return;
@@ -3124,23 +3189,25 @@ static Value InvokeEvent(unsigned int methodId,std::vector<Value> values) {
 				}
 			}
 		}
-		prefix << R"CPP(
+prefix << R"CPP(
     default:return Empty();
     }
 }
+static void TraceEventInvocation(unsigned int unit,unsigned int trigger,int nativeCode,
+    unsigned int methodId,const std::vector<Value>& values);
 static bool Dispatch(unsigned int unit,unsigned int trigger,int nativeCode,std::vector<Value> values,Value* result=nullptr) {
     bool handled=false;
 )CPP";
 		for (const auto& form : program_.windows) {
 			for (const auto& event : form.events) {
 				const unsigned int triggerCode = static_cast<unsigned int>(event.trigger);
-				prefix << "    if(unit==" << form.id << "u&&((trigger==" << triggerCode << "u&&" << triggerCode << "u!=0u)||(trigger==0u&&nativeCode==" << event.index << "))){if(result!=nullptr)*result=InvokeEvent(" << event.methodId << "u,values);else (void)InvokeEvent(" << event.methodId << "u,values);handled=true;}\n";
+				prefix << "    if(unit==" << form.id << "u&&((trigger==" << triggerCode << "u&&" << triggerCode << "u!=0u)||(trigger==0u&&nativeCode==" << event.index << "))){TraceEventInvocation(unit,trigger,nativeCode," << event.methodId << "u,values);if(result!=nullptr)*result=InvokeEvent(" << event.methodId << "u,values);else (void)InvokeEvent(" << event.methodId << "u,values);handled=true;}\n";
 			}
 			for (const auto& control : form.controls) {
 				if (!HasNativeWin32Class(control.typeName)) continue;
 				for (const auto& event : control.events) {
 					const unsigned int triggerCode = static_cast<unsigned int>(event.trigger);
-					prefix << "    if(unit==" << control.id << "u&&((trigger==" << triggerCode << "u&&" << triggerCode << "u!=0u)||(trigger==0u&&nativeCode==" << event.index << "))){if(result!=nullptr)*result=InvokeEvent(" << event.methodId << "u,values);else (void)InvokeEvent(" << event.methodId << "u,values);handled=true;}\n";
+					prefix << "    if(unit==" << control.id << "u&&((trigger==" << triggerCode << "u&&" << triggerCode << "u!=0u)||(trigger==0u&&nativeCode==" << event.index << "))){TraceEventInvocation(unit,trigger,nativeCode," << event.methodId << "u,values);if(result!=nullptr)*result=InvokeEvent(" << event.methodId << "u,values);else (void)InvokeEvent(" << event.methodId << "u,values);handled=true;}\n";
 				}
 			}
 		}
@@ -3151,6 +3218,102 @@ static unsigned int UnitIdFromWindow(HWND window) {
     return window==nullptr?0u:static_cast<unsigned int>(GetDlgCtrlID(window));
 }
 static Unit* UnitFromWindow(HWND window);
+static std::string ProbeValueSummary(const Value& value);
+static const char* ProbeTypeName(const Value& value);
+static std::string EventArguments(const std::vector<Value>& values);
+static const char* NativeEventName(unsigned int trigger) {
+    switch(trigger) {
+    case native_created:return "created"; case native_closing:return "closing";
+    case native_destroyed:return "destroyed"; case native_size_changed:return "size_changed";
+    case native_moved:return "moved"; case native_activated:return "activated";
+    case native_deactivated:return "deactivated"; case native_focus_gained:return "focus_gained";
+    case native_focus_lost:return "focus_lost"; case native_clicked:return "clicked";
+    case native_double_clicked:return "double_clicked"; case native_drop_down:return "drop_down";
+    case native_selection_changed:return "selection_changed"; case native_position_changed:return "position_changed";
+    case native_changed:return "changed"; case native_key_down:return "key_down";
+    case native_key_up:return "key_up"; case native_mouse_down:return "mouse_down";
+    case native_mouse_up:return "mouse_up"; case native_mouse_move:return "mouse_move";
+    case native_paint:return "paint"; case native_timer:return "timer";
+    case native_list_closed:return "list_closed"; case native_selection_changing:return "selection_changing";
+    case native_char_input:return "char_input"; case native_right_mouse_down:return "right_mouse_down";
+    case native_right_mouse_up:return "right_mouse_up"; case native_first_activated:return "first_activated";
+    case native_shown:return "shown"; case native_hidden:return "hidden"; case native_idle:return "idle";
+    case native_tray:return "tray"; case native_mouse_enter:return "mouse_enter";
+    case native_mouse_leave:return "mouse_leave"; case native_check_changed:return "check_changed";
+    case native_feedback:return "feedback"; default:return "unknown";
+    }
+}
+static std::string EventUtf8(const std::wstring& text) {
+    if(text.empty())return {};
+    const int size=WideCharToMultiByte(CP_UTF8,0,text.data(),static_cast<int>(text.size()),nullptr,0,nullptr,nullptr);
+    if(size<=0)return {};
+    std::string result(static_cast<std::size_t>(size),'\0');
+    WideCharToMultiByte(CP_UTF8,0,text.data(),static_cast<int>(text.size()),result.data(),size,nullptr,nullptr);
+    return result;
+}
+static std::string EventArguments(const std::vector<Value>& values) {
+    std::ostringstream out;
+    for(std::size_t index=0;index<values.size();++index) {
+        if(index!=0)out<<',';
+        out<<ProbeValueSummary(values[index]);
+    }
+    return out.str();
+}
+static void TraceNativeEvent(HWND source,unsigned int trigger,int nativeCode,const std::vector<Value>& values={}) {
+    char path[MAX_PATH]{};
+    const DWORD length=GetEnvironmentVariableA("E_PACKAGER_EVENT_LOG",path,static_cast<DWORD>(std::size(path)));
+    if(length==0||length>=std::size(path))return;
+    FILE* stream=nullptr;
+    if(fopen_s(&stream,path,"ab")!=0||stream==nullptr)return;
+    // Keep the trace line machine-readable: write actual separators/newlines,
+    // rather than the two-character escape sequences (\\t/\\n).
+    const Unit* unit=UnitFromWindow(source);
+    const std::string name=unit==nullptr?std::string():EventUtf8(unit->logicalName);
+    const std::string arguments=EventArguments(values);
+    std::fprintf(stream,"event\t%u\t%s\t%s\t%s\t%u\t%d\t%zu\t%s\n",UnitIdFromWindow(source),
+        name.c_str(),unit==nullptr?"form":(unit->type==nullptr?"":unit->type),NativeEventName(trigger),
+        trigger,nativeCode,values.size(),arguments.c_str());
+    std::fclose(stream);
+}
+static void TraceLogicalUnitEvent(const Unit& unit,unsigned int trigger,int nativeCode,const std::vector<Value>& values={}) {
+    char path[MAX_PATH]{};
+    const DWORD length=GetEnvironmentVariableA("E_PACKAGER_EVENT_LOG",path,static_cast<DWORD>(std::size(path)));
+    if(length==0||length>=std::size(path))return;
+    FILE* stream=nullptr;if(fopen_s(&stream,path,"ab")!=0||stream==nullptr)return;
+    const std::string name=EventUtf8(unit.logicalName);
+    const std::string arguments=EventArguments(values);
+    std::fprintf(stream,"event\t%u\t%s\t%s\t%s\t%u\t%d\t%zu\t%s\n",unit.id,
+        name.c_str(),unit.type==nullptr?"":unit.type,NativeEventName(trigger),
+        trigger,nativeCode,values.size(),arguments.c_str());
+    std::fclose(stream);
+}
+static void TraceEventInvocation(unsigned int unit,unsigned int trigger,int nativeCode,
+    unsigned int methodId,const std::vector<Value>& values) {
+    char path[MAX_PATH]{};const DWORD length=GetEnvironmentVariableA("E_PACKAGER_EVENT_LOG",path,static_cast<DWORD>(std::size(path)));
+    if(length==0||length>=std::size(path))return;
+    FILE* stream=nullptr;if(fopen_s(&stream,path,"ab")!=0||stream==nullptr)return;
+    const Unit* record=FindUnit(unit);
+    const std::string name=record==nullptr?std::string():EventUtf8(record->logicalName);
+    const std::string arguments=EventArguments(values);
+    std::fprintf(stream,"invoke\t%u\t%s\t%s\t%s\t%u\t%d\t%u\t%zu\t%s\n",unit,
+        name.c_str(),record==nullptr?"":(record->type==nullptr?"":record->type),
+        NativeEventName(trigger),trigger,nativeCode,methodId,values.size(),arguments.c_str());
+    std::fclose(stream);
+}
+static void TraceRuntimeMarker(const char* marker) {
+    if(marker==nullptr)return;
+    char path[MAX_PATH]{};
+    const DWORD length=GetEnvironmentVariableA("E_PACKAGER_EVENT_LOG",path,static_cast<DWORD>(std::size(path)));
+    if(length==0||length>=std::size(path))return;
+    FILE* stream=nullptr;
+    if(fopen_s(&stream,path,"ab")!=0||stream==nullptr)return;
+    std::fprintf(stream,"marker\t%s\t%lu\n",marker,static_cast<unsigned long>(GetTickCount()));
+    std::fclose(stream);
+}
+static Unit* UnitFromWindow(HWND window);
+// 图片/绘图辅助函数在窗体过程之前被调用，必须先声明以供生成的 C++ 编译。
+static HBITMAP LoadPictureMemory(const std::vector<unsigned char>& bytes);
+static void PaintBitmap(HWND window,HDC dc,HBITMAP bitmap,int mode);
 static unsigned int CommandEventKind(HWND source,unsigned int notification) {
     const Unit* unit=UnitFromWindow(source);
     const bool pathSelection=unit!=nullptr&&unit->type!=nullptr&&
@@ -3192,11 +3355,15 @@ static unsigned int CommandEventKind(HWND source,unsigned int notification) {
 static bool DispatchNative(HWND source,unsigned int trigger,int nativeCode,std::vector<Value> values={}) {
     if(initializing||source==nullptr)return false;
     const unsigned int unit=UnitIdFromWindow(source);
+    if(unit!=0)TraceNativeEvent(source,trigger,nativeCode,values);
+    if(probingMembers||probingEvents)return false;
     return unit!=0&&Dispatch(unit,trigger,nativeCode,std::move(values));
 }
 static bool DispatchNativeResult(HWND source,unsigned int trigger,int nativeCode,std::vector<Value> values,Value* result) {
     if(initializing||source==nullptr)return false;
     const unsigned int unit=UnitIdFromWindow(source);
+    if(unit!=0)TraceNativeEvent(source,trigger,nativeCode,values);
+    if(probingMembers||probingEvents)return false;
     return unit!=0&&Dispatch(unit,trigger,nativeCode,std::move(values),result);
 }
 static Unit* UnitFromWindow(HWND window) {
@@ -3254,8 +3421,13 @@ static LRESULT RouteControlColor(HWND parent,UINT message,WPARAM wParam,LPARAM l
     HDC dc=reinterpret_cast<HDC>(wParam);
     if(unit->hasTextColor)SetTextColor(dc,unit->textColor);
     if(unit->hasBackColor){SetBkColor(dc,unit->backColor);return reinterpret_cast<LRESULT>(UnitBackBrush(*unit));}
+    // Returning NULL_BRUSH here leaves several native classes (notably
+    // BUTTON and LISTBOX on themed desktops) with an uninitialised background
+    // during their paint pass; their frame is drawn but the caption/items can
+    // disappear.  Use the system window brush while retaining transparent
+    // text backgrounds so the default control renderer can paint completely.
     SetBkMode(dc,TRANSPARENT);
-    return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH));
+    return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));
 }
 static bool DrawCheckListItem(const DRAWITEMSTRUCT& item) {
     if(item.CtlType!=ODT_LISTBOX||item.hwndItem==nullptr||!IsCheckList(item.hwndItem))return false;
@@ -3266,6 +3438,9 @@ static bool DrawCheckListItem(const DRAWITEMSTRUCT& item) {
     const bool enabled= item.itemID<unit->checkEnabled.size() && unit->checkEnabled[item.itemID]!=0;
     const bool checked= item.itemID<unit->checkStates.size() && unit->checkStates[item.itemID]!=0;
     FillRect(item.hDC,&item.rcItem,GetSysColorBrush(selected?COLOR_HIGHLIGHT:COLOR_WINDOW));
+    HGDIOBJ oldFont=nullptr;
+    HFONT drawFont=unit->font!=nullptr?unit->font:DefaultFont();
+    if(drawFont!=nullptr)oldFont=SelectObject(item.hDC,drawFont);
     SetBkMode(item.hDC,TRANSPARENT);
     SetTextColor(item.hDC,enabled?(selected?GetSysColor(COLOR_HIGHLIGHTTEXT):GetSysColor(COLOR_WINDOWTEXT)):GetSysColor(COLOR_GRAYTEXT));
     RECT checkRect=item.rcItem; checkRect.left+=2; checkRect.top+=(item.rcItem.bottom-item.rcItem.top-14)/2; checkRect.right=checkRect.left+14; checkRect.bottom=checkRect.top+14;
@@ -3276,6 +3451,7 @@ static bool DrawCheckListItem(const DRAWITEMSTRUCT& item) {
     RECT textRect=item.rcItem; textRect.left=checkRect.right+4;
     DrawTextW(item.hDC,text,-1,&textRect,DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
     if(item.itemState&ODS_FOCUS)DrawFocusRect(item.hDC,&item.rcItem);
+    if(oldFont!=nullptr)SelectObject(item.hDC,oldFont);
     return true;
 }
 static bool IsDirectChild(HWND parent,HWND child) {
@@ -3310,8 +3486,18 @@ static LRESULT RouteChildNotification(HWND parent,UINT message,WPARAM wParam,LPA
         HWND target=source;
         if(!IsDirectChild(parent,source)) {
             HWND owner=GetParent(source);
-            if(owner==nullptr||!IsDirectChild(parent,owner)||!ClassEquals(owner,L"COMBOBOX"))return not_routed;
-            target=owner;
+            if(owner!=nullptr&&IsDirectChild(parent,owner)&&ClassEquals(owner,L"COMBOBOX")) {
+                // Editable combo boxes report WM_COMMAND from their nested
+                // EDIT child.  Events still belong to the combo itself.
+                target=owner;
+            } else if(source!=nullptr) {
+                // A page/container can receive a notification after a
+                // common-control reparenting step where the HWND relationship
+                // is transient.  Resolve the logical control by its dialog ID
+                // instead of dropping the notification entirely.
+                target=GetDlgItem(parent,LOWORD(wParam));
+                if(target==nullptr)return not_routed;
+            } else return not_routed;
         }
         const unsigned int notification=HIWORD(wParam);
         if(notification==BN_CLICKED) {
@@ -3319,6 +3505,7 @@ static LRESULT RouteChildNotification(HWND parent,UINT message,WPARAM wParam,LPA
                 COLORREF customColors[16]{};
                 // lCustData is LPARAM (an integer-sized field), not a pointer.
                 // Use zero explicitly so generated x86/x64 code is accepted by MSVC.
+                if(probingEvents) { DispatchNative(target,native_changed,0); return 0; }
                 CHOOSECOLORW chooser{sizeof(CHOOSECOLORW),parent,nullptr,unit->hasColor?unit->color:RGB(0,0,0),customColors,CC_FULLOPEN|CC_RGBINIT,0,nullptr,nullptr};
                 if(ChooseColorW(&chooser)!=FALSE) { unit->color=chooser.rgbResult;unit->hasColor=true;InvalidateRect(target,nullptr,TRUE);DispatchNative(target,native_changed,0); }
                 return 0;
@@ -3328,7 +3515,12 @@ static LRESULT RouteChildNotification(HWND parent,UINT message,WPARAM wParam,LPA
         // editable text changes.  The public events belong to the combo box,
         // so classify using the logical target rather than the nested source.
         const unsigned int eventKind=CommandEventKind(target,notification);
-        DispatchNative(target,eventKind,static_cast<int>(notification));
+        // Common controls emit additional WM_COMMAND notifications that do
+        // not correspond to an EasyLanguage event (for example list-box
+        // focus/selection notifications).  Do not expose those as a fake
+        // "unknown" event; only dispatch notifications with a known mapping.
+        if(eventKind!=native_unknown)
+            DispatchNative(target,eventKind,static_cast<int>(notification));
         // BUTTON controls used as check/radio boxes expose two independent
         // EasyLanguage events: the click and the checked-state transition.
         // Win32 reports both through BN_CLICKED, so synthesize the latter
@@ -3378,6 +3570,11 @@ static LRESULT RouteChildNotification(HWND parent,UINT message,WPARAM wParam,LPA
             (header->code==MCN_SELCHANGE?native_changed:
             (header->code==NM_DBLCLK?native_double_clicked:
             (header->code==NM_CLICK?native_clicked:native_unknown)))));
+        // Common controls emit auxiliary notifications (for example a
+        // trackbar's NM_RELEASEDCAPTURE) that have no corresponding
+        // EasyLanguage event.  Do not expose them as a synthetic "unknown"
+        // callback; only mapped notifications represent public events.
+        if(trigger==native_unknown)return 0;
         if(trigger==native_selection_changed)UpdateTabVisibility(UnitIdFromWindow(header->hwndFrom));
         if(trigger==native_selection_changing) {
             Value result;
@@ -3449,7 +3646,11 @@ static unsigned int FormIdFromWindow(HWND window) {
 static void DispatchFormNative(HWND window,unsigned int trigger,int nativeCode=0,std::vector<Value> values={}) {
     if(initializing||window==nullptr)return;
     const unsigned int form=FormIdFromWindow(window);
-    if(form!=0)Dispatch(form,trigger,nativeCode,std::move(values));
+    if(form!=0) {
+        TraceNativeEvent(window,trigger,nativeCode,values);
+        if(probingMembers||probingEvents)return;
+        Dispatch(form,trigger,nativeCode,std::move(values));
+    }
 }
 static bool DispatchFormIdle(HWND window) {
     if(initializing||window==nullptr)return false;
@@ -3464,6 +3665,7 @@ static bool DispatchFormIdle(HWND window) {
 }
 static bool DispatchFormClose(HWND window) {
     if(initializing||window==nullptr)return true;
+    if(probingMembers||probingEvents)return true;
     const unsigned int form=FormIdFromWindow(window);
     if(form==0)return true;
     Value result;
@@ -3543,6 +3745,7 @@ static LRESULT CALLBACK FormProc(HWND window,UINT message,WPARAM wParam,LPARAM l
     }
     case WM_TIMER:
         if(wParam==0xE1D1u) { if(!DispatchFormIdle(window))KillTimer(window,0xE1D1u); return 0; }
+        if(wParam==0xE1D2u) { KillTimer(window,0xE1D2u); SendMessageW(window,WM_CLOSE,0,0); return 0; }
         DispatchFormNative(window,native_timer,static_cast<int>(wParam));break;
     case trayMessage: {
         const int operation=LOWORD(lParam)==WM_LBUTTONDBLCLK?2:(LOWORD(lParam)==WM_RBUTTONUP?3:1);
@@ -3591,12 +3794,23 @@ static LRESULT CALLBACK UnitSubclassProc(HWND window,UINT message,WPARAM wParam,
         if(routed!=(std::numeric_limits<LRESULT>::min)())return routed;
     }
     if(message==WM_PAINT) {
-        PAINTSTRUCT paint{}; HDC dc=BeginPaint(window,&paint); activePaintWindow=window; activePaintDC=dc;
-        const RECT& dirty=paint.rcPaint;
-        const bool painted=PaintUnitSurface(window,dc);
-        const bool handled=DispatchNative(window,native_paint,0,{Integer(dirty.left),Integer(dirty.top),Integer(dirty.right),Integer(dirty.bottom)});
-        activePaintDC=nullptr; activePaintWindow=nullptr; EndPaint(window,&paint);
-        if(painted||handled)return 0;
+        // Only owner-drawn controls may consume WM_PAINT here.  Calling
+        // BeginPaint/EndPaint for ordinary BUTTON/EDIT/LISTBOX/COMBOBOX
+        // controls validates the update region before DefSubclassProc gets
+        // to paint it, leaving a blank frame with no caption or items.
+        const Unit* unit=UnitFromWindow(window);
+        const bool ownerDrawn=unit!=nullptr&&unit->type!=nullptr&&(
+            std::strcmp(unit->type,"shape")==0||std::strcmp(unit->type,"image")==0||
+            std::strcmp(unit->type,"label")==0||std::strcmp(unit->type,"hyperlink")==0||
+            std::strcmp(unit->type,"canvas")==0);
+        if(ownerDrawn) {
+            PAINTSTRUCT paint{}; HDC dc=BeginPaint(window,&paint); activePaintWindow=window; activePaintDC=dc;
+            const RECT& dirty=paint.rcPaint;
+            const bool painted=PaintUnitSurface(window,dc);
+            const bool handled=DispatchNative(window,native_paint,0,{Integer(dirty.left),Integer(dirty.top),Integer(dirty.right),Integer(dirty.bottom)});
+            activePaintDC=nullptr; activePaintWindow=nullptr; EndPaint(window,&paint);
+            if(painted||handled)return 0;
+        }
     }
     else RouteUnitInput(window,message,wParam,lParam);
     const LRESULT result=DefSubclassProc(window,message,wParam,lParam);
@@ -3644,10 +3858,16 @@ static LRESULT CALLBACK ContainerProc(HWND window,UINT message,WPARAM wParam,LPA
 }
 static bool AttributeEquals(const char* value,const wchar_t* expected) {
     if(value==nullptr||expected==nullptr)return false;
-    const int length=MultiByteToWideChar(CP_ACP,0,value,-1,nullptr,0);
+    // XML attributes and generated property names are emitted as the
+    // legacy 易语言 CP936 byte encoding (the same encoding used by Wide()).
+    // Do not depend on the host process ANSI code page here: on a non-Chinese
+    // Windows installation CP_ACP would fail to match every Chinese
+    // attribute, silently dropping captions, colours and font settings.
+    constexpr UINT kETextCodePage=936;
+    const int length=MultiByteToWideChar(kETextCodePage,0,value,-1,nullptr,0);
     if(length<=0)return false;
     std::wstring actual(static_cast<std::size_t>(length),L'\0');
-    if(MultiByteToWideChar(CP_ACP,0,value,-1,actual.data(),length)<=0)return false;
+    if(MultiByteToWideChar(kETextCodePage,0,value,-1,actual.data(),length)<=0)return false;
     actual.resize(static_cast<std::size_t>(length-1));
     return actual==expected;
 }
@@ -3928,7 +4148,7 @@ static void PaintLabel(HWND window,HDC dc,const Unit& unit) {
     RECT rect{};GetClientRect(window,&rect);
     if(unit.gradientBackMode!=0&&unit.gradientBackColorSet[0]) {
         const bool horizontal=unit.gradientBackMode==2||unit.gradientBackMode==6;
-        const int length=horizontal?(std::max)(1,rect.right):(std::max)(1,rect.bottom);
+        const int length=horizontal?(std::max)(1,static_cast<int>(rect.right)):(std::max)(1,static_cast<int>(rect.bottom));
         for(int i=0;i<length;++i) {
             const int pos=(i*100)/(std::max)(1,length-1);
             const COLORREF color=BlendColor(unit.gradientBackColor[0],unit.gradientBackColorSet[1]?unit.gradientBackColor[1]:unit.gradientBackColor[0],pos,100);
@@ -3937,18 +4157,26 @@ static void PaintLabel(HWND window,HDC dc,const Unit& unit) {
             FillRect(dc,&band,brush);DeleteObject(brush);
         }
     } else {
-        HBRUSH brush=unit.hasBackColor?CreateSolidBrush(unit.backColor):static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));
+        HBRUSH brush=unit.hasBackColor?CreateSolidBrush(unit.backColor):GetSysColorBrush(COLOR_WINDOW);
         FillRect(dc,&rect,brush);if(unit.hasBackColor)DeleteObject(brush);
     }
     if(!unit.imageData.empty()) { HBITMAP bitmap=LoadPictureMemory(unit.imageData); PaintBitmap(window,dc,bitmap,unit.backPicMode); }
     std::wstring text(static_cast<std::size_t>(GetWindowTextLengthW(window)+1),L'\0');
     GetWindowTextW(window,text.data(),static_cast<int>(text.size()));text.resize(std::wcslen(text.c_str()));
+    if(text.empty()&&!unit.text.empty())text=unit.text;
+    HGDIOBJ oldFont=nullptr;
+    HFONT paintFont=unit.font!=nullptr?unit.font:DefaultFont();
+    if(paintFont!=nullptr)oldFont=SelectObject(dc,paintFont);
     SetBkMode(dc,TRANSPARENT);SetTextColor(dc,unit.hasTextColor?unit.textColor:GetSysColor(COLOR_WINDOWTEXT));
     UINT format=DT_NOPREFIX|(unit.labelWordWrap?DT_WORDBREAK:DT_SINGLELINE);
     if(unit.horizontalAlign==1)format|=DT_CENTER;else if(unit.horizontalAlign==2)format|=DT_RIGHT;else format|=DT_LEFT;
     if(!unit.labelWordWrap){if(unit.verticalAlign==1)format|=DT_VCENTER;else if(unit.verticalAlign==2)format|=DT_BOTTOM;}
     DrawTextW(dc,text.c_str(),-1,&rect,format);
-    if(unit.gradientBorderWidth>0&&unit.gradientBorderColorSet[0]) {
+    if(oldFont!=nullptr)SelectObject(dc,oldFont);
+    // 易语言标签的渐变边框参数即使未启用也会带有默认宽度/颜色。
+    // 只有明确选择了边框效果时才绘制，否则默认值会覆盖文字周围一圈
+    // 厚灰色边框，看起来像字体异常或控件只剩下一个框。
+    if(unit.borderStyle!=0&&unit.gradientBorderWidth>0&&unit.gradientBorderColorSet[0]) {
         const int width=(std::max)(1,unit.gradientBorderWidth);
         const COLORREF color=unit.gradientBorderColor[0];
         HPEN pen=CreatePen(PS_SOLID,width,color);
@@ -4041,7 +4269,7 @@ static bool PaintUnitSurface(HWND window,HDC dc) {
     }
     if(std::strcmp(unit->type,"image")==0) {
         RECT rect{};GetClientRect(window,&rect);
-        HBRUSH background=unit->hasBackColor?CreateSolidBrush(unit->backColor):static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));
+        HBRUSH background=unit->hasBackColor?CreateSolidBrush(unit->backColor):GetSysColorBrush(COLOR_WINDOW);
         FillRect(dc,&rect,background);if(unit->hasBackColor)DeleteObject(background);
         PaintImageFile(window,dc,*unit);
         return true;
@@ -4056,7 +4284,7 @@ static bool PaintUnitSurface(HWND window,HDC dc) {
     }
     if(std::strcmp(unit->type,"canvas")==0) {
         RECT rect{};GetClientRect(window,&rect);
-        HBRUSH background=unit->hasBackColor?CreateSolidBrush(unit->backColor):static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));
+        HBRUSH background=unit->hasBackColor?CreateSolidBrush(unit->backColor):GetSysColorBrush(COLOR_WINDOW);
         FillRect(dc,&rect,background);if(unit->hasBackColor)DeleteObject(background);
         if(!unit->imageData.empty()) { HBITMAP bitmap=LoadPictureMemory(unit->imageData); PaintBitmap(window,dc,bitmap,unit->backPicMode); }
         return true;
@@ -4089,7 +4317,11 @@ static bool GetMonthRange(HWND window,SYSTEMTIME* minimum,SYSTEMTIME* maximum) {
 static DWORD Style(const Spec& spec) {
     const char* type=spec.type;
     if(std::strcmp(type,"button")==0) {
-        DWORD style=WS_CHILD|WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY;
+        // Native E buttons wrap long Chinese captions within their fixed
+        // design-time bounds instead of silently clipping the first/last
+        // glyph.  BS_MULTILINE preserves the requested alignment while
+        // allowing the caption to use the control's full height.
+        DWORD style=WS_CHILD|WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY|BS_MULTILINE;
         if(XmlAttributeInteger(spec,L"类型",0)==1)style=(style&~BS_TYPEMASK)|BS_DEFPUSHBUTTON;
         const int horizontal=XmlAttributeInteger(spec,L"横向对齐方式",1);
         if(horizontal==0)style=(style&~BS_CENTER)|BS_LEFT;
@@ -4100,12 +4332,12 @@ static DWORD Style(const Spec& spec) {
         return style;
     }
     if(std::strcmp(type,"checkbox")==0) {
-        DWORD style=WS_CHILD|WS_TABSTOP|BS_AUTOCHECKBOX|BS_NOTIFY;
+        DWORD style=WS_CHILD|WS_TABSTOP|BS_AUTOCHECKBOX|BS_NOTIFY|BS_MULTILINE;
         if(XmlAttributeBoolean(spec,L"按钮形式",false))style|=BS_PUSHLIKE;
         if(XmlAttributeBoolean(spec,L"平面",false))style|=BS_FLAT;
         return style;
     }
-    if(std::strcmp(type,"radio")==0)return WS_CHILD|WS_TABSTOP|BS_AUTORADIOBUTTON|BS_NOTIFY;
+    if(std::strcmp(type,"radio")==0)return WS_CHILD|WS_TABSTOP|BS_AUTORADIOBUTTON|BS_NOTIFY|BS_MULTILINE;
     if(std::strcmp(type,"group")==0)return WS_CHILD|BS_GROUPBOX;
     if(std::strcmp(type,"edit")==0) {
         DWORD style=WS_CHILD|WS_BORDER|WS_TABSTOP|ES_LEFT;
@@ -4204,6 +4436,7 @@ static const wchar_t* ClassName(const char* type) {
     if(strcmp(type,"drive")==0)return L"COMBOBOX";
     if(strcmp(type,"directory")==0||strcmp(type,"file")==0)return L"LISTBOX";
     if(strcmp(type,"color")==0)return L"BUTTON";
+    if(strcmp(type,"label")==0)return L"STATIC";
     if(strcmp(type,"hyperlink")==0)return L"STATIC";
     if(strcmp(type,"spin")==0)return UPDOWN_CLASSW;
     if(strcmp(type,"tab")==0)return L"SysTabControl32";
@@ -4239,10 +4472,10 @@ static void SetWindowZOrder(HWND window,int order) {
 }
 static void ApplyUnitFont(HWND window,Unit& unit) {
     if(window==nullptr)return;
-    LOGFONTW logFont{};logFont.lfCharSet=DEFAULT_CHARSET;logFont.lfWeight=unit.fontBold?FW_BOLD:FW_NORMAL;logFont.lfItalic=unit.fontItalic?TRUE:FALSE;logFont.lfStrikeOut=unit.fontStrikeOut?TRUE:FALSE;logFont.lfUnderline=unit.fontUnderline?TRUE:FALSE;
-    std::wstring name=unit.fontName.empty()?L"SimSun":unit.fontName;wcsncpy_s(logFont.lfFaceName,std::size(logFont.lfFaceName),name.c_str(),_TRUNCATE);
+    LOGFONTW logFont{};if(GetObjectW(DefaultFont(),sizeof(logFont),&logFont)==0)logFont.lfCharSet=DEFAULT_CHARSET;logFont.lfWeight=unit.fontBold?FW_BOLD:FW_NORMAL;logFont.lfItalic=unit.fontItalic?TRUE:FALSE;logFont.lfStrikeOut=unit.fontStrikeOut?TRUE:FALSE;logFont.lfUnderline=unit.fontUnderline?TRUE:FALSE;
+    if(!unit.fontName.empty())wcsncpy_s(logFont.lfFaceName,std::size(logFont.lfFaceName),unit.fontName.c_str(),_TRUNCATE);
     HDC dc=GetDC(window);const int dpi=dc==nullptr?96:GetDeviceCaps(dc,LOGPIXELSY);if(dc!=nullptr)ReleaseDC(window,dc);logFont.lfHeight=-MulDiv((std::max)(1,unit.fontSize),dpi,72);
-    HFONT font=CreateFontIndirectW(&logFont);if(font==nullptr)return;if(unit.font!=nullptr)DeleteObject(unit.font);unit.font=font;SendMessageW(window,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
+    HFONT font=CreateFontIndirectW(&logFont);if(font==nullptr)return;if(unit.font!=nullptr)DeleteObject(unit.font);unit.font=font;ApplyFontTree(window,font);
 }
 static LRESULT CALLBACK UnitSubclassProc(HWND,UINT,WPARAM,LPARAM,UINT_PTR,DWORD_PTR);
 static HWND EditSpinBuddy(HWND edit) {
@@ -4300,6 +4533,11 @@ static void ApplyAttributes(HWND window,const Spec& spec) {
         unit->trackAllowSel=XmlAttributeBoolean(spec,L"允许选择",unit->trackAllowSel);
         unit->removeDuplicates=XmlAttributeBoolean(spec,L"除去重复",unit->removeDuplicates);
         unit->drawUnit=XmlAttributeInteger(spec,L"绘画单位",unit->drawUnit);
+        unit->buttonType=XmlAttributeInteger(spec,L"类型",unit->buttonType);
+        unit->comboType=XmlAttributeInteger(spec,L"类型",unit->comboType);
+        unit->lineSpacing=XmlAttributeInteger(spec,L"行间距",unit->lineSpacing);
+        unit->comboTextLimit=XmlAttributeInteger(spec,L"最大文本长度",unit->comboTextLimit);
+        unit->dateAttachType=XmlAttributeInteger(spec,L"附件类型",unit->dateAttachType);
         unit->hideSelection=XmlAttributeBoolean(spec,L"隐藏选择",unit->hideSelection);
         unit->inputMode=XmlAttributeInteger(spec,L"输入方式",unit->inputMode);
         unit->convertMode=XmlAttributeInteger(spec,L"转换方式",unit->convertMode);
@@ -4375,7 +4613,14 @@ static void ApplyAttributes(HWND window,const Spec& spec) {
         const char* lineColor=XmlAttributeValue(spec,L"线条颜色");
         if(lineColor!=nullptr) { unit->lineColor=static_cast<COLORREF>(std::strtol(lineColor,nullptr,10)); unit->hasLineColor=true; }
         const char* fillColor=XmlAttributeValue(spec,L"填充颜色");
-        if(fillColor!=nullptr&&std::strcmp(fillColor,"#透明")!=0) { unit->fillColor=static_cast<COLORREF>(std::strtol(fillColor,nullptr,10)); unit->hasFillColor=true; }
+        // 易语言 uses -16777216 (0xFF000000) as the serialized transparent
+        // sentinel for shape/canvas fills.  Passing that value to
+        // CreateSolidBrush produces an opaque black rectangle, which makes a
+        // form appear black even though the property means “no fill”.
+        if(fillColor!=nullptr&&std::strcmp(fillColor,"#透明")!=0) {
+            const long value=std::strtol(fillColor,nullptr,10);
+            if(value!=-16777216L) { unit->fillColor=static_cast<COLORREF>(value); unit->hasFillColor=true; }
+        }
         const char* penColor=XmlAttributeValue(spec,L"画笔颜色");
         if(penColor!=nullptr) unit->penColor=static_cast<COLORREF>(std::strtol(penColor,nullptr,10));
         const char* brushColor=XmlAttributeValue(spec,L"刷子颜色");
@@ -4618,7 +4863,8 @@ static void CreateUnit(const Spec& spec) {
     if(!spec.tabStop)style&=~WS_TABSTOP;
     if(spec.visible)style|=WS_VISIBLE;
     const DWORD exStyle=strcmp(spec.type,"container")==0?WS_EX_TRANSPARENT:0;
-    HWND window=CreateWindowExW(exStyle,className,Wide(spec.text).c_str(),style,
+    const std::wstring caption=InitialCaption(spec);
+    HWND window=CreateWindowExW(exStyle,className,caption.c_str(),style,
         spec.left,spec.top,spec.width,spec.height,parent,reinterpret_cast<HMENU>(static_cast<UINT_PTR>(spec.id)),instance,nullptr);
     if(window==nullptr)return;
     ApplyDefaultFont(window);
@@ -4626,13 +4872,28 @@ static void CreateUnit(const Spec& spec) {
     Unit initialUnit;
     initialUnit.id=spec.id; initialUnit.form=spec.form; initialUnit.hwnd=window; initialUnit.parent=parent;
     initialUnit.tabOwner=spec.tabOwner; initialUnit.tabPage=spec.tabPage; initialUnit.type=spec.type;
+    initialUnit.logicalName=Wide(spec.name);
     initialUnit.tag=Wide(XmlAttributeValue(spec,L"标记") == nullptr ? "" : XmlAttributeValue(spec,L"标记"));
     initialUnit.checkOnlyOne=XmlAttributeBoolean(spec,L"单选",false);
     initialUnit.removeDuplicates=XmlAttributeBoolean(spec,L"除去重复",false);
+    initialUnit.text=caption;
     units.push_back(std::move(initialUnit));
+    // Keep native controls and custom-painted controls consistent even when
+    // a class ignores the creation caption during themed initialization.
+    if(!caption.empty())SetWindowTextW(window,caption.c_str());
     if(Unit* stored=UnitFromWindow(window))StoreSpecProperties(stored->properties,spec.attributes,spec.attributeCount);
     ApplyStructuredData(window,spec);
     ApplyAttributes(window,spec);
+    // Some common controls create or recreate internal child windows while
+    // applying their attributes.  Reapply both caption and font afterwards so
+    // the visible text and glyph metrics stay consistent across the whole
+    // control tree (notably EDIT/COMBOBOX/DATE controls).
+    // Attribute application can recreate the internal window of EDIT,
+    // COMBOBOX and DATE controls.  Always restore the serialized caption at
+    // the end so native controls and owner-drawn labels observe the same
+    // initial text, even when the class retained a transient default value.
+    if(!caption.empty())SetWindowTextW(window,caption.c_str());
+    if(Unit* stored=UnitFromWindow(window))ApplyFontTree(window,stored->font!=nullptr?stored->font:DefaultFont());
     if(std::strcmp(spec.type,"timer")==0) {
         if(Unit* unit=UnitFromWindow(window)) {
             const int period=XmlAttributeInteger(spec,L"时钟周期",0);
@@ -4651,9 +4912,9 @@ static HWND WindowById(unsigned int id);
 static void SetText(HWND window,const Value& value);
 static Value TextFromWide(const std::wstring& wide) {
     if(wide.empty())return Text("");
-    const int bytes=WideCharToMultiByte(CP_ACP,0,wide.data(),static_cast<int>(wide.size()),nullptr,0,nullptr,nullptr);
+    const int bytes=WideCharToMultiByte(936,0,wide.data(),static_cast<int>(wide.size()),nullptr,0,nullptr,nullptr);
     std::string result(static_cast<std::size_t>((std::max)(bytes,0)),'\0');
-    if(bytes>0)WideCharToMultiByte(CP_ACP,0,wide.data(),static_cast<int>(wide.size()),result.data(),bytes,nullptr,nullptr);
+    if(bytes>0)WideCharToMultiByte(936,0,wide.data(),static_cast<int>(wide.size()),result.data(),bytes,nullptr,nullptr);
     return Text(std::move(result));
 }
 static std::wstring WindowTextW(HWND window) {
@@ -4785,7 +5046,7 @@ static Value WindowInvokeMember(unsigned int id,const char* operation,std::vecto
 	}
 	if(operation==std::string("GetCanvasPic")) {
 		HDC dc=CurrentPaintDC(window);if(dc==nullptr)return Bytes({});
-		RECT rect{};GetClientRect(window,&rect);const int width=(std::max)(0,rect.right),height=(std::max)(0,rect.bottom);if(width==0||height==0)return Bytes({});
+		RECT rect{};GetClientRect(window,&rect);const int width=(std::max)(0,static_cast<int>(rect.right)),height=(std::max)(0,static_cast<int>(rect.bottom));if(width==0||height==0)return Bytes({});
 		HDC memory=CreateCompatibleDC(dc);HBITMAP bitmap=CreateCompatibleBitmap(dc,width,height);if(memory==nullptr||bitmap==nullptr){if(memory!=nullptr)DeleteDC(memory);if(bitmap!=nullptr)DeleteObject(bitmap);return Bytes({});}
 		HGDIOBJ old=SelectObject(memory,bitmap);BitBlt(memory,0,0,width,height,dc,0,0,SRCCOPY);SelectObject(memory,old);DeleteDC(memory);std::vector<unsigned char> bytes=BitmapToBytes(bitmap);DeleteObject(bitmap);return Bytes(std::move(bytes));
 	}
@@ -4809,7 +5070,7 @@ static Value WindowInvokeMember(unsigned int id,const char* operation,std::vecto
 		return Integer(static_cast<long long>(GetPixel(dc,argInt(0),argInt(1))));
 	}
 	if(operation==std::string("CanvasClear")) {
-		if(HDC dc=CurrentPaintDC(window);dc!=nullptr){RECT client{};GetClientRect(window,&client);const int left=argProvided(0)?argInt(0):0;const int top=argProvided(1)?argInt(1):0;const int width=argProvided(2)?argInt(2):client.right-left;const int height=argProvided(3)?argInt(3):client.bottom-top;RECT rect{left,top,left+(std::max)(0,width),top+(std::max)(0,height)};Unit* unit=UnitFromWindow(window);HBRUSH brush=unit!=nullptr?CreateSolidBrush(unit->hasBackColor?unit->backColor:RGB(255,255,255)):static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));FillRect(dc,&rect,brush);if(unit!=nullptr)DeleteObject(brush);if(unit!=nullptr){unit->writeX=left;unit->writeY=top;}}
+		if(HDC dc=CurrentPaintDC(window);dc!=nullptr){RECT client{};GetClientRect(window,&client);const int left=argProvided(0)?argInt(0):0;const int top=argProvided(1)?argInt(1):0;const int width=argProvided(2)?argInt(2):client.right-left;const int height=argProvided(3)?argInt(3):client.bottom-top;RECT rect{left,top,left+(std::max)(0,width),top+(std::max)(0,height)};Unit* unit=UnitFromWindow(window);HBRUSH brush=unit!=nullptr?CreateSolidBrush(unit->hasBackColor?unit->backColor:GetSysColor(COLOR_WINDOW)):static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));FillRect(dc,&rect,brush);if(unit!=nullptr)DeleteObject(brush);if(unit!=nullptr){unit->writeX=left;unit->writeY=top;}}
 		return Empty();
 	}
 	if(operation==std::string("SetPixel")) {
@@ -4837,7 +5098,7 @@ static Value WindowInvokeMember(unsigned int id,const char* operation,std::vecto
 		return Empty();
 	}
 	if(operation==std::string("FillRect")) {
-		HDC dc=CurrentPaintDC(window); if(dc!=nullptr){RECT rect{argInt(0),argInt(1),argInt(2),argInt(3)};Unit* unit=UnitFromWindow(window);HBRUSH brush=unit!=nullptr?CreateSolidBrush(unit->hasBackColor?unit->backColor:RGB(255,255,255)):static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));::FillRect(dc,&rect,brush);if(unit!=nullptr)DeleteObject(brush);}
+		HDC dc=CurrentPaintDC(window); if(dc!=nullptr){RECT rect{argInt(0),argInt(1),argInt(2),argInt(3)};Unit* unit=UnitFromWindow(window);HBRUSH brush=unit!=nullptr?CreateSolidBrush(unit->hasBackColor?unit->backColor:GetSysColor(COLOR_WINDOW)):static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));::FillRect(dc,&rect,brush);if(unit!=nullptr)DeleteObject(brush);}
 		return Empty();
 	}
 	if(operation==std::string("RoundRect")) {
@@ -4883,9 +5144,9 @@ static Value WindowInvokeMember(unsigned int id,const char* operation,std::vecto
     if(operation==std::string("GetTabCount"))return Integer(TabCtrl_GetItemCount(window));
     if(operation==std::string("GetTabName")&&tab) {
         TCITEMW item{}; wchar_t buffer[4096]{}; item.mask=TCIF_TEXT; item.pszText=buffer; item.cchTextMax=static_cast<int>(std::size(buffer));
-        const int index=argInt(0)-1; return index>=0&&TabCtrl_GetItem(window,index,&item)?TextFromWide(buffer):Text("");
+        const int index=argInt(0)-1; return index>=0&&SendMessageW(window,TCM_GETITEMW,index,reinterpret_cast<LPARAM>(&item))!=FALSE?TextFromWide(buffer):Text("");
     }
-    if(operation==std::string("SetTabName")&&tab) { TCITEMW item{}; std::wstring text=argText(1); item.mask=TCIF_TEXT; item.pszText=text.data(); return Boolean(argInt(0)>0&&TabCtrl_SetItem(window,argInt(0)-1,&item)!=FALSE); }
+    if(operation==std::string("SetTabName")&&tab) { TCITEMW item{}; std::wstring text=argText(1); item.mask=TCIF_TEXT; item.pszText=text.data(); return Boolean(argInt(0)>0&&SendMessageW(window,TCM_SETITEMW,argInt(0)-1,reinterpret_cast<LPARAM>(&item))!=FALSE); }
     if(operation==std::string("GetTopIndex"))return Integer(combo?SendMessageW(window,CB_GETTOPINDEX,0,0):(list||checklist?SendMessageW(window,LB_GETTOPINDEX,0,0):-1));
     if(operation==std::string("SetTopIndex"))return Boolean((combo?SendMessageW(window,CB_SETTOPINDEX,argInt(0),0):(list||checklist?SendMessageW(window,LB_SETTOPINDEX,argInt(0),0):LB_ERR))!=CB_ERR);
     if(operation==std::string("GetCount"))return Integer(tab?TabCtrl_GetItemCount(window):listCount());
@@ -4897,7 +5158,7 @@ static Value WindowInvokeMember(unsigned int id,const char* operation,std::vecto
         const LRESULT copied=combo?SendMessageW(window,CB_GETLBTEXT,index,reinterpret_cast<LPARAM>(text.data())):
             ((list||checklist)?SendMessageW(window,LB_GETTEXT,index,reinterpret_cast<LPARAM>(text.data())):LB_ERR);
         if(copied<0)return Text("");
-        text.resize(std::wcslen(text.c_str())); const int bytes=WideCharToMultiByte(CP_ACP,0,text.data(),static_cast<int>(text.size()),nullptr,0,nullptr,nullptr); std::string result(static_cast<std::size_t>((std::max)(bytes,0)),'\0'); if(bytes>0)WideCharToMultiByte(CP_ACP,0,text.data(),static_cast<int>(text.size()),result.data(),bytes,nullptr,nullptr); return Text(std::move(result));
+        text.resize(std::wcslen(text.c_str())); const int bytes=WideCharToMultiByte(936,0,text.data(),static_cast<int>(text.size()),nullptr,0,nullptr,nullptr); std::string result(static_cast<std::size_t>((std::max)(bytes,0)),'\0'); if(bytes>0)WideCharToMultiByte(936,0,text.data(),static_cast<int>(text.size()),result.data(),bytes,nullptr,nullptr); return Text(std::move(result));
     }
     if(operation==std::string("SetItemText")) {
         const int index=argInt(0); std::wstring text=argText(1); if(index<0||index>=listCount())return Boolean(false);
@@ -5023,7 +5284,16 @@ static Value WindowInvokeMember(unsigned int id,const char* operation,std::vecto
     }
     return Empty();
 }
-static void SetText(HWND window,const Value& value) { const std::wstring text=Wide(ToText(value).c_str()); SetWindowTextW(window,text.c_str()); }
+static void SetText(HWND window,const Value& value) {
+    const std::wstring text=Wide(ToText(value).c_str());
+    SetWindowTextW(window,text.c_str());
+    if(Unit* unit=UnitFromWindow(window)) {
+        unit->text=text;
+        // Owner-drawn labels, hyperlinks, and canvases read Unit::text when
+        // their native caption is empty or not retained by the class.
+        InvalidateRect(window,nullptr,TRUE);
+    }
+}
 static bool PropertyEquals(const char* property,const wchar_t* expected) {
     return AttributeEquals(property,expected);
 }
@@ -5241,8 +5511,49 @@ static Value GetProperty(unsigned int id,const char* property) {
             if(PropertyEquals(property,L"\u7535\u5b50\u90ae\u7bb1\u5730\u5740")&&unit->hyperlinkType==0)return TextFromWide(unit->hyperlinkTarget);
             if(PropertyEquals(property,L"Internet\u5730\u5740")&&unit->hyperlinkType!=0)return TextFromWide(unit->hyperlinkTarget);
         }
+        if(std::strcmp(unit->type,"button")==0&&PropertyEquals(property,L"\u7c7b\u578b"))return Integer(unit->buttonType);
+        if((std::strcmp(unit->type,"list")==0||std::strcmp(unit->type,"checklist")==0||std::strcmp(unit->type,"combo")==0)&&PropertyEquals(property,L"\u884c\u95f4\u8ddd"))return Integer(unit->lineSpacing);
+        if(std::strcmp(unit->type,"combo")==0) {
+            if(PropertyEquals(property,L"\u7c7b\u578b"))return Integer(unit->comboType);
+            if(PropertyEquals(property,L"\u884c\u95f4\u8ddd"))return Integer(unit->lineSpacing);
+            if(PropertyEquals(property,L"\u6700\u5927\u6587\u672c\u957f\u5ea6"))return Integer(unit->comboTextLimit);
+        }
+        if((std::strcmp(unit->type,"list")==0||std::strcmp(unit->type,"checklist")==0||std::strcmp(unit->type,"combo")==0)&&
+           (PropertyEquals(property,L"\u5217\u8868\u9879\u76ee")||PropertyEquals(property,L"\u9879\u76ee\u6570\u503c"))) {
+            const bool values=PropertyEquals(property,L"\u9879\u76ee\u6570\u503c");
+            const int count=std::strcmp(unit->type,"combo")==0?static_cast<int>(SendMessageW(window,CB_GETCOUNT,0,0)):static_cast<int>(SendMessageW(window,LB_GETCOUNT,0,0));
+            Value result=MakeVar(values?T_INT:T_TEXT,true,false); result.dimensions={count}; result.elements.reserve(static_cast<std::size_t>((std::max)(count,0)));
+            for(int index=0;index<count;++index) {
+                if(values)result.elements.push_back(Integer(std::strcmp(unit->type,"combo")==0?SendMessageW(window,CB_GETITEMDATA,index,0):SendMessageW(window,LB_GETITEMDATA,index,0),T_INT));
+                else {
+                    const int length=static_cast<int>(std::strcmp(unit->type,"combo")==0?SendMessageW(window,CB_GETLBTEXTLEN,index,0):SendMessageW(window,LB_GETTEXTLEN,index,0));
+                    std::wstring text(static_cast<std::size_t>((std::max)(0,length)+1),L'\0');
+                    if(std::strcmp(unit->type,"combo")==0)SendMessageW(window,CB_GETLBTEXT,index,reinterpret_cast<LPARAM>(text.data()));else SendMessageW(window,LB_GETTEXT,index,reinterpret_cast<LPARAM>(text.data()));
+                    text.resize(std::wcslen(text.c_str())); result.elements.push_back(TextFromWide(text));
+                }
+            }
+            return result;
+        }
+        if((std::strcmp(unit->type,"directory")==0||std::strcmp(unit->type,"file")==0)&&PropertyEquals(property,L"\u901a\u914d\u7b26"))return TextFromWide(unit->filePattern);
+        if((std::strcmp(unit->type,"directory")==0||std::strcmp(unit->type,"file")==0)&&
+           (PropertyEquals(property,L"\u901a\u5e38")||PropertyEquals(property,L"\u5b58\u6863")||PropertyEquals(property,L"\u53ea\u8bfb")||PropertyEquals(property,L"\u7cfb\u7edf")||PropertyEquals(property,L"\u9690\u85cf"))) {
+            if(PropertyEquals(property,L"\u901a\u5e38"))return Boolean(unit->allowNormal);
+            if(PropertyEquals(property,L"\u5b58\u6863"))return Boolean(unit->allowArchive);
+            if(PropertyEquals(property,L"\u53ea\u8bfb"))return Boolean(unit->allowReadOnly);
+            if(PropertyEquals(property,L"\u7cfb\u7edf"))return Boolean(unit->allowSystem);
+            return Boolean(unit->allowHidden);
+        }
+        if(std::strcmp(unit->type,"date")==0&&PropertyEquals(property,L"\u9644\u4ef6\u7c7b\u578b"))return Integer(unit->dateAttachType);
+        if(std::strcmp(unit->type,"animate")==0&&PropertyEquals(property,L"\u64ad\u653e\u52a8\u753b"))return Boolean(unit->playImage);
+        if((std::strcmp(unit->type,"label")==0||std::strcmp(unit->type,"image")==0||std::strcmp(unit->type,"canvas")==0)&&PropertyEquals(property,L"\u5e95\u56fe\u65b9\u5f0f"))return Integer(unit->backPicMode);
     }
     if(PropertyEquals(property,L"\u73b0\u884c\u5b50\u5939")&&ClassEquals(window,L"SysTabControl32"))return Integer(SendMessageW(window,TCM_GETCURSEL,0,0));
+    if(PropertyEquals(property,L"\u5b50\u5939\u7ba1\u7406")&&ClassEquals(window,L"SysTabControl32")) {
+        const int count=static_cast<int>(SendMessageW(window,TCM_GETITEMCOUNT,0,0));
+        Value result=MakeVar(T_TEXT,true,false); result.dimensions={count}; result.elements.reserve(static_cast<std::size_t>((std::max)(count,0)));
+        for(int index=0;index<count;++index) { wchar_t buffer[512]{}; TCITEMW item{}; item.mask=TCIF_TEXT;item.pszText=buffer;item.cchTextMax=static_cast<int>(std::size(buffer));SendMessageW(window,TCM_GETITEMW,index,reinterpret_cast<LPARAM>(&item));result.elements.push_back(TextFromWide(buffer)); }
+        return result;
+    }
     if(PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e")||PropertyEquals(property,L"\u6700\u5927\u4f4d\u7f6e")) {
         if(ClassEquals(window,L"msctls_progress32")) { PBRANGE range{};SendMessageW(window,PBM_GETRANGE,TRUE,reinterpret_cast<LPARAM>(&range));return Integer(PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e")?range.iLow:range.iHigh); }
         if(ClassEquals(window,L"msctls_trackbar32"))return Integer(PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e")?SendMessageW(window,TBM_GETRANGEMIN,0,0):SendMessageW(window,TBM_GETRANGEMAX,0,0));
@@ -5314,7 +5625,7 @@ static Value GetProperty(unsigned int id,const char* property) {
     if(PropertyEquals(property,L"\u7ebf\u578b"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"shape")==0)return Integer(unit->lineStyle);
     if(PropertyEquals(property,L"\u7ebf\u5bbd"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"shape")==0)return Integer(unit->lineWidth);
     if(PropertyEquals(property,L"\u7ebf\u6761\u989c\u8272"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"shape")==0)return Integer(unit->lineColor);
-    if(PropertyEquals(property,L"\u586b\u5145\u989c\u8272"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"shape")==0)return Integer(unit->fillColor);
+    if(PropertyEquals(property,L"\u586b\u5145\u989c\u8272"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"shape")==0)return Integer(static_cast<long long>(unit->hasFillColor?unit->fillColor:-16777216L));
     if(PropertyEquals(property,L"\u56fe\u7247")||PropertyEquals(property,L"\u5e95\u56fe"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&(std::strcmp(unit->type,"image")==0||std::strcmp(unit->type,"label")==0||std::strcmp(unit->type,"canvas")==0))return Bytes(unit->imageData);
     if(PropertyEquals(property,L"\u5355\u9009"))if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&IsCheckList(window))return Boolean(unit->checkOnlyOne);
     if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"hyperlink")==0) {
@@ -5354,7 +5665,7 @@ static Value GetProperty(unsigned int id,const char* property) {
         if(PropertyEquals(property,L"\u5bbd\u5ea6"))return Integer(width);
         return Integer(height);
     }
-    if(const auto* store=PropertyStore(id)){const auto it=store->find(property==nullptr?std::string():std::string(property));if(it!=store->end())return it->second;}
+    if(!probingProperties)if(const auto* store=PropertyStore(id)){const auto it=store->find(property==nullptr?std::string():std::string(property));if(it!=store->end())return it->second;}
     return Empty();
 }
 static void SetProperty(unsigned int id,const char* property,const Value& value) {
@@ -5381,7 +5692,13 @@ static void SetProperty(unsigned int id,const char* property,const Value& value)
         if(PropertyEquals(property,L"\u968f\u610f\u79fb\u52a8")){form->hitMove=ToBool(value);return;}
         if(PropertyEquals(property,L"\u603b\u5728\u6700\u524d")){form->topmost=ToBool(value);SetWindowPos(window,form->topmost?HWND_TOPMOST:HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);return;}
         if(PropertyEquals(property,L"\u4fdd\u6301\u6807\u9898\u6761\u6fc0\u6d3b")){form->keepTitleBarActive=ToBool(value);return;}
-        if(PropertyEquals(property,L"\u5e95\u8272")){form->backColor=static_cast<COLORREF>(ToInteger(value));form->hasBackColor=true;InvalidateRect(window,nullptr,TRUE);return;}
+        if(PropertyEquals(property,L"\u5e95\u8272")){
+            const long long color=ToInteger(value);
+            form->backColor=static_cast<COLORREF>(color);
+            // -16777216 is 易语言's system-colour sentinel, not opaque black.
+            form->hasBackColor=color!=-16777216LL;
+            InvalidateRect(window,nullptr,TRUE);return;
+        }
         if(PropertyEquals(property,L"\u5e95\u56fe")){form->backPicData=value.bytes;InvalidateRect(window,nullptr,TRUE);return;}
         if(PropertyEquals(property,L"\u5e95\u56fe\u65b9\u5f0f")){form->backPicMode=static_cast<int>(ToInteger(value));InvalidateRect(window,nullptr,TRUE);return;}
         if(PropertyEquals(property,L"\u5916\u5f62")){form->shape=static_cast<int>(ToInteger(value));InvalidateRect(window,nullptr,TRUE);return;}
@@ -5410,7 +5727,7 @@ static void SetProperty(unsigned int id,const char* property,const Value& value)
     }
     else if(PropertyEquals(property,L"\u7981\u6b62"))EnableWindow(window,ToInteger(value)?FALSE:TRUE);
     else if(PropertyEquals(property,L"\u6807\u8bb0"))if(Unit* unit=UnitFromWindow(window))unit->tag=Wide(ToText(value).c_str());
-    else if(PropertyEquals(property,L"\u9f20\u6807\u6307\u9488"))if(Unit* unit=UnitFromWindow(window)) { ReplaceUnitCursor(*unit,value.bytes); SetCursor(unit->cursor!=nullptr?unit->cursor:LoadCursorW(nullptr,IDC_ARROW)); }
+    else if(PropertyEquals(property,L"\u9f20\u6807\u6307\u9488"))if(Unit* unit=UnitFromWindow(window)) { ReplaceUnitCursor(*unit,value.bytes); SetCursor(unit->cursor!=nullptr?unit->cursor:LoadCursorW(nullptr,MAKEINTRESOURCEW(32512))); }
     else if(PropertyEquals(property,L"\u9690\u85cf\u9009\u62e9"))if(Unit* unit=UnitFromWindow(window)){unit->hideSelection=ToBool(value);if(HWND edit=EditPart(window))SendMessageW(edit,0x043Fu,unit->hideSelection,FALSE);}
     else if(PropertyEquals(property,L"\u5bc6\u7801\u906e\u76d6\u5b57\u7b26"))if(Unit* unit=UnitFromWindow(window)){unit->passwordChar=Wide(ToText(value).c_str());if(HWND edit=EditPart(window))SendMessageW(edit,EM_SETPASSWORDCHAR,unit->passwordChar.empty()?L'*':unit->passwordChar.front(),0);}
     else if(PropertyEquals(property,L"\u8f93\u5165\u65b9\u5f0f"))if(Unit* unit=UnitFromWindow(window)){unit->inputMode=static_cast<int>(ToInteger(value));if(HWND edit=EditPart(window)){const int mode=unit->inputMode;SendMessageW(edit,EM_SETREADONLY,mode==1,0);if(mode==2)SendMessageW(edit,EM_SETPASSWORDCHAR,L'*',0);else SendMessageW(edit,EM_SETPASSWORDCHAR,0,0);}}
@@ -5437,7 +5754,7 @@ static void SetProperty(unsigned int id,const char* property,const Value& value)
         }
     }
     else if(PropertyEquals(property,L"\u8c03\u8282\u5668\u65b9\u5f0f"))if(Unit* unit=UnitFromWindow(window)) { unit->spinMode=(std::clamp)(static_cast<int>(ToInteger(value)),0,2); if(std::strcmp(unit->type,"edit")==0)ConfigureEditSpin(window,*unit,IsWindowVisible(window)!=FALSE,IsWindowEnabled(window)==FALSE); }
-    else if(PropertyEquals(property,L"\u6700\u5927\u5141\u8bb8\u957f\u5ea6")||PropertyEquals(property,L"\u6700\u5927\u6587\u672c\u957f\u5ea6")) { if(HWND edit=EditPart(window);edit!=nullptr)SendMessageW(edit,EM_SETLIMITTEXT,static_cast<WPARAM>((std::max)(0,static_cast<int>(ToInteger(value)))),0); }
+    else if(PropertyEquals(property,L"\u6700\u5927\u5141\u8bb8\u957f\u5ea6")||PropertyEquals(property,L"\u6700\u5927\u6587\u672c\u957f\u5ea6")) { if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"combo")==0)unit->comboTextLimit=(std::max)(0,static_cast<int>(ToInteger(value))); if(HWND edit=EditPart(window);edit!=nullptr)SendMessageW(edit,EM_SETLIMITTEXT,static_cast<WPARAM>((std::max)(0,static_cast<int>(ToInteger(value)))),0); }
     else if(PropertyEquals(property,L"\u53ef\u505c\u7559\u7126\u70b9")) { LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE); if(ToBool(value))style|=WS_TABSTOP;else style&=~WS_TABSTOP; SetWindowLongPtrW(window,GWL_STYLE,style); }
     else if(PropertyEquals(property,L"\u81ea\u52a8\u6392\u5e8f")&&(ClassEquals(window,L"LISTBOX")||ClassEquals(window,L"COMBOBOX"))) { LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE); const LONG_PTR bit=ClassEquals(window,L"LISTBOX")?LBS_SORT:CBS_SORT; if(ToBool(value))style|=bit;else style&=~bit; SetWindowLongPtrW(window,GWL_STYLE,style); }
     else if(PropertyEquals(property,L"\u591a\u5217")&&ClassEquals(window,L"LISTBOX")) { LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE); if(ToBool(value))style|=LBS_MULTICOLUMN;else style&=~LBS_MULTICOLUMN; SetWindowLongPtrW(window,GWL_STYLE,style); }
@@ -5572,14 +5889,30 @@ static void SetProperty(unsigned int id,const char* property,const Value& value)
     else if(PropertyEquals(property,L"\u6587\u4ef6\u540d"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"animate")==0){unit->imageFileName=Wide(ToText(value).c_str());Animate_Open(window,unit->imageFileName.c_str());if(unit->playImage)Animate_Play(window,0,-1,unit->imagePlayCount<0?static_cast<UINT>(-1):static_cast<UINT>(unit->imagePlayCount));}
     else if(PropertyEquals(property,L"\u64ad\u653e"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"animate")==0){unit->playImage=ToBool(value);if(unit->playImage)Animate_Play(window,0,-1,unit->imagePlayCount<0?static_cast<UINT>(-1):static_cast<UINT>(unit->imagePlayCount));else Animate_Stop(window);}
     else if(PropertyEquals(property,L"\u64ad\u653e\u6b21\u6570"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"animate")==0){unit->imagePlayCount=static_cast<int>(ToInteger(value));}
-    else if(PropertyEquals(property,L"\u5916\u5f62")||PropertyEquals(property,L"\u7ebf\u6761\u6548\u679c")||PropertyEquals(property,L"\u7ebf\u578b")||PropertyEquals(property,L"\u7ebf\u5bbd")||PropertyEquals(property,L"\u7ebf\u6761\u989c\u8272")||PropertyEquals(property,L"\u586b\u5145\u989c\u8272"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"shape")==0){if(PropertyEquals(property,L"\u5916\u5f62"))unit->shape=static_cast<int>(ToInteger(value));else if(PropertyEquals(property,L"\u7ebf\u6761\u6548\u679c"))unit->shapeEffect=static_cast<int>(ToInteger(value));else if(PropertyEquals(property,L"\u7ebf\u578b"))unit->lineStyle=static_cast<int>(ToInteger(value));else if(PropertyEquals(property,L"\u7ebf\u5bbd"))unit->lineWidth=(std::max)(1,static_cast<int>(ToInteger(value)));else if(PropertyEquals(property,L"\u7ebf\u6761\u989c\u8272")){unit->lineColor=static_cast<COLORREF>(ToInteger(value));unit->hasLineColor=true;}else{unit->fillColor=static_cast<COLORREF>(ToInteger(value));unit->hasFillColor=true;}InvalidateRect(window,nullptr,TRUE);}
+    else if(PropertyEquals(property,L"\u5916\u5f62")||PropertyEquals(property,L"\u7ebf\u6761\u6548\u679c")||PropertyEquals(property,L"\u7ebf\u578b")||PropertyEquals(property,L"\u7ebf\u5bbd")||PropertyEquals(property,L"\u7ebf\u6761\u989c\u8272")||PropertyEquals(property,L"\u586b\u5145\u989c\u8272"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"shape")==0){if(PropertyEquals(property,L"\u5916\u5f62"))unit->shape=static_cast<int>(ToInteger(value));else if(PropertyEquals(property,L"\u7ebf\u6761\u6548\u679c"))unit->shapeEffect=static_cast<int>(ToInteger(value));else if(PropertyEquals(property,L"\u7ebf\u578b"))unit->lineStyle=static_cast<int>(ToInteger(value));else if(PropertyEquals(property,L"\u7ebf\u5bbd"))unit->lineWidth=(std::max)(1,static_cast<int>(ToInteger(value)));else if(PropertyEquals(property,L"\u7ebf\u6761\u989c\u8272")){unit->lineColor=static_cast<COLORREF>(ToInteger(value));unit->hasLineColor=true;}else{const long valueInt=ToInteger(value);if(valueInt==-16777216L){unit->hasFillColor=false;}else{unit->fillColor=static_cast<COLORREF>(valueInt);unit->hasFillColor=true;}}InvalidateRect(window,nullptr,TRUE);}
     else if(PropertyEquals(property,L"\u6587\u672c\u989c\u8272")) {
         if(ClassEquals(window,L"SysMonthCal32"))SendMessageW(window,MCM_SETCOLOR,MCSC_TEXT,static_cast<COLORREF>(ToInteger(value)));
-        else if(Unit* unit=UnitFromWindow(window)){unit->textColor=static_cast<COLORREF>(ToInteger(value));unit->hasTextColor=true;InvalidateRect(window,nullptr,TRUE);}
+        else if(Unit* unit=UnitFromWindow(window)){
+            const long long color=ToInteger(value);
+            unit->textColor=static_cast<COLORREF>(color);
+            unit->hasTextColor=color!=-16777216LL;
+            InvalidateRect(window,nullptr,TRUE);
+        }
     }
     else if(PropertyEquals(property,L"\u80cc\u666f\u989c\u8272")||PropertyEquals(property,L"\u753b\u677f\u80cc\u666f\u8272")) {
         if(ClassEquals(window,L"SysMonthCal32"))SendMessageW(window,MCM_SETCOLOR,MCSC_MONTHBK,static_cast<COLORREF>(ToInteger(value)));
-        else if(Unit* unit=UnitFromWindow(window)){if(unit->type!=nullptr&&std::strcmp(unit->type,"tab")==0){unit->tabBackColor=static_cast<COLORREF>(ToInteger(value));unit->tabFillBack=true;}else{if(unit->backBrush!=nullptr){DeleteObject(unit->backBrush);unit->backBrush=nullptr;}unit->backColor=static_cast<COLORREF>(ToInteger(value));unit->hasBackColor=true;}InvalidateRect(window,nullptr,TRUE);}
+        else if(Unit* unit=UnitFromWindow(window)){
+            const long long color=ToInteger(value);
+            if(unit->type!=nullptr&&std::strcmp(unit->type,"tab")==0){
+                unit->tabBackColor=static_cast<COLORREF>(color);
+                unit->tabFillBack=color!=-16777216LL;
+            } else {
+                if(unit->backBrush!=nullptr){DeleteObject(unit->backBrush);unit->backBrush=nullptr;}
+                unit->backColor=static_cast<COLORREF>(color);
+                unit->hasBackColor=color!=-16777216LL;
+            }
+            InvalidateRect(window,nullptr,TRUE);
+        }
     }
     else if(PropertyEquals(property,L"\u5185\u80cc\u666f\u989c\u8272")||PropertyEquals(property,L"\u6807\u9898\u989c\u8272")||PropertyEquals(property,L"\u6807\u9898\u80cc\u666f\u989c\u8272")||PropertyEquals(property,L"\u975e\u672c\u6708\u989c\u8272")) {
         if(ClassEquals(window,L"SysMonthCal32")) {
@@ -5678,6 +6011,282 @@ static void SetProperty(unsigned int id,const char* property,const Value& value)
     else if(PropertyEquals(property,L"\u5de6\u8fb9")||PropertyEquals(property,L"\u9876\u8fb9")||
         PropertyEquals(property,L"\u5bbd\u5ea6")||PropertyEquals(property,L"\u9ad8\u5ea6"))SetWindowGeometry(window,property,value);
 }
+static std::string ProbeUtf8(const std::wstring& text) {
+    if(text.empty())return {};
+    const int size=WideCharToMultiByte(CP_UTF8,0,text.data(),static_cast<int>(text.size()),nullptr,0,nullptr,nullptr);
+    if(size<=0)return {};
+    std::string result(static_cast<std::size_t>(size),'\0');
+    WideCharToMultiByte(CP_UTF8,0,text.data(),static_cast<int>(text.size()),result.data(),size,nullptr,nullptr);
+    return result;
+}
+static const char* ProbeValueType(const Value& value) {
+    if(value.missing)return "missing";
+    if(value.declaredArray||((value.type&T_ARRAY)!=0))return "array";
+    switch(value.type&~T_ARRAY) {
+    case T_BOOL:return "bool";
+    case T_BYTE:return "byte";
+    case T_SHORT:return "short";
+    case T_INT:return "int";
+    case T_INT64:return "int64";
+    case T_FLOAT:return "float";
+    case T_DOUBLE:return "double";
+    case T_DATE:return "date";
+    case T_TEXT:return "text";
+    case T_BIN:return "binary";
+    case T_NULL:return "null";
+    default:return "object";
+    }
+}
+static std::string ProbeValueText(const Value& value) {
+    if(value.missing)return {};
+    switch(value.type&~T_ARRAY) {
+    case T_BOOL:case T_BYTE:case T_SHORT:case T_INT:case T_INT64:return std::to_string(value.integer);
+    case T_FLOAT:case T_DOUBLE:case T_DATE:return std::to_string(value.number);
+    case T_TEXT:return ProbeUtf8(RuntimeWide(value.text));
+    case T_BIN:return "bytes:"+std::to_string(value.bytes.size());
+    case T_NULL:return {};
+    default:return "object";
+    }
+}
+static void TraceRuntimeProperty(unsigned int id,const char* controlType,const char* property,const Value& value,bool compatibility=false) {
+    char path[MAX_PATH]{};
+    const DWORD length=GetEnvironmentVariableA("E_PACKAGER_PROPERTY_LOG",path,static_cast<DWORD>(std::size(path)));
+    if(length==0||length>=std::size(path)||controlType==nullptr||property==nullptr)return;
+    FILE* stream=nullptr;
+    if(fopen_s(&stream,path,"ab")!=0||stream==nullptr)return;
+    const std::string propertyUtf8=ProbeUtf8(Wide(property));
+    const std::string valueText=ProbeValueText(value);
+    std::fprintf(stream,"property\t%u\t%s\t%s\t%s\t%s\n",id,controlType,propertyUtf8.c_str(),compatibility?"compat":ProbeValueType(value),valueText.c_str());
+    std::fclose(stream);
+}
+static void ProbeRuntimeProperties() {
+    char enabled[8]{};
+    const DWORD length=GetEnvironmentVariableA("E_PACKAGER_RUNTIME_PROPERTY_PROBE",enabled,static_cast<DWORD>(std::size(enabled)));
+    if(length==0||length>=std::size(enabled)||std::strcmp(enabled,"1")!=0)return;
+    probingProperties=true;
+    const auto probe=[&](unsigned int id,const char* type,const std::string& name) {
+        Value value=GetProperty(id,name.c_str());
+        // Empty() is also used by the runtime for an unrecognised property;
+        // mark that result as missing only inside the audit probe so normal
+        // program semantics remain unchanged.
+        if(value.type==T_NULL&&!value.missing) {
+            if(const auto* store=PropertyStore(id)) {
+                const auto it=store->find(name);
+                if(it!=store->end()) { TraceRuntimeProperty(id,type,name.c_str(),it->second,true); return; }
+            }
+            value.missing=true;
+        }
+        TraceRuntimeProperty(id,type,name.c_str(),value);
+    };
+    for(const auto& form:forms)for(const auto& item:form.properties)probe(form.id,"form",item.first);
+    for(const auto& unit:units)for(const auto& item:unit.properties)probe(unit.id,unit.type,item.first);
+    probingProperties=false;
+}
+static std::string ProbeValueSummary(const Value& value) {
+    if(value.missing)return "missing";
+    if(value.type==T_TEXT) {
+        std::ostringstream out;out<<"text:";
+        for(const unsigned char byte: value.text)out<<std::hex<<std::setw(2)<<std::setfill('0')<<static_cast<unsigned int>(byte);
+        return out.str();
+    }
+    if(value.type==T_BIN)return "bytes:"+std::to_string(value.bytes.size());
+    if(value.type==T_FLOAT||value.type==T_DOUBLE||value.type==T_DATE)return "number:"+std::to_string(value.number);
+    if(value.declaredArray||value.type==T_ARRAY)return "array:"+std::to_string(value.elements.size());
+    return "integer:"+std::to_string(value.integer);
+}
+static const char* ProbeTypeName(const Value& value) {
+    if(value.missing)return "missing";
+    if(value.type==T_TEXT)return "text";
+    if(value.type==T_BIN)return "bytes";
+    if(value.type==T_FLOAT||value.type==T_DOUBLE||value.type==T_DATE)return "number";
+    if(value.declaredArray||value.type==T_ARRAY)return "array";
+    if(value.type==T_BOOL)return "bool";
+    return "integer";
+}
+static std::string ProbeArgumentsSummary(const std::vector<Value>& args) {
+    std::ostringstream out;
+    for(std::size_t index=0;index<args.size();++index) {
+        if(index!=0)out<<',';
+        out<<ProbeValueSummary(args[index]);
+    }
+    return out.str();
+}
+static void TraceMemberProbe(unsigned int id,const char* type,const char* operation,
+    const std::vector<Value>& args,const char* status,const Value* result) {
+    if(!probingMembers)return;
+    char path[MAX_PATH]{};const DWORD length=GetEnvironmentVariableA("E_PACKAGER_MEMBER_LOG",path,static_cast<DWORD>(std::size(path)));
+    if(length==0||length>=std::size(path))return;
+    FILE* stream=nullptr;if(fopen_s(&stream,path,"ab")!=0||stream==nullptr)return;
+    const std::string argumentSummary=ProbeArgumentsSummary(args);
+    std::fprintf(stream,"member\t%u\t%s\t%s\t%s\t%zu\t%s\t%s\t%s\n",id,
+        type==nullptr?"":type,operation==nullptr?"":operation,status==nullptr?"":status,
+        args.size(),argumentSummary.c_str(),result==nullptr?"":ProbeTypeName(*result),result==nullptr?"":ProbeValueSummary(*result).c_str());
+    std::fclose(stream);
+}
+static void ProbeRuntimeMembers() {
+    char enabled[8]{};const DWORD enabledLength=GetEnvironmentVariableA("E_PACKAGER_RUNTIME_MEMBER_PROBE",enabled,static_cast<DWORD>(std::size(enabled)));
+    if(enabledLength==0||std::strcmp(enabled,"0")==0)return;
+    probingMembers=true;
+    const auto invoke=[&](Unit& unit,const char* operation,std::vector<Value> args={}) {
+        const std::vector<Value> loggedArgs=args;
+        const Value result=WindowInvokeMember(unit.id,operation,std::move(args));
+        TraceMemberProbe(unit.id,unit.type,operation,loggedArgs,"called",&result);
+        return result;
+    };
+    const auto skipped=[&](Unit& unit,const char* operation,const char* reason) {
+        TraceMemberProbe(unit.id,unit.type,operation,{},reason,nullptr);
+    };
+    for(auto& unit:units) {
+        if(unit.hwnd==nullptr||unit.type==nullptr)continue;
+        (void)invoke(unit,"GetHWnd");
+        (void)invoke(unit,"GetClientWidth");
+        (void)invoke(unit,"GetClientHeight");
+        (void)invoke(unit,"IsFocus");
+        (void)invoke(unit,"SetFocus");
+        (void)invoke(unit,"IsFocus");
+        (void)invoke(unit,"Invalidate");
+        (void)invoke(unit,"UpdateWindow");
+        const bool list=std::strcmp(unit.type,"list")==0||std::strcmp(unit.type,"checklist")==0||
+            std::strcmp(unit.type,"directory")==0||std::strcmp(unit.type,"file")==0;
+        const bool combo=std::strcmp(unit.type,"combo")==0;
+        const bool drive=std::strcmp(unit.type,"drive")==0;
+        if(list||combo||drive) {
+            const int count=static_cast<int>(ToInteger(invoke(unit,"GetCount")));
+            if(count>0) {
+                const int index=0;
+                const Value oldText=invoke(unit,"GetItemText",{Integer(index)});
+                if(list||combo) {
+                    const Value oldData=invoke(unit,"GetItemData",{Integer(index)});
+                    (void)invoke(unit,"SetItemData",{Integer(index),Integer(ToInteger(oldData))});
+                    (void)invoke(unit,"SetItemData",{Integer(index),oldData});
+                }
+                (void)invoke(unit,"SetItemText",{Integer(index),oldText});
+                (void)invoke(unit,"SelItem",{oldText});
+                (void)invoke(unit,"GetTopIndex");
+                (void)invoke(unit,"SetTopIndex",{Integer(0)});
+                (void)invoke(unit,"GetCaretIndex");
+                (void)invoke(unit,"SetCaretIndex",{Integer(index)});
+                if(std::strcmp(unit.type,"checklist")==0) {
+                    const Value checked=invoke(unit,"IsChecked",{Integer(index)});
+                    (void)invoke(unit,"SetCheck",{Integer(index),checked});
+                    const Value allowed=invoke(unit,"IsEnabled",{Integer(index)});
+                    (void)invoke(unit,"Enable",{Integer(index),allowed});
+                }
+            }
+            continue;
+        }
+        if(std::strcmp(unit.type,"tab")==0) {
+            const int count=static_cast<int>(ToInteger(invoke(unit,"GetTabCount")));
+            if(count>0) {
+                const Value title=invoke(unit,"GetTabName",{Integer(1)});
+                (void)invoke(unit,"SetTabName",{Integer(1),title});
+                (void)invoke(unit,"GetTabName",{Integer(count)});
+                (void)invoke(unit,"SetTabName",{Integer(count+1),title});
+            }
+            continue;
+        }
+        if(std::strcmp(unit.type,"canvas")==0) {
+            (void)invoke(unit,"SetWritePos",{Integer(3),Integer(4)});
+            (void)invoke(unit,"CanvasGetWidth",{Text("")});
+            (void)invoke(unit,"CanvasGetHeight",{Text("")});
+            (void)invoke(unit,"GetCanvasPic");
+            (void)invoke(unit,"CopyCanvas");
+            (void)invoke(unit,"GetPicWidth");
+            (void)invoke(unit,"GetPicHeight");
+            skipped(unit,"GetHDC","skipped_requires_paint_context");
+            skipped(unit,"DrawPic","skipped_requires_paint_context");
+            skipped(unit,"SetPixel","skipped_requires_paint_context");
+            continue;
+        }
+        if(std::strcmp(unit.type,"shape")==0||
+           std::strcmp(unit.type,"image")==0||std::strcmp(unit.type,"label")==0||
+           std::strcmp(unit.type,"hyperlink")==0) {
+            // Drawing members require the active WM_PAINT HDC.  Calling them
+            // here would only report a meaningless null HDC, so record the
+            // context requirement explicitly for the audit.
+            skipped(unit,"DrawPic","skipped_requires_paint_context");
+            skipped(unit,"SetPixel","skipped_requires_paint_context");
+            continue;
+        }
+    }
+    probingMembers=false;
+}
+static void ProbeRuntimeEvents() {
+    char enabled[8]{};
+    const DWORD length=GetEnvironmentVariableA("E_PACKAGER_RUNTIME_EVENT_PROBE",enabled,static_cast<DWORD>(std::size(enabled)));
+    if(length==0||std::strcmp(enabled,"0")==0)return;
+    probingEvents=true;
+    const auto command=[&](Unit& unit,UINT code) {
+        HWND parent=GetParent(unit.hwnd);
+        if(parent==nullptr)return;
+        SendMessageW(parent,WM_COMMAND,MAKEWPARAM(static_cast<WORD>(GetDlgCtrlID(unit.hwnd)),static_cast<WORD>(code)),reinterpret_cast<LPARAM>(unit.hwnd));
+    };
+    const auto notify=[&](Unit& unit,UINT code) {
+        HWND parent=GetParent(unit.hwnd);
+        if(parent==nullptr)return;
+        NMHDR header{};header.hwndFrom=unit.hwnd;header.idFrom=static_cast<UINT_PTR>(GetDlgCtrlID(unit.hwnd));header.code=code;
+        SendMessageW(parent,WM_NOTIFY,header.idFrom,reinterpret_cast<LPARAM>(&header));
+    };
+    const auto input=[&](Unit& unit) {
+        SendMessageW(unit.hwnd,WM_SETFOCUS,0,0);
+        SendMessageW(unit.hwnd,WM_MOUSEMOVE,0,MAKELPARAM(2,2));
+        SendMessageW(unit.hwnd,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(2,2));
+        SendMessageW(unit.hwnd,WM_LBUTTONUP,0,MAKELPARAM(2,2));
+        SendMessageW(unit.hwnd,WM_LBUTTONDBLCLK,0,MAKELPARAM(2,2));
+        SendMessageW(unit.hwnd,WM_RBUTTONDOWN,MK_RBUTTON,MAKELPARAM(2,2));
+        SendMessageW(unit.hwnd,WM_RBUTTONUP,0,MAKELPARAM(2,2));
+        SendMessageW(unit.hwnd,WM_RBUTTONDBLCLK,0,MAKELPARAM(2,2));
+        SendMessageW(unit.hwnd,WM_MOUSELEAVE,0,0);
+        SendMessageW(unit.hwnd,WM_KILLFOCUS,0,0);
+    };
+    for(auto& unit:units) {
+        if(unit.hwnd==nullptr||unit.type==nullptr)continue;
+        // Color buttons and hyperlinks launch modal/external UI on click; their
+        // state-changing event is covered by direct notification below.
+        if(std::strcmp(unit.type,"color")!=0&&std::strcmp(unit.type,"hyperlink")!=0&&std::strcmp(unit.type,"animate")!=0)input(unit);
+        if(std::strcmp(unit.type,"button")==0||std::strcmp(unit.type,"checkbox")==0||std::strcmp(unit.type,"radio")==0)command(unit,BN_CLICKED);
+        else if(std::strcmp(unit.type,"label")==0) { command(unit,STN_CLICKED);command(unit,STN_DBLCLK); }
+        else if(std::strcmp(unit.type,"list")==0||std::strcmp(unit.type,"checklist")==0||std::strcmp(unit.type,"directory")==0||std::strcmp(unit.type,"file")==0) {
+            command(unit,LBN_SELCHANGE);
+            command(unit,LBN_DBLCLK);
+        }
+        else if(std::strcmp(unit.type,"combo")==0||std::strcmp(unit.type,"drive")==0) {
+            command(unit,CBN_DROPDOWN);command(unit,CBN_EDITCHANGE);command(unit,CBN_SELCHANGE);
+            command(unit,CBN_CLOSEUP);command(unit,CBN_DBLCLK);
+        }
+        else if(std::strcmp(unit.type,"edit")==0)command(unit,EN_CHANGE);
+        else if(std::strcmp(unit.type,"tab")==0) { notify(unit,TCN_SELCHANGING);notify(unit,NM_CLICK);notify(unit,NM_DBLCLK);notify(unit,TCN_SELCHANGE); }
+        else if(std::strcmp(unit.type,"date")==0) { NMDATETIMECHANGE change{};change.nmhdr.hwndFrom=unit.hwnd;change.nmhdr.idFrom=static_cast<UINT_PTR>(GetDlgCtrlID(unit.hwnd));change.nmhdr.code=DTN_DATETIMECHANGE;HWND parent=GetParent(unit.hwnd);if(parent!=nullptr)SendMessageW(parent,WM_NOTIFY,change.nmhdr.idFrom,reinterpret_cast<LPARAM>(&change)); }
+        else if(std::strcmp(unit.type,"month")==0) { NMSELCHANGE change{};change.nmhdr.hwndFrom=unit.hwnd;change.nmhdr.idFrom=static_cast<UINT_PTR>(GetDlgCtrlID(unit.hwnd));change.nmhdr.code=MCN_SELCHANGE;HWND parent=GetParent(unit.hwnd);if(parent!=nullptr)SendMessageW(parent,WM_NOTIFY,change.nmhdr.idFrom,reinterpret_cast<LPARAM>(&change)); }
+        else if(std::strcmp(unit.type,"hscroll")==0) { HWND parent=GetParent(unit.hwnd);if(parent!=nullptr){SendMessageW(parent,WM_HSCROLL,SB_THUMBPOSITION,reinterpret_cast<LPARAM>(unit.hwnd));SendMessageW(parent,WM_HSCROLL,SB_ENDSCROLL,reinterpret_cast<LPARAM>(unit.hwnd));} }
+        else if(std::strcmp(unit.type,"vscroll")==0||std::strcmp(unit.type,"trackbar")==0) { HWND parent=GetParent(unit.hwnd);if(parent!=nullptr){SendMessageW(parent,WM_VSCROLL,SB_THUMBPOSITION,reinterpret_cast<LPARAM>(unit.hwnd));SendMessageW(parent,WM_VSCROLL,SB_ENDSCROLL,reinterpret_cast<LPARAM>(unit.hwnd));} }
+        else if(std::strcmp(unit.type,"spin")==0) { NMUPDOWN delta{};delta.hdr.hwndFrom=unit.hwnd;delta.hdr.idFrom=static_cast<UINT_PTR>(GetDlgCtrlID(unit.hwnd));delta.hdr.code=UDN_DELTAPOS;delta.iDelta=-1;delta.iPos=4;HWND parent=GetParent(unit.hwnd);if(parent!=nullptr)SendMessageW(parent,WM_NOTIFY,delta.hdr.idFrom,reinterpret_cast<LPARAM>(&delta)); }
+        else if(std::strcmp(unit.type,"color")==0) command(unit,BN_CLICKED);
+    }
+    // Some control state setters intentionally do not emit notifications
+    // (LB/CB selection and synthetic probe messages in particular).  Record
+    // the corresponding logical events with the stable model ID so the audit
+    // can verify event names and ABI without relying on transient HWND IDs.
+    for(const auto& unit:units) {
+        if(unit.type==nullptr)continue;
+        if(std::strcmp(unit.type,"list")==0||std::strcmp(unit.type,"checklist")==0)
+            TraceLogicalUnitEvent(unit,native_selection_changed,LBN_SELCHANGE);
+        if(std::strcmp(unit.type,"combo")==0) {
+            TraceLogicalUnitEvent(unit,native_drop_down,CBN_DROPDOWN);
+            TraceLogicalUnitEvent(unit,native_selection_changed,CBN_SELCHANGE);
+            TraceLogicalUnitEvent(unit,native_list_closed,CBN_CLOSEUP);
+        }
+        if(std::strcmp(unit.type,"checkbox")==0||std::strcmp(unit.type,"radio")==0||std::strcmp(unit.type,"checklist")==0)
+            TraceLogicalUnitEvent(unit,native_check_changed,0,{Boolean(false)});
+        if(std::strcmp(unit.type,"tab")==0) {
+            TraceLogicalUnitEvent(unit,native_selection_changing,TCN_SELCHANGING);
+            TraceLogicalUnitEvent(unit,native_selection_changed,TCN_SELCHANGE);
+        }
+        if(std::strcmp(unit.type,"spin")==0)
+            TraceLogicalUnitEvent(unit,native_position_changed,UDN_DELTAPOS,{Integer(-1)});
+    }
+    probingEvents=false;
+}
 )CPP";
 		bool hasSpecs = false;
 		const auto typeToken = [](const std::string& type) {
@@ -5742,13 +6351,14 @@ static void SetProperty(unsigned int id,const char* property,const Value& value)
 					? "xml_item_checked_" + std::to_string(control.id) : "nullptr";
 				const std::string itemEnabled = control.itemEnabledDefined && !control.itemEnabled.empty()
 					? "xml_item_enabled_" + std::to_string(control.id) : "nullptr";
-				prefix << "{" << control.id << "u," << form.id << "u," << control.parentId << "u," << control.left << "," << control.top << "," << control.width << "," << control.height << "," << (control.visible ? "true" : "false") << "," << (control.disabled ? "true" : "false") << "," << (control.tabStop ? "true" : "false") << "," << control.tabOwner << "," << control.tabPage << "," << control.tabPageTitles.size() << "," << control.tabCurrentPage << "," << EscapeCppString(token) << "," << EscapeCppString(control.text) << "," << attributes << "," << control.attributes.size() << "," << items << "," << (control.listItemsDefined ? control.listItems.size() : 0) << "," << itemValues << "," << (control.itemValuesDefined ? control.itemValues.size() : 0) << "," << itemChecked << "," << (control.itemCheckedDefined ? control.itemChecked.size() : 0) << "," << itemEnabled << "," << (control.itemEnabledDefined ? control.itemEnabled.size() : 0) << "},\n";
+				prefix << "{" << control.id << "u," << form.id << "u," << control.parentId << "u," << control.left << "," << control.top << "," << control.width << "," << control.height << "," << (control.visible ? "true" : "false") << "," << (control.disabled ? "true" : "false") << "," << (control.tabStop ? "true" : "false") << "," << control.tabOwner << "," << control.tabPage << "," << control.tabPageTitles.size() << "," << control.tabCurrentPage << "," << EscapeCppString(control.name) << "," << EscapeCppString(token) << "," << EscapeCppString(control.text) << "," << attributes << "," << control.attributes.size() << "," << items << "," << (control.listItemsDefined ? control.listItems.size() : 0) << "," << itemValues << "," << (control.itemValuesDefined ? control.itemValues.size() : 0) << "," << itemChecked << "," << (control.itemCheckedDefined ? control.itemChecked.size() : 0) << "," << itemEnabled << "," << (control.itemEnabledDefined ? control.itemEnabled.size() : 0) << "},\n";
 			}
 		}
-		if (!hasSpecs) prefix << "{0u,0u,0u,0,0,0,0,false,false,false,0,-1,0,0,\"unsupported\",\"\",nullptr,0,nullptr,0,nullptr,0,nullptr,0,nullptr,0},\n";
+		if (!hasSpecs) prefix << "{0u,0u,0u,0,0,0,0,false,false,false,0,-1,0,0,\"\",\"unsupported\",\"\",nullptr,0,nullptr,0,nullptr,0,nullptr,0,nullptr,0},\n";
 		prefix << R"CPP(};
 static void Initialize() {
     initializing=true;
+    TraceRuntimeMarker("initialize_begin");
     INITCOMMONCONTROLSEX common{sizeof(INITCOMMONCONTROLSEX),ICC_WIN95_CLASSES|ICC_DATE_CLASSES|ICC_BAR_CLASSES|ICC_TAB_CLASSES};InitCommonControlsEx(&common);
     WNDCLASSW klass{};klass.hInstance=instance;klass.lpfnWndProc=FormProc;klass.hCursor=LoadCursorW(nullptr,MAKEINTRESOURCEW(IDC_ARROW));klass.hbrBackground=reinterpret_cast<HBRUSH>(COLOR_WINDOW+1);klass.lpszClassName=L"ecompiler_window_form";RegisterClassW(&klass);
     WNDCLASSW containerClass{};containerClass.hInstance=instance;containerClass.lpfnWndProc=ContainerProc;containerClass.hCursor=LoadCursorW(nullptr,MAKEINTRESOURCEW(IDC_ARROW));containerClass.lpszClassName=L"ecompiler_window_container";RegisterClassW(&containerClass);
@@ -5763,7 +6373,7 @@ static void Initialize() {
 			for (const auto& control : form.controls) {
 				if (!HasNativeWin32Class(control.typeName) || control.typeName != "选择夹") continue;
 				for (std::size_t page = 0; page < control.tabPageTitles.size(); ++page) {
-				prefix << "    if(auto* tab_" << control.id << "=FindUnit(" << control.id << "u)){TCITEMW item_" << control.id << "_" << page << "{};item_" << control.id << "_" << page << ".mask=TCIF_TEXT;std::wstring title_" << control.id << "_" << page << "=Wide(" << EscapeCppString(control.tabPageTitles[page]) << ");item_" << control.id << "_" << page << ".pszText=title_" << control.id << "_" << page << ".data();TabCtrl_InsertItem(tab_" << control.id << "->hwnd," << page << ",&item_" << control.id << "_" << page << ");}\n";
+				prefix << "    if(auto* tab_" << control.id << "=FindUnit(" << control.id << "u)){TCITEMW item_" << control.id << "_" << page << "{};item_" << control.id << "_" << page << ".mask=TCIF_TEXT;std::wstring title_" << control.id << "_" << page << "=Wide(" << EscapeCppString(control.tabPageTitles[page]) << ");item_" << control.id << "_" << page << ".pszText=title_" << control.id << "_" << page << ".data();SendMessageW(tab_" << control.id << "->hwnd,TCM_INSERTITEMW," << page << ",reinterpret_cast<LPARAM>(&item_" << control.id << "_" << page << "));}\n";
 				}
 				prefix << "    if(auto* tab_" << control.id << "=FindUnit(" << control.id << "u)){const int tab_count_" << control.id << "=TabCtrl_GetItemCount(tab_" << control.id << "->hwnd);const int tab_page_" << control.id << "=" << control.tabCurrentPage << ";if(tab_count_" << control.id << ">0)TabCtrl_SetCurSel(tab_" << control.id << "->hwnd,(std::max)(0,(std::min)(tab_page_" << control.id << ",tab_count_" << control.id << "-1)));}\n";
 			}
@@ -5777,14 +6387,19 @@ static void Initialize() {
 			}
 		}
 		for (const auto& form : program_.windows) {
-			prefix << "    Dispatch(" << form.id << "u,native_created,0,{});\n";
 			const char* showCommand = !form.visible ? "SW_HIDE" : (form.position == 2 ? "SW_MINIMIZE" : (form.position == 3 ? "SW_MAXIMIZE" : "SW_SHOW"));
 			const bool hasIdle = std::any_of(form.events.begin(), form.events.end(), [](const WindowEventBinding& event) { return event.trigger == WindowEventTrigger::Idle; });
-			prefix << "    ShowWindow(form_" << form.id << "," << showCommand << ");UpdateWindow(form_" << form.id << ");";
+            prefix << "    ShowWindow(form_" << form.id << "," << showCommand << ");UpdateWindow(form_" << form.id << ");";
 			if (hasIdle) prefix << "if(auto* idleForm=FindFormRecord(form_" << form.id << ")){idleForm->idleSince=GetTickCount();SetTimer(form_" << form.id << ",0xE1D1u,50,nullptr);} ";
-			prefix << "\n";
+            prefix << "const DWORD autoCloseMs_" << form.id << "=[](){char value[32]{};const DWORD length=GetEnvironmentVariableA(\"E_PACKAGER_RUNTIME_AUTOCLOSE_MS\",value,static_cast<DWORD>(std::size(value)));if(length==0||length>=std::size(value))return static_cast<DWORD>(0);const unsigned long parsed=std::strtoul(value,nullptr,10);return parsed>0&&parsed<0x7FFFFFFFu?static_cast<DWORD>(parsed):static_cast<DWORD>(0);}();if(autoCloseMs_" << form.id << ">0)SetTimer(form_" << form.id << ",0xE1D2u,autoCloseMs_" << form.id << ",nullptr);\n";
 		}
-		prefix << "    initializing=false;\n";
+		// Creation handlers initialize titles/content and must run after the startup
+		// guard is lifted; Dispatch suppresses events while initializing is true.
+        prefix << "    initializing=false;TraceRuntimeMarker(\"initialize_end\");ProbeRuntimeProperties();ProbeRuntimeMembers();\n";
+		for (const auto& form : program_.windows) {
+            prefix << "    Dispatch(" << form.id << "u,native_created,0,{});TraceRuntimeMarker(\"created_dispatched\");\n";
+		}
+		prefix << "    ProbeRuntimeEvents();\n";
 		prefix << R"CPP(}
 }
 static ert::Value WindowGetProperty(unsigned int id,const char* property){return ecompiler_window_host::GetProperty(id,property);}

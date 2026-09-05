@@ -422,13 +422,13 @@ HUNIT CallCreateUnitSafely(
 	}
 #if defined(_MSC_VER)
 	__try {
-		return procedure(
+		const HUNIT created = procedure(
 			data,
 			dataSize,
-			0,
+			WS_CHILD | WS_VISIBLE,
 			parent,
-			100,
-			nullptr,
+			unitId,
+			reinterpret_cast<HMENU>(static_cast<UINT_PTR>(unitId)),
 			10,
 			20,
 			300,
@@ -437,12 +437,15 @@ HUNIT CallCreateUnitSafely(
 			unitId,
 			parent,
 			TRUE);
+		return created;
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {
 		return 0;
 	}
 #else
-	return procedure(data, dataSize, 0, parent, 100, nullptr, 10, 20, 300, 100, formId, unitId, parent, TRUE);
+	return procedure(data, dataSize, WS_CHILD | WS_VISIBLE, parent, unitId,
+		reinterpret_cast<HMENU>(static_cast<UINT_PTR>(unitId)), 10, 20, 300, 100,
+		formId, unitId, parent, TRUE);
 #endif
 }
 
@@ -1663,7 +1666,13 @@ std::vector<std::filesystem::path> BuildSupportLibraryCandidates(
 		}
 	};
 
-	if (!library.resolvedPath.empty()) {
+	// In restricted mode (modern BlackMoon adapter / x64), an absolute path
+	// persisted in an old project bundle must not win over the target
+	// architecture's search roots.  Such paths commonly point at the user's
+	// e5.6 x86 lib directory and expose a different property-data ABI.  The
+	// caller still supplies the filename, so the matching FNE is discovered
+	// from the explicitly selected architecture roots below.
+	if (!restrictSearch && !library.resolvedPath.empty()) {
 		pushUnique(Utf8PathToPath(library.resolvedPath));
 	}
 
@@ -1675,6 +1684,11 @@ std::vector<std::filesystem::path> BuildSupportLibraryCandidates(
 		fileName.erase(fileName.begin());
 	}
 	std::filesystem::path filePath(fileName);
+	if (restrictSearch && filePath.is_absolute()) {
+		// Keep only the logical module filename while searching the selected
+		// architecture roots; never reintroduce the persisted absolute path.
+		filePath = filePath.filename();
+	}
 	std::vector<std::filesystem::path> fileVariants;
 	if (!filePath.empty()) {
 		if (filePath.extension().empty()) {
@@ -1691,7 +1705,7 @@ std::vector<std::filesystem::path> BuildSupportLibraryCandidates(
 			}
 		}
 	}
-	if (filePath.is_absolute()) {
+	if (filePath.is_absolute() && !restrictSearch) {
 		for (const auto& variant : fileVariants) {
 			pushUnique(variant);
 		}
@@ -1749,11 +1763,16 @@ FormControlPropertyCodec::LibraryState* FormControlPropertyCodec::EnsureLibrary(
 		return state.info == nullptr ? nullptr : &state;
 	}
 	state.attempted = true;
+	const auto& requestedLibrary = m_libraries[static_cast<std::size_t>(supportIndex - 1)];
 	const auto candidates = BuildSupportLibraryCandidates(
 		m_sourcePath,
-		m_libraries[static_cast<std::size_t>(supportIndex - 1)],
+		requestedLibrary,
 		m_searchDirectories,
 		m_restrictSearch);
+	std::cerr << "property probe library support=" << supportIndex
+		<< " file=" << requestedLibrary.fileName
+		<< " resolved=" << requestedLibrary.resolvedPath
+		<< " candidates=" << candidates.size() << "\n";
 	for (const auto& candidate : candidates) {
 		HMODULE module = LoadLibraryExW(candidate.c_str(), nullptr, 0);
 		if (module == nullptr) {
@@ -1775,8 +1794,11 @@ FormControlPropertyCodec::LibraryState* FormControlPropertyCodec::EnsureLibrary(
 		state.info = info;
 		state.utf8 = DetectUtf8LibraryStrings(info);
 		state.path = PathToUtf8(candidate);
+		std::cerr << "property probe library loaded support=" << supportIndex
+			<< " path=" << state.path << "\n";
 		return &state;
 	}
+	std::cerr << "property probe library unavailable support=" << supportIndex << "\n";
 	return nullptr;
 }
 
