@@ -3608,6 +3608,18 @@ static void RouteUnitInput(HWND source,UINT message,WPARAM wParam,LPARAM lParam)
     default:break;
     }
 }
+static bool ComboDropButtonHit(HWND window,LPARAM lParam) {
+    if(window==nullptr||!ClassEquals(window,L"COMBOBOX"))return false;
+    const LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE);
+    if((style&CBS_DROPDOWNLIST)==CBS_SIMPLE)return false;
+    RECT client{};
+    if(!GetClientRect(window,&client))return false;
+    const int x=static_cast<short>(LOWORD(lParam));
+    const int y=static_cast<short>(HIWORD(lParam));
+    if(x<0||y<0||x>=client.right||y>=client.bottom)return false;
+    const int buttonWidth=(std::max)(GetSystemMetrics(SM_CXVSCROLL),16);
+    return x>=client.right-buttonWidth;
+}
 static Form* FindFormRecord(HWND window) {
     for(auto& form:forms)if(form.hwnd==window)return &form;
     return nullptr;
@@ -3813,7 +3825,17 @@ static LRESULT CALLBACK UnitSubclassProc(HWND window,UINT message,WPARAM wParam,
         }
     }
     else RouteUnitInput(window,message,wParam,lParam);
+    // A combo's arrow is handled by the native window procedure.  Some
+    // themed/common-control combinations do not open it when the control is
+    // subclassed, even though CB_SHOWDROPDOWN works and the items are valid.
+    // Preserve the normal toggle behavior and only repair the closed -> open
+    // transition when the click was on the arrow and native handling did not
+    // open the list.
+    const bool comboArrowClick=message==WM_LBUTTONUP&&ComboDropButtonHit(window,lParam)&&
+        SendMessageW(window,CB_GETDROPPEDSTATE,0,0)==FALSE;
     const LRESULT result=DefSubclassProc(window,message,wParam,lParam);
+    if(comboArrowClick&&SendMessageW(window,CB_GETDROPPEDSTATE,0,0)==FALSE)
+        SendMessageW(window,CB_SHOWDROPDOWN,TRUE,0);
     if(IsCheckList(window)) {
         if(message==WM_LBUTTONUP) {
             const int index=CheckItemAtPoint(window,lParam);
