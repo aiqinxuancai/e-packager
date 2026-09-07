@@ -2336,6 +2336,14 @@ bool ParseSources(Program& program, std::string& error)
 			index = bodyEnd;
 		}
 	}
+	// 方法按程序集限定名存储；运行入口另建唯一短名索引。
+	for (const auto& method : program.methods) {
+		if (method.name != "_启动子程序" || program.assemblies[method.assemblyIndex].isClass) continue;
+		if (!program.methodByName.emplace(method.name, method.id).second) {
+			error = "ambiguous_startup_method:_启动子程序";
+			return false;
+		}
+	}
 	if (!program.methodByName.contains("_启动子程序")) {
 		// 窗口工程的隐藏启动方法由 IDE 生成，源码目录中通常只有窗口
 		// 创建事件。独立编译器用一个空启动方法承接同一生命周期入口。

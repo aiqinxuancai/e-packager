@@ -6382,7 +6382,9 @@ static void Initialize() {
     initializing=true;
     TraceRuntimeMarker("initialize_begin");
     INITCOMMONCONTROLSEX common{sizeof(INITCOMMONCONTROLSEX),ICC_WIN95_CLASSES|ICC_DATE_CLASSES|ICC_BAR_CLASSES|ICC_TAB_CLASSES};InitCommonControlsEx(&common);
-    WNDCLASSW klass{};klass.hInstance=instance;klass.lpfnWndProc=FormProc;klass.hCursor=LoadCursorW(nullptr,MAKEINTRESOURCEW(IDC_ARROW));klass.hbrBackground=reinterpret_cast<HBRUSH>(COLOR_WINDOW+1);klass.lpszClassName=L"ecompiler_window_form";RegisterClassW(&klass);
+    WNDCLASSEXW klass{};klass.cbSize=sizeof(klass);klass.hInstance=instance;klass.lpfnWndProc=FormProc;klass.hCursor=LoadCursorW(nullptr,MAKEINTRESOURCEW(IDC_ARROW));klass.hbrBackground=reinterpret_cast<HBRUSH>(COLOR_WINDOW+1);klass.lpszClassName=L"ecompiler_window_form";
+    klass.hIcon=static_cast<HICON>(LoadImageW(instance,MAKEINTRESOURCEW(101),IMAGE_ICON,GetSystemMetrics(SM_CXICON),GetSystemMetrics(SM_CYICON),LR_SHARED));
+    klass.hIconSm=static_cast<HICON>(LoadImageW(instance,MAKEINTRESOURCEW(101),IMAGE_ICON,GetSystemMetrics(SM_CXSMICON),GetSystemMetrics(SM_CYSMICON),LR_SHARED));RegisterClassExW(&klass);
     WNDCLASSW containerClass{};containerClass.hInstance=instance;containerClass.lpfnWndProc=ContainerProc;containerClass.hCursor=LoadCursorW(nullptr,MAKEINTRESOURCEW(IDC_ARROW));containerClass.lpszClassName=L"ecompiler_window_container";RegisterClassW(&containerClass);
 )CPP";
 		for (const auto& form : program_.windows) {

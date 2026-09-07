@@ -255,6 +255,39 @@ e-packager update MyApp\ --add-audio D:\res\notify.wav
 e-packager update MyApp\ --add-image 启动画面=D:\res\splash.bin
 ```
 
+### 直接编译的图标与属性
+
+`semantic` 编译支持 x86/x64 的 EXE 图标、文件属性，以及 DLL 版本资源。在拆包目录中创建 `project/executable.json`：
+
+```json
+{
+  "icon": "../assets/app.ico",
+  "fileDescription": "程序说明",
+  "productName": "产品名称",
+  "companyName": "开发者或公司名称",
+  "author": "作者",
+  "legalCopyright": "Copyright (C) 2026 作者",
+  "fileVersion": "1.0.0.0",
+  "productVersion": "1.0.0.0"
+}
+```
+
+所有字段可省略。JSON 使用 UTF-8（允许 BOM），`icon` 相对于配置文件解析。ICO 可包含 16、32、48、256 像素等多个尺寸。版本接受一至四段数字，补齐为四段，每段范围为 `0–65535`。
+
+```powershell
+# 自动读取 MyApp/project/executable.json
+e-packager compile MyApp MyApp.exe --arch x64
+
+# 替换默认配置，并覆盖配置内的图标；也适用于直接编译 .e
+e-packager compile MyApp.e MyApp.exe --exe-config release.json --icon assets/app.ico
+```
+
+`--exe-config` 替换整个默认配置，不与其合并；`--icon` 优先于配置文件。命令行路径相对于当前工作目录。未配置图标时继承原工程已保存的图标；未配置产品名称、文件描述及版本时继承工程名称和版本，缺少工程版本时使用 `1.0.0.0`。公司、作者和版权不自动推断。`OriginalFilename` 自动使用输出文件名。
+
+`author` 写入自定义 `Author` 字段，Windows 资源管理器不保证显示；建议用 `companyName` 展示开发者。此配置不提供数字签名，也不改变签名中的发布者。窗口默认加载 EXE 的大小图标，窗口自身显式设置的图标优先。
+
+配置只用于直接编译，不写回 `.e`，目录 `update` 会保留此文件。传统 `legacy-blackmoon` 不读取该配置，并拒绝新命令行参数。无配置的工程仍可编译。非法字段、版本、图标或资源编译错误会导致编译失败；资源编译日志保存在输出目录的 `<名称>.resources.log` 中。
+
 ### 实用工具
 
 ```bash

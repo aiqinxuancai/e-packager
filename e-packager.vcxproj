@@ -165,6 +165,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="src\compiler\ExecutableResourceBuilder.cpp" />
     <ClCompile Include="src\AutoLinkerCompileCheck.cpp" />
     <ClCompile Include="src\BundlePathUtils.cpp" />
     <ClCompile Include="src\DependencyDownloader.cpp" />
@@ -196,6 +197,7 @@
     <ClCompile Include="src\SupportLibraryPublicInfo.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\compiler\ExecutableResourceBuilder.h" />
     <ClInclude Include="src\AutoLinkerCompileCheck.h" />
     <ClInclude Include="src\BundlePathUtils.h" />
     <ClInclude Include="src\DependencyDownloader.h" />

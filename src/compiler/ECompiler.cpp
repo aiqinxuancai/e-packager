@@ -3,6 +3,7 @@
 #include "BlackMoonCompiler.h"
 #include "CompilerModel.h"
 #include "CppEmitter.h"
+#include "ExecutableResourceBuilder.h"
 #include "../PathHelper.h"
 #include "../e2txt.h"
 #include "../EFolderCodec.h"
@@ -1209,6 +1210,12 @@ bool Compile(
 			? CompileMode::LegacyBlackMoon : CompileMode::Semantic;
 	}
 	if (effectiveCompileMode == CompileMode::LegacyBlackMoon) {
+		if (!options.executableConfigPath.empty() || !options.iconPath.empty()) {
+			result = {};
+			result.outputPath = outputPath;
+			result.message = "legacy_blackmoon_does_not_support_executable_resources_options";
+			return false;
+		}
 		if (targetArchitecture != TargetArchitecture::X86) {
 			result = {};
 			result.outputPath = outputPath;
@@ -1319,6 +1326,33 @@ bool Compile(
 	std::filesystem::create_directories(outputDirectory, filesystemError);
 	if (filesystemError) {
 		result.message = "create_output_directory_failed:" + filesystemError.message();
+		return false;
+	}
+	std::filesystem::path executableConfig = options.executableConfigPath;
+	if (executableConfig.empty() && std::filesystem::is_directory(inputPath)) {
+		const auto candidate = inputPath / L"project" / L"executable.json";
+		if (std::filesystem::exists(candidate)) executableConfig = candidate;
+	}
+	ExecutableResources executableResources;
+	if (!PrepareExecutableResources(program.bundle, executableConfig, options.iconPath,
+		outputPath, program.buildDll, executableResources, error)) {
+		result.message = error;
+		return false;
+	}
+	if (!IsRegularFile(resourceCompiler)) {
+		result.message = "windows_sdk_resource_compiler_not_found:" + PathToUtf8(resourceCompiler);
+		return false;
+	}
+	const auto resourceLog = outputDirectory / (outputPath.stem().wstring() + L".resources.log");
+	std::string resourceOutput;
+	if (!RunProcess(resourceCompiler, { L"/nologo", L"/c65001", L"/fo",
+		Quote(executableResources.resourcePath), Quote(executableResources.scriptPath) },
+		outputDirectory, resourceLog, resourceOutput, error)) {
+		result.message = "resource_compile_failed:" + error;
+		return false;
+	}
+	if (!IsRegularFile(executableResources.resourcePath)) {
+		result.message = "resource_compiler_reported_success_without_output";
 		return false;
 	}
 	result.sourcePath = outputPath;
@@ -1525,12 +1559,7 @@ bool Compile(
 		}
 		linkerArguments.push_back(L"/DEF:" + Quote(definitionPath));
 	}
-	if (!program.buildDll) {
-		if (!IsRegularFile(resourceCompiler)) {
-			result.message = "windows_sdk_resource_compiler_not_found:" + PathToUtf8(resourceCompiler);
-			return false;
-		}
-	}
+	linkerArguments.push_back(Quote(executableResources.resourcePath));
 	for (const auto& directory : systemLibraryDirectories) linkerArguments.push_back(L"/LIBPATH:" + Quote(directory));
 	// Legacy FNE archives carry default-library directives such as LIBCIMT and
 	// DAOUUID.  Their companion archives live beside the EasyLanguage runtime,
@@ -1568,6 +1597,9 @@ bool Compile(
 		return false;
 	}
 	if (!options.keepObject) {
+		std::filesystem::remove(executableResources.scriptPath, filesystemError);
+		std::filesystem::remove(executableResources.resourcePath, filesystemError);
+		if (!executableResources.iconPath.empty()) std::filesystem::remove(executableResources.iconPath, filesystemError);
 		std::filesystem::remove(result.objectPath, filesystemError);
 		filesystemError.clear();
 		std::filesystem::remove(result.sourcePath, filesystemError);

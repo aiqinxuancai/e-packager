@@ -39,6 +39,10 @@ enum class BlackMoonMode {
 
 // 独立源码编译选项。编译器和链接器均可显式覆盖；semantic 支持 x86/x64。
 struct Options {
+	// 独立 EXE 属性配置；目录输入默认读取 project/executable.json。
+	std::filesystem::path executableConfigPath;
+	// 显式图标覆盖，优先于配置文件及原工程图标。
+	std::filesystem::path iconPath;
 	// MSVC 版本根目录（包含 bin/include/lib）；留空时自动发现。
 	std::filesystem::path vcToolsDirectory;
 	// Windows Kits 根目录（包含 Include/Lib/bin）；留空时自动发现。

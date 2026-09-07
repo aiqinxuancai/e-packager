@@ -2766,6 +2766,7 @@ void PrintUsage()
 	std::cout << Utf8Literal(u8"       --compile-check [--eide <e.exe>] [--compile-target auto|win_exe|win_console_exe|win_dll|ecom] [--compile-static] [--compile-timeout <seconds>]") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager validate <input-dir> [--diagnostics text|json]  # 快速检查声明、基础语法和可确定的类型错误") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager compile <input.e|input-dir> <output.exe|output.dll> [--diagnostics text|json] [--compile-mode semantic|legacy-blackmoon|blackmoon] [--arch host|x86|x64] [--subsystem auto|console|windows] [--legacy-blackmoon-mode asm|cpp|mfc] [--dll] [--define <macro>]... [--vc-tools-dir <dir>] [--windows-sdk-dir <dir>] [--compiler <cl.exe>] [--linker <link.exe>] [--e-dir <易语言目录>] [--eide <e.exe>] [--legacy-blackmoon-dir <dir>] [--legacy-blackmoon-linker <LINK.EXE>] [--blackmoon-core-dir <dir>] [--blackmoon-x86-dir <dir>] [--blackmoon-x64-dir <dir>] [--x86-decoder <e-packager.exe>] [--blackmoon-timeout <seconds>]  # 默认 semantic；窗口工程自动使用 Windows 子系统") << std::endl;
+	std::cout << Utf8Literal(u8"       [--exe-config <json>] [--icon <ico>]  # semantic 专用；目录默认读取 project/executable.json") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager compile-check <input.e|input.ec> [--eide <e.exe>] [--compile-target ...] [--compile-static] [--compile-timeout <seconds>]  # 直接启动 IDE 执行权威无头编译") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager update <input-dir> [--add-ecom <file.ec>]... [--add-elib <name|file.fne>]... [--add-image <file|name=file>]... [--add-audio <file|name=file>]...   # 刷新派生内容并新增资源") << std::endl;
 #if defined(_M_X64)
@@ -2889,6 +2890,18 @@ int RunCommand(int argc, char* argv[])
 		};
 		for (int index = 4; index < argc; ++index) {
 			const std::string option = argv[index];
+			if ((option == "--exe-config" || option == "--icon") && index + 1 < argc) {
+				auto& path = option == "--exe-config" ? options.executableConfigPath : options.iconPath;
+				path = ResolveAbsolutePath(std::filesystem::path(argv[++index]));
+				continue;
+			}
+			if (option.rfind("--exe-config=", 0) == 0 || option.rfind("--icon=", 0) == 0) {
+				const auto value = option.substr(option.find('=') + 1);
+				if (value.empty()) { PrintUsage(); return EXIT_FAILURE; }
+				auto& path = option.rfind("--exe-config=", 0) == 0 ? options.executableConfigPath : options.iconPath;
+				path = ResolveAbsolutePath(std::filesystem::path(value));
+				continue;
+			}
 			if (option == "--diagnostics" && index + 1 < argc) {
 				if (!ParseDiagnosticOutputFormat(argv[++index], diagnosticFormat)) {
 					PrintUsage();

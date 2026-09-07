@@ -1447,7 +1447,7 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 		std::filesystem::remove(GetNativeSourceMapPath(root), removeEc);
 	}
 
-	if (!bundle.nativeGlobalSnapshots.empty() ||
+	if (bundle.nativeProgramHeader.has_value() || !bundle.nativeGlobalSnapshots.empty() ||
 		!bundle.nativeStructSnapshots.empty() ||
 		!bundle.nativeDllSnapshots.empty() ||
 		!bundle.nativeConstantSnapshots.empty()) {
