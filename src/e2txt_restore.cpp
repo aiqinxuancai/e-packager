@@ -4765,13 +4765,14 @@ void WriteNativeCallHeader(
 	ByteWriter& writer,
 	const std::int32_t methodId,
 	const std::int16_t libraryId,
-	const std::int16_t flags)
+	const std::int16_t flags,
+	const std::string& comment = {})
 {
 	writer.WriteI32(methodId);
 	writer.WriteI16(libraryId);
 	writer.WriteI16(flags);
 	writer.WriteBStr(std::nullopt);
-	writer.WriteBStr(std::nullopt);
+	writer.WriteBStr(comment.empty() ? std::nullopt : std::make_optional(comment));
 }
 
 std::string StripOuterParentheses(std::string expression)
@@ -5445,7 +5446,7 @@ bool TryEncodeNativeObjectMethodCallLine(
 
 	ByteWriter writer;
 	writer.WriteU8(0x6A);
-	WriteNativeCallHeader(writer, methodSymbol.methodId, methodSymbol.libraryId, static_cast<std::int16_t>(statement.mask ? 0x20 : 0));
+	WriteNativeCallHeader(writer, methodSymbol.methodId, methodSymbol.libraryId, static_cast<std::int16_t>(statement.mask ? 0x20 : 0), statement.fixedComment);
 	if (methodSymbol.libraryId == -2 || methodSymbol.libraryId == -3) {
 		outExpression.methodReferences.push_back(0);
 	}
@@ -5516,7 +5517,7 @@ bool TryEncodeNativeFunctionCallStatementLine(
 		outExpression.methodReferences.push_back(callOffset);
 	}
 	writer.WriteU8(0x6A);
-	WriteNativeCallHeader(writer, functionSymbol.methodId, functionSymbol.libraryId, static_cast<std::int16_t>(statement.mask ? 0x20 : 0));
+	WriteNativeCallHeader(writer, functionSymbol.methodId, functionSymbol.libraryId, static_cast<std::int16_t>(statement.mask ? 0x20 : 0), statement.fixedComment);
 	writer.WriteU8(0x36);
 	const bool needsDefaultReturnValue =
 		functionSymbol.libraryId == 0 &&
@@ -5573,7 +5574,7 @@ bool TryEncodeNativeAssignmentLine(
 
 	ByteWriter writer;
 	writer.WriteU8(0x6A);
-	WriteNativeCallHeader(writer, 52, 0, static_cast<std::int16_t>(statement.mask ? 0x20 : 0));
+	WriteNativeCallHeader(writer, 52, 0, static_cast<std::int16_t>(statement.mask ? 0x20 : 0), statement.fixedComment);
 	writer.WriteU8(0x36);
 	std::string expressionError;
 	if (!TryEncodeNativeExpression(leftExpression, context, writer, outExpression.methodReferences, outExpression.variableReferences, outExpression.constantReferences, &expressionError)) {
@@ -5595,11 +5596,36 @@ bool TryEncodeNativeAssignmentLine(
 }
 
 bool TryEncodeNativeRawStatementLine(
-	const BodyStatement& statement,
+	const BodyStatement& sourceStatement,
 	const NativeObjectMethodEncodeContext& context,
 	EncodedNativeExpression& outExpression,
 	std::string* outError = nullptr)
 {
+	// 只在语义编码入口拆分注释，原始代码仍用于原生快照比较和未检查行输出。
+	BodyStatement statement = sourceStatement;
+	bool inChineseQuote = false;
+	bool inAsciiQuote = false;
+	for (size_t index = 0; index < statement.code.size(); ++index) {
+		size_t quoteLength = 0;
+		if (!inAsciiQuote && TryGetNativeTextQuoteLength(statement.code, index, quoteLength)) {
+			inChineseQuote = !inChineseQuote;
+			index += quoteLength - 1;
+			continue;
+		}
+		if (!inChineseQuote && statement.code[index] == '"') {
+			inAsciiQuote = !inAsciiQuote;
+			continue;
+		}
+		if (!inChineseQuote && !inAsciiQuote && statement.code[index] == '\'') {
+			statement.fixedComment = statement.code.substr(index + 1);
+			if (!statement.fixedComment.empty() && statement.fixedComment.front() == ' ') {
+				statement.fixedComment.erase(0, 1);
+			}
+			statement.code = TrimRightAsciiCopy(statement.code.substr(0, index));
+			break;
+		}
+	}
+
 	std::string lastError;
 	std::string objectCallError;
 	std::string assignmentError;
@@ -9050,6 +9076,14 @@ bool CanReuseNativeBytesForSemanticEquivalentSources(
 		ComputeBundleDigestWithoutSourceFiles(originalBundle)) {
 		return false;
 	}
+	// Native method snapshots are only safe when the source text itself is
+	// unchanged.  The semantic-shape digest intentionally ignores some
+	// statement details (including comments); using it as the sole reuse gate
+	// can therefore return an old native method body after an edited source
+	// line such as `返回 (0)  ' comment` has been added or changed.
+	if (ComputeBundleDigest(bundle) != ComputeBundleDigest(originalBundle)) {
+		return false;
+	}
 
 	std::unordered_set<std::string> formNames;
 	for (const auto& form : document.formXmls) {
@@ -11073,12 +11107,15 @@ bool BuildRestoreModel(
 			const bool methodTextUnchanged =
 				originalParsedMethod != nullptr &&
 				AreParsedMethodsTextuallyEquivalent(parsedMethod, *originalParsedMethod);
-			if (reusableNativeMethodSnapshot != nullptr ||
+			if ((reusableNativeMethodSnapshot != nullptr && methodTextUnchanged) ||
 				(canReuseIdentityNativeMethodSnapshot &&
 					methodTextUnchanged) ||
-				(preferNativeMethodSnapshots && identityNativeMethodSnapshot != nullptr)) {
+				(preferNativeMethodSnapshots && identityNativeMethodSnapshot != nullptr &&
+					methodTextUnchanged)) {
 				const BundleNativeMethodSnapshot* nativeMethodSnapshot =
-					reusableNativeMethodSnapshot != nullptr ? reusableNativeMethodSnapshot : identityNativeMethodSnapshot;
+					(reusableNativeMethodSnapshot != nullptr && methodTextUnchanged)
+						? reusableNativeMethodSnapshot
+						: identityNativeMethodSnapshot;
 				method.lineOffset = nativeMethodSnapshot->lineOffset;
 				method.blockOffset = nativeMethodSnapshot->blockOffset;
 				method.methodReference = nativeMethodSnapshot->methodReference;
@@ -13260,10 +13297,35 @@ bool RestoreBundleToBytesInternal(
 		outBytes = bundle.nativeSourceBytes;
 		return true;
 	}
+	// Once source text differs from the native snapshot, do not let any of the
+	// per-method/per-line reuse machinery silently carry stale executable data
+	// into the rebuilt module.  In particular, a changed trailing comment can
+	// make the semantic shape look unchanged while the corresponding native
+	// line segment is absent or no longer valid.
+	ProjectBundle restoreBundle = bundle;
+	const bool sourceTextMatchesNativeSnapshot =
+		originalBundlePtr != nullptr &&
+		ComputeBundleDigest(bundle) == ComputeBundleDigest(*originalBundlePtr);
+	if (!sourceTextMatchesNativeSnapshot) {
+		restoreBundle.nativeSourceBytes.clear();
+		restoreBundle.nativeBundleDigest.clear();
+		restoreBundle.nativeSourceSnapshots.clear();
+		restoreBundle.nativeProgramHeader.reset();
+		restoreBundle.nativeGlobalSnapshots.clear();
+		restoreBundle.nativeStructSnapshots.clear();
+		restoreBundle.nativeDllSnapshots.clear();
+		restoreBundle.nativeConstantSnapshots.clear();
+	}
 
 	RestoreDocumentModel model;
 	try {
-		if (!BuildRestoreModel(document, &bundle, model, outError, originalBundlePtr, preferNativeMethodSnapshots)) {
+		if (!BuildRestoreModel(
+			document,
+			&restoreBundle,
+			model,
+			outError,
+			sourceTextMatchesNativeSnapshot ? originalBundlePtr : nullptr,
+			sourceTextMatchesNativeSnapshot ? preferNativeMethodSnapshots : false)) {
 			return false;
 		}
 	}
@@ -13276,15 +13338,21 @@ bool RestoreBundleToBytesInternal(
 
 	std::vector<NativeSectionSnapshot> originalSections;
 	std::vector<NativeSectionSnapshot>* originalSectionsPtr = nullptr;
-	if (!bundle.nativeSourceBytes.empty()) {
+	if (!restoreBundle.nativeSourceBytes.empty()) {
 		std::string ignoredError;
-		if (CaptureNativeSectionSnapshots(bundle.nativeSourceBytes, originalSections, &ignoredError)) {
+		if (CaptureNativeSectionSnapshots(restoreBundle.nativeSourceBytes, originalSections, &ignoredError)) {
 			originalSectionsPtr = &originalSections;
 		}
 	}
 
 	try {
-		return SerializeToModuleBytes(model, outBytes, outError, &bundle, originalBundlePtr, originalSectionsPtr);
+		return SerializeToModuleBytes(
+			model,
+			outBytes,
+			outError,
+			&restoreBundle,
+			sourceTextMatchesNativeSnapshot ? originalBundlePtr : nullptr,
+			originalSectionsPtr);
 	}
 	catch (const std::exception& ex) {
 		if (outError != nullptr) {
