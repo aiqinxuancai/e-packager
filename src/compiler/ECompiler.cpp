@@ -1412,7 +1412,13 @@ bool Compile(
 		? productRoot / L"static_lib" : coreRoots.staticLibraryDirectory;
 	const bool useLegacyX86Runtime = !targetX64 && !usesModernCoreAdapter;
 	std::filesystem::path vc6RuntimeLibrary = productRoot / L"linker" / L"VC6linker" / L"Lib" / L"MSVCRT.LIB";
-	std::filesystem::path mfcLibrary = vcLibrary / L"NAFXCW.LIB";
+	// Modern MSVC installs the VC6-compatible MFC import library under
+	// `atlmfc\lib\<arch>`, beside (rather than inside) `lib\<arch>`.
+	// Keep the path explicit because LINK does not search atlmfc implicitly.
+	const std::filesystem::path vcToolsRoot = vcLibrary.parent_path().parent_path();
+	const std::filesystem::path mfcLibraryDirectory = vcToolsRoot / L"atlmfc" / L"lib" /
+		(targetArchitecture == TargetArchitecture::X64 ? L"x64" : L"x86");
+	std::filesystem::path mfcLibrary = mfcLibraryDirectory / L"NAFXCW.LIB";
 	if (useLegacyX86Runtime && !options.eDirectory.empty()) {
 		const std::filesystem::path eRoot = AbsolutePath(options.eDirectory);
 		const std::vector<std::pair<std::filesystem::path, std::filesystem::path>> legacyCandidates = {
@@ -1561,6 +1567,9 @@ bool Compile(
 	}
 	linkerArguments.push_back(Quote(executableResources.resourcePath));
 	for (const auto& directory : systemLibraryDirectories) linkerArguments.push_back(L"/LIBPATH:" + Quote(directory));
+	if (useLegacyX86Runtime && std::filesystem::is_directory(mfcLibraryDirectory)) {
+		linkerArguments.push_back(L"/LIBPATH:" + Quote(mfcLibraryDirectory));
+	}
 	// Legacy FNE archives carry default-library directives such as LIBCIMT and
 	// DAOUUID.  Their companion archives live beside the EasyLanguage runtime,
 	// so expose every validated dependency directory to LINK as well.
