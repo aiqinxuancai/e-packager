@@ -4153,10 +4153,17 @@ std::string NormalizeNativeOperatorSyntaxForParsing(const std::string& text)
 		std::string_view target;
 		bool needsWordBoundary = false;
 	};
-	constexpr std::array<OperatorAlias, 12> kAliases = {
+	constexpr std::array<OperatorAlias, 19> kAliases = {
 		OperatorAlias{ "≠", "!=" },
 		{ "≤", "<=" },
 		{ "≥", ">=" },
+		{ "<>", "!=" },
+		{ "％", "%" },
+		{ "!=", "!=" },
+		{ "<=", "<=" },
+		{ ">=", ">=" },
+		{ "==", "==" },
+		{ "=", "==" },
 		{ "＝", "==" },
 		{ "＜", "<" },
 		{ "＞", ">" },
@@ -4401,6 +4408,7 @@ bool SplitNativeObjectCallArguments(const std::string& text, std::vector<std::st
 	}
 	std::string current;
 	int parenDepth = 0;
+	int braceDepth = 0;
 	bool inChineseQuote = false;
 	bool inAsciiQuote = false;
 	for (size_t index = 0; index < text.size(); ++index) {
@@ -4423,7 +4431,13 @@ bool SplitNativeObjectCallArguments(const std::string& text, std::vector<std::st
 			else if (text[index] == ')' && parenDepth > 0) {
 				--parenDepth;
 			}
-			else if (text[index] == ',' && parenDepth == 0) {
+			else if (text[index] == '{') {
+				++braceDepth;
+			}
+			else if (text[index] == '}' && braceDepth > 0) {
+				--braceDepth;
+			}
+			else if (text[index] == ',' && parenDepth == 0 && braceDepth == 0) {
 				outArgs.push_back(TrimAsciiCopy(current));
 				current.clear();
 				continue;
@@ -4432,7 +4446,7 @@ bool SplitNativeObjectCallArguments(const std::string& text, std::vector<std::st
 		current.push_back(text[index]);
 	}
 	outArgs.push_back(TrimAsciiCopy(current));
-	return !inChineseQuote && !inAsciiQuote && parenDepth == 0;
+	return !inChineseQuote && !inAsciiQuote && parenDepth == 0 && braceDepth == 0;
 }
 
 bool ParseNativeObjectCallLine(const std::string& code, ParsedNativeObjectCallLine& outCall)
