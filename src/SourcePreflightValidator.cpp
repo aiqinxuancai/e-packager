@@ -1,6 +1,7 @@
 ﻿#include "SourcePreflightValidator.h"
 
 #include <Windows.h>
+#include "SourceExpressionParser.h"
 
 #include <algorithm>
 #include <array>
@@ -1190,7 +1191,7 @@ void ValidateProgramPage(
 	MethodState method;
 	for (size_t index = 0; index < lines.size(); ++index) {
 		const size_t lineNumber = index + 1;
-		std::string line = TrimAsciiCopy(lines[index]);
+		std::string line = NormalizeSourceParentheses(TrimAsciiCopy(lines[index]));
 		if (line.empty()) {
 			continue;
 		}

@@ -203,11 +203,11 @@ bool ReadUtf8TextFile(const std::filesystem::path& path, std::string& outText)
 	}
 
 	size_t offset = 0;
-	if (bytes.size() >= 3 &&
-		bytes[0] == kUtf8Bom[0] &&
-		bytes[1] == kUtf8Bom[1] &&
-		bytes[2] == kUtf8Bom[2]) {
-		offset = 3;
+	while (bytes.size() - offset >= 3 &&
+		bytes[offset] == kUtf8Bom[0] &&
+		bytes[offset + 1] == kUtf8Bom[1] &&
+		bytes[offset + 2] == kUtf8Bom[2]) {
+		offset += 3;
 	}
 	outText.assign(reinterpret_cast<const char*>(bytes.data() + offset), bytes.size() - offset);
 	return true;

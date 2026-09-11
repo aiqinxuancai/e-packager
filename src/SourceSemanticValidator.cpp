@@ -75,6 +75,7 @@ struct Callable {
 
 struct TypeSymbol {
 	TypeInfo type;
+	std::string baseType;
 	bool enumeration = false;
 	std::unordered_map<std::string, Symbol> members;
 	std::unordered_map<std::string, std::vector<Callable>> methods;
@@ -92,6 +93,7 @@ struct ProgramSource {
 	std::string path;
 	std::vector<std::string> lines;
 	std::string assemblyName;
+	std::string baseType;
 	bool hasFormBinding = false;
 	bool formSymbolsComplete = false;
 	std::string formBaseType;
@@ -577,6 +579,7 @@ void CollectProgramSource(const BundleSourceFile& file, SemanticModel& model)
 		if (MatchDirective(line, "程序集", &rest)) {
 			const ParsedDeclaration declaration = SplitFields(rest);
 			program.assemblyName = Field(declaration, 0);
+			program.baseType = Field(declaration, 1);
 			continue;
 		}
 		if (MatchDirective(line, "程序集变量", &rest)) {
@@ -624,6 +627,7 @@ void CollectProgramSource(const BundleSourceFile& file, SemanticModel& model)
 	if (!program.assemblyName.empty()) {
 		TypeSymbol& classType = model.types[program.assemblyName];
 		classType.type = TypeInfo { .name = program.assemblyName };
+		classType.baseType = program.baseType;
 		for (const auto& [name, symbol] : program.classSymbols) classType.members.emplace(name, symbol);
 		for (const MethodSymbol& method : program.methods) {
 			if (!method.callable.name.empty()) classType.methods[method.callable.name].push_back(method.callable);
@@ -847,7 +851,10 @@ void ParseEcomHeader(const std::string& text, SemanticModel& model)
 		if (MatchDirective(line, "程序集", &rest)) {
 			const ParsedDeclaration declaration = SplitFields(rest);
 			currentType = Field(declaration, 0);
-			if (!currentType.empty()) model.types[currentType].type = TypeInfo { .name = currentType };
+			if (!currentType.empty()) {
+				model.types[currentType].type = TypeInfo { .name = currentType };
+				model.types[currentType].baseType = Field(declaration, 1);
+			}
 			current = nullptr;
 			continue;
 		}
@@ -969,6 +976,22 @@ EvaluatedExpression EvaluateExpression(
 	const EvaluationContext& context,
 	SourcePreflightReport& report);
 
+const TypeSymbol* FindMemberOwner(const std::string& typeName, const std::string& memberName,
+	const SemanticModel& model, const bool method)
+{
+	std::unordered_set<std::string> visited;
+	std::string current = typeName;
+	while (!current.empty() && visited.insert(current).second) {
+		const auto it = model.types.find(current);
+		if (it == model.types.end()) return nullptr;
+		if (method ? it->second.methods.contains(memberName) : it->second.members.contains(memberName)) {
+			return &it->second;
+		}
+		current = it->second.baseType;
+	}
+	return nullptr;
+}
+
 std::vector<const Callable*> FindCallableCandidates(
 	const std::string& name,
 	const EvaluationContext& context,
@@ -976,10 +999,8 @@ std::vector<const Callable*> FindCallableCandidates(
 {
 	std::vector<const Callable*> result;
 	if (!ownerType.empty()) {
-		if (const auto typeIt = context.model.types.find(ownerType); typeIt != context.model.types.end()) {
-			if (const auto methodIt = typeIt->second.methods.find(name); methodIt != typeIt->second.methods.end()) {
-				for (const Callable& callable : methodIt->second) result.push_back(&callable);
-			}
+		if (const auto* owner = FindMemberOwner(ownerType, name, context.model, true)) {
+			for (const Callable& callable : owner->methods.at(name)) result.push_back(&callable);
 		}
 		if (const auto sharedIt = context.model.memberFunctions.find(name); sharedIt != context.model.memberFunctions.end()) {
 			for (const Callable& callable : sharedIt->second) result.push_back(&callable);
@@ -1084,6 +1105,7 @@ EvaluatedExpression EvaluateCall(
 	const SourceExpressionNode& callee = *node.children.front();
 	std::string name;
 	std::string ownerType;
+	std::string receiverName;
 	if (callee.kind == SourceExpressionKind::Name) {
 		name = callee.text;
 	}
@@ -1094,12 +1116,14 @@ EvaluatedExpression EvaluateCall(
 		if (callee.children.front()->kind == SourceExpressionKind::Name &&
 			context.model.types.contains(callee.children.front()->text)) {
 			ownerType = callee.children.front()->text;
+			receiverName = ownerType;
 		}
 		else {
 			const EvaluatedExpression receiver = EvaluateExpression(*callee.children.front(), context, report);
 			if (receiver.state == ResolveState::Invalid) return receiver;
 			if (receiver.state == ResolveState::Unknown) return { ResolveState::Unknown, {}, false, name };
 			ownerType = receiver.type.name;
+			receiverName = receiver.name;
 		}
 	}
 	else {
@@ -1112,7 +1136,9 @@ EvaluatedExpression EvaluateCall(
 			return { ResolveState::Invalid, {}, false, name };
 		}
 		if (!ownerType.empty() && context.model.types.contains(ownerType)) {
-			AddSemanticError(report, context.path, context.line, "member_not_found", "the object type has no member command with this name");
+			AddSemanticError(report, context.path, context.line, "member_not_found",
+				"the object type has no member command with this name: member=" + LocalTextToUtf8(name) +
+				", owner_type=" + LocalTextToUtf8(ownerType) + ", receiver=" + LocalTextToUtf8(receiverName));
 			return { ResolveState::Invalid, {}, false, name };
 		}
 		if (ownerType.empty() && context.model.externalMetadataComplete) {
@@ -1326,7 +1352,9 @@ EvaluatedExpression EvaluateExpression(
 			const std::string typeName = node.children.front()->text.substr(1);
 			if (const auto typeIt = context.model.types.find(typeName); typeIt != context.model.types.end()) {
 				if (const auto memberIt = typeIt->second.members.find(node.text); memberIt != typeIt->second.members.end()) return { ResolveState::Valid, memberIt->second.type, false, node.text };
-				AddSemanticError(report, context.path, context.line, "member_not_found", "the published enum or data type has no member with this name");
+				AddSemanticError(report, context.path, context.line, "member_not_found",
+					"the published enum or data type has no member with this name: member=" + LocalTextToUtf8(node.text) +
+					", owner_type=" + LocalTextToUtf8(typeName) + ", receiver=" + LocalTextToUtf8(node.children.front()->text));
 				return { ResolveState::Invalid, {}, false, node.text };
 			}
 		}
@@ -1334,9 +1362,14 @@ EvaluatedExpression EvaluateExpression(
 		if (base.state != ResolveState::Valid) return base;
 		const auto typeIt = context.model.types.find(base.type.name);
 		if (typeIt == context.model.types.end()) return { ResolveState::Unknown, {}, false, node.text };
-		if (const auto memberIt = typeIt->second.members.find(node.text); memberIt != typeIt->second.members.end()) return { ResolveState::Valid, memberIt->second.type, memberIt->second.lvalue, node.text };
-		if (typeIt->second.methods.contains(node.text)) return { ResolveState::Valid, TypeInfo {}, false, node.text };
-		AddSemanticError(report, context.path, context.line, "member_not_found", "the object type has no member with this name");
+		if (const auto* owner = FindMemberOwner(base.type.name, node.text, context.model, false)) {
+			const auto& member = owner->members.at(node.text);
+			return { ResolveState::Valid, member.type, member.lvalue, node.text };
+		}
+		if (FindMemberOwner(base.type.name, node.text, context.model, true)) return { ResolveState::Valid, TypeInfo {}, false, node.text };
+		AddSemanticError(report, context.path, context.line, "member_not_found",
+			"the object type has no member with this name: member=" + LocalTextToUtf8(node.text) +
+			", owner_type=" + LocalTextToUtf8(base.type.name) + ", receiver=" + LocalTextToUtf8(base.name));
 		return { ResolveState::Invalid, {}, false, node.text };
 	}
 	case SourceExpressionKind::Unary: {
@@ -1656,7 +1689,7 @@ void ValidateMethodBody(
 			++commentedCountLoopStarts;
 			continue;
 		}
-		const std::string code = Trim(StripComment(program.lines[index - 1]));
+		const std::string code = NormalizeSourceParentheses(Trim(StripComment(program.lines[index - 1])));
 		if (code.empty() || StartsWith(code, "'") || code == ".版本 2") continue;
 		EvaluationContext context { .model = model, .program = program, .method = method, .flows = &flows, .path = program.path, .line = index };
 		if (code.front() == '.') {

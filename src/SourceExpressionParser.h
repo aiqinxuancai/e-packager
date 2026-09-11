@@ -44,6 +44,9 @@ struct SourceExpressionParseResult {
 // 解析易语言表达式，支持调用、成员访问、数组下标、字面量和常见运算符。
 SourceExpressionParseResult ParseSourceExpression(const std::string& text);
 
+// 统一源码中的全角圆括号，保留字符串与注释内容；输入为本地编码。
+std::string NormalizeSourceParentheses(const std::string& text);
+
 // 在不进入文本字面量、括号、数组和字节集常量时查找顶层赋值号。
 bool FindSourceTopLevelAssignment(
 	const std::string& text,

@@ -38,6 +38,7 @@ public:
 
 	bool Parse(SimpleXmlNode& outRoot, SimpleXmlParseError* outError)
 	{
+		while (StartsWith(Remaining(), "\xEF\xBB\xBF")) position_ += 3;
 		SkipWhitespace();
 		if (StartsWith(Remaining(), "<?xml")) {
 			const std::size_t end = text_.find("?>", position_);

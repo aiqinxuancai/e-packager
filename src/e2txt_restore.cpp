@@ -1,6 +1,7 @@
 ﻿#include "e2txt.h"
 
 #include <Windows.h>
+#include "SourceExpressionParser.h"
 
 #include <algorithm>
 #include <array>
@@ -2328,12 +2329,12 @@ private:
 		const LIB_INFO* libInfo = CallGetLibInfoSafely(getInfoProc);
 		if (libInfo == nullptr ||
 			!IsReadableMemoryRange(libInfo, sizeof(LIB_INFO)) ||
-			libInfo->m_nDataTypeCount <= 0 ||
+			libInfo->m_nDataTypeCount < 0 ||
 			libInfo->m_nDataTypeCount > kMaxSupportLibraryArrayCount ||
-			libInfo->m_pDataType == nullptr ||
-			!IsReadableMemoryRange(
-				libInfo->m_pDataType,
-				sizeof(LIB_DATA_TYPE_INFO) * static_cast<size_t>(libInfo->m_nDataTypeCount))) {
+			(libInfo->m_nDataTypeCount > 0 && (libInfo->m_pDataType == nullptr ||
+				!IsReadableMemoryRange(
+					libInfo->m_pDataType,
+					sizeof(LIB_DATA_TYPE_INFO) * static_cast<size_t>(libInfo->m_nDataTypeCount))))) {
 			if (tryTextWorkspaceFallback()) {
 				return;
 			}
@@ -3154,12 +3155,13 @@ bool ParseBodyBlock(
 		bool mask = false;
 		std::string code;
 		ExtractMaskPrefix(effectiveLine, mask, code);
+		code = NormalizeSourceParentheses(code);
 		const std::string trimmedCode = TrimAsciiCopy(code);
 		if (!StartsWith(trimmedCode, ".")) {
 			bool rawMask = false;
 			std::string rawCode;
 			ExtractMaskPrefixPreserveIndent(StripExpectedIndent(effectiveLine, expectedIndent), rawMask, rawCode);
-			outStatements.push_back(BodyStatement{ BodyStatementKind::Raw, rawMask, false, TrimRightAsciiCopy(rawCode) });
+			outStatements.push_back(BodyStatement{ BodyStatementKind::Raw, rawMask, false, NormalizeSourceParentheses(TrimRightAsciiCopy(rawCode)) });
 			++index;
 			continue;
 		}
@@ -4110,6 +4112,7 @@ struct NativeObjectMethodEncodeContext {
 	std::unordered_map<std::string, NativeConstantSymbol> constantsByName;
 	std::unordered_map<std::string, NativeFunctionSymbol> functionsByName;
 	std::unordered_map<std::int32_t, std::unordered_map<std::string, NativeFunctionSymbol>> methodsByOwnerType;
+	std::unordered_map<std::int32_t, std::int32_t> baseTypes;
 	const TypeResolver* typeResolver = nullptr;
 };
 
@@ -4933,20 +4936,27 @@ bool TryResolveNativeOwnerMethod(
 	NativeFunctionSymbol& outSymbol)
 {
 	const std::string methodKey = TypeResolver::NormalizeTypeName(rawName);
-	const auto ownerIt = context.methodsByOwnerType.find(ownerType);
-	if (ownerIt != context.methodsByOwnerType.end()) {
-		const auto methodIt = ownerIt->second.find(methodKey);
-		if (methodIt != ownerIt->second.end()) {
-			outSymbol = methodIt->second;
-			return true;
+	std::unordered_set<std::int32_t> visited;
+	std::int32_t currentType = ownerType;
+	while (currentType > 0 && visited.insert(currentType).second) {
+		const auto ownerIt = context.methodsByOwnerType.find(currentType);
+		if (ownerIt != context.methodsByOwnerType.end()) {
+			const auto methodIt = ownerIt->second.find(methodKey);
+			if (methodIt != ownerIt->second.end()) {
+				outSymbol = methodIt->second;
+				return true;
+			}
 		}
-	}
-	if (context.typeResolver != nullptr) {
-		SupportLibraryCommandInfo supportMethod;
-		if (context.typeResolver->TryResolveSupportTypeMethod(ownerType, rawName, supportMethod)) {
-			outSymbol = NativeFunctionSymbol{ supportMethod.libraryId, supportMethod.commandId };
-			return true;
+		if (context.typeResolver != nullptr) {
+			SupportLibraryCommandInfo supportMethod;
+			if (context.typeResolver->TryResolveSupportTypeMethod(currentType, rawName, supportMethod)) {
+				outSymbol = NativeFunctionSymbol{ supportMethod.libraryId, supportMethod.commandId };
+				return true;
+			}
 		}
+		const auto base = context.baseTypes.find(currentType);
+		if (base == context.baseTypes.end()) break;
+		currentType = base->second;
 	}
 	outSymbol = {};
 	return false;
@@ -5428,29 +5438,8 @@ bool TryEncodeNativeObjectMethodCallLine(
 		return false;
 	}
 
-	const auto ownerIt = context.methodsByOwnerType.find(targetTypeId);
-	if (ownerIt == context.methodsByOwnerType.end()) {
-		if (outError != nullptr) {
-			*outError = "owner_type_methods_missing: " + call.objectName + " type=" + std::to_string(targetTypeId);
-		}
-		return false;
-	}
-	const std::string methodKey = TypeResolver::NormalizeTypeName(call.methodName);
 	NativeFunctionSymbol methodSymbol;
-	bool hasMethodSymbol = false;
-	const auto methodIt = ownerIt->second.find(methodKey);
-	if (methodIt != ownerIt->second.end()) {
-		methodSymbol = methodIt->second;
-		hasMethodSymbol = true;
-	}
-	else if (context.typeResolver != nullptr) {
-		SupportLibraryCommandInfo supportMethod;
-		if (context.typeResolver->TryResolveSupportTypeMethod(targetTypeId, call.methodName, supportMethod)) {
-			methodSymbol = NativeFunctionSymbol{ supportMethod.libraryId, supportMethod.commandId };
-			hasMethodSymbol = true;
-		}
-	}
-	if (!hasMethodSymbol) {
+	if (!TryResolveNativeOwnerMethod(targetTypeId, call.methodName, context, methodSymbol)) {
 		if (outError != nullptr) {
 			*outError = "object_method_not_found: " + call.objectName + "." + call.methodName +
 				" type=" + std::to_string(targetTypeId);
@@ -10750,6 +10739,101 @@ bool BuildRestoreModel(
 				: allocator.Alloc(epl_system_id::kTypeConstant);
 	}
 
+	for (const auto& variable : parsedGlobals) {
+		localGlobalModelIndices.push_back(model.globals.size());
+		const auto* snapshot = findReusableGlobalSnapshot(variable);
+		RestoreVariable converted =
+			convertVariableWithId(
+				variable,
+				epl_system_id::kTypeGlobal,
+				false,
+				true,
+				std::nullopt,
+				snapshot != nullptr ? snapshot->dataType : 0);
+		if (snapshot != nullptr && snapshot->id != 0) {
+			converted.id = snapshot->id;
+		}
+		model.globals.push_back(std::move(converted));
+	}
+
+	for (size_t structIndex = 0; structIndex < parsedStructs.size(); ++structIndex) {
+		const auto& parsedStruct = parsedStructs[structIndex];
+		const BundleNativeStructSnapshot* reusableStructSnapshot =
+			structIndex < nativeStructSnapshotsByIndex.size() ? nativeStructSnapshotsByIndex[structIndex] : nullptr;
+		for (size_t memberIndex = 0; memberIndex < parsedStruct.members.size(); ++memberIndex) {
+			RestoreVariable convertedMember =
+				convertVariableWithId(
+					parsedStruct.members[memberIndex],
+					epl_system_id::kTypeStructMember,
+					false,
+					false,
+					std::nullopt,
+					reusableStructSnapshot != nullptr ? vectorTypeAt(reusableStructSnapshot->memberTypes, memberIndex) : 0);
+			if (structIndex < localStructMemberIds.size() &&
+				memberIndex < localStructMemberIds[structIndex].size() &&
+				localStructMemberIds[structIndex][memberIndex] != 0) {
+				convertedMember.id = localStructMemberIds[structIndex][memberIndex];
+			}
+			model.structs[localStructModelIndices[structIndex]].members.push_back(std::move(convertedMember));
+		}
+	}
+
+	for (const auto& parsedDll : parsedDlls) {
+		const BundleNativeDllSnapshot* reusableDllSnapshot = findReusableDllSnapshot(parsedDll);
+		RestoreDll dll;
+		dll.id =
+			reusableDllSnapshot != nullptr && reusableDllSnapshot->id != 0
+			? reusableDllSnapshot->id
+			: allocator.Alloc(epl_system_id::kTypeDll);
+		dll.memoryAddress = reusableDllSnapshot != nullptr ? reusableDllSnapshot->memoryAddress : 0;
+		dll.attr = parsedDll.isPublic ? 0x2 : 0;
+		dll.returnType =
+			reusableDllSnapshot != nullptr && reusableDllSnapshot->returnType != 0
+				? reusableDllSnapshot->returnType
+				: ensureTypeId(parsedDll.returnTypeName);
+		dll.name = parsedDll.name;
+		dll.comment = parsedDll.comment;
+		dll.fileName = parsedDll.fileName;
+		dll.commandName = parsedDll.commandName;
+		for (size_t paramIndex = 0; paramIndex < parsedDll.params.size(); ++paramIndex) {
+			RestoreVariable converted =
+				convertVariableWithId(
+					parsedDll.params[paramIndex],
+					epl_system_id::kTypeDllParameter,
+					false,
+					false,
+					std::nullopt,
+					reusableDllSnapshot != nullptr ? vectorTypeAt(reusableDllSnapshot->paramTypes, paramIndex) : 0);
+			if (reusableDllSnapshot != nullptr &&
+				paramIndex < reusableDllSnapshot->paramIds.size() &&
+				reusableDllSnapshot->paramIds[paramIndex] != 0) {
+				converted.id = reusableDllSnapshot->paramIds[paramIndex];
+			}
+			dll.params.push_back(std::move(converted));
+		}
+		localDllModelIndices.push_back(model.dlls.size());
+		model.dlls.push_back(std::move(dll));
+	}
+
+	for (size_t constantIndex = 0; constantIndex < parsedConstants.size(); ++constantIndex) {
+		const auto& parsedConstant = parsedConstants[constantIndex];
+		RestoreConstant constant;
+		constant.id =
+			constantIndex < localConstantIds.size() && localConstantIds[constantIndex] != 0
+				? localConstantIds[constantIndex]
+				: allocator.Alloc(epl_system_id::kTypeConstant);
+		constant.attr = parsedConstant.isPublic ? kConstAttrPublic : 0;
+		if (parsedConstant.isLongText) {
+			constant.attr |= kConstAttrLongText;
+		}
+		constant.name = parsedConstant.name;
+		constant.comment = parsedConstant.comment;
+		constant.valueText = parsedConstant.valueText;
+		localConstantKeys.push_back(BuildBundleItemKey("constant", parsedConstant.name, localConstantKeyCounters));
+		localConstantModelIndices.push_back(model.constants.size());
+		model.constants.push_back(std::move(constant));
+	}
+
 	// 先为所有本地方法分配稳定 ID，方法体编码才能正确解析前向调用、递归和跨页调用。
 	for (size_t classIndex = 0; classIndex < parsedClasses.size(); ++classIndex) {
 		const auto& parsedClass = parsedClasses[classIndex];
@@ -10834,6 +10918,14 @@ bool BuildRestoreModel(
 					? -1
 					: ensureTypeId(parsedClass.baseClassName));
 		}
+	}
+	// Resolve the complete inheritance graph before encoding any method;
+	// base classes can occur after their callers in the source file order.
+	for (size_t classIndex = 0; classIndex < parsedClasses.size(); ++classIndex) {
+		const auto& parsedClass = parsedClasses[classIndex];
+		const BundleNativeSourceFileSnapshot* nativeSourceSnapshot =
+			classIndex < nativeSourceSnapshotsByIndex.size() ? nativeSourceSnapshotsByIndex[classIndex] : nullptr;
+		auto& targetClass = model.classes[localClassModelIndices[classIndex]];
 		for (size_t variableIndex = 0; variableIndex < parsedClass.vars.size(); ++variableIndex) {
 			RestoreVariable variable =
 				convertVariableWithId(
@@ -10957,6 +11049,9 @@ bool BuildRestoreModel(
 			}
 			NativeObjectMethodEncodeContext nativeObjectEncodeContext;
 			nativeObjectEncodeContext.typeResolver = &resolver;
+			for (const auto& ownerClass : model.classes) {
+				nativeObjectEncodeContext.baseTypes.emplace(ownerClass.id, ownerClass.baseClass);
+			}
 			const auto addNativeObjectVariable = [&nativeObjectEncodeContext](const std::string& name, const std::int32_t id, const std::int32_t typeId) {
 				const std::string key = TypeResolver::NormalizeTypeName(name);
 				if (key.empty() || id == 0) {
@@ -11020,24 +11115,21 @@ bool BuildRestoreModel(
 			for (size_t constantIndex = 0; constantIndex < parsedConstants.size() && constantIndex < localConstantIds.size(); ++constantIndex) {
 				addNativeConstant(parsedConstants[constantIndex].name, localConstantIds[constantIndex]);
 			}
+			for (const auto& global : model.globals) {
+				addNativeObjectVariable(global.name, global.id, global.dataType);
+			}
+			for (const auto& dll : model.dlls) {
+				nativeObjectEncodeContext.functionsByName.insert_or_assign(
+					TypeResolver::NormalizeTypeName(dll.name), NativeFunctionSymbol{ -3, dll.id });
+			}
+			for (const auto& classVariable : targetClass.vars) {
+				addNativeObjectVariable(classVariable.name, classVariable.id, classVariable.dataType);
+			}
 			for (size_t paramIndex = 0; paramIndex < parsedMethod.params.size() && paramIndex < method.params.size(); ++paramIndex) {
 				addNativeObjectVariable(parsedMethod.params[paramIndex].name, method.params[paramIndex].id, method.params[paramIndex].dataType);
 			}
 			for (size_t localIndex = 0; localIndex < parsedMethod.locals.size() && localIndex < method.locals.size(); ++localIndex) {
 				addNativeObjectVariable(parsedMethod.locals[localIndex].name, method.locals[localIndex].id, method.locals[localIndex].dataType);
-			}
-			for (const auto& classVariable : targetClass.vars) {
-				addNativeObjectVariable(classVariable.name, classVariable.id, classVariable.dataType);
-			}
-			for (const auto& globalDefinition : parsedGlobals) {
-				const BundleNativeGlobalSnapshot* snapshot = peekReusableGlobalSnapshot(globalDefinition);
-				if (snapshot == nullptr || snapshot->id == 0) {
-					continue;
-				}
-				addNativeObjectVariable(
-					globalDefinition.name,
-					snapshot->id,
-					resolveTypeIdWithNativeFallback(globalDefinition.typeName, snapshot->dataType));
 			}
 			for (const auto& [formName, matchedClassIndex] : formClassMatches) {
 				if (matchedClassIndex != classIndex ||
@@ -11197,101 +11289,6 @@ bool BuildRestoreModel(
 			targetClass.functionIds.push_back(method.id);
 			model.methods.push_back(std::move(method));
 		}
-	}
-
-	for (const auto& variable : parsedGlobals) {
-		localGlobalModelIndices.push_back(model.globals.size());
-		const auto* snapshot = findReusableGlobalSnapshot(variable);
-		RestoreVariable converted =
-			convertVariableWithId(
-				variable,
-				epl_system_id::kTypeGlobal,
-				false,
-				true,
-				std::nullopt,
-				snapshot != nullptr ? snapshot->dataType : 0);
-		if (snapshot != nullptr && snapshot->id != 0) {
-			converted.id = snapshot->id;
-		}
-		model.globals.push_back(std::move(converted));
-	}
-
-	for (size_t structIndex = 0; structIndex < parsedStructs.size(); ++structIndex) {
-		const auto& parsedStruct = parsedStructs[structIndex];
-		const BundleNativeStructSnapshot* reusableStructSnapshot =
-			structIndex < nativeStructSnapshotsByIndex.size() ? nativeStructSnapshotsByIndex[structIndex] : nullptr;
-		for (size_t memberIndex = 0; memberIndex < parsedStruct.members.size(); ++memberIndex) {
-			RestoreVariable convertedMember =
-				convertVariableWithId(
-					parsedStruct.members[memberIndex],
-					epl_system_id::kTypeStructMember,
-					false,
-					false,
-					std::nullopt,
-					reusableStructSnapshot != nullptr ? vectorTypeAt(reusableStructSnapshot->memberTypes, memberIndex) : 0);
-			if (structIndex < localStructMemberIds.size() &&
-				memberIndex < localStructMemberIds[structIndex].size() &&
-				localStructMemberIds[structIndex][memberIndex] != 0) {
-				convertedMember.id = localStructMemberIds[structIndex][memberIndex];
-			}
-			model.structs[localStructModelIndices[structIndex]].members.push_back(std::move(convertedMember));
-		}
-	}
-
-	for (const auto& parsedDll : parsedDlls) {
-		const BundleNativeDllSnapshot* reusableDllSnapshot = findReusableDllSnapshot(parsedDll);
-		RestoreDll dll;
-		dll.id =
-			reusableDllSnapshot != nullptr && reusableDllSnapshot->id != 0
-			? reusableDllSnapshot->id
-			: allocator.Alloc(epl_system_id::kTypeDll);
-		dll.memoryAddress = reusableDllSnapshot != nullptr ? reusableDllSnapshot->memoryAddress : 0;
-		dll.attr = parsedDll.isPublic ? 0x2 : 0;
-		dll.returnType =
-			reusableDllSnapshot != nullptr && reusableDllSnapshot->returnType != 0
-				? reusableDllSnapshot->returnType
-				: ensureTypeId(parsedDll.returnTypeName);
-		dll.name = parsedDll.name;
-		dll.comment = parsedDll.comment;
-		dll.fileName = parsedDll.fileName;
-		dll.commandName = parsedDll.commandName;
-		for (size_t paramIndex = 0; paramIndex < parsedDll.params.size(); ++paramIndex) {
-			RestoreVariable converted =
-				convertVariableWithId(
-					parsedDll.params[paramIndex],
-					epl_system_id::kTypeDllParameter,
-					false,
-					false,
-					std::nullopt,
-					reusableDllSnapshot != nullptr ? vectorTypeAt(reusableDllSnapshot->paramTypes, paramIndex) : 0);
-			if (reusableDllSnapshot != nullptr &&
-				paramIndex < reusableDllSnapshot->paramIds.size() &&
-				reusableDllSnapshot->paramIds[paramIndex] != 0) {
-				converted.id = reusableDllSnapshot->paramIds[paramIndex];
-			}
-			dll.params.push_back(std::move(converted));
-		}
-		localDllModelIndices.push_back(model.dlls.size());
-		model.dlls.push_back(std::move(dll));
-	}
-
-	for (size_t constantIndex = 0; constantIndex < parsedConstants.size(); ++constantIndex) {
-		const auto& parsedConstant = parsedConstants[constantIndex];
-		RestoreConstant constant;
-		constant.id =
-			constantIndex < localConstantIds.size() && localConstantIds[constantIndex] != 0
-				? localConstantIds[constantIndex]
-				: allocator.Alloc(epl_system_id::kTypeConstant);
-		constant.attr = parsedConstant.isPublic ? kConstAttrPublic : 0;
-		if (parsedConstant.isLongText) {
-			constant.attr |= kConstAttrLongText;
-		}
-		constant.name = parsedConstant.name;
-		constant.comment = parsedConstant.comment;
-		constant.valueText = parsedConstant.valueText;
-		localConstantKeys.push_back(BuildBundleItemKey("constant", parsedConstant.name, localConstantKeyCounters));
-		localConstantModelIndices.push_back(model.constants.size());
-		model.constants.push_back(std::move(constant));
 	}
 
 	std::unordered_map<std::string, std::int32_t> formClassIds;

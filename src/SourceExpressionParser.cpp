@@ -8,6 +8,31 @@
 #include <string_view>
 
 namespace e2txt {
+std::string NormalizeSourceParentheses(const std::string& text)
+{
+	std::string result;
+	bool asciiQuote = false;
+	bool chineseQuote = false;
+	for (std::size_t i = 0; i < text.size();) {
+		const char* current = text.c_str() + i;
+		const std::size_t length = (std::min)(text.size() - i,
+			static_cast<std::size_t>(CharNextExA(CP_ACP, current, 0) - current));
+		const std::string_view token(current, length);
+		if (!asciiQuote && !chineseQuote && token == "'") {
+			result.append(text, i, std::string::npos);
+			break;
+		}
+		if (!chineseQuote && token == "\"") asciiQuote = !asciiQuote;
+		else if (!asciiQuote && token == "“") chineseQuote = true;
+		else if (!asciiQuote && token == "”") chineseQuote = false;
+		if (!asciiQuote && !chineseQuote && token == "（") result += '(';
+		else if (!asciiQuote && !chineseQuote && token == "）") result += ')';
+		else result.append(token);
+		i += length;
+	}
+	return result;
+}
+
 namespace {
 
 enum class TokenKind {
