@@ -879,7 +879,7 @@ bool ResolvePackOutputPath(
 	std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch) {
 		return static_cast<char>(std::tolower(ch));
 	});
-	if (extension != ".e") {
+	if (extension != ".e" && extension != ".ec") {
 		outOutputPath += L".e";
 	}
 	return true;

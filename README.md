@@ -76,6 +76,8 @@ e-packager unpack <input.e|input.ec> <output-dir>
 e-packager pack <input-dir> <output.e|output.ec>
 ```
 
+未修改的 `.ec` 拆包目录可以回包为原始 `.ec`，保持字节一致。显式指定 `.e` 输出时转换为易语言源工程；修改源码或资源后，请回包为 `.e` 并通过易语言编译为模块。工具不会把 `.e` 数据写入 `.ec` 文件，也不会在修改后复用旧模块快照。
+
 #### 常用选项
 
 ```bash

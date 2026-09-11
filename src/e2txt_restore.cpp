@@ -11452,12 +11452,8 @@ bool CanReuseNativeBundleSnapshot(const ProjectBundle& bundle)
 	if (bundle.nativeSourceBytes.empty() || bundle.nativeBundleDigest.empty()) {
 		return false;
 	}
-	// A form-less GUI workspace is a deliberate project-type conversion. The
-	// original snapshot may still describe a console entry and must be rebuilt
-	// from the semantic model so the subsystem marker is emitted consistently.
-	if (bundle.projectSubsystem == ProjectSubsystem::WindowsGui && bundle.formFiles.empty()) {
-		return false;
-	}
+	// The digest includes the subsystem and forms, so an actual conversion
+	// already invalidates reuse; an unchanged form-less GUI is still lossless.
 	return ComputeBundleDigest(bundle) == bundle.nativeBundleDigest;
 }
 
@@ -13260,7 +13256,7 @@ bool RestoreBundleToBytesInternal(
 		outError->clear();
 	}
 
-	if (CanReuseNativeBundleSnapshot(bundle)) {
+	if (!preferNativeMethodSnapshots && CanReuseNativeBundleSnapshot(bundle)) {
 		outBytes = bundle.nativeSourceBytes;
 		return true;
 	}
@@ -13306,7 +13302,7 @@ bool RestoreBundleToBytesInternal(
 			originalBundlePtr = &originalBundle;
 		}
 	}
-	if (originalBundlePtr != nullptr &&
+	if (!preferNativeMethodSnapshots && originalBundlePtr != nullptr &&
 		CanReuseNativeBytesForSemanticEquivalentSources(bundle, *originalBundlePtr, document)) {
 		outBytes = bundle.nativeSourceBytes;
 		return true;

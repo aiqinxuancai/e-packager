@@ -1,15 +1,18 @@
 ﻿param(
     [string]$Packager = "$PSScriptRoot/../bin/Win32/Release/e-packager.exe",
+    [string]$Decoder,
     [string]$OutputRoot = "$PSScriptRoot/../temp/return-roundtrip-$([guid]::NewGuid().ToString('N'))",
     [string]$Eide,
     [string]$AutoLinkerTest
 )
 $ErrorActionPreference = 'Stop'
 $Packager = (Resolve-Path $Packager).Path
+$Decoder = if ($Decoder) { (Resolve-Path $Decoder).Path } else { $Packager }
 $template = (Resolve-Path "$PSScriptRoot/../eproj/e-console-exe-new-proj.e").Path
 $encoding = [Text.UTF8Encoding]::new($true)
 function Invoke-Packager([string[]]$Arguments) {
-    & $Packager @Arguments
+    $tool = if ($Arguments[0] -eq 'unpack') { $Decoder } else { $Packager }
+    & $tool @Arguments
     if ($LASTEXITCODE -ne 0) { throw "e-packager failed: $Arguments" }
 }
 New-Item -ItemType Directory -Force $OutputRoot | Out-Null

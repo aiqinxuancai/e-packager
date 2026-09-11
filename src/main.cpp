@@ -698,36 +698,8 @@ bool DoUnpackInternal(
 	std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch) {
 		return static_cast<char>(std::tolower(ch));
 	});
-	if (extension == ".ec") {
-		e2txt::ProjectBundle ecBundle;
-		if (!generator.GenerateBundle(PathToUtf8(effectiveInputPath), ecBundle, &outError, options.readOptions)) {
-			return false;
-		}
-
-		e2txt::ProjectBundle bridgeSourceBundle = ecBundle;
-		bridgeSourceBundle.nativeSourceBytes.clear();
-		bridgeSourceBundle.nativeBundleDigest.clear();
-
-		e2txt::Restorer restorer;
-		std::vector<std::uint8_t> eBytes;
-		if (!restorer.RestoreBundleToBytesForEcUnpackBridge(bridgeSourceBundle, eBytes, &outError)) {
-			return false;
-		}
-
-		std::filesystem::path bridgeSourcePath = effectiveInputPath;
-		bridgeSourcePath += L".e";
-		if (!generator.GenerateBundleFromBytes(eBytes, PathToUtf8(bridgeSourcePath), bundle, &outError)) {
-			return false;
-		}
-		bundle.sourcePath = PathToUtf8(effectiveInputPath);
-		bundle.sourceFileKind = e2txt::SourceFileKind::EC;
-		bundle.publicHeaderText = ecBundle.publicHeaderText;
-		workspaceOptions.defaultPackOutputFileName = PathToUtf8(effectiveInputPath.filename()) + ".e";
-	}
-	else {
-		if (!generator.GenerateBundle(PathToUtf8(effectiveInputPath), bundle, &outError, options.readOptions)) {
-			return false;
-		}
+	if (!generator.GenerateBundle(PathToUtf8(effectiveInputPath), bundle, &outError, options.readOptions)) {
+		return false;
 	}
 
 	e2txt::BundleDirectoryCodec codec;
@@ -808,7 +780,16 @@ bool DoPack(
 
 	e2txt::Restorer restorer;
 	std::vector<std::uint8_t> plainBytes;
-	if (bundle.sourceFileKind == e2txt::SourceFileKind::EC) {
+	std::string outputExtension = effectiveOutputPath.extension().string();
+	std::transform(outputExtension.begin(), outputExtension.end(), outputExtension.begin(), [](unsigned char ch) {
+		return static_cast<char>(std::tolower(ch));
+	});
+	if (bundle.sourceFileKind == e2txt::SourceFileKind::EC && outputExtension == ".ec" &&
+		(bundle.nativeSourceBytes.empty() || e2txt::ComputeBundleDigest(bundle) != bundle.nativeBundleDigest)) {
+		outError = "modified_ec_requires_e_output: pack to .e and compile the edited module with the IDE";
+		return false;
+	}
+	if (bundle.sourceFileKind == e2txt::SourceFileKind::EC && outputExtension == ".e") {
 		if (!restorer.RestoreBundleToBytesForEcBridge(bundle, plainBytes, &outError)) {
 			return false;
 		}
@@ -2299,28 +2280,7 @@ int RunCompareBundle(const char* inputPath, const char* inputDir, const e2txt::R
 	std::string error;
 	const std::filesystem::path effectiveInputPath = ResolveAbsolutePath(std::filesystem::path(inputPath));
 	const std::filesystem::path effectiveInputDir = ResolveAbsolutePath(std::filesystem::path(inputDir));
-	std::string inputExtension = effectiveInputPath.extension().string();
-	std::transform(inputExtension.begin(), inputExtension.end(), inputExtension.begin(), [](unsigned char ch) {
-		return static_cast<char>(std::tolower(ch));
-	});
-	if (inputExtension == ".ec") {
-		// .ec 拆包使用内部 .e 桥接源码；比较时采用同一语义入口，
-		// 避免把原生 .ec 公开接口与桥接目录误判为源码不一致。
-		e2txt::ProjectBundle ecBundle;
-		if (!generator.GenerateBundle(PathToUtf8(effectiveInputPath), ecBundle, &error, readOptions)) {
-			return PrintStringResult("compare-bundle", -1, error.c_str());
-		}
-		ecBundle.nativeSourceBytes.clear();
-		ecBundle.nativeBundleDigest.clear();
-		std::vector<std::uint8_t> bridgeBytes;
-		if (!restorer.RestoreBundleToBytesForEcUnpackBridge(ecBundle, bridgeBytes, &error) ||
-			!generator.GenerateBundleFromBytes(bridgeBytes, PathToUtf8(effectiveInputPath), bundleFromE, &error)) {
-			return PrintStringResult("compare-bundle", -1, error.c_str());
-		}
-		bundleFromE.sourcePath = PathToUtf8(effectiveInputPath);
-		bundleFromE.sourceFileKind = e2txt::SourceFileKind::EC;
-	}
-	else if (!generator.GenerateBundle(PathToUtf8(effectiveInputPath), bundleFromE, &error, readOptions)) {
+	if (!generator.GenerateBundle(PathToUtf8(effectiveInputPath), bundleFromE, &error, readOptions)) {
 		return PrintStringResult("compare-bundle", -1, error.c_str());
 	}
 	if (!codec.ReadBundle(PathToUtf8(effectiveInputDir), bundleFromDir, &error)) {
@@ -2328,9 +2288,7 @@ int RunCompareBundle(const char* inputPath, const char* inputDir, const e2txt::R
 	}
 
 	std::vector<std::uint8_t> rebuiltBytes;
-	const bool restored = bundleFromDir.sourceFileKind == e2txt::SourceFileKind::EC
-		? restorer.RestoreBundleToBytesForEcBridge(bundleFromDir, rebuiltBytes, &error)
-		: restorer.RestoreBundleToBytes(bundleFromDir, rebuiltBytes, &error);
+	const bool restored = restorer.RestoreBundleToBytes(bundleFromDir, rebuiltBytes, &error);
 	if (!restored) {
 		const std::string restoreError = "restore_directory_bundle_failed: " + error;
 		return PrintStringResult("compare-bundle", -1, restoreError.c_str());
@@ -2500,6 +2458,13 @@ void NormalizeJsonForCompare(json& value)
 	value.erase("nativeBundleDigest");
 	value.erase("projectName");
 	value.erase("projectNameStored");
+	if (auto dependencies = value.find("dependencies"); dependencies != value.end() && dependencies->is_array()) {
+		for (auto& dependency : *dependencies) {
+			if (dependency.is_object()) {
+				dependency.erase("resolvedPath");
+			}
+		}
+	}
 
 	auto it = value.find("rootChildKeys");
 	if (it != value.end() && it->is_array()) {
