@@ -17,6 +17,7 @@
 #include <limits>
 #include <optional>
 #include <sstream>
+#include <span>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -31,6 +32,7 @@
 #include "PathHelper.h"
 #include "SimpleXmlDocument.h"
 #include "SourcePreflightValidator.h"
+#include "SupportLibraryPublicInfo.h"
 
 namespace e2txt {
 
@@ -1181,19 +1183,33 @@ std::string ReadSupportLibraryName(const char* text)
 	return std::string(text, length);
 }
 
-std::vector<std::string> BuildSupportTypeMemberNames(const LIB_DATA_TYPE_INFO& dataType)
+std::span<const UNIT_PROPERTY> GetSupportTypeProperties(const LIB_DATA_TYPE_INFO& dataType)
 {
 	constexpr int kMaxSupportLibraryArrayCount = 16384;
-	std::vector<std::string> memberNames;
+	if ((dataType.m_dwState & LDT_WIN_UNIT) == 0 || (dataType.m_dwState & LDT_ENUM) != 0) {
+		return {};
+	}
 	if (dataType.m_nPropertyCount > 0 &&
 		dataType.m_nPropertyCount <= kMaxSupportLibraryArrayCount &&
 		dataType.m_pPropertyBegin != nullptr &&
 		IsReadableMemoryRange(
 			dataType.m_pPropertyBegin,
 			sizeof(UNIT_PROPERTY) * static_cast<size_t>(dataType.m_nPropertyCount))) {
-		memberNames.reserve(static_cast<size_t>(dataType.m_nPropertyCount));
-		for (int propertyIndex = 0; propertyIndex < dataType.m_nPropertyCount; ++propertyIndex) {
-			memberNames.emplace_back(ReadSupportLibraryName(dataType.m_pPropertyBegin[propertyIndex].m_szName));
+		return { dataType.m_pPropertyBegin, static_cast<size_t>(dataType.m_nPropertyCount) };
+	}
+	// SDK 规定无独立属性表的窗口组件仍具有八个公共属性。
+	static const UNIT_PROPERTY fixedProperties[] = { FIXED_WIN_UNIT_PROPERTY };
+	return fixedProperties;
+}
+
+std::vector<std::string> BuildSupportTypeMemberNames(const LIB_DATA_TYPE_INFO& dataType)
+{
+	constexpr int kMaxSupportLibraryArrayCount = 16384;
+	std::vector<std::string> memberNames;
+	const auto properties = GetSupportTypeProperties(dataType);
+	if (!properties.empty()) {
+		for (const auto& property : properties) {
+			memberNames.emplace_back(ReadSupportLibraryName(property.m_szName));
 		}
 		return memberNames;
 	}
@@ -1905,6 +1921,8 @@ private:
 struct SupportLibraryCommandInfo {
 	std::int16_t libraryId = 0;
 	std::int32_t commandId = 0;
+	std::int32_t returnType = 0;
+	std::string returnTypeName;
 };
 
 struct SupportLibraryConstantInfo {
@@ -1914,13 +1932,26 @@ struct SupportLibraryConstantInfo {
 
 struct SupportLibraryTypeInfo {
 	std::int32_t typeId = 0;
+	bool isEnumeration = false;
 	bool isTabControl = false;
+	bool sharesWindowMethods = false;
 	std::unordered_map<std::string, SupportLibraryCommandInfo> methodsByName;
+	struct Member {
+		std::int32_t id = 0;
+		std::int32_t typeId = 0;
+		std::string typeName;
+	};
+	std::unordered_map<std::string, Member> membersByName;
 };
 
 struct SupportLibraryTextTypeInfo {
 	std::string name;
+	bool isEnumeration = false;
 	std::vector<std::string> methodNames;
+	std::unordered_map<std::string, std::int32_t> methodIndexes;
+	std::unordered_map<std::string, std::string> methodSignatures;
+	std::vector<std::pair<std::string, std::string>> members;
+	bool sharesWindowMethods = false;
 };
 
 class TypeResolver {
@@ -2010,6 +2041,7 @@ public:
 			return false;
 		}
 		outInfo = it->second;
+		if (outInfo.returnType == 0) outInfo.returnType = ResolveTypeId(outInfo.returnTypeName);
 		return true;
 	}
 
@@ -2045,12 +2077,44 @@ public:
 			}
 			const auto methodIt = info.methodsByName.find(methodName);
 			if (methodIt == info.methodsByName.end()) {
+				if (info.sharesWindowMethods && typeId != 65537) {
+					return TryResolveSupportTypeMethod(65537, rawMethodName, outInfo);
+				}
 				break;
 			}
 			outInfo = methodIt->second;
+			if (outInfo.returnType == 0) outInfo.returnType = ResolveTypeId(outInfo.returnTypeName);
 			return true;
 		}
 		outInfo = {};
+		return false;
+	}
+
+	bool TryResolveSupportTypeMember(const std::int32_t typeId, const std::string& name,
+		SupportLibraryTypeInfo::Member& outMember) const
+	{
+		for (const auto& [_, info] : m_supportTypes) {
+			if (info.typeId != typeId) {
+				continue;
+			}
+			const auto it = info.membersByName.find(NormalizeTypeName(name));
+			if (it == info.membersByName.end()) {
+				return false;
+			}
+			outMember = it->second;
+			if (outMember.typeId == 0) {
+				outMember.typeId = ResolveTypeId(outMember.typeName);
+			}
+			return true;
+		}
+		return false;
+	}
+
+	bool IsEnumeration(const std::int32_t typeId) const
+	{
+		for (const auto& [_, info] : m_supportTypes) {
+			if (info.typeId == typeId) return info.isEnumeration;
+		}
 		return false;
 	}
 
@@ -2120,8 +2184,10 @@ private:
 		struct TextCommandInfo {
 			std::string name;
 			bool memberOnly = false;
+			std::string returnTypeName;
 		};
 		std::vector<TextCommandInfo> commands;
+		std::unordered_map<std::string, std::vector<std::int32_t>> commandIndexesBySignature;
 		std::vector<std::string> constantNames;
 		std::vector<SupportLibraryTextTypeInfo> typeInfos;
 		SupportLibraryTextTypeInfo* currentType = nullptr;
@@ -2155,26 +2221,55 @@ private:
 			if (section == Section::Commands) {
 				std::string name = ExtractSupportLibraryTextName(line, ".命令 ");
 				if (!name.empty()) {
+					commandIndexesBySignature[line.substr(std::strlen(".命令 "))].push_back(
+						static_cast<std::int32_t>(commands.size()));
 					commands.push_back(TextCommandInfo {
 						.name = std::move(name),
 						.memberOnly = line.find("分类=成员命令") != std::string::npos,
 					});
+					for (const auto& field : SplitTopLevelCommaFields(line)) {
+						const std::string value = TrimAsciiCopy(field);
+						if (StartsWith(value, "返回值=")) commands.back().returnTypeName = value.substr(std::strlen("返回值="));
+					}
 				}
 				continue;
 			}
 
 			if (section == Section::Types) {
 				if (std::string typeName = ExtractSupportLibraryTextName(line, ".数据类型 "); !typeName.empty()) {
-					typeInfos.push_back(SupportLibraryTextTypeInfo{ std::move(typeName), {} });
+					typeInfos.push_back(SupportLibraryTextTypeInfo{ .name = std::move(typeName) });
 					currentType = &typeInfos.back();
+					currentType->isEnumeration = line.find("类型=枚举") != std::string::npos;
+					currentType->sharesWindowMethods = line.find("类型=窗口组件") != std::string::npos &&
+						line.find("功能提供者") == std::string::npos;
 					continue;
 				}
 				if (currentType != nullptr) {
+					if (StartsWith(line, ".成员 ")) {
+						const auto fields = SplitTopLevelCommaFields(line.substr(std::strlen(".成员 ")));
+						if (fields.size() >= 2) {
+							std::string typeName = TrimAsciiCopy(fields[1]);
+							if (typeName.ends_with("[]")) {
+								typeName.resize(typeName.size() - 2);
+							}
+							currentType->members.emplace_back(TrimAsciiCopy(fields[0]), std::move(typeName));
+						}
+					}
 					std::string methodName = ExtractSupportLibraryTextName(line, ".成员命令 ");
 					if (methodName.empty()) {
 						methodName = ExtractSupportLibraryTextName(line, ".方法 ");
 					}
 					if (!methodName.empty()) {
+						currentType->methodSignatures.insert_or_assign(NormalizeTypeName(methodName),
+							line.substr(line.find(' ') + 1));
+						for (const auto& field : SplitTopLevelCommaFields(line)) {
+							const std::string value = TrimAsciiCopy(field);
+							std::int32_t commandIndex = -1;
+							if (StartsWith(value, "命令索引=") &&
+								TryParseInt32(value.substr(std::strlen("命令索引=")), commandIndex) && commandIndex >= 0) {
+								currentType->methodIndexes.insert_or_assign(NormalizeTypeName(methodName), commandIndex);
+							}
+						}
 						currentType->methodNames.push_back(std::move(methodName));
 					}
 				}
@@ -2194,19 +2289,17 @@ private:
 		}
 
 		const auto libraryId = static_cast<std::int16_t>(supportIndex - 1);
-		std::unordered_map<std::string, std::int32_t> commandIndexByName;
 		for (size_t index = 0; index < commands.size(); ++index) {
 			const std::string normalizedName = NormalizeTypeName(commands[index].name);
 			if (normalizedName.empty()) {
 				continue;
 			}
 			const auto commandIndex = static_cast<std::int32_t>(index);
-			commandIndexByName.insert_or_assign(normalizedName, commandIndex);
 			if (!commands[index].memberOnly) {
 				// 同名成员命令不能覆盖先加载支持库中的全局命令。
 				m_supportCommands.emplace(
 					normalizedName,
-					SupportLibraryCommandInfo{ libraryId, commandIndex });
+					SupportLibraryCommandInfo{ libraryId, commandIndex, 0, commands[index].returnTypeName });
 			}
 		}
 
@@ -2227,16 +2320,30 @@ private:
 			}
 			SupportLibraryTypeInfo info;
 			info.typeId = (supportIndex << 16) | static_cast<std::int32_t>(index + 1);
+			info.sharesWindowMethods = typeInfos[index].sharesWindowMethods;
+			info.isEnumeration = typeInfos[index].isEnumeration;
+			for (size_t memberIndex = 0; memberIndex < typeInfos[index].members.size(); ++memberIndex) {
+				const auto& [name, typeName] = typeInfos[index].members[memberIndex];
+				info.membersByName.insert_or_assign(NormalizeTypeName(name),
+					SupportLibraryTypeInfo::Member{ static_cast<std::int32_t>(memberIndex + 1), 0, typeName });
+			}
 			for (const std::string& rawMethodName : typeInfos[index].methodNames) {
 				const std::string normalizedMethodName = NormalizeTypeName(rawMethodName);
 				if (normalizedMethodName.empty()) {
 					continue;
 				}
-				if (const auto it = commandIndexByName.find(normalizedMethodName);
-					it != commandIndexByName.end()) {
+				const auto explicitIndex = typeInfos[index].methodIndexes.find(normalizedMethodName);
+				const auto signature = typeInfos[index].methodSignatures.find(normalizedMethodName);
+				const auto matching = signature != typeInfos[index].methodSignatures.end()
+					? commandIndexesBySignature.find(signature->second) : commandIndexesBySignature.end();
+				// 旧导出文本仅在完整签名唯一时可定位，不能按同名命令的最后一项猜测。
+				const auto commandIndex = explicitIndex != typeInfos[index].methodIndexes.end()
+					? explicitIndex->second : (matching != commandIndexesBySignature.end() && matching->second.size() == 1
+						? matching->second.front() : -1);
+				if (commandIndex >= 0 && static_cast<size_t>(commandIndex) < commands.size()) {
 					info.methodsByName.insert_or_assign(
 						normalizedMethodName,
-						SupportLibraryCommandInfo{ libraryId, it->second });
+						SupportLibraryCommandInfo{ libraryId, commandIndex, 0, commands[commandIndex].returnTypeName });
 				}
 			}
 			m_supportTypes.insert_or_assign(normalizedTypeName, std::move(info));
@@ -2348,11 +2455,37 @@ private:
 			return;
 		}
 
+		const auto resolveReturnType = [supportIndex](const DATA_TYPE rawType) {
+			const auto type = rawType & ~DT_IS_ARY;
+			return static_cast<std::int32_t>((type > 0 && (type & 0xFFFF0000u) == 0)
+				? (supportIndex << 16) | type : type);
+		};
 		for (int i = 0; i < libInfo->m_nDataTypeCount; ++i) {
 			const LIB_DATA_TYPE_INFO& dataType = libInfo->m_pDataType[i];
 			SupportLibraryTypeInfo info;
 			info.typeId = (supportIndex << 16) | (i + 1);
+			info.isEnumeration = (dataType.m_dwState & LDT_ENUM) != 0;
 			info.isTabControl = (dataType.m_dwState & LDT_IS_TAB_UNIT) != 0;
+			info.sharesWindowMethods = (dataType.m_dwState & LDT_WIN_UNIT) != 0 &&
+				(dataType.m_dwState & LDT_IS_FUNCTION_PROVIDER) == 0;
+			const auto memberNames = BuildSupportTypeMemberNames(dataType);
+			const auto properties = GetSupportTypeProperties(dataType);
+			for (size_t memberIndex = 0; memberIndex < memberNames.size(); ++memberIndex) {
+				SupportLibraryTypeInfo::Member member;
+				member.id = static_cast<std::int32_t>(memberIndex + 1);
+				if (!properties.empty()) {
+					member.typeName = support_library_public_info::GetPropertyDataTypeName(
+						properties[memberIndex].m_shtType);
+				}
+				else {
+					const auto type = dataType.m_pElementBegin[memberIndex].m_dtType & ~DT_IS_ARY;
+					member.typeId = static_cast<std::int32_t>(type);
+					if ((type & 0xFFFF0000u) == 0 && type > 0 && type <= static_cast<DATA_TYPE>(libInfo->m_nDataTypeCount)) {
+						member.typeId = (supportIndex << 16) | type;
+					}
+				}
+				info.membersByName.insert_or_assign(NormalizeTypeName(memberNames[memberIndex]), std::move(member));
+			}
 			if (dataType.m_nCmdCount > 0 &&
 				dataType.m_nCmdCount <= kMaxSupportLibraryArrayCount &&
 				dataType.m_pnCmdsIndex != nullptr &&
@@ -2374,7 +2507,8 @@ private:
 					if (!methodName.empty()) {
 						info.methodsByName.insert_or_assign(
 							methodName,
-							SupportLibraryCommandInfo{ libraryId, globalCmdIndex });
+							SupportLibraryCommandInfo{ libraryId, globalCmdIndex,
+								resolveReturnType(libInfo->m_pBeginCmdInfo[globalCmdIndex].m_dtRetValType) });
 					}
 				}
 			}
@@ -2398,7 +2532,7 @@ private:
 				const std::string name = NormalizeTypeName(ReadSupportLibraryName(command.m_szName));
 				if (!name.empty()) {
 					// 成员命令只通过所属类型解析；同名全局命令沿用先加载支持库中的定义。
-					m_supportCommands.emplace(name, SupportLibraryCommandInfo{ libraryId, i });
+					m_supportCommands.emplace(name, SupportLibraryCommandInfo{ libraryId, i, resolveReturnType(command.m_dtRetValType) });
 				}
 			}
 		}
@@ -2433,11 +2567,24 @@ private:
 
 std::optional<std::pair<std::string, std::string>> SplitFixedCodeComment(const std::string& text)
 {
-	const size_t pos = text.find("  ' ");
-	if (pos == std::string::npos) {
-		return std::make_pair(text, std::string());
+	bool asciiQuote = false;
+	bool chineseQuote = false;
+	for (size_t pos = 0; pos < text.size();) {
+		const char* current = text.c_str() + pos;
+		const size_t length = (std::min)(text.size() - pos,
+			static_cast<size_t>(CharNextExA(CP_ACP, current, 0) - current));
+		const std::string_view token(current, length);
+		if (!asciiQuote && !chineseQuote && token == "'") {
+			size_t commentBegin = pos + 1;
+			if (commentBegin < text.size() && text[commentBegin] == ' ') ++commentBegin;
+			return std::make_pair(TrimAsciiCopy(text.substr(0, pos)), text.substr(commentBegin));
+		}
+		if (!chineseQuote && token == "\"") asciiQuote = !asciiQuote;
+		else if (!asciiQuote && token == "“") chineseQuote = true;
+		else if (!asciiQuote && token == "”") chineseQuote = false;
+		pos += length;
 	}
-	return std::make_pair(text.substr(0, pos), text.substr(pos + 4));
+	return std::make_pair(text, std::string());
 }
 
 struct BodyStatement;
@@ -3155,13 +3302,15 @@ bool ParseBodyBlock(
 		bool mask = false;
 		std::string code;
 		ExtractMaskPrefix(effectiveLine, mask, code);
-		code = NormalizeSourceParentheses(code);
+		if (!mask) code = NormalizeSourceParentheses(code);
 		const std::string trimmedCode = TrimAsciiCopy(code);
 		if (!StartsWith(trimmedCode, ".")) {
 			bool rawMask = false;
 			std::string rawCode;
 			ExtractMaskPrefixPreserveIndent(StripExpectedIndent(effectiveLine, expectedIndent), rawMask, rawCode);
-			outStatements.push_back(BodyStatement{ BodyStatementKind::Raw, rawMask, false, NormalizeSourceParentheses(TrimRightAsciiCopy(rawCode)) });
+			rawCode = TrimRightAsciiCopy(rawCode);
+			if (!rawMask) rawCode = NormalizeSourceParentheses(rawCode);
+			outStatements.push_back(BodyStatement{ BodyStatementKind::Raw, rawMask, false, std::move(rawCode) });
 			++index;
 			continue;
 		}
@@ -4099,6 +4248,10 @@ struct NativeObjectMemberSymbol {
 struct NativeFunctionSymbol {
 	std::int16_t libraryId = 0;
 	std::int32_t methodId = 0;
+	std::int32_t returnType = 0;
+	bool qualified = false;
+	std::int32_t minimumArguments = 0;
+	std::int32_t maximumArguments = -1;
 };
 
 struct NativeConstantSymbol {
@@ -4114,6 +4267,7 @@ struct NativeObjectMethodEncodeContext {
 	std::unordered_map<std::int32_t, std::unordered_map<std::string, NativeFunctionSymbol>> methodsByOwnerType;
 	std::unordered_map<std::int32_t, std::int32_t> baseTypes;
 	const TypeResolver* typeResolver = nullptr;
+	std::int32_t currentOwnerTypeId = 0;
 };
 
 bool StartsWithAt(const std::string& text, const size_t offset, const std::string_view token)
@@ -4156,7 +4310,7 @@ std::string NormalizeNativeOperatorSyntaxForParsing(const std::string& text)
 		std::string_view target;
 		bool needsWordBoundary = false;
 	};
-	constexpr std::array<OperatorAlias, 19> kAliases = {
+	constexpr std::array<OperatorAlias, 20> kAliases = {
 		OperatorAlias{ "≠", "!=" },
 		{ "≤", "<=" },
 		{ "≥", ">=" },
@@ -4166,6 +4320,7 @@ std::string NormalizeNativeOperatorSyntaxForParsing(const std::string& text)
 		{ "<=", "<=" },
 		{ ">=", ">=" },
 		{ "==", "==" },
+		{ "?=", "?=" },
 		{ "=", "==" },
 		{ "＝", "==" },
 		{ "＜", "<" },
@@ -4214,7 +4369,11 @@ std::string NormalizeNativeOperatorSyntaxForParsing(const std::string& text)
 			}
 		}
 		if (!replaced) {
-			normalized.push_back(text[index++]);
+			const char* current = text.c_str() + index;
+			const size_t length = (std::min)(text.size() - index,
+				static_cast<size_t>(CharNextExA(CP_ACP, current, 0) - current));
+			normalized.append(text, index, length);
+			index += length;
 		}
 	}
 	return normalized;
@@ -4273,6 +4432,8 @@ bool CollectTopLevelOperatorPositions(
 	}
 
 	int parenDepth = 0;
+	int bracketDepth = 0;
+	int braceDepth = 0;
 	bool inChineseQuote = false;
 	bool inAsciiQuote = false;
 	for (size_t index = 0; index < text.size(); ++index) {
@@ -4280,6 +4441,10 @@ bool CollectTopLevelOperatorPositions(
 		if (!inAsciiQuote && TryGetNativeTextQuoteLength(text, index, quoteLength)) {
 			inChineseQuote = !inChineseQuote;
 			index += quoteLength - 1;
+			continue;
+		}
+		if (IsDBCSLeadByteEx(CP_ACP, static_cast<BYTE>(text[index])) && index + 1 < text.size()) {
+			++index;
 			continue;
 		}
 		if (!inChineseQuote && text[index] == '"') {
@@ -4297,12 +4462,16 @@ bool CollectTopLevelOperatorPositions(
 			--parenDepth;
 			continue;
 		}
-		if (parenDepth == 0 && StartsWithAt(text, index, token)) {
+		if (text[index] == '[') { ++bracketDepth; continue; }
+		if (text[index] == ']') { --bracketDepth; continue; }
+		if (text[index] == '{') { ++braceDepth; continue; }
+		if (text[index] == '}') { --braceDepth; continue; }
+		if (parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 && StartsWithAt(text, index, token)) {
 			outPositions.push_back(index);
 			index += token.size() - 1;
 		}
 	}
-	return !inChineseQuote && !inAsciiQuote && parenDepth == 0;
+	return !inChineseQuote && !inAsciiQuote && parenDepth == 0 && bracketDepth == 0 && braceDepth == 0;
 }
 
 bool TrySplitTopLevelExpressionByToken(
@@ -4422,6 +4591,11 @@ bool SplitNativeObjectCallArguments(const std::string& text, std::vector<std::st
 			index += quoteLength - 1;
 			continue;
 		}
+		if (IsDBCSLeadByteEx(CP_ACP, static_cast<BYTE>(text[index])) && index + 1 < text.size()) {
+			current.append(text, index, 2);
+			++index;
+			continue;
+		}
 		if (!inChineseQuote && text[index] == '"') {
 			inAsciiQuote = !inAsciiQuote;
 			current.push_back(text[index]);
@@ -4452,33 +4626,7 @@ bool SplitNativeObjectCallArguments(const std::string& text, std::vector<std::st
 	return !inChineseQuote && !inAsciiQuote && parenDepth == 0 && braceDepth == 0;
 }
 
-bool ParseNativeObjectCallLine(const std::string& code, ParsedNativeObjectCallLine& outCall)
-{
-	outCall = {};
-	const std::string trimmed = TrimAsciiCopy(code);
-	if (trimmed.empty() || trimmed.front() == '\'') {
-		return false;
-	}
-	const size_t callPos = trimmed.find('(');
-	if (callPos == std::string::npos) {
-		return false;
-	}
-	const size_t closePos = trimmed.rfind(')');
-	if (closePos == std::string::npos || closePos < callPos) {
-		return false;
-	}
-	const size_t dotPos = trimmed.rfind('.', callPos);
-	if (dotPos == std::string::npos || dotPos == 0 || dotPos + 1 >= callPos) {
-		return false;
-	}
-	outCall.objectName = TrimAsciiCopy(trimmed.substr(0, dotPos));
-	outCall.methodName = TrimAsciiCopy(trimmed.substr(dotPos + 1, callPos - dotPos - 1));
-	if (outCall.objectName.empty() || outCall.methodName.empty()) {
-		return false;
-	}
-	const std::string argText = trimmed.substr(callPos + 1, closePos - callPos - 1);
-	return SplitNativeObjectCallArguments(argText, outCall.args);
-}
+bool ParseNativeObjectCallLine(const std::string& code, ParsedNativeObjectCallLine& outCall);
 
 struct ParsedNativeFunctionCallExpression {
 	std::string name;
@@ -4494,6 +4642,8 @@ bool ParseNativeFunctionCallExpression(
 	if (expression.empty() || expression.back() != ')') {
 		return false;
 	}
+	const auto parsed = ParseSourceExpression(expression);
+	if (!parsed.IsValid() || parsed.root->kind != SourceExpressionKind::Call) return false;
 
 	int parenDepth = 0;
 	bool inChineseQuote = false;
@@ -4506,6 +4656,10 @@ bool ParseNativeFunctionCallExpression(
 			index += quoteLength - 1;
 			continue;
 		}
+		if (IsDBCSLeadByteEx(CP_ACP, static_cast<BYTE>(expression[index])) && index + 1 < expression.size()) {
+			++index;
+			continue;
+		}
 		if (!inChineseQuote && expression[index] == '"') {
 			inAsciiQuote = !inAsciiQuote;
 			continue;
@@ -4514,7 +4668,7 @@ bool ParseNativeFunctionCallExpression(
 			continue;
 		}
 		if (expression[index] == '(') {
-			if (parenDepth == 0 && callPos == std::string::npos) {
+			if (parenDepth == 0) {
 				callPos = index;
 			}
 			++parenDepth;
@@ -4522,9 +4676,6 @@ bool ParseNativeFunctionCallExpression(
 		else if (expression[index] == ')') {
 			--parenDepth;
 			if (parenDepth < 0) {
-				return false;
-			}
-			if (parenDepth == 0 && index + 1 != expression.size()) {
 				return false;
 			}
 		}
@@ -4539,6 +4690,21 @@ bool ParseNativeFunctionCallExpression(
 	}
 	const std::string argText = expression.substr(callPos + 1, expression.size() - callPos - 2);
 	return SplitNativeObjectCallArguments(argText, outCall.args);
+}
+
+bool ParseNativeObjectCallLine(const std::string& code, ParsedNativeObjectCallLine& outCall)
+{
+	outCall = {};
+	ParsedNativeFunctionCallExpression call;
+	if (!ParseNativeFunctionCallExpression(code, call)) return false;
+	const auto parsed = ParseSourceExpression(code);
+	if (parsed.root->children.empty() || parsed.root->children[0]->kind != SourceExpressionKind::Member) return false;
+	const size_t dot = call.name.rfind('.');
+	if (dot == std::string::npos) return false;
+	outCall.objectName = TrimAsciiCopy(call.name.substr(0, dot));
+	outCall.methodName = TrimAsciiCopy(call.name.substr(dot + 1));
+	outCall.args = std::move(call.args);
+	return !outCall.objectName.empty() && !outCall.methodName.empty();
 }
 
 struct ParsedNativeVariableAccessStep {
@@ -4615,6 +4781,12 @@ bool TryResolveNativeMember(
 {
 	const auto ownerIt = context.membersByOwnerType.find(ownerTypeId);
 	if (ownerIt == context.membersByOwnerType.end()) {
+		SupportLibraryTypeInfo::Member member;
+		if (context.typeResolver != nullptr &&
+			context.typeResolver->TryResolveSupportTypeMember(ownerTypeId, rawMemberName, member)) {
+			outMember = NativeObjectMemberSymbol{ member.id, ownerTypeId, member.typeId };
+			return true;
+		}
 		outMember = {};
 		return false;
 	}
@@ -4836,18 +5008,39 @@ std::string StripOuterParentheses(std::string expression)
 bool TryResolveNativeFunction(
 	const std::string& rawName,
 	const NativeObjectMethodEncodeContext& context,
-	NativeFunctionSymbol& outSymbol)
+	NativeFunctionSymbol& outSymbol,
+	const std::optional<size_t> argumentCount = std::nullopt)
 {
 	const std::string functionKey = TypeResolver::NormalizeTypeName(rawName);
+	const auto acceptsArguments = [&](const NativeFunctionSymbol& symbol) {
+		return !argumentCount.has_value() ||
+			(*argumentCount >= static_cast<size_t>(symbol.minimumArguments) &&
+				(symbol.maximumArguments < 0 || *argumentCount <= static_cast<size_t>(symbol.maximumArguments)));
+	};
+	// 非限定调用只在当前类及继承链中查找成员，其他类的方法不能遮蔽全局命令。
+	std::unordered_set<std::int32_t> visited;
+	for (auto owner = context.currentOwnerTypeId; owner > 0 && visited.insert(owner).second;) {
+		const auto methods = context.methodsByOwnerType.find(owner);
+		if (methods != context.methodsByOwnerType.end()) {
+			const auto method = methods->second.find(functionKey);
+			if (method != methods->second.end() && acceptsArguments(method->second)) {
+				outSymbol = method->second;
+				return true;
+			}
+		}
+		const auto base = context.baseTypes.find(owner);
+		if (base == context.baseTypes.end()) break;
+		owner = base->second;
+	}
 	const auto functionIt = context.functionsByName.find(functionKey);
-	if (functionIt != context.functionsByName.end()) {
+	if (functionIt != context.functionsByName.end() && acceptsArguments(functionIt->second)) {
 		outSymbol = functionIt->second;
 		return true;
 	}
 	if (context.typeResolver != nullptr) {
 		SupportLibraryCommandInfo commandInfo;
 		if (context.typeResolver->TryResolveSupportCommand(rawName, commandInfo)) {
-			outSymbol = NativeFunctionSymbol{ commandInfo.libraryId, commandInfo.commandId };
+			outSymbol = NativeFunctionSymbol{ commandInfo.libraryId, commandInfo.commandId, commandInfo.returnType };
 			return true;
 		}
 	}
@@ -4950,7 +5143,7 @@ bool TryResolveNativeOwnerMethod(
 		if (context.typeResolver != nullptr) {
 			SupportLibraryCommandInfo supportMethod;
 			if (context.typeResolver->TryResolveSupportTypeMethod(currentType, rawName, supportMethod)) {
-				outSymbol = NativeFunctionSymbol{ supportMethod.libraryId, supportMethod.commandId };
+				outSymbol = NativeFunctionSymbol{ supportMethod.libraryId, supportMethod.commandId, supportMethod.returnType };
 				return true;
 			}
 		}
@@ -4971,6 +5164,23 @@ bool TryResolveNativeExpressionType(
 	if (ParseNativeVariableAccessExpression(rawExpression, context, access)) {
 		outTypeId = access.typeId;
 		return outTypeId != 0;
+	}
+	ParsedNativeFunctionCallExpression call;
+	if (ParseNativeFunctionCallExpression(rawExpression, call)) {
+		NativeFunctionSymbol function;
+		ParsedNativeObjectCallLine memberCall;
+		if (ParseNativeObjectCallLine(rawExpression, memberCall)) {
+			std::int32_t ownerType = 0;
+			if (TryResolveNativeExpressionType(memberCall.objectName, context, ownerType) &&
+				TryResolveNativeOwnerMethod(ownerType, memberCall.methodName, context, function)) {
+				outTypeId = function.returnType;
+				return outTypeId != 0;
+			}
+		}
+		if (TryResolveNativeFunction(call.name, context, function, call.args.size())) {
+			outTypeId = function.returnType;
+			return outTypeId != 0;
+		}
 	}
 	outTypeId = 0;
 	return false;
@@ -5033,35 +5243,60 @@ bool TryEncodeNativeOperatorExpression(
 		{ "<", 40 },
 		{ ">", 41 },
 	};
+	size_t comparisonPosition = std::string::npos;
+	size_t comparisonLength = 0;
+	std::int32_t comparisonMethod = 0;
 	for (const auto& [token, methodId] : kBinaryOperators) {
-		if (TrySplitTopLevelExpressionByToken(expression, token, parts) && parts.size() == 2) {
-			return TryEncodeNativeOperatorCall(methodId, parts, context, writer, methodReferences, variableReferences, constantReferences, outError);
+		std::vector<size_t> positions;
+		if (!CollectTopLevelOperatorPositions(expression, token, positions)) continue;
+		for (const size_t pos : positions) {
+			if (token.size() == 1 && pos + 1 < expression.size() && expression[pos + 1] == '=') continue;
+			if (comparisonPosition == std::string::npos || pos > comparisonPosition) {
+				comparisonPosition = pos;
+				comparisonLength = token.size();
+				comparisonMethod = methodId;
+			}
 		}
 	}
-
-	if (TrySplitTopLevelExpressionByToken(expression, "+", parts) && parts.size() > 1) {
-		return TryEncodeNativeOperatorCall(19, parts, context, writer, methodReferences, variableReferences, constantReferences, outError);
+	if (comparisonPosition != std::string::npos) {
+		parts = { TrimAsciiCopy(expression.substr(0, comparisonPosition)),
+			TrimAsciiCopy(expression.substr(comparisonPosition + comparisonLength)) };
+		return TryEncodeNativeOperatorCall(comparisonMethod, parts, context, writer,
+			methodReferences, variableReferences, constantReferences, outError);
 	}
 
 	size_t binaryMinusPos = std::string::npos;
-	if (TryFindTopLevelBinaryMinus(expression, binaryMinusPos)) {
+	const bool hasMinus = TryFindTopLevelBinaryMinus(expression, binaryMinusPos);
+	std::vector<size_t> plusPositions;
+	CollectTopLevelOperatorPositions(expression, "+", plusPositions);
+	if (!plusPositions.empty() && (!hasMinus || plusPositions.back() > binaryMinusPos)) {
+		const size_t pos = plusPositions.back();
+		parts = { TrimAsciiCopy(expression.substr(0, pos)), TrimAsciiCopy(expression.substr(pos + 1)) };
+		return TryEncodeNativeOperatorCall(19, parts, context, writer, methodReferences, variableReferences, constantReferences, outError);
+	}
+	if (hasMinus) {
 		std::vector<std::string> minusParts;
 		minusParts.push_back(TrimAsciiCopy(expression.substr(0, binaryMinusPos)));
 		minusParts.push_back(TrimAsciiCopy(expression.substr(binaryMinusPos + 1)));
 		return TryEncodeNativeOperatorCall(20, minusParts, context, writer, methodReferences, variableReferences, constantReferences, outError);
 	}
 
-	if (TrySplitTopLevelExpressionByToken(expression, "*", parts) && parts.size() > 1) {
-		return TryEncodeNativeOperatorCall(15, parts, context, writer, methodReferences, variableReferences, constantReferences, outError);
+		size_t multiplicativePosition = std::string::npos;
+	std::int32_t multiplicativeMethod = 0;
+	constexpr std::array<std::string_view, 4> multiplicativeTokens = { "*", "/", "\\", "%" };
+	for (size_t index = 0; index < multiplicativeTokens.size(); ++index) {
+		std::vector<size_t> positions;
+		CollectTopLevelOperatorPositions(expression, multiplicativeTokens[index], positions);
+		if (!positions.empty() && (multiplicativePosition == std::string::npos || index >= 2 || positions.back() > multiplicativePosition)) {
+			multiplicativePosition = positions.back();
+			multiplicativeMethod = 15 + static_cast<std::int32_t>(index);
+		}
 	}
-	if (TrySplitTopLevelExpressionByToken(expression, "/", parts) && parts.size() > 1) {
-		return TryEncodeNativeOperatorCall(16, parts, context, writer, methodReferences, variableReferences, constantReferences, outError);
-	}
-	if (TrySplitTopLevelExpressionByToken(expression, "\\", parts) && parts.size() > 1) {
-		return TryEncodeNativeOperatorCall(17, parts, context, writer, methodReferences, variableReferences, constantReferences, outError);
-	}
-	if (TrySplitTopLevelExpressionByToken(expression, "%", parts) && parts.size() > 1) {
-		return TryEncodeNativeOperatorCall(18, parts, context, writer, methodReferences, variableReferences, constantReferences, outError);
+	if (multiplicativePosition != std::string::npos) {
+		parts = { TrimAsciiCopy(expression.substr(0, multiplicativePosition)),
+			TrimAsciiCopy(expression.substr(multiplicativePosition + 1)) };
+		return TryEncodeNativeOperatorCall(multiplicativeMethod, parts, context, writer,
+			methodReferences, variableReferences, constantReferences, outError);
 	}
 
 	if (!expression.empty() && expression.front() == '-' && IsUnaryMinusContext(expression, 0)) {
@@ -5087,6 +5322,12 @@ bool TryEncodeNativeIn38Expression(
 	ParsedNativeVariableAccessExpression access;
 	std::string parseError;
 	if (!ParseNativeVariableAccessExpression(rawExpression, context, access, &parseError)) {
+		if (!includeExpressionWrapper && ParseSourceExpression(rawExpression).IsValid()) {
+			writer.WriteI32(epl_system_id::kIdNaV);
+			writer.WriteU8(0x3A);
+			return TryEncodeNativeExpression(rawExpression, context, writer,
+				methodReferences, variableReferences, constantReferences, outError);
+		}
 		if (outError != nullptr) {
 			*outError = parseError.empty() ? "in38_expression_not_found: " + StripOuterParentheses(rawExpression) : parseError;
 		}
@@ -5104,27 +5345,11 @@ bool TryEncodeNativeIn38Expression(
 			writer.WriteU8(0x3A);
 			ParsedNativeVariableAccessExpression indexAccess;
 			if (ParseNativeVariableAccessExpression(step.indexExpression, context, indexAccess)) {
-				variableReferences.push_back(static_cast<std::int32_t>(writer.position()));
+				// 下标内的 0x38 由外层变量链递归处理，不能作为独立引用表入口。
 				writer.WriteU8(0x38);
-				writer.WriteI32(indexAccess.base.id);
-				for (const auto& indexStep : indexAccess.steps) {
-					if (indexStep.kind == ParsedNativeVariableAccessStep::Kind::ArrayIndex) {
-						writer.WriteU8(0x3A);
-						if (!TryEncodeNativeExpression(
-								indexStep.indexExpression,
-								context,
-								writer,
-								methodReferences,
-								variableReferences,
-								constantReferences,
-								outError)) {
-							return false;
-						}
-						continue;
-					}
-					writer.WriteU8(0x39);
-					writer.WriteI32(indexStep.member.id);
-					writer.WriteI32(indexStep.member.ownerTypeId);
+				if (!TryEncodeNativeIn38Expression(step.indexExpression, context, writer,
+					methodReferences, variableReferences, constantReferences, false, outError)) {
+					return false;
 				}
 				writer.WriteU8(0x37);
 			}
@@ -5197,12 +5422,41 @@ bool TryEncodeNativeExpression(
 		return true;
 	}
 
-	if (expression.front() == '#') {
+	const auto parsedExpression = ParseSourceExpression(expression);
+	if (expression.front() == '#' && parsedExpression.IsValid() &&
+		parsedExpression.root->kind == SourceExpressionKind::Member && context.typeResolver != nullptr) {
+		const size_t dot = expression.find('.');
+		const std::int32_t typeId = context.typeResolver->ResolveTypeId(expression.substr(1, dot - 1));
+		SupportLibraryTypeInfo::Member member;
+		if (!context.typeResolver->IsEnumeration(typeId) ||
+			!context.typeResolver->TryResolveSupportTypeMember(typeId, expression.substr(dot + 1), member)) {
+			if (outError != nullptr) *outError = "enum_member_not_found: " + expression;
+			return false;
+		}
+		writer.WriteU8(0x23);
+		writer.WriteI16(static_cast<std::int16_t>(typeId & 0xFFFF));
+		writer.WriteI16(static_cast<std::int16_t>((typeId >> 16) & 0xFFFF));
+		writer.WriteI32(member.id);
+		return true;
+	}
+	if (parsedExpression.IsValid() && parsedExpression.root->kind == SourceExpressionKind::DateTimeLiteral) {
+		double value = 0;
+		if (!ParseSourceDateLiteral(expression, value)) {
+			if (outError != nullptr) *outError = "invalid_date_literal: " + expression;
+			return false;
+		}
+		writer.WriteU8(0x19);
+		writer.WriteDouble(value);
+		return true;
+	}
+	if (expression.front() == '#' && parsedExpression.IsValid() &&
+		parsedExpression.root->kind == SourceExpressionKind::Name) {
 		const std::string constantName = TrimAsciiCopy(expression.substr(1));
 		const auto constantIt = context.constantsByName.find(TypeResolver::NormalizeTypeName(constantName));
 		if (constantIt != context.constantsByName.end() && constantIt->second.id != 0) {
-			constantReferences.push_back(static_cast<std::int32_t>(writer.position()));
 			if (constantIt->second.libraryId == -2) {
+				// IDE 常量引用表只存放 0x1B 工程常量，不包含支持库常量和枚举。
+				constantReferences.push_back(static_cast<std::int32_t>(writer.position()));
 				writer.WriteU8(0x1B);
 				writer.WriteI32(constantIt->second.id);
 			}
@@ -5216,7 +5470,6 @@ bool TryEncodeNativeExpression(
 		if (context.typeResolver != nullptr) {
 			SupportLibraryConstantInfo constantInfo;
 			if (context.typeResolver->TryResolveSupportConstant(constantName, constantInfo)) {
-				constantReferences.push_back(static_cast<std::int32_t>(writer.position()));
 				writer.WriteU8(0x1C);
 				writer.WriteI16(static_cast<std::int16_t>(constantInfo.libraryId + 1));
 				writer.WriteI16(static_cast<std::int16_t>(constantInfo.constantId + 1));
@@ -5229,7 +5482,8 @@ bool TryEncodeNativeExpression(
 		return false;
 	}
 
-	if (expression.size() >= 2 && expression.front() == '{' && expression.back() == '}') {
+	if (expression.size() >= 2 && expression.front() == '{' && expression.back() == '}' &&
+		parsedExpression.IsValid() && parsedExpression.root->kind == SourceExpressionKind::ByteSetLiteral) {
 		std::vector<std::string> items;
 		const std::string itemText = expression.substr(1, expression.size() - 2);
 		if (!SplitNativeObjectCallArguments(itemText, items)) {
@@ -5270,7 +5524,8 @@ bool TryEncodeNativeExpression(
 
 	std::string textValue;
 	bool isLongText = false;
-	if (TryDecodeExpressionTextLiteral(expression, textValue, isLongText) && !isLongText) {
+	if (parsedExpression.IsValid() && parsedExpression.root->kind == SourceExpressionKind::TextLiteral &&
+		TryDecodeExpressionTextLiteral(expression, textValue, isLongText) && !isLongText) {
 		writer.WriteU8(0x1A);
 		writer.WriteBStr(std::make_optional(textValue));
 		return true;
@@ -5290,6 +5545,7 @@ bool TryEncodeNativeExpression(
 		return true;
 	}
 
+	std::string operatorError;
 	if (TryEncodeNativeOperatorExpression(
 			expression,
 			context,
@@ -5297,16 +5553,24 @@ bool TryEncodeNativeExpression(
 			methodReferences,
 			variableReferences,
 			constantReferences,
-			nullptr)) {
+			&operatorError)) {
 		return true;
+	}
+	if (!operatorError.empty()) {
+		if (outError != nullptr) *outError = operatorError;
+		return false;
 	}
 
 	ParsedNativeFunctionCallExpression functionCall;
 	if (ParseNativeFunctionCallExpression(expression, functionCall)) {
 		ParsedNativeObjectCallLine memberCall;
-		if (ParseNativeObjectCallLine(expression, memberCall)) {
-			std::int32_t targetTypeId = 0;
-			if (!TryResolveNativeExpressionType(memberCall.objectName, context, targetTypeId)) {
+		const auto qualified = context.functionsByName.find(TypeResolver::NormalizeTypeName(functionCall.name));
+		std::int32_t targetTypeId = 0;
+		const bool isMemberCall = ParseNativeObjectCallLine(expression, memberCall);
+		const bool hasObjectTarget = isMemberCall &&
+			TryResolveNativeExpressionType(memberCall.objectName, context, targetTypeId);
+		if (isMemberCall && (hasObjectTarget || qualified == context.functionsByName.end() || !qualified->second.qualified)) {
+			if (!hasObjectTarget) {
 				if (outError != nullptr) {
 					*outError = "member_call_target_type_not_found: " + memberCall.objectName;
 				}
@@ -5333,7 +5597,7 @@ bool TryEncodeNativeExpression(
 		}
 
 		NativeFunctionSymbol functionSymbol;
-		if (!TryResolveNativeFunction(functionCall.name, context, functionSymbol)) {
+		if (!TryResolveNativeFunction(functionCall.name, context, functionSymbol, functionCall.args.size())) {
 			if (outError != nullptr) {
 				*outError = "function_not_found: " + functionCall.name;
 			}
@@ -5377,7 +5641,7 @@ bool TryEncodeNativeCallExpression(
 	}
 
 	writer.WriteU8(0x21);
-	WriteNativeCallHeader(writer, functionSymbol.methodId, functionSymbol.libraryId, 0);
+	WriteNativeCallHeader(writer, functionSymbol.methodId, functionSymbol.libraryId, functionSymbol.qualified ? 0x10 : 0);
 	if (targetExpression.has_value()) {
 		writer.WriteU8(0x38);
 		if (!TryEncodeNativeIn38Expression(
@@ -5507,7 +5771,7 @@ bool TryEncodeNativeFunctionCallStatementLine(
 	}
 
 	NativeFunctionSymbol functionSymbol;
-	if (!TryResolveNativeFunction(call.name, context, functionSymbol)) {
+	if (!TryResolveNativeFunction(call.name, context, functionSymbol, call.args.size())) {
 		if (outError != nullptr) {
 			*outError = "function_not_found: " + call.name;
 		}
@@ -5520,7 +5784,8 @@ bool TryEncodeNativeFunctionCallStatementLine(
 		outExpression.methodReferences.push_back(callOffset);
 	}
 	writer.WriteU8(0x6A);
-	WriteNativeCallHeader(writer, functionSymbol.methodId, functionSymbol.libraryId, static_cast<std::int16_t>(statement.mask ? 0x20 : 0), statement.fixedComment);
+	WriteNativeCallHeader(writer, functionSymbol.methodId, functionSymbol.libraryId,
+		static_cast<std::int16_t>((statement.mask ? 0x20 : 0) | (functionSymbol.qualified ? 0x10 : 0)), statement.fixedComment);
 	writer.WriteU8(0x36);
 	const bool needsDefaultReturnValue =
 		functionSymbol.libraryId == 0 &&
@@ -5606,33 +5871,17 @@ bool TryEncodeNativeRawStatementLine(
 {
 	// 只在语义编码入口拆分注释，原始代码仍用于原生快照比较和未检查行输出。
 	BodyStatement statement = sourceStatement;
-	bool inChineseQuote = false;
-	bool inAsciiQuote = false;
-	for (size_t index = 0; index < statement.code.size(); ++index) {
-		size_t quoteLength = 0;
-		if (!inAsciiQuote && TryGetNativeTextQuoteLength(statement.code, index, quoteLength)) {
-			inChineseQuote = !inChineseQuote;
-			index += quoteLength - 1;
-			continue;
-		}
-		if (!inChineseQuote && statement.code[index] == '"') {
-			inAsciiQuote = !inAsciiQuote;
-			continue;
-		}
-		if (!inChineseQuote && !inAsciiQuote && statement.code[index] == '\'') {
-			statement.fixedComment = statement.code.substr(index + 1);
-			if (!statement.fixedComment.empty() && statement.fixedComment.front() == ' ') {
-				statement.fixedComment.erase(0, 1);
-			}
-			statement.code = TrimRightAsciiCopy(statement.code.substr(0, index));
-			break;
-		}
+	const auto split = SplitFixedCodeComment(statement.code);
+	if (split->first != statement.code) {
+		statement.code = split->first;
+		statement.fixedComment = split->second;
 	}
 
 	std::string lastError;
 	std::string objectCallError;
 	std::string assignmentError;
-	const bool objectCallLike = LooksLikeReusableObjectMethodLine(statement.code);
+	ParsedNativeObjectCallLine objectCall;
+	const bool objectCallLike = ParseNativeObjectCallLine(statement.code, objectCall);
 	if (TryEncodeNativeObjectMethodCallLine(statement, context, outExpression, &lastError)) {
 		return true;
 	}
@@ -5697,7 +5946,8 @@ bool TryEncodeNativeStructuredCall(
 {
 	outExpression = {};
 	ParsedNativeFunctionCallExpression call;
-	if (!ParseNativeFunctionCallExpression(code, call)) {
+	const auto split = SplitFixedCodeComment(code);
+	if (!ParseNativeFunctionCallExpression(split->first, call)) {
 		if (outError != nullptr) {
 			*outError = "structured_call_parse_failed: " + code;
 		}
@@ -5712,7 +5962,7 @@ bool TryEncodeNativeStructuredCall(
 
 	ByteWriter writer;
 	writer.WriteU8(type);
-	WriteNativeCallHeader(writer, methodId, 0, static_cast<std::int16_t>(mask ? 0x20 : 0));
+	WriteNativeCallHeader(writer, methodId, 0, static_cast<std::int16_t>(mask ? 0x20 : 0), split->second);
 	writer.WriteU8(0x36);
 	for (const auto& arg : call.args) {
 		std::string expressionError;
@@ -8113,7 +8363,8 @@ bool ParseProgramPage(const Page& page, const std::unordered_set<std::string>& f
 	outClass.sourcePath = page.sourcePath;
 	outClass.name = fields.size() > 0 ? fields[0] : page.name;
 	outClass.baseClassName = GetFieldOrEmpty(fields, 1);
-	outClass.hasBaseClassField = fields.size() > 1;
+	// 普通程序集的公开/备注字段也会补齐空基类列；仅旧式双字段标题保留根类含义。
+	outClass.hasBaseClassField = fields.size() == 2 || !outClass.baseClassName.empty();
 	outClass.isPublic = GetFieldOrEmpty(fields, 2) == "公开";
 	outClass.comment = ExtractRemainingDefinitionFieldText(TrimAsciiCopy(page.lines[index]), "程序集", 3);
 	const std::string normalizedBaseClassName = TypeResolver::NormalizeTypeName(outClass.baseClassName);
@@ -8351,9 +8602,7 @@ bool ParseConstantPage(
 		}
 		else {
 			const std::string legacyPublicField = GetFieldOrEmpty(fields, 3);
-			const bool usesLegacyFiveFields =
-				legacyPublicField == "公开" ||
-				(fields.size() > 4 && legacyPublicField.empty());
+			const bool usesLegacyFiveFields = legacyPublicField == "公开";
 			if (usesLegacyFiveFields) {
 				item.isPublic = legacyPublicField == "公开";
 				commentFieldIndex = 4;
@@ -10834,6 +11083,28 @@ bool BuildRestoreModel(
 		model.constants.push_back(std::move(constant));
 	}
 
+	std::vector<size_t> resourceModelIndices;
+	if (bundle != nullptr) {
+		resourceModelIndices.reserve(bundle->resources.size());
+		for (const auto& resource : bundle->resources) {
+			RestoreConstant constant;
+			const BundleNativeConstantSnapshot* reusableResourceSnapshot = findReusableResourceSnapshot(resource);
+			constant.id =
+				reusableResourceSnapshot != nullptr && reusableResourceSnapshot->id != 0
+				? reusableResourceSnapshot->id
+				: allocator.Alloc(resource.kind == BundleResourceKind::Image
+					? epl_system_id::kTypeImageResource
+					: epl_system_id::kTypeSoundResource);
+			constant.attr = resource.isPublic ? kConstAttrPublic : 0;
+			constant.pageType = resource.kind == BundleResourceKind::Image ? kConstPageImage : kConstPageSound;
+			constant.name = resource.logicalName;
+			constant.comment = resource.comment;
+			constant.rawData = resource.data;
+			resourceModelIndices.push_back(model.constants.size());
+			model.constants.push_back(std::move(constant));
+		}
+	}
+
 	// 先为所有本地方法分配稳定 ID，方法体编码才能正确解析前向调用、递归和跨页调用。
 	for (size_t classIndex = 0; classIndex < parsedClasses.size(); ++classIndex) {
 		const auto& parsedClass = parsedClasses[classIndex];
@@ -11049,6 +11320,7 @@ bool BuildRestoreModel(
 			}
 			NativeObjectMethodEncodeContext nativeObjectEncodeContext;
 			nativeObjectEncodeContext.typeResolver = &resolver;
+			nativeObjectEncodeContext.currentOwnerTypeId = targetClass.id;
 			for (const auto& ownerClass : model.classes) {
 				nativeObjectEncodeContext.baseTypes.emplace(ownerClass.id, ownerClass.baseClass);
 			}
@@ -11163,7 +11435,9 @@ bool BuildRestoreModel(
 						continue;
 					}
 					const NativeFunctionSymbol sourceMethodSymbol{ -2, sourceMethodSnapshot.id };
-					nativeObjectEncodeContext.functionsByName.insert_or_assign(sourceMethodKey, sourceMethodSymbol);
+					if ((sourceSnapshot->classId & epl_system_id::kMaskType) != epl_system_id::kTypeClass) {
+						nativeObjectEncodeContext.functionsByName.insert_or_assign(sourceMethodKey, sourceMethodSymbol);
+					}
 					nativeObjectEncodeContext
 						.methodsByOwnerType[sourceSnapshot->classId]
 						.insert_or_assign(sourceMethodKey, sourceMethodSymbol);
@@ -11173,11 +11447,11 @@ bool BuildRestoreModel(
 				if (existingMethod.id == 0 || existingMethod.name.empty()) {
 					continue;
 				}
-				nativeObjectEncodeContext
-					.functionsByName
-					.insert_or_assign(
+				if ((existingMethod.ownerClass & epl_system_id::kMaskType) != epl_system_id::kTypeClass) {
+					nativeObjectEncodeContext.functionsByName.insert_or_assign(
 						TypeResolver::NormalizeTypeName(existingMethod.name),
-						NativeFunctionSymbol{ -2, existingMethod.id });
+						NativeFunctionSymbol{ -2, existingMethod.id, existingMethod.returnType });
+				}
 				if (existingMethod.ownerClass == 0) {
 					continue;
 				}
@@ -11197,8 +11471,22 @@ bool BuildRestoreModel(
 					if (sourceMethodKey.empty() || sourceMethodId == 0) {
 						continue;
 					}
-					const NativeFunctionSymbol sourceMethodSymbol{ -2, sourceMethodId };
-					nativeObjectEncodeContext.functionsByName.insert_or_assign(sourceMethodKey, sourceMethodSymbol);
+					NativeFunctionSymbol sourceMethodSymbol{ -2, sourceMethodId,
+						ensureTypeId(sourceClass.methods[sourceMethodIndex].returnTypeName) };
+					const auto& sourceParams = sourceClass.methods[sourceMethodIndex].params;
+					sourceMethodSymbol.maximumArguments = static_cast<std::int32_t>(sourceParams.size());
+					for (size_t parameterIndex = 0; parameterIndex < sourceParams.size(); ++parameterIndex) {
+						if (!HasWordFlag(sourceParams[parameterIndex].flagsText, "可空")) {
+							sourceMethodSymbol.minimumArguments = static_cast<std::int32_t>(parameterIndex + 1);
+						}
+					}
+					NativeFunctionSymbol qualifiedSymbol = sourceMethodSymbol;
+					qualifiedSymbol.qualified = true;
+					nativeObjectEncodeContext.functionsByName.insert_or_assign(
+						TypeResolver::NormalizeTypeName(sourceClass.name) + "." + sourceMethodKey, qualifiedSymbol);
+					if ((sourceOwnerTypeId & epl_system_id::kMaskType) != epl_system_id::kTypeClass) {
+						nativeObjectEncodeContext.functionsByName.insert_or_assign(sourceMethodKey, sourceMethodSymbol);
+					}
 					nativeObjectEncodeContext
 						.methodsByOwnerType[sourceOwnerTypeId]
 						.insert_or_assign(sourceMethodKey, sourceMethodSymbol);
@@ -11319,27 +11607,6 @@ bool BuildRestoreModel(
 	}
 
 	if (bundle != nullptr) {
-		const size_t baseConstantCount = model.constants.size();
-		std::vector<size_t> resourceModelIndices;
-		resourceModelIndices.reserve(bundle->resources.size());
-		for (const auto& resource : bundle->resources) {
-			RestoreConstant constant;
-			const BundleNativeConstantSnapshot* reusableResourceSnapshot = findReusableResourceSnapshot(resource);
-			constant.id =
-				reusableResourceSnapshot != nullptr && reusableResourceSnapshot->id != 0
-				? reusableResourceSnapshot->id
-				: allocator.Alloc(resource.kind == BundleResourceKind::Image
-					? epl_system_id::kTypeImageResource
-					: epl_system_id::kTypeSoundResource);
-			constant.attr = resource.isPublic ? kConstAttrPublic : 0;
-			constant.pageType = resource.kind == BundleResourceKind::Image ? kConstPageImage : kConstPageSound;
-			constant.name = resource.logicalName;
-			constant.comment = resource.comment;
-			constant.rawData = resource.data;
-			resourceModelIndices.push_back(model.constants.size());
-			model.constants.push_back(std::move(constant));
-		}
-
 		std::unordered_map<std::string, std::int32_t> keyToId;
 		for (size_t index = 0; index < bundle->sourceFiles.size() && index < localClassModelIndices.size(); ++index) {
 			keyToId.insert_or_assign(bundle->sourceFiles[index].key, model.classes[localClassModelIndices[index]].id);
@@ -11362,7 +11629,7 @@ bool BuildRestoreModel(
 			keyToId.insert_or_assign(BuildBundleItemKey("constant", parsedConstants[index].name, fixedKeyCounters), model.constants[localConstantModelIndices[index]].id);
 		}
 		for (size_t index = 0; index < bundle->resources.size(); ++index) {
-			keyToId.insert_or_assign(bundle->resources[index].key, model.constants[baseConstantCount + index].id);
+			keyToId.insert_or_assign(bundle->resources[index].key, model.constants[resourceModelIndices[index]].id);
 		}
 
 		for (const auto& folder : bundle->folders) {

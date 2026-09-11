@@ -213,8 +213,12 @@ try {
 返回 (0)
 "@
 	$unknownFailure = Invoke-PackagerExpectFailure -Arguments @("pack", $unknownWorkspace, $unknownOutput)
-	if ($unknownFailure -notmatch "code=call_not_found") {
-		throw "Unknown function did not produce the expected call_not_found preflight diagnostic:`n$unknownFailure"
+	if ($unknownFailure -notmatch "code=call_not_found" -and
+		$unknownFailure -notmatch "function_not_found: 确定不存在的函数") {
+		throw "Unknown function did not produce a name-resolution diagnostic:`n$unknownFailure"
+	}
+	if (Test-Path -LiteralPath $unknownOutput) {
+		throw "Unknown function produced an output file: $unknownOutput"
 	}
 	Write-Host "PASS unknown_function_is_rejected"
 

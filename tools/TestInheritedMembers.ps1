@@ -12,7 +12,7 @@ function Write-Source([string]$Name, [string]$Content) {
 }
 Write-Source '基类' @'
 .版本 2
-.程序集 基类, , 公开
+.程序集 基类, <对象>, 公开
 .子程序 取值, 整数型, 公开
 返回 (42)
 '@

@@ -5195,7 +5195,9 @@ bool ParseExpression(ByteReader& reader, std::unique_ptr<Expr>& outExpr, std::st
 				}
 				return false;
 			}
-			return ParseExpression(reader, outExpr, outError, true);
+			if (!ParseExpression(reader, expr, outError, false)) {
+				return false;
+			}
 		}
 		break;
 	case 0x3B:
@@ -5220,7 +5222,8 @@ bool ParseExpression(ByteReader& reader, std::unique_ptr<Expr>& outExpr, std::st
 		return false;
 	}
 
-	if (!parseMember) {
+	// 0x38 的成员链自带 0x37 结束符，下标内也必须完整解析，不能并入外层链。
+	if (!parseMember && type != 0x38) {
 		outExpr = std::move(expr);
 		return true;
 	}
@@ -5272,8 +5275,10 @@ bool ParseExpression(ByteReader& reader, std::unique_ptr<Expr>& outExpr, std::st
 			continue;
 		}
 		if (nextType == 0x37) {
-			reader.ReadU8(nextType);
-			continue;
+			if (type == 0x38) {
+				reader.ReadU8(nextType);
+			}
+			break;
 		}
 		break;
 	}
@@ -5893,6 +5898,9 @@ void BuildProgramPages(
 		AppendLine(page, "");
 
 		std::string baseClassName;
+		if (pageInfo.baseClass == -1) {
+			baseClassName = "<对象>";
+		}
 		if (pageInfo.baseClass != 0 && pageInfo.baseClass != -1) {
 			baseClassName = TrimAsciiCopy(resolver.ResolveType(pageInfo.baseClass));
 		}
@@ -7329,7 +7337,7 @@ bool TryBuildProgramPageSnapshot(const Page& page, SnapshotClassDef& outSnapshot
 	}
 	outSnapshot.name = GetSnapshotFieldOrEmpty(fields, 0);
 	outSnapshot.baseClassName = GetSnapshotFieldOrEmpty(fields, 1);
-	outSnapshot.hasBaseClassField = fields.size() > 1;
+	outSnapshot.hasBaseClassField = fields.size() == 2 || !outSnapshot.baseClassName.empty();
 	outSnapshot.isPublic = GetSnapshotFieldOrEmpty(fields, 2) == "公开";
 	if (fields.size() > 3) {
 		std::vector<std::string> remain(fields.begin() + 3, fields.end());

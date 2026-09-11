@@ -2,11 +2,21 @@
     [Parameter(Mandatory = $true)][string]$InputFile,
     [string]$OutputRoot = "$PSScriptRoot/../temp/edited-roundtrip-$([guid]::NewGuid().ToString('N'))",
     [string[]]$Architectures = @('Win32', 'x64'),
-    [int]$Limit = 0
+    [int]$Limit = 0,
+    [ValidateRange(1, 2147483647)][int]$StartPage = 1,
+    [switch]$AllPagesTogether,
+    [string]$CompileIde,
+    [string]$CompileLauncher
 )
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $repo = Split-Path -Parent $PSScriptRoot
+if ($CompileIde -or $CompileLauncher) {
+    if (-not (Test-Path -LiteralPath $CompileIde -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $CompileLauncher -PathType Leaf)) {
+        throw 'IDE verification requires existing CompileIde and CompileLauncher paths'
+    }
+}
 $OutputRoot = [IO.Path]::GetFullPath($OutputRoot)
 if (Test-Path -LiteralPath $OutputRoot) { throw "Output root already exists: $OutputRoot" }
 [IO.Directory]::CreateDirectory($OutputRoot) | Out-Null
@@ -25,7 +35,15 @@ $unpack = Run-Tool $decoder @('unpack', $inputCopy, $workspace) (Join-Path $Outp
 if ($unpack.Code -ne 0) { throw $unpack.Text }
 $meta = Get-Content -LiteralPath (Join-Path $workspace 'project/_meta.json') -Raw | ConvertFrom-Json
 $pages = @($meta.sourceFiles)
+$pages = @($pages | Select-Object -Skip ($StartPage - 1))
 if ($Limit -gt 0) { $pages = @($pages | Select-Object -First $Limit) }
+$cases = if ($AllPagesTogether) {
+    @([pscustomobject]@{ logicalName = 'all-pages'; relativePath = '*'; sourcePages = $pages })
+} else {
+    @($pages | ForEach-Object { [pscustomobject]@{
+        logicalName = $_.logicalName; relativePath = $_.relativePath; sourcePages = @($_)
+    } })
+}
 $baselineFiles = @{}
 foreach ($folder in @('src', 'image', 'audio')) {
     foreach ($file in Get-ChildItem -LiteralPath (Join-Path $workspace $folder) -File -Recurse) {
@@ -34,7 +52,9 @@ foreach ($folder in @('src', 'image', 'audio')) {
     }
 }
 function Normalize-Text([string]$Text) {
-    return (($Text -split '\r?\n' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join "`n")
+    $lines = $Text.Replace("`r`n", "`n")
+    $trimmed = [regex]::Replace($lines, '(?m)^[^\S\n]+|[^\S\n]+$', '')
+    return [regex]::Replace($trimmed, '(?m)^\n', '').TrimEnd("`n")
 }
 $results = [Collections.Generic.List[object]]::new()
 foreach ($arch in $Architectures) {
@@ -46,22 +66,26 @@ foreach ($arch in $Architectures) {
     if ($baseline.Code -ne 0 -or (Get-FileHash -LiteralPath $baselineOutput).Hash -ne $originalHash) {
         throw "Baseline roundtrip failed: $($baseline.Text)"
     }
-    $index = 0
-    foreach ($page in $pages) {
+    $index = $StartPage - 1
+    foreach ($page in $cases) {
         $index++
         $id = '{0:D3}' -f $index
         $caseRoot = Join-Path $archRoot $id
         [IO.Directory]::CreateDirectory($caseRoot) | Out-Null
-        $path = Join-Path $workspace $page.relativePath
-        $originalBytes = [IO.File]::ReadAllBytes($path)
+        $originalBytes = @{}
         $marker = "' edited-roundtrip-$id"
-        $edited = [IO.File]::ReadAllText($path).TrimEnd() + "`r`n`r`n$marker`r`n"
         $output = Join-Path $caseRoot 'edited.e'
         $decoded = Join-Path $caseRoot 'decoded'
         $failure = ''
         $packCode = $null
+        $compilePassed = $null
         try {
-            [IO.File]::WriteAllText($path, $edited, [Text.UTF8Encoding]::new($true))
+            foreach ($sourcePage in $page.sourcePages) {
+                $path = Join-Path $workspace $sourcePage.relativePath
+                $originalBytes[$path] = [IO.File]::ReadAllBytes($path)
+                $edited = [IO.File]::ReadAllText($path).TrimEnd() + "`r`n`r`n$marker`r`n"
+                [IO.File]::WriteAllText($path, $edited, [Text.UTF8Encoding]::new($true))
+            }
             $pack = Run-Tool $tool @('pack', $workspace, $output) (Join-Path $caseRoot 'pack.log')
             $packCode = $pack.Code
             if ($pack.Code -ne 0) { throw $pack.Text.Trim() }
@@ -86,14 +110,33 @@ foreach ($arch in $Architectures) {
                         (Get-FileHash -LiteralPath $actualPath).Hash) { throw "Resource mismatch: $relative" }
                 }
             }
+            if ($CompileIde) {
+                $compileResult = Join-Path $caseRoot 'compile-result.json'
+                $artifact = Join-Path $caseRoot "jingyi-audit-$arch-$id.ec"
+                $compile = Run-Tool $CompileLauncher @('headless-compile', $CompileIde, $output, $artifact,
+                    '--target', 'ecom', '--result', $compileResult, '--timeout', '120') (Join-Path $caseRoot 'compile.log')
+                $compilePassed = $false
+                if ($compile.Code -ne 0 -or -not (Test-Path -LiteralPath $compileResult)) {
+                    throw "IDE compile failed: $($compile.Text.Trim())"
+                }
+                $report = Get-Content -LiteralPath $compileResult -Raw | ConvertFrom-Json
+                if (-not $report.ok -or -not $report.compile_result.artifact_verified -or
+                    -not (Test-Path -LiteralPath $artifact) -or (Get-Item -LiteralPath $artifact).Length -eq 0) {
+                    throw 'IDE did not verify a nonempty compiled artifact'
+                }
+                $compilePassed = $true
+            }
         } catch { $failure = $_.Exception.Message }
-        finally { [IO.File]::WriteAllBytes($path, $originalBytes) }
+        finally {
+            foreach ($path in $originalBytes.Keys) { [IO.File]::WriteAllBytes($path, $originalBytes[$path]) }
+        }
         $results.Add([pscustomobject]@{
             Architecture = $arch; Page = $page.relativePath; Marker = $marker
-            PackExit = $packCode; Passed = ($failure -eq ''); Failure = $failure; Directory = $caseRoot
+            ModifiedPages = $page.sourcePages.Count
+            PackExit = $packCode; CompilePassed = $compilePassed; Passed = ($failure -eq ''); Failure = $failure; Directory = $caseRoot
         })
         $results | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $OutputRoot 'results.json') -Encoding utf8
-        Write-Host "$arch $id/$($pages.Count) $($page.logicalName): passed=$($failure -eq '')"
+        Write-Host "$arch $id/$($cases.Count) $($page.logicalName): passed=$($failure -eq '')"
     }
 }
 $failed = @($results | Where-Object { -not $_.Passed }).Count

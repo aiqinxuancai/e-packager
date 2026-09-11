@@ -11,6 +11,9 @@
 // 支持库公开信息导出辅助。
 namespace support_library_public_info {
 
+// 将支持库控件属性类型转换为与文本导出一致的数据类型名。
+std::string GetPropertyDataTypeName(std::int16_t propertyType);
+
 // 支持库参数的稳定 ABI 描述，所有字符串均已从 FNE 内存复制。
 struct ArgumentMetadata {
 	std::string name;

@@ -1108,6 +1108,7 @@ void AppendCommandDetails(
 	AppendNamedField(headerFields, "返回值", DecodeCommandReturnType(cmd, libInfo));
 	headerFields.emplace_back("分类=" + DecodeCommandCategory(cmd, libInfo));
 	headerFields.emplace_back("参数数=" + std::to_string(cmd.m_nArgCount));
+	headerFields.emplace_back("命令索引=" + std::to_string(&cmd - libInfo->m_pBeginCmdInfo));
 	AppendNamedField(headerFields, "英文名", cmdEnglishName);
 	if (!stateLabels.empty()) {
 		AppendNamedField(headerFields, "属性", JoinTextParts(stateLabels, "|"));
@@ -1797,6 +1798,11 @@ bool IsEquivalentDependency(const e2txt::Dependency& left, const e2txt::Dependen
 }
 
 }  // namespace
+
+std::string GetPropertyDataTypeName(const std::int16_t propertyType)
+{
+	return DecodeUnitPropertyDataType(propertyType);
+}
 
 bool LoadSupportLibraryMetadata(
 	const std::filesystem::path& inputPath,

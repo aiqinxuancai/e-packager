@@ -44,6 +44,9 @@ struct SourceExpressionParseResult {
 // 解析易语言表达式，支持调用、成员访问、数组下标、字面量和常见运算符。
 SourceExpressionParseResult ParseSourceExpression(const std::string& text);
 
+// 解析本地编码的日期字面量，严格校验日历后转换为 OLE 日期值。
+bool ParseSourceDateLiteral(const std::string& text, double& outValue);
+
 // 统一源码中的全角圆括号，保留字符串与注释内容；输入为本地编码。
 std::string NormalizeSourceParentheses(const std::string& text);
 

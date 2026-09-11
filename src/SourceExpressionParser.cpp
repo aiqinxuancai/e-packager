@@ -4,10 +4,38 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
+#include <chrono>
 #include <cstdlib>
 #include <string_view>
 
 namespace e2txt {
+bool ParseSourceDateLiteral(const std::string& text, double& outValue)
+{
+	if (text.size() < 2 || text.front() != '[' || text.back() != ']') return false;
+	size_t position = 1;
+	const auto readPart = [&](const std::string_view suffix, WORD& value) {
+		unsigned parsed = 0;
+		const char* begin = text.data() + position;
+		const auto result = std::from_chars(begin, text.data() + text.size() - 1, parsed);
+		if (result.ec != std::errc() || result.ptr == begin || parsed > 65535) return false;
+		position = static_cast<size_t>(result.ptr - text.data());
+		if (text.compare(position, suffix.size(), suffix) != 0) return false;
+		position += suffix.size();
+		value = static_cast<WORD>(parsed);
+		return true;
+	};
+	SYSTEMTIME time = {};
+	if (!readPart("年", time.wYear) || !readPart("月", time.wMonth) || !readPart("日", time.wDay)) return false;
+	if (position != text.size() - 1 &&
+		(!readPart("时", time.wHour) || !readPart("分", time.wMinute) || !readPart("秒", time.wSecond))) return false;
+	const std::chrono::year_month_day date{ std::chrono::year(time.wYear),
+		std::chrono::month(time.wMonth), std::chrono::day(time.wDay) };
+	if (position != text.size() - 1 || time.wYear < 100 || time.wYear > 9999 || !date.ok() ||
+		time.wHour > 23 || time.wMinute > 59 || time.wSecond > 59) return false;
+	return SystemTimeToVariantTime(&time, &outValue) != FALSE;
+}
+
 std::string NormalizeSourceParentheses(const std::string& text)
 {
 	std::string result;
@@ -94,7 +122,7 @@ bool IsOperatorStart(const std::string& text, const std::size_t position)
 {
 	static constexpr std::string_view kOperators[] = {
 		"＋", "－", "×", "÷", "＝", "≠", "＜", "＞", "≤", "≥",
-		"％", "?=", "==", "!=", "<=", ">=", "<>", "+", "-", "*", "/", "\\", "%", "=", "<", ">", "&", "|",
+		"％", "?=", "==", "!=", "<=", ">=", "<>", "&&", "||", "+", "-", "*", "/", "\\", "%", "=", "<", ">", "&", "|",
 	};
 	for (const auto operatorText : kOperators) {
 		if (StartsAt(text, position, operatorText)) {
@@ -199,7 +227,7 @@ public:
 			if (IsOperatorStart(source_, position_)) {
 				static constexpr std::string_view kOperators[] = {
 					"＋", "－", "×", "÷", "＝", "≠", "＜", "＞", "≤", "≥",
-					"％", "?=", "==", "!=", "<=", ">=", "<>", "+", "-", "*", "/", "\\", "%", "=", "<", ">", "&", "|",
+					"％", "?=", "==", "!=", "<=", ">=", "<>", "&&", "||", "+", "-", "*", "/", "\\", "%", "=", "<", ">", "&", "|",
 				};
 				std::string_view matched;
 				for (const auto operatorText : kOperators) {
@@ -503,13 +531,14 @@ private:
 
 	static int BinaryPrecedence(const std::string& op)
 	{
-		if (op == "或" || op == "|") return 1;
-		if (op == "且" || op == "&") return 2;
+		if (op == "或" || op == "|" || op == "||") return 1;
+		if (op == "且" || op == "&" || op == "&&") return 2;
 		if (op == "＝" || op == "=" || op == "==" || op == "≠" || op == "!=" || op == "<>" ||
 			op == "?=" || op == "＜" || op == "<" || op == "＞" || op == ">" || op == "≤" || op == "<=" || op == "≥" || op == ">=") return 3;
 		if (op == "＋" || op == "+" || op == "－" || op == "-") return 4;
-		if (op == "×" || op == "*" || op == "÷" || op == "/" || op == "\\" || op == "%") return 5;
-		if (op == "％") return 5;
+		if (op == "%" || op == "％") return 5;
+		if (op == "\\") return 6;
+		if (op == "×" || op == "*" || op == "÷" || op == "/") return 7;
 		return -1;
 	}
 
