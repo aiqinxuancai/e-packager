@@ -12,6 +12,7 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cwchar>
 #include <cwctype>
 #include <chrono>
@@ -596,7 +597,17 @@ bool WriteImportDefinition(
 	// intentionally different, so the emitter adds an /alternatename mapping
 	// to the real symbol.  Emitting the local alias here would make the loader
 	// search for ecompiler_import_* in the target DLL.
-	text << "    " << item.entryName << "\r\n";
+	if (item.entryName.starts_with('#')) {
+		unsigned int ordinal = 0;
+		const std::string number = item.entryName.substr(1);
+		const auto parsed = std::from_chars(number.data(), number.data() + number.size(), ordinal);
+		if (parsed.ec != std::errc() || parsed.ptr != number.data() + number.size() || ordinal == 0 || ordinal > 65535) {
+			error = "invalid_dll_import_ordinal:" + item.entryName;
+			return false;
+		}
+		text << "    " << item.symbol << "_ordinal @" << ordinal << " NONAME\r\n";
+	}
+	else text << "    " << item.entryName << "\r\n";
 	return WriteTextFile(path, text.str(), error);
 }
 

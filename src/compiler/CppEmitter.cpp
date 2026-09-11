@@ -2,6 +2,9 @@
 
 #include <Windows.h>
 #include "NativeWindowControl.h"
+#include "NativeX86Runtime.h"
+#include "PlatformDllRuntime.h"
+#include "BinaryValueRuntime.h"
 #include "../PathHelper.h"
 
 #include <algorithm>
@@ -115,12 +118,12 @@ bool IsCompilePrimitive(const support_library_public_info::CommandMetadata& comm
 {
 	static constexpr std::string_view names[] = {
 		"MachineCode", "hex", "binary", "GetAppName", "XchgVar", "ForceXchgVar",
-		"GetRuntimeDataType", "IsCondMacroDefined", "this",
+		"GetRuntimeDataType", "IsCondMacroDefined", "IsDebugVer", "IsMissing", "iif", "this", "GetBinElement", "pbin",
 		// These are language/runtime primitives. Their FNE entries describe the
 		// source signature, while the generated Value runtime owns the actual
 		// array state and must perform the mutation consistently across cores.
 		"ReDim", "GetAryElementCount", "CopyAry", "AddElement", "InsElement",
-		"RemoveElement", "RemoveAll", "dir", "not",
+		"RemoveElement", "RemoveAll", "dir", "not", "store",
 	};
 	return std::find(std::begin(names), std::end(names), command.englishName) != std::end(names);
 }
@@ -137,6 +140,8 @@ bool IsPlatformImportModule(const std::string& moduleName)
 	return normalized == "kernel32.dll" || normalized == "user32.dll" || normalized == "gdi32.dll" ||
 		normalized == "advapi32.dll" || normalized == "shell32.dll" || normalized == "ole32.dll" ||
 		normalized == "oleaut32.dll" || normalized == "comdlg32.dll" || normalized == "winmm.dll" ||
+		normalized == "gdiplus.dll" || normalized == "msimg32.dll" || normalized == "dwmapi.dll" ||
+		normalized == "imm32.dll" || normalized == "shlwapi.dll" || normalized == "uxtheme.dll" || normalized == "comctl32.dll" ||
 		normalized == "odbc32.dll" || normalized == "odbccp32.dll" || normalized == "ws2_32.dll";
 }
 
@@ -257,7 +262,8 @@ static FILE* ResolveLegacyStandardStream(FILE* stream) {
     auto* streams=module==nullptr?nullptr:reinterpret_cast<unsigned char*>(GetProcAddress(module,"_iob"));
     return streams==nullptr?stream:reinterpret_cast<FILE*>(streams+offset);
 }
-extern "C" int __cdecl fprintf(FILE* stream,const char* format,...) {
+#pragma comment(linker,"/alternatename:_fprintf=_ecompiler_legacy_fprintf")
+extern "C" int __cdecl ecompiler_legacy_fprintf(FILE* stream,const char* format,...) {
     (void)stream;
     va_list arguments; va_start(arguments,format);
     const char* text=nullptr;
@@ -329,25 +335,40 @@ struct MData {
 static_assert(sizeof(MData)==12);
 using ExecuteCommand=void (__cdecl*)(MData*,int,MData*);
 
-struct FieldDesc { std::uint32_t type; std::size_t offset; bool array; };
+struct FieldDesc { std::uint32_t type; std::size_t offset; bool array; std::initializer_list<int> dimensions; };
 struct TypeDesc {
     std::uint32_t type; std::size_t size; const FieldDesc* fields; std::size_t fieldCount;
     ExecuteCommand constructor; ExecuteCommand destructor; ExecuteCommand copier; bool enumeration;
 };
+struct Value;
+struct NativeStorage;
+static std::vector<NativeStorage*>& NativeObjects() { static auto* objects=new std::vector<NativeStorage*>;return *objects; }
+struct NativeStorage {
+    Value* owner=nullptr;
+    void* pointer=nullptr;
+    std::vector<unsigned char> bytes;
+    bool storing=false;
+    NativeStorage() { NativeObjects().push_back(this); }
+    ~NativeStorage() { auto& objects=NativeObjects();objects.erase(std::remove(objects.begin(),objects.end(),this),objects.end()); }
+};
 struct Value {
     std::uint32_t declared=T_NULL, type=T_NULL;
-    bool declaredArray=false, missing=false;
+    bool declaredArray=false, missing=false, semanticInitialized=false;
     long long integer=0; double number=0;
     std::string text; std::vector<unsigned char> bytes; std::vector<Value> elements;
     std::vector<int> dimensions;
     std::vector<Value> fields; std::vector<unsigned char> object;
+    std::shared_ptr<NativeStorage> native;
+    unsigned char* byteReference=nullptr;
     Value()=default;
     Value(const Value& other);
     Value& operator=(const Value& other);
-    Value(Value&& other) noexcept=default;
-    Value& operator=(Value&& other) noexcept=default;
+    Value(Value&& other) noexcept;
+    Value& operator=(Value&& other) noexcept;
+    ~Value() { if(native && native->owner==this)native->owner=nullptr; }
 };
 static void ReadObject(Value& value,const void* source);
+static void Redim(Value& value,const std::vector<int>& dimensions,bool preserve);
 struct ParamSpec { std::uint32_t type; std::uint32_t state; };
 struct Arg {
     Value* reference=nullptr; std::shared_ptr<Value> temporary;
@@ -375,7 +396,11 @@ static Value MakeVar(std::uint32_t type,bool array=false,bool invokeConstructor=
     if(array) return value;
     if(const auto* desc=FindType(type)) {
         value.object.resize((std::max)(desc->size,std::size_t(64)));
-        for(std::size_t index=0;index<desc->fieldCount;++index) value.fields.push_back(MakeVar(desc->fields[index].type,desc->fields[index].array));
+        for(std::size_t index=0;index<desc->fieldCount;++index) {
+            const auto& field=desc->fields[index];
+            value.fields.push_back(MakeVar(field.type,field.array));
+            if(field.array && field.dimensions.size()) Redim(value.fields.back(),std::vector<int>(field.dimensions),false);
+        }
         if(invokeConstructor && !desc->enumeration && desc->constructor) {
             MData receiver{}; receiver.type=type; receiver.pointerValue=value.object.data();
             MData result{}; result.type=type; desc->constructor(&result,1,&receiver);
@@ -394,11 +419,13 @@ static Value Exchange(Value& left,Value& right) { if(&left!=&right) std::swap(le
 static Value RuntimeType(const Value& value) { return Integer(static_cast<long long>(value.type|(value.declaredArray?T_ARRAY:0))); }
 
 static long long ToInteger(const Value& value) {
+    if(value.byteReference)return *value.byteReference;
     if(value.type==T_TEXT) return value.text.empty()?0:_strtoi64(value.text.c_str(),nullptr,10);
     if(value.type==T_FLOAT||value.type==T_DOUBLE||value.type==T_DATE) return static_cast<long long>(value.number);
     return value.integer;
 }
 static double ToNumber(const Value& value) {
+    if(value.byteReference)return *value.byteReference;
     if(value.type==T_TEXT) return value.text.empty()?0:std::strtod(value.text.c_str(),nullptr);
     return (value.type==T_FLOAT||value.type==T_DOUBLE||value.type==T_DATE)?value.number:static_cast<double>(value.integer);
 }
@@ -613,6 +640,7 @@ static Value ParseBinaryValue(const Value& value) {
 }
 static Value Convert(Value value,std::uint32_t type) {
     if(type==T_NULL||type==T_ALL) return value;
+    if(value.missing) { if(value.type==type)return value;Value result=MakeVar(type,value.declaredArray,false);result.missing=true;return result; }
     if(type==T_TEXT) return Text(ToText(value));
     if(type==T_BOOL) return Boolean(ToBool(value));
     if(type==T_FLOAT||type==T_DOUBLE||type==T_DATE) { Value result=MakeVar(type); result.number=ToNumber(value); result.integer=static_cast<long long>(result.number); return result; }
@@ -631,6 +659,9 @@ static bool CopyCompound(Value& target,const Value& source) {
     return true;
 }
 static Value& Assign(Value& target,Value value) {
+    if(target.byteReference) { *target.byteReference=static_cast<unsigned char>(ToInteger(value));target.integer=*target.byteReference;target.number=static_cast<double>(target.integer);return target; }
+    auto native=target.native;
+    struct PreserveNative { Value& target;std::shared_ptr<NativeStorage>& memory;~PreserveNative(){if(memory){target.native=std::move(memory);target.native->owner=&target;}} } preserve{target,native};
     if(target.declaredArray) { target=std::move(value); target.declaredArray=true; return target; }
     const auto declared=target.declared;
     if(declared!=T_NULL && !target.declaredArray && !value.declaredArray && CopyCompound(target,value)) {
@@ -670,6 +701,13 @@ static Value Or(const Value& a,const Value& b) { return Boolean(ToBool(a)||ToBoo
 static Value Not(const Value& a) { return Boolean(!ToBool(a)); }
 
 static Value& Index(Value& value,long long index) {
+    if(value.type==T_BIN && !value.declaredArray && index>=1 && static_cast<std::size_t>(index)<=value.bytes.size()) {
+        if(value.elements.size()!=value.bytes.size())value.elements.resize(value.bytes.size());
+        auto& element=value.elements[static_cast<std::size_t>(index-1)];
+        element.declared=element.type=T_BYTE;element.byteReference=&value.bytes[static_cast<std::size_t>(index-1)];
+        element.integer=*element.byteReference;element.number=static_cast<double>(element.integer);
+        return element;
+    }
     if(index<1||static_cast<std::size_t>(index)>value.elements.size()) {
         std::fputs("ecompiler: array index out of bounds\r\n",stderr); OutputDebugStringA("ecompiler: array index out of bounds\r\n"); ExitProcess(87);
     }
@@ -1209,8 +1247,8 @@ static void DestroyValue(Value& value) {
     value.object.clear();
 }
 Value::Value(const Value& other)
-    : declared(other.declared), type(other.type), declaredArray(other.declaredArray), missing(other.missing),
-      integer(other.integer), number(other.number), text(other.text), bytes(other.bytes), elements(other.elements),
+    : declared(other.declared), type(other.type), declaredArray(other.declaredArray), missing(other.missing), semanticInitialized(other.semanticInitialized),
+      integer(ToInteger(other)), number(ToNumber(other)), text(other.text), bytes(other.bytes), elements(other.elements),
       dimensions(other.dimensions), fields(other.fields), object(other.object) {
     const auto* descriptor=FindType(type);
     if(!declaredArray && descriptor!=nullptr && !descriptor->enumeration && descriptor->copier!=nullptr && !object.empty() && !other.object.empty()) {
@@ -1223,14 +1261,38 @@ Value::Value(const Value& other)
 Value& Value::operator=(const Value& other) {
     if(this==&other) return *this;
     DestroyValue(*this);
-    declared=other.declared; type=other.type; declaredArray=other.declaredArray; missing=other.missing;
-    integer=other.integer; number=other.number; text=other.text; bytes=other.bytes;
+    declared=other.declared; type=other.type; declaredArray=other.declaredArray; missing=other.missing;semanticInitialized=other.semanticInitialized;
+    integer=ToInteger(other); number=ToNumber(other); text=other.text; bytes=other.bytes;byteReference=nullptr;
     elements=other.elements; dimensions=other.dimensions; fields=other.fields; object=other.object;
     const auto* descriptor=FindType(type);
     if(!declaredArray && descriptor!=nullptr && !descriptor->enumeration && descriptor->copier!=nullptr && !object.empty() && !other.object.empty()) {
         MData arguments[2]{}; arguments[0].type=type; arguments[0].pointerValue=object.data(); arguments[1].type=type; arguments[1].pointerValue=const_cast<unsigned char*>(other.object.data());
         MData result{}; result.type=type; descriptor->copier(&result,2,arguments);
     }
+    return *this;
+}
+Value::Value(Value&& other) noexcept
+    :declared(other.declared),type(other.type),declaredArray(other.declaredArray),missing(other.missing),semanticInitialized(other.semanticInitialized),
+     integer(other.integer),number(other.number),text(std::move(other.text)),bytes(std::move(other.bytes)),
+     elements(std::move(other.elements)),dimensions(std::move(other.dimensions)),fields(std::move(other.fields)),
+     object(std::move(other.object)),native(std::move(other.native)),byteReference(other.byteReference) {
+    if(native)native->owner=this;
+}
+static Value ArrayLiteral(std::uint32_t type,std::vector<Value> values) {
+    Value result=MakeVar(type,true);
+    result.dimensions={static_cast<int>(values.size())};
+    for(auto& value:values)result.elements.push_back(Convert(std::move(value),type));
+    return result;
+}
+Value& Value::operator=(Value&& other) noexcept {
+    if(this==&other)return *this;
+    DestroyValue(*this);
+    if(native && native->owner==this)native->owner=nullptr;
+    declared=other.declared;type=other.type;declaredArray=other.declaredArray;missing=other.missing;semanticInitialized=other.semanticInitialized;
+    integer=other.integer;number=other.number;text=std::move(other.text);bytes=std::move(other.bytes);
+    elements=std::move(other.elements);dimensions=std::move(other.dimensions);fields=std::move(other.fields);
+    object=std::move(other.object);native=std::move(other.native);byteReference=other.byteReference;
+    if(native)native->owner=this;
     return *this;
 }
 struct MethodValueScope {
@@ -1248,6 +1310,19 @@ struct StatementScope {
     explicit StatementScope(std::function<Value()> evaluator) : previous(std::move(currentStatement)) { currentStatement=std::move(evaluator); }
     ~StatementScope() { currentStatement=std::move(previous); }
 };
+#if defined(_M_IX86)
+static void NativeEnterExternal();
+static void NativeLeaveExternal();
+#else
+static void NativeEnterExternal() {}
+static void NativeLeaveExternal() {}
+#endif
+struct NativeExternalScope {
+    bool active=true;
+    NativeExternalScope() { NativeEnterExternal(); }
+    void Finish() { if(active) { active=false;NativeLeaveExternal(); } }
+    ~NativeExternalScope() { Finish(); }
+};
 static Value CallFne(const char* name,ExecuteCommand command,std::uint32_t returnType,bool returnsArray,std::vector<Arg> args,std::vector<ParamSpec> specs) {
     (void)name;
     std::vector<MData> raw((std::max)(args.size(),std::size_t(1))); Arena arena;
@@ -1262,7 +1337,9 @@ static Value CallFne(const char* name,ExecuteCommand command,std::uint32_t retur
         if(byReference) MarshalByReference(args[i].Get(),specs[i].type,specs[i].state,raw[i],arena);
         else MarshalValue(args[i].Get(),specs[i].type,raw[i],arena);
     }
+    NativeExternalScope nativeCall;
     MData result{}; result.type=returnType|(returnsArray?T_ARRAY:0); InvokeCommand(command,&result,static_cast<int>(args.size()),raw.data());
+    nativeCall.Finish();
     ApplyWritebacks(arena);
     Value returned=CopyReturned(result,returnType,returnsArray);
     ReleaseArena(arena);
@@ -1284,8 +1361,13 @@ public:
 			result.text = "#define ECOMPILER_LEGACY_X86_RUNTIME 1\n";
 		}
 		result.text += RuntimeSourceUtf8(kRuntimeSource);
+		result.text += kPlatformDllRuntime;
+		result.text += kBinaryValueRuntime;
+		if (program_.targetArchitecture == TargetArchitecture::X86) result.text += kNativeX86Runtime;
 		body_ << "\nusing namespace ert;\n";
+		body_ << "static void ConstructSemantic(Value& value);\n";
 		EmitGlobals();
+		for (const auto& method : program_.methods) if (method.ownerType.valid && method.name == "_初始化") QueueMethod(method.id);
 		const auto startup = program_.methodByName.find("_启动子程序");
 		if (startup == program_.methodByName.end()) return Fail("startup_method_not_found:_启动子程序");
 		QueueMethod(startup->second);
@@ -1306,8 +1388,10 @@ public:
 			if (!EmitMethod(program_.methods[pendingMethods_[index]])) return false;
 		}
 		for (const Method& method : program_.methods) {
-			if (program_.buildDll && method.isPublic) EmitExportWrapper(method);
+			if ((program_.buildDll && method.isPublic) || callbackMethods_.contains(method.id)) EmitExportWrapper(method);
 		}
+		EmitSemanticConstruction();
+		if (program_.targetArchitecture == TargetArchitecture::X86) EmitNativeClassWrappers();
 		if (!EmitTypes()) return false;
 		EmitDeclarationsAndStartup();
 		result.reachableLibraries = reachableLibraries_;
@@ -1405,7 +1489,9 @@ private:
 			if (type.elements.empty()) continue;
 			body_ << "static const FieldDesc type_fields_" << typeIndex << "[]={";
 			for (const TypeElement& element : type.elements) {
-				body_ << '{' << Hex(element.type.code) << ',' << element.offset << ',' << (element.type.isArray ? "true" : "false") << "},";
+				body_ << '{' << Hex(element.type.code) << ',' << element.offset << ',' << (element.type.isArray ? "true" : "false") << ",{";
+				for (const auto dimension : element.arrayDimensions) body_ << dimension << ',';
+				body_ << "}},";
 			}
 			body_ << "};\n";
 		}
@@ -1439,7 +1525,7 @@ private:
 				for (const int dimension : variable.arrayDimensions) body_ << dimension << ',';
 				body_ << "},false);";
 			}
-			body_ << "}return *value;}\n";
+			body_ << "ConstructSemantic(*value);}return *value;}\n";
 		}
 		for (std::size_t assemblyIndex = 0; assemblyIndex < program_.assemblies.size(); ++assemblyIndex) {
 			const auto& assembly = program_.assemblies[assemblyIndex];
@@ -1453,7 +1539,7 @@ private:
 					for (const int dimension : variable.arrayDimensions) body_ << dimension << ',';
 					body_ << "},false);";
 				}
-				body_ << "}return *value;}\n";
+				body_ << "ConstructSemantic(*value);}return *value;}\n";
 			}
 		}
 	}
@@ -1662,15 +1748,23 @@ private:
 
 	void QueueMethod(const std::size_t id)
 	{
-		if (emittedMethods_.insert(id).second) pendingMethods_.push_back(id);
+		if (!emittedMethods_.insert(id).second) return;
+		pendingMethods_.push_back(id);
+		if (program_.targetArchitecture == TargetArchitecture::X86 && program_.methods[id].ownerType.valid) {
+			if (const auto* type = program_.FindType(program_.methods[id].ownerType.code))
+				for (const auto member : type->memberMethodIds) QueueMethod(member);
+		}
 	}
 
 	std::optional<std::pair<std::string, TypeRef>> FindVariable(const Method& method, const std::string& name) const
 	{
 		for (std::size_t index = 0; index < method.parameters.size(); ++index)
-			if (method.parameters[index].name == name) return std::pair { "p[" + std::to_string(index) + "]", method.parameters[index].type };
+			if (method.parameters[index].name == name) {
+				const auto slot = std::to_string(index);
+				return std::pair { method.parameters[index].byReference ? "(a.size()>" + slot + "?a[" + slot + "].Get():p[" + slot + "])" : "p[" + slot + "]", method.parameters[index].type };
+			}
 		for (std::size_t index = 0; index < method.locals.size(); ++index)
-			if (method.locals[index].name == name) return std::pair { "v[" + std::to_string(index) + "]", method.locals[index].type };
+			if (method.locals[index].name == name) return std::pair { method.locals[index].isStatic ? "s_" + std::to_string(method.id) + '_' + std::to_string(index) + "()" : "v[" + std::to_string(index) + "]", method.locals[index].type };
 		const auto& assembly = program_.assemblies[method.assemblyIndex];
 		if (method.ownerType.valid) {
 			for (std::size_t index = 0; index < assembly.variables.size(); ++index)
@@ -1684,6 +1778,13 @@ private:
 			return std::pair {
 				"Integer(static_cast<long long>(" + std::to_string(control->id) + "),T_WINDOW_UNIT)",
 				TypeRef { kTypeWindowUnit, false, true } };
+		}
+		for (const auto& form : program_.windows) {
+			if (name == form.name || name == form.className) {
+				return std::pair {
+					"Integer(static_cast<long long>(" + std::to_string(form.id) + "),T_WINDOW_UNIT)",
+					TypeRef { kTypeWindowUnit, false, true } };
+			}
 		}
 		return std::nullopt;
 	}
@@ -1803,7 +1904,9 @@ private:
 			return node.children.empty() ? TypeRef{} : Infer(method, *node.children.front());
 		case Kind::Index: {
 			if (node.children.empty()) return {};
-			TypeRef type = Infer(method, *node.children.front()); type.isArray = false; return type;
+			TypeRef type = Infer(method, *node.children.front());
+			if (!type.isArray && type.code == kTypeBinary) type.code = kTypeByte;
+			type.isArray = false; return type;
 		}
 		case Kind::Member: {
 			if (node.children.empty()) return {};
@@ -1887,6 +1990,11 @@ private:
 				if (const Method* owned = ResolveOwnedMethod(method, callee.text, count)) return owned->returnType;
 				if (const Method* targetMethod = ResolveUnqualifiedMethod(method, callee.text, count)) return targetMethod->returnType;
 				if (const DllCommand* dll = ResolveDllCommand(callee.text, count)) return dll->returnType;
+				if (const auto* form = WindowForMethod(method)) {
+					e2txt::SourceExpressionNode receiver;
+					receiver.kind = Kind::Name; receiver.text = form->name;
+					if (const auto operation = WindowMemberOperation(method, receiver, callee.text)) return WindowMemberReturnType(*operation);
+				}
 				if (const auto command = ResolveGlobalCommand(callee.text, count)) {
 					return { program_.NormalizeLibraryType(command->libraryIndex, command->command->returnType), (command->command->state & kCommandReturnsArray) != 0, true };
 				}
@@ -1906,6 +2014,11 @@ private:
 
 	std::string EmitConstant(const Constant& constant) const
 	{
+		if (constant.type == kTypeBinary) {
+			std::string value = "Bytes({";
+			for (const auto byte : constant.binaryValue) value += std::to_string(byte) + ',';
+			return value + "})";
+		}
 		if (constant.type == kTypeText) return "Text(" + EscapeCppString(constant.textValue) + ")";
 		if (constant.type == kTypeBool) return std::string("Boolean(") + (constant.numberValue != 0 ? "true" : "false") + ")";
 		std::ostringstream value; value << std::setprecision(17) << constant.numberValue;
@@ -1944,7 +2057,7 @@ private:
 		Fail(method.sourceFile + ":" + std::to_string(method.sourceLine) + ": expression_is_not_assignable"); return "*static_cast<Value*>(nullptr)";
 	}
 
-	std::string EmitArg(const Method& method, const e2txt::SourceExpressionNode& node, const bool byReference)
+	std::string EmitArg(const Method& method, const e2txt::SourceExpressionNode& node, const bool byReference, TypeRef expected = {})
 	{
 		bool referenceable = IsLvalue(node);
 		std::uint32_t ignoredUnitId = 0;
@@ -1953,13 +2066,42 @@ private:
 		// A named constant is an expression, not a mutable variable.  This is
 		// important for generic all-type parameters such as console output.
 		if (node.kind == e2txt::SourceExpressionKind::Name && !FindVariable(method, node.text)) referenceable = false;
-		return byReference && referenceable ? "Arg::Ref(" + EmitLvalue(method, node) + ')' : "Arg::Temp(" + EmitExpression(method, node) + ')';
+		return byReference && referenceable ? "Arg::Ref(" + EmitLvalue(method, node) + ')' : "Arg::Temp(" + EmitExpression(method, node, expected) + ')';
 	}
 
 	std::string EmitBuiltin(const Method& method, const CommandBinding& binding, const e2txt::SourceExpressionNode& call)
 	{
 		const std::string& operation = binding.command->englishName;
 		const auto arg = [&](const std::size_t index) -> const e2txt::SourceExpressionNode& { return *call.children[index + 1]; };
+		// 当前编译器只生成发布程序，没有易语言 IDE 调试运行环境。
+		if (operation == "IsDebugVer") return "Boolean(false)";
+		if (operation == "pbin") return "ReadMemoryBytes({" + EmitArg(method, arg(0), false) + ',' + EmitArg(method, arg(1), false) + "})";
+		if (operation == "GetBinElement") {
+			std::string values = "ReadBinaryElement({";
+			for (std::size_t index = 1; index < call.children.size(); ++index) values += EmitArg(method, *call.children[index], index == 3) + ',';
+			return values + "})";
+		}
+		if (operation == "store") {
+			std::string value = "([&](){Value source=" + EmitExpression(method, arg(0)) + ";";
+			for (std::size_t index = 2; index < call.children.size(); ++index)
+				value += "Assign(" + EmitLvalue(method, *call.children[index]) + ",source);";
+			return value + "return Empty();}())";
+		}
+		if (operation == "IsMissing") {
+			if (call.children.size() == 2 && arg(0).kind == e2txt::SourceExpressionKind::Name) {
+				for (std::size_t index = 0; index < method.parameters.size(); ++index) {
+					if (method.parameters[index].name == arg(0).text) {
+						const std::string slot = std::to_string(index);
+						return "Boolean(a.size()<=" + slot + "||a[" + slot + "].Get().missing)";
+					}
+				}
+			}
+			Fail(method.sourceFile + ": is_missing_requires_parameter"); return "Empty()";
+		}
+		if (operation == "iif") {
+			if (call.children.size() != 4) { Fail("conditional_expression_requires_three_arguments"); return "Empty()"; }
+			return "(ToBool(" + EmitExpression(method, arg(0)) + ")?" + EmitExpression(method, arg(1)) + ":" + EmitExpression(method, arg(2)) + ")";
+		}
 		if (operation == "MachineCode") {
 			Fail(method.sourceFile + ":" + std::to_string(method.sourceLine) + ": machine_code_must_be_statement");
 			return "Empty()";
@@ -2062,6 +2204,16 @@ private:
 		return type.code == kTypeNull ? "void" : DllCType(type, false);
 	}
 
+	std::string DllParameterCType(const TypeRef type, const bool byReference) const
+	{
+		// 易语言按完整整数槽传递小整数；先截断，再由调用签名扩展。
+		if (!byReference && !type.isArray) {
+			if (type.code == kTypeByte) return "unsigned int";
+			if (type.code == kTypeShort) return "int";
+		}
+		return DllCType(type, byReference);
+	}
+
 	std::string ImportLinkerSymbol(
 		const std::string& name,
 		const bool isCdecl,
@@ -2148,15 +2300,20 @@ private:
 				continue;
 			}
 			if (!parameter.byReference) {
+				if(referenceable && (type.code==kTypeBinary || type.code==kTypeText)) {
+					const std::string member=type.code==kTypeBinary?"bytes":"text";
+					result << "Value& __dll_target_" << index << "=" << EmitLvalue(method,*source) << ";auto __dll_before_" << index << "=" << valueName << '.' << member << ";";
+					syncStatements.push_back("if("+valueName+"."+member+"!=__dll_before_"+std::to_string(index)+") Assign(__dll_target_"+std::to_string(index)+","+valueName+");");
+				}
 				const bool platformComposite = IsPlatformImportModule(command.fileName) &&
 					program_.FindType(type.code) != nullptr;
 				if (referenceable && platformComposite) {
 					result << "Value& __dll_target_" << index << "=" << EmitLvalue(method, *source) << ";";
 					syncStatements.push_back(
-						"if(!" + valueName + ".object.empty()) { ReadObject(" + valueName + "," + valueName + ".object.data()); Assign(__dll_target_" +
+						"if(!" + valueName + ".object.empty()) { ReadPlatformObject(" + valueName + "," + valueName + ".object.data()); Assign(__dll_target_" +
 						std::to_string(index) + "," + valueName + "); }");
 				}
-				callArguments.push_back(DllValueExpression(type, valueName));
+				callArguments.push_back(platformComposite ? "PlatformObject(" + valueName + ")" : DllValueExpression(type, valueName));
 				continue;
 			}
 			const std::string cType = DllCType(type, false);
@@ -2176,9 +2333,10 @@ private:
 			if (type.code != kTypeByte && type.code != kTypeShort && type.code != kTypeInt &&
 				type.code != kTypeBool && type.code != kTypeSubroutine && type.code != kTypeInt64 &&
 				type.code != kTypeFloat && type.code != kTypeDouble && type.code != kTypeDateTime) {
-				result << "void* __dll_ref_" << index << "=DllObject(" << valueName << ");";
+				const bool platform = IsPlatformImportModule(command.fileName);
+				result << "void* __dll_ref_" << index << '=' << (platform ? "PlatformObject(" : "DllObject(") << valueName << ");";
 				callArguments.push_back(IsPlatformImportModule(command.fileName) ? "__dll_ref_" + std::to_string(index) : "&__dll_ref_" + std::to_string(index));
-				if (referenceable) syncStatements.push_back("if(__dll_ref_" + std::to_string(index) + ") ReadObject(" + valueName + ",__dll_ref_" + std::to_string(index) + "); Assign(__dll_target_" + std::to_string(index) + "," + valueName + ");");
+				if (referenceable) syncStatements.push_back("if(__dll_ref_" + std::to_string(index) + ") " + (platform ? "ReadPlatformObject(" : "ReadObject(") + valueName + ",__dll_ref_" + std::to_string(index) + "); Assign(__dll_target_" + std::to_string(index) + "," + valueName + ");");
 				continue;
 			}
 			result << cType << " __dll_ref_" << index << "=" << DllValueExpression(type, valueName) << ";";
@@ -2202,12 +2360,14 @@ private:
 		// in RegisterDllImport and is mapped to the real import symbol by the
 		// generated linker directive.
 		const std::string invoked = importSymbol + "(" + joinedArguments + ")";
+		result << "NativeExternalScope __native_call;";
 		if (returnType.code == kTypeNull) {
 			result << invoked << ";";
 		}
 		else {
 			result << "auto __dll_result=" << invoked << ";";
 		}
+		result << "__native_call.Finish();";
 		for (const std::string& statement : syncStatements) result << statement;
 		if (returnType.code == kTypeNull) result << "return Empty();";
 		else if (returnType.isArray) result << "MData __dll_data{}; __dll_data.type=" << Hex(returnType.code) << "|T_ARRAY; __dll_data.pointerValue=__dll_result; return CopyReturned(__dll_data," << Hex(returnType.code) << ",true);";
@@ -2242,7 +2402,7 @@ private:
 			// well as in EmitDllCall's argument marshalling.
 			declarations_ << ((IsPlatformImportModule(command.fileName) && command.parameters[index].byReference && program_.FindType(type.code) != nullptr)
 				? "void*"
-				: DllCType(type, command.parameters[index].byReference));
+				: DllParameterCType(type, command.parameters[index].byReference));
 		}
 		declarations_ << ");\n";
 		const std::string localSymbol = ImportLinkerSymbol(
@@ -2250,9 +2410,9 @@ private:
 			command.usesCdecl,
 			AbiParameterBytes(command.parameters));
 		const std::string targetSymbol = ImportLinkerSymbol(
-			command.entryName,
-			true,
-			0);
+			command.entryName.starts_with('#') ? symbol + "_ordinal" : command.entryName,
+			command.fileName.empty() ? command.usesCdecl : true,
+			command.fileName.empty() ? AbiParameterBytes(command.parameters) : 0);
 		const std::string localImportSymbol = LinkerDirectiveName("__imp_" + localSymbol);
 		const std::string targetImportSymbol = LinkerDirectiveName("__imp_" + targetSymbol);
 		declarations_ << "#pragma comment(linker,\"/alternatename:" << localImportSymbol
@@ -2269,6 +2429,13 @@ private:
 	std::string EmitFneCall(const Method& method, const CommandBinding& binding, const e2txt::SourceExpressionNode& call, const e2txt::SourceExpressionNode* receiver)
 	{
 		const auto& command = *binding.command;
+		if (receiver == nullptr && command.englishName == "LoadWin" && !program_.windows.empty()) {
+			const auto value = [&](std::size_t index, const char* fallback) {
+				return index < call.children.size() && call.children[index]->kind != e2txt::SourceExpressionKind::Missing
+					? EmitExpression(method, *call.children[index]) : std::string(fallback);
+			};
+			return "WindowLoad(" + value(1, "Missing()") + ',' + value(2, "Missing()") + ',' + value(3, "Boolean(true)") + ')';
+		}
 		if (IsCompilePrimitive(command)) return EmitBuiltin(method, binding, call);
 		const bool isMsgBox = receiver == nullptr &&
 			(command.englishName == "MsgBox" || command.name == "信息框");
@@ -2363,7 +2530,7 @@ private:
 				QueueMethod(owned->id); std::string arguments = "{";
 				for (std::size_t index = 1; index < node.children.size(); ++index) {
 					const bool byReference = index - 1 < owned->parameters.size() && owned->parameters[index - 1].byReference;
-					arguments += EmitArg(method, *node.children[index], byReference) + ',';
+					arguments += EmitArg(method, *node.children[index], byReference, owned->parameters[index - 1].type) + ',';
 				}
 				arguments += '}'; return "method_" + std::to_string(owned->id) + '(' + arguments + ',' + (method.ownerType.valid ? "self" : "nullptr") + ')';
 			}
@@ -2373,13 +2540,21 @@ private:
 				for (std::size_t index = 1; index < node.children.size(); ++index) {
 					const std::size_t parameterIndex = index - 1;
 					const bool byReference = parameterIndex < targetMethod->parameters.size() && targetMethod->parameters[parameterIndex].byReference;
-					const bool referenceable = IsLvalue(*node.children[index]) && !(node.children[index]->kind == Kind::Name && !FindVariable(method, node.children[index]->text));
-					if (byReference && !referenceable) { Fail(method.sourceFile + ": reference_parameter_requires_variable:" + callee.text); return "Empty()"; }
-					arguments += EmitArg(method, *node.children[index], byReference) + ',';
+					arguments += EmitArg(method, *node.children[index], byReference, targetMethod->parameters[parameterIndex].type) + ',';
 				}
 				arguments += '}'; return "method_" + std::to_string(targetMethod->id) + '(' + arguments + ",nullptr)";
 			}
 			if (const DllCommand* dll = ResolveDllCommand(callee.text, argumentCount)) return EmitDllCall(method, *dll, node);
+			if (const auto* form = WindowForMethod(method)) {
+				e2txt::SourceExpressionNode receiver;
+				receiver.kind = Kind::Name;
+				receiver.text = form->name;
+				if (const auto operation = WindowMemberOperation(method, receiver, callee.text)) {
+					std::string arguments = "{";
+					for (std::size_t index = 1; index < node.children.size(); ++index) arguments += EmitExpression(method, *node.children[index]) + ',';
+					return "WindowInvokeMember(" + std::to_string(form->id) + "u," + EscapeCppString(*operation) + ",std::vector<Value>" + arguments + "})";
+				}
+			}
 			const auto binding = ResolveGlobalCommand(callee.text, argumentCount);
 			if (!binding) {
 				Fail(method.sourceFile + ": unknown_call:" + callee.text + "/" + std::to_string(argumentCount));
@@ -2405,7 +2580,7 @@ private:
 				std::string arguments = "{";
 				for (std::size_t index = 1; index < node.children.size(); ++index) {
 					const bool byReference = index - 1 < member->parameters.size() && member->parameters[index - 1].byReference;
-					arguments += EmitArg(method, *node.children[index], byReference) + ',';
+					arguments += EmitArg(method, *node.children[index], byReference, member->parameters[index - 1].type) + ',';
 				}
 				arguments += '}';
 				return "method_" + std::to_string(member->id) + '(' + arguments + ",&" + EmitLvalue(method, *callee.children.front()) + ')';
@@ -2454,7 +2629,7 @@ private:
 		return result;
 	}
 
-	std::string EmitExpression(const Method& method, const e2txt::SourceExpressionNode& node)
+	std::string EmitExpression(const Method& method, const e2txt::SourceExpressionNode& node, TypeRef expected = {})
 	{
 		using Kind = e2txt::SourceExpressionKind;
 		switch (node.kind) {
@@ -2465,6 +2640,12 @@ private:
 		case Kind::LogicalLiteral: return std::string("Boolean(") + (node.text == "真" ? "true" : "false") + ')';
 		case Kind::DateTimeLiteral: return DateTimeValue(node.text);
 		case Kind::ByteSetLiteral: {
+			if (!expected.valid && !node.children.empty() && Infer(method, *node.children.front()).code == kTypeText) expected = { kTypeText, true, true };
+			if (expected.isArray) {
+				std::string result = "ArrayLiteral(" + Hex(expected.code) + ",{";
+				for (const auto& child : node.children) result += EmitExpression(method, *child) + ',';
+				return result + "})";
+			}
 			std::string result = "Bytes({"; for (const auto& child : node.children) result += "static_cast<unsigned char>(ToInteger(" + EmitExpression(method, *child) + ")),"; return result + "})";
 		}
 		case Kind::Name:
@@ -2486,10 +2667,38 @@ private:
 				const std::string qualified = node.children.front()->text + "." + node.text;
 				if (const auto constant = program_.constants.find(qualified); constant != program_.constants.end()) return EmitConstant(constant->second);
 			}
+			if (!node.children.empty()) {
+				const TypeInfo* type = program_.FindType(Infer(method, *node.children.front()).code);
+				if (type != nullptr) {
+					for (std::size_t index = 0; index < type->elements.size(); ++index) {
+						if (type->elements[index].name == node.text)
+							return "([&](){Value value=" + EmitExpression(method, *node.children.front()) + ";return Value(Field(value," + std::to_string(index) + "));}())";
+					}
+				}
+			}
 			return EmitLvalue(method, node);
 		case Kind::Index: return EmitLvalue(method, node);
-		case Kind::Group: return node.children.empty() ? "Empty()" : '(' + EmitExpression(method, *node.children.front()) + ')';
-		case Kind::AddressOf: return node.children.empty() ? "Empty()" : EmitExpression(method, *node.children.front());
+		case Kind::Group: return node.children.empty() ? "Empty()" : '(' + EmitExpression(method, *node.children.front(), expected) + ')';
+		case Kind::AddressOf: {
+			if (node.children.size() != 1 || node.children.front()->kind != Kind::Name) {
+				Fail(method.sourceFile + ": invalid_subroutine_address"); return "Empty()";
+			}
+			const Method* target = ResolveUnqualifiedMethod(method, node.children.front()->text, 0);
+			if (target == nullptr || target->ownerType.valid) {
+				Fail(method.sourceFile + ": unknown_subroutine_address:" + node.children.front()->text); return "Empty()";
+			}
+			QueueMethod(target->id);
+			if (callbackMethods_.insert(target->id).second) {
+				declarations_ << "extern \"C\" " << (target->returnType.code == kTypeNull ? "void" : ExportCType(target->returnType, false))
+					<< (target->usesCdecl ? " __cdecl " : " __stdcall ") << "ecompiler_export_" << target->id << '(';
+				for (std::size_t index = 0; index < target->parameters.size(); ++index) {
+					if (index != 0) declarations_ << ',';
+					declarations_ << ExportCType(target->parameters[index].type, target->parameters[index].byReference);
+				}
+				declarations_ << ");\n";
+			}
+			return "Integer(static_cast<long long>(reinterpret_cast<std::uintptr_t>(&ecompiler_export_" + std::to_string(target->id) + ")),T_SUB)";
+		}
 		case Kind::Unary:
 			if (node.children.empty()) return "Empty()";
 			if (node.text == "－" || node.text == "-") return "Neg(" + EmitExpression(method, *node.children.front()) + ')';
@@ -2523,6 +2732,7 @@ private:
 	{
 		for (const Statement& statement : statements) {
 			SourceLine(method.sourceFile, statement.sourceLine);
+			if (program_.targetArchitecture == TargetArchitecture::X86) Line(indent, "__frame.Store();");
 			switch (statement.kind) {
 			case StatementKind::Expression: Line(indent, "(void)" + EmitExpression(method, *statement.expression) + ";"); break;
 			case StatementKind::Assignment: {
@@ -2532,7 +2742,7 @@ private:
 					Line(indent, "WindowSetProperty(" + std::to_string(unitId) + "," + EscapeCppString(property) + "," + EmitExpression(method, *statement.expression) + ");");
 				}
 				else {
-					Line(indent, "Assign(" + EmitLvalue(method, *statement.target) + ',' + EmitExpression(method, *statement.expression) + ");");
+					Line(indent, "Assign(" + EmitLvalue(method, *statement.target) + ',' + EmitExpression(method, *statement.expression, Infer(method, *statement.target)) + ");");
 				}
 				break;
 			}
@@ -2568,7 +2778,12 @@ private:
 			}
 			case StatementKind::Break: Line(indent, "break;"); break;
 			case StatementKind::Continue: Line(indent, "continue;"); break;
-			case StatementKind::MachineCode: return Fail(method.sourceFile + ": machine_code_internal_error");
+			case StatementKind::MachineCode: {
+				if (program_.targetArchitecture != TargetArchitecture::X86) return Fail(method.sourceFile + ": machine_code_internal_error");
+				const std::string helper = "ecompiler_machine_" + std::to_string(method.id) + "_" + std::to_string(statement.sourceLine);
+				Line(indent, "{ Value result; if(__frame.Execute(reinterpret_cast<void*>(&" + helper + ")," + Hex(method.returnType.code) + ",result)) return result; }");
+				break;
+			}
 			}
 			if (!error_->empty()) return false;
 		}
@@ -2590,6 +2805,7 @@ private:
 			return Fail(method.sourceFile + ": x64_machine_code_return_type_not_supported");
 		}
 		body_ << "\nstatic Value method_" << method.id << "(std::vector<Arg> a,Value* self) {\n";
+		EmitVirtualDispatch(method);
 		Line(1, "std::vector<Value> p; p.reserve(" + std::to_string(method.parameters.size()) + ");");
 		for (std::size_t index = 0; index < method.parameters.size(); ++index) {
 			const auto& parameter = method.parameters[index];
@@ -2628,11 +2844,38 @@ private:
 		return true;
 	}
 
+	void EmitVirtualDispatch(const Method& method)
+	{
+		if (!method.ownerType.valid || method.name == "_初始化" || method.name == "_销毁") return;
+		for (const auto& type : program_.types) {
+			const TypeInfo* ancestor = program_.FindType(type.baseType.code);
+			while (ancestor && ancestor->type.code != method.ownerType.code) ancestor = program_.FindType(ancestor->baseType.code);
+			if (!ancestor) continue;
+			for (const auto id : type.memberMethodIds) if (id != method.id && program_.methods[id].name == method.name) {
+				QueueMethod(id);
+				Line(1, "if(self && self->type==" + Hex(type.type.code) + ")return method_" + std::to_string(id) + "(std::move(a),self);");
+				break;
+			}
+		}
+	}
+
 	bool EmitMethod(const Method& method)
 	{
 		SourceLine(method.sourceFile, method.sourceLine);
+		for (std::size_t index = 0; index < method.locals.size(); ++index) {
+			const auto& local = method.locals[index];
+			if (!local.isStatic) continue;
+			body_ << "static Value& s_" << method.id << '_' << index << "(){static Value value=[](){Value value=MakeVar(" << Hex(local.type.code) << ',' << (local.type.isArray ? "true" : "false") << ");";
+			if (local.type.isArray && !local.arrayDimensions.empty()) {
+				body_ << "Redim(value,std::vector<int>{";
+				for (const auto dimension : local.arrayDimensions) body_ << dimension << ',';
+				body_ << "},false);";
+			}
+			body_ << "return value;}();ConstructSemantic(value);return value;}\n";
+		}
+		if (program_.targetArchitecture == TargetArchitecture::X86) EmitNativeMachineBlocks(method, method.body);
 		const Statement* machineStatement = nullptr;
-		for (const Statement& statement : method.body) {
+		if (program_.targetArchitecture != TargetArchitecture::X86) for (const Statement& statement : method.body) {
 			if (statement.kind == StatementKind::MachineCode) {
 				if (machineStatement != nullptr) return Fail(method.sourceFile + ": multiple_machine_code_statements");
 				machineStatement = &statement;
@@ -2642,64 +2885,15 @@ private:
 			if (machineStatement != nullptr) return Fail(method.sourceFile + ": machine_code_must_be_only_method_statement");
 		}
 		if (machineStatement != nullptr) {
-			if (program_.targetArchitecture == TargetArchitecture::X64) {
-				return EmitX64MachineMethod(method, *machineStatement);
+			if (&method.body.front() != machineStatement) {
+				return Fail(method.sourceFile + ":" + std::to_string(machineStatement->sourceLine) +
+					": machine_code_with_source_statements_requires_native_abi");
 			}
-			const std::string helper = "ecompiler_machine_" + std::to_string(method.id);
-			const bool hasExplicitReturn = std::any_of(
-				machineStatement->machineCode.begin(),
-				machineStatement->machineCode.end(),
-				[](const std::uint8_t byte) { return byte == 0xC2 || byte == 0xC3 || byte == 0xCA || byte == 0xCB; });
-			// 不带 ret 的片段是 IDE 嵌入到正常子程序框架中的代码；
-			// 该框架提供 EBP 参数槽及尾声。带 ret 的片段自行管理 ABI。
-			const bool usesEbpFrame = !hasExplicitReturn ||
-				std::find(machineStatement->machineCode.begin(), machineStatement->machineCode.end(), static_cast<std::uint8_t>(0xC9)) != machineStatement->machineCode.end() ||
-				std::find(machineStatement->machineCode.begin(), machineStatement->machineCode.end(), static_cast<std::uint8_t>(0x55)) != machineStatement->machineCode.end();
-			const bool returnsLong = method.returnType.code == kTypeInt64;
-			const std::string helperReturn = returnsLong ? "long long" : "int";
-			body_ << "\nextern \"C\" __declspec(naked) " << helperReturn << ' ' << (method.usesCdecl ? "__cdecl" : "__stdcall") << ' ' << helper << "(";
-			for (std::size_t index = 0; index < method.parameters.size(); ++index) {
-				if (index != 0) body_ << ',';
-				body_ << "int arg" << index;
-			}
-			body_ << ") {\n    __asm {\n";
-			if (usesEbpFrame) body_ << "        push ebp\n        mov ebp, esp\n";
-			for (const std::uint8_t byte : machineStatement->machineCode) {
-				std::ostringstream instruction;
-				instruction << "        _emit 0x" << std::hex << std::uppercase << static_cast<unsigned int>(byte) << "\n";
-				body_ << instruction.str();
-			}
-			if (!hasExplicitReturn) {
-				if (usesEbpFrame) body_ << "        mov esp, ebp\n        pop ebp\n";
-				if (method.usesCdecl || method.parameters.empty()) body_ << "        ret\n";
-				else body_ << "        ret " << (method.parameters.size() * sizeof(std::uint32_t)) << "\n";
-			}
-			body_ << "    }\n}\n";
-			body_ << "\nstatic Value method_" << method.id << "(std::vector<Arg> a,Value* self) {\n";
-			Line(1, "std::vector<Value> p; p.reserve(" + std::to_string(method.parameters.size()) + ");");
-			for (std::size_t index = 0; index < method.parameters.size(); ++index) {
-				const auto& parameter = method.parameters[index];
-				Line(1, "p.push_back(MakeVar(" + Hex(parameter.type.code) + "," + (parameter.type.isArray ? "true" : "false") + "));" );
-				Line(1, "if(a.size()>" + std::to_string(index) + ") Assign(p.back(),a[" + std::to_string(index) + "].Get());");
-			}
-			std::string call = helper + "(";
-			for (std::size_t index = 0; index < method.parameters.size(); ++index) {
-				if (index != 0) call += ',';
-				call += "static_cast<int>(ToInteger(p[" + std::to_string(index) + "]))";
-			}
-			call += ")";
-			if (method.returnType.code == kTypeNull) Line(1, "(void)" + call + ";");
-			else if (returnsLong) {
-				Line(1, "long long __machine_result=" + call + ";");
-				Line(1, "Value __machine_value=MakeVar(" + Hex(method.returnType.code) + "); __machine_value.integer=__machine_result; return __machine_value;");
-			}
-			else Line(1, "return Integer(" + call + "," + Hex(method.returnType.code) + ");");
-			if (method.returnType.code == kTypeNull) Line(1, "return Empty();");
-			body_ << "}\n";
-			return true;
+			return EmitX64MachineMethod(method, *machineStatement);
 		}
 		body_ << "\nstatic Value method_" << method.id << "(std::vector<Arg> a,Value* self) {\n";
 		for (const auto& parameter : method.parameters) usedTypes_.insert(parameter.type.code);
+		EmitVirtualDispatch(method);
 		for (const auto& local : method.locals) usedTypes_.insert(local.type.code);
 		Line(1, "std::vector<Value> p; p.reserve(" + std::to_string(method.parameters.size()) + ");");
 		for (std::size_t index = 0; index < method.parameters.size(); ++index) {
@@ -2714,34 +2908,109 @@ private:
 		}
 		Line(1, "std::vector<Value> v; v.reserve(" + std::to_string(method.locals.size()) + ");");
 		for (const auto& local : method.locals) {
+			if (local.isStatic) { Line(1, "v.push_back(Empty());"); continue; }
 			Line(1, "v.push_back(MakeVar(" + Hex(local.type.code) + ',' + (local.type.isArray ? "true" : "false") + ")); ");
-			const TypeInfo* localType = program_.FindType(local.type.code);
-			if (localType != nullptr && !local.type.isArray) {
-				const auto initializer = std::find_if(localType->memberMethodIds.begin(), localType->memberMethodIds.end(), [&](const std::size_t methodId) {
-					return methodId < program_.methods.size() && program_.methods[methodId].name == "_初始化";
-				});
-				if (initializer != localType->memberMethodIds.end()) {
-					QueueMethod(*initializer);
-					Line(1, "method_" + std::to_string(*initializer) + "({},&v[" + std::to_string(&local - method.locals.data()) + "]); ");
-				}
-			}
 			if (local.type.isArray && !local.arrayDimensions.empty()) {
 				std::string dimensions = "std::vector<int>{";
 				for (const int dimension : local.arrayDimensions) dimensions += std::to_string(dimension) + ',';
 				dimensions += "}";
 				Line(1, "Redim(v.back()," + dimensions + ",false);");
 			}
+			Line(1, "ConstructSemantic(v.back());");
 		}
-		std::string writeback = "[&](){";
-		for (std::size_t index = 0; index < method.parameters.size(); ++index) {
-			if (method.parameters[index].byReference) {
-				writeback += "if(a.size()>" + std::to_string(index) + " && a[" + std::to_string(index) + "].reference) Assign(*a[" + std::to_string(index) + "].reference,p[" + std::to_string(index) + "]);";
-			}
+		Line(1, "MethodValueScope __scope{&p,&v,{}};");
+		if (program_.targetArchitecture == TargetArchitecture::X86) {
+			std::string specs = "{";
+			for (const auto& parameter : method.parameters) specs += std::string("{") + (parameter.byReference ? "true" : "false") + "," + (parameter.nullable ? "true" : "false") + "},";
+			std::string locals = "{";
+			for (std::size_t index = 0; index < method.locals.size(); ++index) if (!method.locals[index].isStatic) locals += "&v[" + std::to_string(index) + "],";
+			Line(1, "NativeFrame __frame(p," + locals + "},a," + specs + "},self);");
 		}
-		writeback += "}";
-		Line(1, "MethodValueScope __scope{&p,&v," + writeback + "};");
 		if (!EmitStatements(method, method.body, 1)) return false;
 		Line(1, "return Empty();"); body_ << "}\n"; return true;
+	}
+
+	void EmitSemanticConstruction()
+	{
+		body_ << "\nstatic void ConstructSemantic(Value& value) {\n    if(value.semanticInitialized)return;\n    value.semanticInitialized=true;\n    for(auto& field:value.fields)ConstructSemantic(field);\n    if(value.declaredArray){for(auto& element:value.elements)ConstructSemantic(element);return;}\n    switch(value.type) {\n";
+		for (const auto& type : program_.types) {
+			if (type.memberMethodIds.empty()) continue;
+			std::vector<const TypeInfo*> hierarchy;
+			for (const TypeInfo* current = &type; current; current = program_.FindType(current->baseType.code)) hierarchy.push_back(current);
+			body_ << "    case " << Hex(type.type.code) << ":";
+			for (auto current = hierarchy.rbegin(); current != hierarchy.rend(); ++current) {
+				for (const auto id : (*current)->memberMethodIds) {
+					const auto& method = program_.methods[id];
+					if (method.name == "_初始化" && method.ownerType.code == (*current)->type.code) body_ << "method_" << id << "({},&value);";
+				}
+			}
+			body_ << "break;\n";
+		}
+		body_ << "    default:break;\n    }\n}\n";
+	}
+
+	void EmitNativeClassWrappers()
+	{
+		for (const auto id : pendingMethods_) {
+			const auto& method = program_.methods[id];
+			if (!method.ownerType.valid) continue;
+			const std::string returnType = method.returnType.code == kTypeNull ? "void" : ExportCType(method.returnType, false);
+			body_ << "\nstatic " << returnType << (method.usesCdecl ? " __cdecl " : " __stdcall ") << "ecompiler_native_" << id << "(void* receiver";
+			std::vector<unsigned> offsets;
+			unsigned words = 0;
+			for (const auto& parameter : method.parameters) {
+				offsets.push_back(words);
+				words += !parameter.byReference && !parameter.type.isArray && (parameter.type.code == kTypeInt64 || parameter.type.code == kTypeDouble || parameter.type.code == kTypeDateTime) ? 2 : 1;
+				if (parameter.nullable) ++words;
+			}
+			for (unsigned word = 0; word < words; ++word) body_ << ",unsigned raw" << word;
+			body_ << ") {\n    NativeCallbackScope callback;\n    std::vector<Value> p; p.reserve(" << method.parameters.size() << ");\n    std::vector<Arg> a;\n";
+			for (std::size_t index = 0; index < method.parameters.size(); ++index) {
+				const auto& parameter = method.parameters[index];
+				body_ << "    p.push_back(MakeVar(" << Hex(parameter.type.code) << ',' << (parameter.type.isArray ? "true" : "false") << "));\n";
+				if (parameter.nullable) {
+					const unsigned presence = (index + 1 == offsets.size() ? words : offsets[index + 1]) - 1;
+					body_ << "    p.back().missing=raw" << presence << "==0;\n";
+				}
+				body_ << "    if(!p.back().missing) NativeRead(p.back(),";
+				if (parameter.byReference || (!parameter.type.isArray && program_.FindType(parameter.type.code) && !program_.FindType(parameter.type.code)->isEnum)) body_ << "reinterpret_cast<const void*>(raw" << offsets[index] << ')';
+				else body_ << "&raw" << offsets[index];
+				body_ << ");\n    a.push_back(Arg::Ref(p.back()));\n";
+			}
+			body_ << "    Value result=method_" << id << "(std::move(a),NativeResolveSelf(receiver));\n";
+			for (std::size_t index = 0; index < method.parameters.size(); ++index) {
+				if (method.parameters[index].byReference) body_ << "    if(raw" << offsets[index] << ") NativeStore(p[" << index << "],reinterpret_cast<void*>(raw" << offsets[index] << "));\n";
+			}
+			if (method.returnType.code == kTypeNull) body_ << "    return;\n";
+			else if (method.returnType.code == kTypeFloat || method.returnType.code == kTypeDouble || method.returnType.code == kTypeDateTime) body_ << "    return static_cast<" << returnType << ">(ToNumber(result));\n";
+			else if (method.returnType.code == kTypeText) body_ << "    return RuntimeText(result.text);\n";
+			else if (method.returnType.code == kTypeBinary) body_ << "    return RuntimeBinary(result.bytes);\n";
+			else if (program_.FindType(method.returnType.code)) body_ << "    unsigned raw;NativeStore(result,&raw);auto* copy=RuntimeAlloc(FindType(result.type)->size);std::memcpy(copy,reinterpret_cast<void*>(raw),FindType(result.type)->size);return copy;\n";
+			else body_ << "    return static_cast<" << returnType << ">(ToInteger(result));\n";
+			body_ << "}\n";
+		}
+		body_ << "namespace ert {\nconst void* const* NativeClassTable(std::uint32_t type) {\n    switch(type) {\n";
+		for (const auto& type : program_.types) {
+			if (type.memberMethodIds.empty() || !emittedMethods_.contains(type.memberMethodIds.front())) continue;
+			body_ << "    case " << Hex(type.type.code) << ": { static const void* const methods[]={";
+			for (const auto id : type.memberMethodIds) body_ << "reinterpret_cast<const void*>(&ecompiler_native_" << id << "),";
+			body_ << "}; return methods; }\n";
+		}
+		body_ << "    default:return nullptr;\n    }\n}\n}\n";
+	}
+
+	void EmitNativeMachineBlocks(const Method& method, const std::vector<Statement>& statements)
+	{
+		for (const auto& statement : statements) {
+			if (statement.kind == StatementKind::MachineCode) {
+				body_ << "\nstatic void __declspec(naked) ecompiler_machine_" << method.id << '_' << statement.sourceLine << "() {\n    __asm {\n";
+				for (const auto byte : statement.machineCode) body_ << "        _emit " << static_cast<unsigned>(byte) << '\n';
+				body_ << "        jmp NativeMachineFallthrough\n    }\n}\n";
+			}
+			EmitNativeMachineBlocks(method, statement.body);
+			EmitNativeMachineBlocks(method, statement.elseBody);
+			for (const auto& branch : statement.branches) EmitNativeMachineBlocks(method, branch.body);
+		}
 	}
 
 	std::string ExportCType(const TypeRef type, const bool byReference) const
@@ -2809,7 +3078,8 @@ private:
 		else if (method.returnType.code == kTypeSubroutine) body_ << "    return reinterpret_cast<void*>(static_cast<std::uintptr_t>(result.integer));\n";
 		else body_ << "    return static_cast<" << returnType << ">(result.integer);\n";
 		body_ << "}\n";
-		exports_.push_back({ method.exportName.empty() ? method.name : method.exportName, symbol, method.usesCdecl, AbiParameterBytes(method.parameters) });
+		if (program_.buildDll && method.isPublic)
+			exports_.push_back({ method.exportName.empty() ? method.name : method.exportName, symbol, method.usesCdecl, AbiParameterBytes(method.parameters) });
 	}
 
 	void EmitWindowRuntime(std::ostringstream& prefix)
@@ -2968,6 +3238,7 @@ struct Form {
     bool showInTaskbar=true; bool keepTitleBarActive=false; int border=2; int position=0;
     bool controlButtons=true; bool maximizeButton=true; bool minimizeButton=true; int shape=0; int backPicMode=0; int playCount=2;
     DWORD idleSince=0;
+    int startupShowCommand=-1;
     bool hasBackColor=false; COLORREF backColor=RGB(255,255,255);
     std::wstring helpFileName; int helpContext=0; std::wstring backPicFile; std::vector<unsigned char> backPicData; HICON icon=nullptr;
     NOTIFYICONDATAW tray{}; HICON trayIcon=nullptr; bool trayRegistered=false;
@@ -3745,6 +4016,10 @@ static LRESULT CALLBACK FormProc(HWND window,UINT message,WPARAM wParam,LPARAM l
         RouteFormInput(window,message,wParam,lParam);break;
     case WM_SHOWWINDOW:DispatchFormNative(window,wParam?native_shown:native_hidden);break;
     case WM_ERASEBKGND: {
+        if(GetWindowLongPtrW(window,GWL_EXSTYLE)&WS_EX_LAYERED) {
+            COLORREF key{};BYTE alpha{};DWORD flags{};
+            if(!GetLayeredWindowAttributes(window,&key,&alpha,&flags))return 1;
+        }
         Form* form=FindFormRecord(window);
         if(form!=nullptr&&form->hasBackColor) { RECT rect{};GetClientRect(window,&rect);HBRUSH brush=CreateSolidBrush(form->backColor);FillRect(reinterpret_cast<HDC>(wParam),&rect,brush);DeleteObject(brush);return 1; }
         break;
@@ -3764,7 +4039,12 @@ static LRESULT CALLBACK FormProc(HWND window,UINT message,WPARAM wParam,LPARAM l
         DispatchFormNative(window,native_tray,operation,{Integer(operation)});return 0;
     }
     case WM_CLOSE:if(DispatchFormClose(window))DestroyWindow(window);return 0;
-    case WM_DESTROY:if(Form* form=FindFormRecord(window))RemoveTrayIcon(*form);DispatchFormNative(window,native_destroyed);PostQuitMessage(0);return 0;
+    case WM_DESTROY:
+        if(Form* form=FindFormRecord(window))RemoveTrayIcon(*form);
+        DispatchFormNative(window,native_destroyed);
+        if(Form* form=FindFormRecord(window))form->hwnd=nullptr;
+        if(std::none_of(forms.begin(),forms.end(),[](const Form& form){return IsWindow(form.hwnd)!=FALSE;}))PostQuitMessage(0);
+        return 0;
     case WM_NCHITTEST: {
         const Form* form=FindFormRecord(window);
         const LRESULT hit=DefWindowProcW(window,message,wParam,lParam);
@@ -5742,7 +6022,7 @@ static void SetProperty(unsigned int id,const char* property,const Value& value)
     }
     else if(PropertyEquals(property,L"\u8fb9\u6846"))if(Unit* unit=UnitFromWindow(window)){unit->borderStyle=static_cast<int>(ToInteger(value));SetWindowBorder(window,unit->borderStyle);}
     else if(PropertyEquals(property,L"\u6a2a\u5411\u5bf9\u9f50\u65b9\u5f0f")||PropertyEquals(property,L"\u7eb5\u5411\u5bf9\u9f50\u65b9\u5f0f"))if(Unit* unit=UnitFromWindow(window)){if(PropertyEquals(property,L"\u6a2a\u5411\u5bf9\u9f50\u65b9\u5f0f"))unit->horizontalAlign=static_cast<int>(ToInteger(value));else unit->verticalAlign=static_cast<int>(ToInteger(value));InvalidateRect(window,nullptr,TRUE);}
-    else if(PropertyEquals(property,L"\u53ef\u89c6"))ShowWindow(window,ToInteger(value)?SW_SHOW:SW_HIDE);
+    else if(PropertyEquals(property,L"\u53ef\u89c6")){const int command=ToInteger(value)?SW_SHOW:SW_HIDE;if(Form* form=FindFormRecord(window))form->startupShowCommand=command;ShowWindow(window,command);}
     else if(PropertyEquals(property,L"\u9690\u85cf\u81ea\u8eab")) {
         if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"tab")==0)
             ShowWindow(window,ToBool(value)?SW_HIDE:SW_SHOW);
@@ -6378,7 +6658,10 @@ static void ProbeRuntimeEvents() {
 		}
 		if (!hasSpecs) prefix << "{0u,0u,0u,0,0,0,0,false,false,false,0,-1,0,0,\"\",\"unsupported\",\"\",nullptr,0,nullptr,0,nullptr,0,nullptr,0,nullptr,0},\n";
 		prefix << R"CPP(};
-static void Initialize() {
+static void Initialize(unsigned int requested,HWND owner=nullptr) {
+    if(IsWindow(FindForm(requested)))return;
+    forms.erase(std::remove_if(forms.begin(),forms.end(),[&](const Form& form){return form.id==requested&&!IsWindow(form.hwnd);}),forms.end());
+    units.erase(std::remove_if(units.begin(),units.end(),[&](const Unit& unit){return unit.form==requested&&!IsWindow(unit.hwnd);}),units.end());
     initializing=true;
     TraceRuntimeMarker("initialize_begin");
     INITCOMMONCONTROLSEX common{sizeof(INITCOMMONCONTROLSEX),ICC_WIN95_CLASSES|ICC_DATE_CLASSES|ICC_BAR_CLASSES|ICC_TAB_CLASSES};InitCommonControlsEx(&common);
@@ -6388,40 +6671,40 @@ static void Initialize() {
     WNDCLASSW containerClass{};containerClass.hInstance=instance;containerClass.lpfnWndProc=ContainerProc;containerClass.hCursor=LoadCursorW(nullptr,MAKEINTRESOURCEW(IDC_ARROW));containerClass.lpszClassName=L"ecompiler_window_container";RegisterClassW(&containerClass);
 )CPP";
 		for (const auto& form : program_.windows) {
-			prefix << "    DWORD formStyle_" << form.id << "=FormStyle(" << form.border << "," << (form.controlButtons ? "true" : "false") << "," << (form.maximizeButton ? "true" : "false") << "," << (form.minimizeButton ? "true" : "false") << ");DWORD formExStyle_" << form.id << "=FormExtendedStyle(" << (form.showInTaskbar ? "true" : "false") << ");RECT formRect_" << form.id << "{0,0," << form.width << "," << form.height << "};AdjustWindowRectEx(&formRect_" << form.id << ",formStyle_" << form.id << ",FALSE,formExStyle_" << form.id << ");HWND form_" << form.id << "=CreateWindowExW(formExStyle_" << form.id << ",L\"ecompiler_window_form\",Wide(" << EscapeCppString(form.title) << ").c_str(),formStyle_" << form.id << "," << form.left << "," << form.top << ",formRect_" << form.id << ".right-formRect_" << form.id << ".left,formRect_" << form.id << ".bottom-formRect_" << form.id << ".top,nullptr,nullptr,instance,nullptr);if(form_" << form.id << "==nullptr)return;ApplyDefaultFont(form_" << form.id << ");forms.push_back(Form{" << form.id << "u,form_" << form.id << "," << (form.escapeCloses ? "true" : "false") << "," << (form.canMove ? "true" : "false") << ",false});if(auto* stored=FindFormRecord(form_" << form.id << ")){stored->enterToNext=" << (form.enterToNext ? "true" : "false") << ";stored->f1OpenHelp=" << (form.f1OpenHelp ? "true" : "false") << ";stored->hitMove=" << (form.hitMove ? "true" : "false") << ";stored->topmost=" << (form.topmost ? "true" : "false") << ";stored->keepTitleBarActive=" << (form.keepTitleBarActive ? "true" : "false") << ";stored->showInTaskbar=" << (form.showInTaskbar ? "true" : "false") << ";stored->border=" << form.border << ";stored->controlButtons=" << (form.controlButtons ? "true" : "false") << ";stored->maximizeButton=" << (form.maximizeButton ? "true" : "false") << ";stored->minimizeButton=" << (form.minimizeButton ? "true" : "false") << ";stored->shape=" << form.shape << ";stored->hasBackColor=" << (form.hasBackColor ? "true" : "false") << ";stored->backColor=static_cast<COLORREF>(" << form.backColor << ");stored->helpFileName=Wide(" << EscapeCppString(form.helpFileName) << ");stored->helpContext=" << form.helpContext << ";StoreSpecProperties(stored->properties," << (form.attributes.empty() ? "nullptr" : "xml_form_attributes_" + std::to_string(form.id)) << "," << form.attributes.size() << ");}PlaceForm(form_" << form.id << "," << form.left << "," << form.top << "," << form.position << ");if(" << (form.topmost ? "true" : "false") << ")SetWindowPos(form_" << form.id << ",HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);if(" << (form.disabled ? "true" : "false") << ")EnableWindow(form_" << form.id << ",FALSE);\n";
+			prefix << "    HWND form_" << form.id << "=nullptr;if(requested==" << form.id << "u){DWORD formStyle_" << form.id << "=FormStyle(" << form.border << "," << (form.controlButtons ? "true" : "false") << "," << (form.maximizeButton ? "true" : "false") << "," << (form.minimizeButton ? "true" : "false") << ");DWORD formExStyle_" << form.id << "=FormExtendedStyle(" << (form.showInTaskbar ? "true" : "false") << ");RECT formRect_" << form.id << "{0,0," << form.width << "," << form.height << "};AdjustWindowRectEx(&formRect_" << form.id << ",formStyle_" << form.id << ",FALSE,formExStyle_" << form.id << ");form_" << form.id << "=CreateWindowExW(formExStyle_" << form.id << ",L\"ecompiler_window_form\",Wide(" << EscapeCppString(form.title) << ").c_str(),formStyle_" << form.id << "," << form.left << "," << form.top << ",formRect_" << form.id << ".right-formRect_" << form.id << ".left,formRect_" << form.id << ".bottom-formRect_" << form.id << ".top,owner,nullptr,instance,nullptr);if(form_" << form.id << "==nullptr)return;ApplyDefaultFont(form_" << form.id << ");forms.push_back(Form{" << form.id << "u,form_" << form.id << "," << (form.escapeCloses ? "true" : "false") << "," << (form.canMove ? "true" : "false") << ",false});if(auto* stored=FindFormRecord(form_" << form.id << ")){stored->enterToNext=" << (form.enterToNext ? "true" : "false") << ";stored->f1OpenHelp=" << (form.f1OpenHelp ? "true" : "false") << ";stored->hitMove=" << (form.hitMove ? "true" : "false") << ";stored->topmost=" << (form.topmost ? "true" : "false") << ";stored->keepTitleBarActive=" << (form.keepTitleBarActive ? "true" : "false") << ";stored->showInTaskbar=" << (form.showInTaskbar ? "true" : "false") << ";stored->border=" << form.border << ";stored->controlButtons=" << (form.controlButtons ? "true" : "false") << ";stored->maximizeButton=" << (form.maximizeButton ? "true" : "false") << ";stored->minimizeButton=" << (form.minimizeButton ? "true" : "false") << ";stored->shape=" << form.shape << ";stored->hasBackColor=" << (form.hasBackColor ? "true" : "false") << ";stored->backColor=static_cast<COLORREF>(" << form.backColor << ");stored->helpFileName=Wide(" << EscapeCppString(form.helpFileName) << ");stored->helpContext=" << form.helpContext << ";StoreSpecProperties(stored->properties," << (form.attributes.empty() ? "nullptr" : "xml_form_attributes_" + std::to_string(form.id)) << "," << form.attributes.size() << ");}PlaceForm(form_" << form.id << "," << form.left << "," << form.top << "," << form.position << ");if(" << (form.topmost ? "true" : "false") << ")SetWindowPos(form_" << form.id << ",HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);if(" << (form.disabled ? "true" : "false") << ")EnableWindow(form_" << form.id << ",FALSE);}\n";
 		}
 		prefix << R"CPP(    constexpr std::size_t count=sizeof(specs)/sizeof(specs[0]);
-    for(std::size_t pass=0;pass<count+1;++pass)for(const auto& spec:specs)if(spec.id!=0&&spec.tabOwner==0&&FindUnit(spec.id)==nullptr&& (spec.parent==0||FindUnit(spec.parent)!=nullptr))CreateUnit(spec);
+    for(std::size_t pass=0;pass<count+1;++pass)for(const auto& spec:specs)if(spec.form==requested&&spec.id!=0&&spec.tabOwner==0&&FindUnit(spec.id)==nullptr&& (spec.parent==0||FindUnit(spec.parent)!=nullptr))CreateUnit(spec);
 )CPP";
 		for (const auto& form : program_.windows) {
 			for (const auto& control : form.controls) {
 				if (!HasNativeWin32Class(control.typeName) || control.typeName != "选择夹") continue;
 				for (std::size_t page = 0; page < control.tabPageTitles.size(); ++page) {
-				prefix << "    if(auto* tab_" << control.id << "=FindUnit(" << control.id << "u)){TCITEMW item_" << control.id << "_" << page << "{};item_" << control.id << "_" << page << ".mask=TCIF_TEXT;std::wstring title_" << control.id << "_" << page << "=Wide(" << EscapeCppString(control.tabPageTitles[page]) << ");item_" << control.id << "_" << page << ".pszText=title_" << control.id << "_" << page << ".data();SendMessageW(tab_" << control.id << "->hwnd,TCM_INSERTITEMW," << page << ",reinterpret_cast<LPARAM>(&item_" << control.id << "_" << page << "));}\n";
+				prefix << "    if(requested==" << form.id << "u)if(auto* tab_" << control.id << "=FindUnit(" << control.id << "u)){TCITEMW item_" << control.id << "_" << page << "{};item_" << control.id << "_" << page << ".mask=TCIF_TEXT;std::wstring title_" << control.id << "_" << page << "=Wide(" << EscapeCppString(control.tabPageTitles[page]) << ");item_" << control.id << "_" << page << ".pszText=title_" << control.id << "_" << page << ".data();SendMessageW(tab_" << control.id << "->hwnd,TCM_INSERTITEMW," << page << ",reinterpret_cast<LPARAM>(&item_" << control.id << "_" << page << "));}\n";
 				}
-				prefix << "    if(auto* tab_" << control.id << "=FindUnit(" << control.id << "u)){const int tab_count_" << control.id << "=TabCtrl_GetItemCount(tab_" << control.id << "->hwnd);const int tab_page_" << control.id << "=" << control.tabCurrentPage << ";if(tab_count_" << control.id << ">0)TabCtrl_SetCurSel(tab_" << control.id << "->hwnd,(std::max)(0,(std::min)(tab_page_" << control.id << ",tab_count_" << control.id << "-1)));}\n";
+				prefix << "    if(requested==" << form.id << "u)if(auto* tab_" << control.id << "=FindUnit(" << control.id << "u)){const int tab_count_" << control.id << "=TabCtrl_GetItemCount(tab_" << control.id << "->hwnd);const int tab_page_" << control.id << "=" << control.tabCurrentPage << ";if(tab_count_" << control.id << ">0)TabCtrl_SetCurSel(tab_" << control.id << "->hwnd,(std::max)(0,(std::min)(tab_page_" << control.id << ",tab_count_" << control.id << "-1)));}\n";
 			}
 		}
-		prefix << R"CPP(    for(std::size_t pass=0;pass<count+1;++pass)for(const auto& spec:specs)if(spec.id!=0&&spec.tabOwner!=0&&FindUnit(spec.id)==nullptr&& (spec.parent==0||FindUnit(spec.parent)!=nullptr))CreateUnit(spec);
+		prefix << R"CPP(    for(std::size_t pass=0;pass<count+1;++pass)for(const auto& spec:specs)if(spec.form==requested&&spec.id!=0&&spec.tabOwner!=0&&FindUnit(spec.id)==nullptr&& (spec.parent==0||FindUnit(spec.parent)!=nullptr))CreateUnit(spec);
 )CPP";
 		for (const auto& form : program_.windows) {
 			for (const auto& control : form.controls) {
 				if (!HasNativeWin32Class(control.typeName) || control.typeName != "选择夹") continue;
-				prefix << "    UpdateTabVisibility(" << control.id << "u);\n";
+				prefix << "    if(requested==" << form.id << "u)UpdateTabVisibility(" << control.id << "u);\n";
 			}
+		}
+		// 创建事件允许安装窗口过程和修改样式，必须先于首次显示。
+		prefix << "    initializing=false;TraceRuntimeMarker(\"initialize_end\");ProbeRuntimeProperties();ProbeRuntimeMembers();\n";
+		for (const auto& form : program_.windows) {
+			prefix << "    if(requested==" << form.id << "u){Dispatch(" << form.id << "u,native_created,0,{});TraceRuntimeMarker(\"created_dispatched\");}\n";
 		}
 		for (const auto& form : program_.windows) {
 			const char* showCommand = !form.visible ? "SW_HIDE" : (form.position == 2 ? "SW_MINIMIZE" : (form.position == 3 ? "SW_MAXIMIZE" : "SW_SHOW"));
 			const bool hasIdle = std::any_of(form.events.begin(), form.events.end(), [](const WindowEventBinding& event) { return event.trigger == WindowEventTrigger::Idle; });
-            prefix << "    ShowWindow(form_" << form.id << "," << showCommand << ");UpdateWindow(form_" << form.id << ");";
+            prefix << "    if(requested==" << form.id << "u && IsWindow(form_" << form.id << ")){const auto* showForm=FindFormRecord(form_" << form.id << ");ShowWindow(form_" << form.id << ",showForm&&showForm->startupShowCommand>=0?showForm->startupShowCommand:" << showCommand << ");UpdateWindow(form_" << form.id << ");";
 			if (hasIdle) prefix << "if(auto* idleForm=FindFormRecord(form_" << form.id << ")){idleForm->idleSince=GetTickCount();SetTimer(form_" << form.id << ",0xE1D1u,50,nullptr);} ";
             prefix << "const DWORD autoCloseMs_" << form.id << "=[](){char value[32]{};const DWORD length=GetEnvironmentVariableA(\"E_PACKAGER_RUNTIME_AUTOCLOSE_MS\",value,static_cast<DWORD>(std::size(value)));if(length==0||length>=std::size(value))return static_cast<DWORD>(0);const unsigned long parsed=std::strtoul(value,nullptr,10);return parsed>0&&parsed<0x7FFFFFFFu?static_cast<DWORD>(parsed):static_cast<DWORD>(0);}();if(autoCloseMs_" << form.id << ">0)SetTimer(form_" << form.id << ",0xE1D2u,autoCloseMs_" << form.id << ",nullptr);\n";
-		}
-		// Creation handlers initialize titles/content and must run after the startup
-		// guard is lifted; Dispatch suppresses events while initializing is true.
-        prefix << "    initializing=false;TraceRuntimeMarker(\"initialize_end\");ProbeRuntimeProperties();ProbeRuntimeMembers();\n";
-		for (const auto& form : program_.windows) {
-            prefix << "    Dispatch(" << form.id << "u,native_created,0,{});TraceRuntimeMarker(\"created_dispatched\");\n";
+			prefix << "}\n";
 		}
 		prefix << "    ProbeRuntimeEvents();\n";
 		prefix << R"CPP(}
@@ -6429,8 +6712,40 @@ static void Initialize() {
 static ert::Value WindowGetProperty(unsigned int id,const char* property){return ecompiler_window_host::GetProperty(id,property);}
 static void WindowSetProperty(unsigned int id,const char* property,const ert::Value& value){ecompiler_window_host::SetProperty(id,property,value);}
 static ert::Value WindowInvokeMember(unsigned int id,const char* operation,std::vector<ert::Value> args){return ecompiler_window_host::WindowInvokeMember(id,operation,std::move(args));}
-static void EWindowInitialize(){ecompiler_window_host::Initialize();}
+static ert::Value WindowLoad(const ert::Value& target,const ert::Value& parent,const ert::Value& modal) {
+    using namespace ecompiler_window_host;
+    const auto id=static_cast<unsigned int>(ert::ToInteger(target));
+    HWND owner=parent.missing?nullptr:FindForm(static_cast<unsigned int>(ert::ToInteger(parent)));
+    if(!parent.missing&&!IsWindow(owner))return ert::Boolean(false);
+    Initialize(id,owner);
+    HWND window=FindForm(id);
+    if(!IsWindow(window))return ert::Boolean(false);
+    if(ert::ToBool(modal)&&IsWindowVisible(window)) {
+        const bool disableOwner=IsWindow(owner)&&IsWindowEnabled(owner);
+        if(disableOwner)EnableWindow(owner,FALSE);
+        MSG message{};
+        while(IsWindow(window)) {
+            const BOOL result=GetMessageW(&message,nullptr,0,0);
+            if(result<=0){if(result==0)PostQuitMessage(static_cast<int>(message.wParam));break;}
+            if(!IsDialogMessageW(window,&message)){TranslateMessage(&message);DispatchMessageW(&message);}
+        }
+        if(disableOwner&&IsWindow(owner))EnableWindow(owner,TRUE);
+    }
+    return ert::Boolean(true);
+}
+static void EWindowRunLoop() {
+    using namespace ecompiler_window_host;
+    MSG message{};
+    while(std::any_of(forms.begin(),forms.end(),[](const Form& form){return IsWindow(form.hwnd)!=FALSE;})&&GetMessageW(&message,nullptr,0,0)>0) {
+        TranslateMessage(&message);DispatchMessageW(&message);
+    }
+}
 )CPP";
+		const auto& startup = program_.methods[program_.methodByName.at("_启动子程序")];
+		prefix << "static void EWindowInitialize(){";
+		if (startup.sourceFile == "<window-startup>" && !program_.windows.empty())
+			prefix << "ecompiler_window_host::Initialize(" << program_.windows.front().id << "u);";
+		prefix << "}\n";
 	}
 
 	void EmitDeclarationsAndStartup()
@@ -6459,6 +6774,7 @@ static void EWindowInitialize(){ecompiler_window_host::Initialize();}
 		}
 		if (!program_.windows.empty()) {
 			prefix << "static ert::Value WindowGetProperty(unsigned int,const char*);\n";
+			prefix << "static ert::Value WindowLoad(const ert::Value&,const ert::Value&,const ert::Value&);\n";
 			prefix << "static void WindowSetProperty(unsigned int,const char*,const ert::Value&);\n";
 			prefix << "static ert::Value WindowInvokeMember(unsigned int,const char*,std::vector<ert::Value>);\n";
 		}
@@ -6610,15 +6926,15 @@ extern "C" ert::EIntPtr __stdcall BlackMoonFuncForeLibNotifySys(
 		if (!program_.buildDll) {
 			if (program_.windowsGui) {
 				if (targetX64) {
-					if (!program_.windows.empty()) prefix << "int WINAPI WinMain(HINSTANCE,HINSTANCE,LPSTR,int){E_Init();if(!EStartup())ExitProcess(1);EWindowInitialize();const int result=ECodeStart();MSG message{};while(GetMessageW(&message,nullptr,0,0)>0){TranslateMessage(&message);DispatchMessageW(&message);}ecompiler_safe_destroy();return result;}\n";
+					if (!program_.windows.empty()) prefix << "int WINAPI WinMain(HINSTANCE,HINSTANCE,LPSTR,int){E_Init();if(!EStartup())ExitProcess(1);EWindowInitialize();const int result=ECodeStart();EWindowRunLoop();ecompiler_safe_destroy();return result;}\n";
 					else prefix << "int WINAPI WinMain(HINSTANCE,HINSTANCE,LPSTR,int){E_Init();if(!EStartup())ExitProcess(1);const int result=ECodeStart();ecompiler_safe_destroy();return result;}\n";
 				}
 				else if (program_.useLegacyX86RuntimeBridge) {
-					if (!program_.windows.empty()) prefix << "int WINAPI WinMain(HINSTANCE,HINSTANCE,LPSTR,int){ert::InitializeLegacyCrtData();E_Init();if(!EStartup())ExitProcess(1);EWindowInitialize();const int result=ECodeStart();MSG message{};while(GetMessageW(&message,nullptr,0,0)>0){TranslateMessage(&message);DispatchMessageW(&message);}ecompiler_safe_destroy();ExitProcess(static_cast<UINT>(result));}\n";
+					if (!program_.windows.empty()) prefix << "int WINAPI WinMain(HINSTANCE,HINSTANCE,LPSTR,int){ert::InitializeLegacyCrtData();E_Init();if(!EStartup())ExitProcess(1);EWindowInitialize();const int result=ECodeStart();EWindowRunLoop();ecompiler_safe_destroy();ExitProcess(static_cast<UINT>(result));}\n";
 					else prefix << "int WINAPI WinMain(HINSTANCE,HINSTANCE,LPSTR,int){ert::InitializeLegacyCrtData();E_Init();if(!EStartup())ExitProcess(1);const int result=ECodeStart();ecompiler_safe_destroy();ExitProcess(static_cast<UINT>(result));}\n";
 				}
 				else {
-					if (!program_.windows.empty()) prefix << "int WINAPI WinMain(HINSTANCE,HINSTANCE,LPSTR,int){ert::InitializeLegacyTimezoneData();E_Init();if(!EStartup())ExitProcess(1);EWindowInitialize();const int result=ECodeStart();MSG message{};while(GetMessageW(&message,nullptr,0,0)>0){TranslateMessage(&message);DispatchMessageW(&message);}ecompiler_safe_destroy();return result;}\n";
+					if (!program_.windows.empty()) prefix << "int WINAPI WinMain(HINSTANCE,HINSTANCE,LPSTR,int){ert::InitializeLegacyTimezoneData();E_Init();if(!EStartup())ExitProcess(1);EWindowInitialize();const int result=ECodeStart();EWindowRunLoop();ecompiler_safe_destroy();return result;}\n";
 					else prefix << "int WINAPI WinMain(HINSTANCE,HINSTANCE,LPSTR,int){ert::InitializeLegacyTimezoneData();E_Init();if(!EStartup())ExitProcess(1);const int result=ECodeStart();ecompiler_safe_destroy();return result;}\n";
 				}
 			}
@@ -6649,6 +6965,7 @@ extern "C" ert::EIntPtr __stdcall BlackMoonFuncForeLibNotifySys(
 	std::ostringstream declarations_;
 	std::unordered_map<std::size_t, std::string> dllImportSymbols_;
 	std::unordered_set<std::uint32_t> usedTypes_;
+	std::unordered_set<std::size_t> callbackMethods_;
 };
 
 }  // namespace

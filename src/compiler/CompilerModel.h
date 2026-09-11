@@ -46,6 +46,8 @@ struct Variable {
 	TypeRef type;
 	bool byReference = false;
 	bool nullable = false;
+	// 静态局部变量跨调用保留同一份存储。
+	bool isStatic = false;
 	std::vector<int> arrayDimensions;
 	std::size_t sourceLine = 0;
 };
@@ -102,6 +104,8 @@ struct Method {
 
 struct Assembly {
 	std::string name;
+	// 源码声明的父类名称，根对象不参与用户类布局。
+	std::string baseClassName;
 	std::string sourceFile;
 	bool isClass = false;
 	std::vector<Variable> variables;
@@ -133,6 +137,8 @@ struct Constant {
 	std::uint32_t type = kTypeNull;
 	double numberValue = 0;
 	std::string textValue;
+	// 图片、音频及其他二进制常量的原始内容。
+	std::vector<std::uint8_t> binaryValue;
 };
 
 struct TypeElement {
@@ -140,10 +146,14 @@ struct TypeElement {
 	TypeRef type;
 	std::size_t offset = 0;
 	std::int32_t defaultValue = 0;
+	// 定长成员数组的维度，用于初始化以及系统 DLL 的内联布局。
+	std::vector<int> arrayDimensions;
 };
 
 struct TypeInfo {
 	TypeRef type;
+	// 用户类的直接父类，用于方法槽继承和动态分派。
+	TypeRef baseType;
 	std::string name;
 	std::size_t libraryIndex = static_cast<std::size_t>(-1);
 	std::size_t dataTypeIndex = static_cast<std::size_t>(-1);

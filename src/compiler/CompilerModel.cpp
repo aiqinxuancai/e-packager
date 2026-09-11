@@ -832,9 +832,11 @@ Variable ParseVariableDeclaration(const std::string& line, const std::size_t sou
 	const std::string attributes = fields.size() >= 3 ? Trim(fields[2]) : std::string();
 	variable.byReference = attributes.find("参考") != std::string::npos || attributes.find("传址") != std::string::npos;
 	variable.nullable = attributes.find("可空") != std::string::npos || attributes.find("默认空") != std::string::npos;
-	variable.type.isArray = attributes.find("数组") != std::string::npos ||
-		(fields.size() >= 4 && !fields[3].empty() && fields[3] != "\"\"");
-	if (fields.size() >= 4 && !fields[3].empty() && fields[3] != "\"\"") {
+	variable.isStatic = attributes.find("静态") != std::string::npos;
+	// 参数的第四列是注释；局部变量和成员的第四列才是数组维度。
+	const bool hasDimensions = !StartsWith(line, ".参数 ") && fields.size() >= 4 && !fields[3].empty() && fields[3] != "\"\"";
+	variable.type.isArray = attributes.find("数组") != std::string::npos || hasDimensions;
+	if (hasDimensions) {
 		std::string bounds = fields[3];
 		if (bounds.size() >= 2 && bounds.front() == '"' && bounds.back() == '"') bounds = bounds.substr(1, bounds.size() - 2);
 		for (const std::string& bound : SplitFields(bounds)) {
@@ -982,6 +984,16 @@ bool RegisterDllCommands(Program& program, std::string& error)
 
 bool RegisterProjectConstants(Program& program, std::string& error)
 {
+	for (const auto& resource : program.bundle.resources) {
+		Constant constant;
+		constant.name = "#" + resource.logicalName;
+		constant.type = kTypeBinary;
+		constant.binaryValue = resource.data;
+		if (!program.constants.emplace(constant.name, std::move(constant)).second) {
+			error = "duplicate_resource_constant:" + resource.logicalName;
+			return false;
+		}
+	}
 	const auto lines = SplitLines(program.bundle.constantText);
 	for (std::size_t index = 0; index < lines.size(); ++index) {
 		const std::string line = Trim(StripUtf8Bom(StripComment(lines[index])));
@@ -1042,6 +1054,7 @@ bool RegisterProjectTypes(Program& program, std::string& error)
 		bool isArray = false;
 		std::int32_t defaultValue = 0;
 		std::size_t sourceLine = 0;
+		std::vector<int> arrayDimensions;
 	};
 	std::unordered_map<std::size_t, std::vector<PendingMember>> pendingMembers;
 	const auto lines = SplitLines(program.bundle.dataTypeText);
@@ -1091,7 +1104,7 @@ bool RegisterProjectTypes(Program& program, std::string& error)
 		pendingMembers[current].push_back(PendingMember {
 			Trim(fields[0]), Trim(fields[1]),
 			!program.types[current].isEnum && fields.size() >= 4 && !Trim(fields[3]).empty() && fields[3] != "\"\"",
-			defaultValue, index + 1,
+			defaultValue, index + 1, ParseVariableDeclaration(line, index + 1).arrayDimensions,
 		});
 	}
 
@@ -1103,7 +1116,7 @@ bool RegisterProjectTypes(Program& program, std::string& error)
 				return false;
 			}
 			program.types[typeIndex].elements.push_back(TypeElement {
-				pending.name, memberType, 0, pending.defaultValue,
+				pending.name, memberType, 0, pending.defaultValue, pending.arrayDimensions,
 			});
 			if (program.types[typeIndex].isEnum) {
 				Constant constant;
@@ -2263,6 +2276,8 @@ bool ParseSources(Program& program, std::string& error)
 				Assembly assembly;
 				const std::string declaration = Trim(line.substr(std::string(".程序集 ").size()));
 				assembly.isClass = declaration.find(',') != std::string::npos;
+				const auto assemblyFields = SplitFields(declaration);
+				if (assemblyFields.size() > 1 && assemblyFields[1] != "<对象>") assembly.baseClassName = assemblyFields[1];
 				assembly.name = declaration;
 				const std::size_t comma = assembly.name.find(',');
 				if (comma != std::string::npos) assembly.name = Trim(assembly.name.substr(0, comma));
@@ -2378,7 +2393,7 @@ bool RegisterClassTypes(Program& program, std::string& error)
 		type.name = assembly.name;
 		for (const Variable& variable : assembly.variables) {
 			if (!variable.type.valid) continue;
-			type.elements.push_back(TypeElement { variable.name, variable.type, 0, 0 });
+			type.elements.push_back(TypeElement { variable.name, variable.type, 0, 0, variable.arrayDimensions });
 		}
 		const std::size_t typeIndex = program.types.size();
 		program.typeByCode.emplace(type.type.code, typeIndex);
@@ -2393,8 +2408,39 @@ bool RegisterClassTypes(Program& program, std::string& error)
 	return true;
 }
 
-void PopulateClassTypeFields(Program& program)
+bool PopulateClassTypeFields(Program& program, std::string& error)
 {
+	std::vector<int> state(program.assemblies.size());
+	const auto inherit = [&](auto&& visit, std::size_t index) -> bool {
+		if (state[index] == 2) return true;
+		Assembly& assembly = program.assemblies[index];
+		if (state[index] == 1) { error = "cyclic_class_inheritance:" + assembly.name; return false; }
+		state[index] = 1;
+		if (!assembly.baseClassName.empty()) {
+			const auto base = std::find_if(program.assemblies.begin(), program.assemblies.end(), [&](const Assembly& item) {
+				return item.isClass && item.name == assembly.baseClassName;
+			});
+			if (base == program.assemblies.end()) { error = "unknown_base_class:" + assembly.baseClassName; return false; }
+			if (!visit(visit, static_cast<std::size_t>(base - program.assemblies.begin()))) return false;
+			assembly.variables.insert(assembly.variables.begin(), base->variables.begin(), base->variables.end());
+			auto& type = program.types[program.typeByCode.at(program.typeByName.at(assembly.name).code)];
+			const auto& baseType = program.types[program.typeByCode.at(program.typeByName.at(base->name).code)];
+			type.baseType = baseType.type;
+			auto methods = baseType.memberMethodIds;
+			for (const auto own : type.memberMethodIds) {
+				const auto slot = std::find_if(methods.begin(), methods.end(), [&](std::size_t inherited) {
+					return program.methods[inherited].name == program.methods[own].name;
+				});
+				if (slot == methods.end()) methods.push_back(own);
+				else *slot = own;
+			}
+			type.memberMethodIds = std::move(methods);
+		}
+		state[index] = 2;
+		return true;
+	};
+	for (std::size_t index = 0; index < program.assemblies.size(); ++index)
+		if (program.assemblies[index].isClass && !inherit(inherit, index)) return false;
 	for (std::size_t typeIndex = 0; typeIndex < program.types.size(); ++typeIndex) {
 		TypeInfo& type = program.types[typeIndex];
 		if (type.name.empty()) continue;
@@ -2403,10 +2449,15 @@ void PopulateClassTypeFields(Program& program)
 		});
 		if (assembly == program.assemblies.end()) continue;
 		type.elements.clear();
+		type.size = 0;
 		for (const Variable& variable : assembly->variables) {
-			if (variable.type.valid) type.elements.push_back(TypeElement { variable.name, variable.type, 0, 0 });
+			if (!variable.type.valid) continue;
+			type.elements.push_back(TypeElement { variable.name, variable.type, type.size, 0, variable.arrayDimensions });
+			const std::size_t scalarSize = variable.type.isArray ? 0 : SystemTypeSize(variable.type.code, program.targetArchitecture);
+			type.size += scalarSize != 0 ? scalarSize : (program.targetArchitecture == TargetArchitecture::X64 ? 8u : 4u);
 		}
 	}
+	return true;
 }
 
 void RegisterCommands(Program& program)
@@ -2517,7 +2568,7 @@ bool BuildCompilerModel(
 		}
 	}
 	if (!ResolveVariables(outProgram, outError)) return false;
-	PopulateClassTypeFields(outProgram);
+	if (!PopulateClassTypeFields(outProgram, outError)) return false;
 	RegisterCommands(outProgram);
 	if (!RegisterConstants(outProgram, outError)) return false;
 	// ResolveVariables runs before library commands are registered, so class

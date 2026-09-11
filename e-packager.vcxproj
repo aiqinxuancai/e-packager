@@ -217,6 +217,9 @@
 	<ClInclude Include="src\compiler\CompilerModel.h" />
 	<ClInclude Include="src\compiler\WindowModel.h" />
 	<ClInclude Include="src\compiler\NativeWindowControl.h" />
+	<ClInclude Include="src\compiler\NativeX86Runtime.h" />
+	<ClInclude Include="src\compiler\PlatformDllRuntime.h" />
+	<ClInclude Include="src\compiler\BinaryValueRuntime.h" />
 	<ClInclude Include="src\compiler\CompilerTarget.h" />
 	<ClInclude Include="src\compiler\CppEmitter.h" />
     <ClInclude Include="src\compiler\ECompiler.h" />
