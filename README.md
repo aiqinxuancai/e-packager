@@ -227,6 +227,7 @@ e-packager compile-check MyApp.e \
 | `audio/` | 音频资源，元数据在 `audio/list.json` |
 | `tool/e-packager.exe` | 随目录自带的封包工具 |
 | `info.json` | 来源文件的类型、路径、修改时间、MD5 |
+| `README.md` | 自动生成的项目结构、工具来源与回包方法说明 |
 | `AGENTS.md` | 供 AI Agent 阅读的项目结构说明 |
 
 ---

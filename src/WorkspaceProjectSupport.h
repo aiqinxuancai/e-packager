@@ -8,6 +8,7 @@ namespace workspace_support {
 
 struct WorkspaceWriteOptions {
 	std::string defaultPackOutputFileName;
+	// 同时生成 AGENTS.md 与 README.md；依赖模块副本可关闭说明文档。
 	bool writeAgentsMarkdown = true;
 };
 

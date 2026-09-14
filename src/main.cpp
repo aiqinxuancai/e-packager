@@ -2484,7 +2484,7 @@ void NormalizeJsonForCompare(json& value)
 
 bool ShouldIgnorePathForRoundTripCompare(const std::string& relativePath)
 {
-	return relativePath == "AGENTS.md" ||
+	return relativePath == "AGENTS.md" || relativePath == "README.md" ||
 		relativePath.starts_with("src/.native_");
 }
 
