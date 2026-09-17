@@ -1,4 +1,5 @@
 ﻿#include "SupportLibraryPublicInfo.h"
+#include "SupportLibraryRuntime.h"
 
 #include <Windows.h>
 
@@ -474,20 +475,6 @@ std::string ReadAnsiText(const char* text)
 		return ConvertCodePage(raw, CP_UTF8, CP_ACP, MB_ERR_INVALID_CHARS);
 	}
 	return raw;
-#endif
-}
-
-const LIB_INFO* CallGetLibInfoSafely(const PFN_GET_LIB_INFO getInfoProc)
-{
-#if defined(_MSC_VER)
-	__try {
-		return getInfoProc == nullptr ? nullptr : getInfoProc();
-	}
-	__except (EXCEPTION_EXECUTE_HANDLER) {
-		return nullptr;
-	}
-#else
-	return getInfoProc == nullptr ? nullptr : getInfoProc();
 #endif
 }
 
@@ -1497,9 +1484,15 @@ bool TryLoadSupportLibraryDump(
 			return false;
 		}
 
-		libInfo = CallGetLibInfoSafely(getInfoProc);
+		DWORD exceptionCode = 0;
+		libInfo = support_library_runtime::CallGetLibInfo(getInfoProc, &exceptionCode);
 		if (libInfo == nullptr || !IsReadableMemoryRange(libInfo, sizeof(LIB_INFO))) {
 			outAttemptError = "GetNewInf returned invalid LIB_INFO";
+			if (exceptionCode != 0) {
+				std::ostringstream details;
+				details << "GetNewInf raised exception 0x" << std::hex << exceptionCode;
+				outAttemptError = details.str();
+			}
 			libInfo = nullptr;
 			closeModule();
 			return false;

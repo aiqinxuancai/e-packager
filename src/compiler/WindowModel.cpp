@@ -210,6 +210,9 @@ WindowEventTrigger ClassifyEvent(
 	if ((typeName == "日期框" || typeName == "月历") && index == 0) return WindowEventTrigger::Changed;
 	if ((typeName == "滑块条" || typeName == "横向滚动条" || typeName == "纵向滚动条") && index == 0) return WindowEventTrigger::PositionChanged;
 	if (typeName == "调节器" && index == 0) return WindowEventTrigger::PositionChanged;
+	// 负编号是所有可视组件共享的原生事件，不属于支持库私有事件表。
+	if (index == -1) return WindowEventTrigger::MouseDown;
+	if (index == -2) return WindowEventTrigger::MouseUp;
 	if (index == -3) return WindowEventTrigger::DoubleClicked;
 	if (typeName == "组合框" && index == 2) return WindowEventTrigger::DropDown;
 	return WindowEventTrigger::Unknown;
@@ -376,7 +379,10 @@ void ReadEvents(
 {
 	for (const auto& child : node.children) {
 		if (child.name == nodeName) {
-			const std::int32_t index = IntAttribute(child, "索引", -1);
+			const std::string indexText = Attribute(child, "索引");
+			std::int32_t index = 0;
+			const auto parsed = std::from_chars(indexText.data(), indexText.data() + indexText.size(), index);
+			if (parsed.ec != std::errc() || parsed.ptr != indexText.data() + indexText.size()) continue;
 			const std::string eventDisplayName = EventName(child);
 			const std::string handler = Attribute(child, "处理器");
 			const std::size_t separator = handler.rfind("::");
@@ -391,7 +397,7 @@ void ReadEvents(
 				: std::find_if(program.methods.begin(), program.methods.end(), [&](const Method& method) {
 					return method.name == methodName;
 				});
-			if (index != -1 && fallback != program.methods.end()) {
+			if (fallback != program.methods.end()) {
 				output.push_back(WindowEventBinding {
 					index, fallback->id, eventDisplayName,
 					ClassifyEvent(eventDisplayName, index, nodeName) });
@@ -554,7 +560,10 @@ bool ReadControl(
 	for (const auto& child : node.children) {
 		if (child.name == tabPageNodeName) {
 			tabPages.push_back(&child);
-			const std::int32_t index = IntAttribute(child, "索引", -1);
+			const std::string indexText = Attribute(child, "索引");
+			std::int32_t index = 0;
+			const auto parsed = std::from_chars(indexText.data(), indexText.data() + indexText.size(), index);
+			if (parsed.ec != std::errc() || parsed.ptr != indexText.data() + indexText.size()) continue;
 			if (index >= 0) explicitPageCount = (std::max)(explicitPageCount, static_cast<std::size_t>(index) + 1);
 		}
 		if (child.name == tabManagerNodeName) {

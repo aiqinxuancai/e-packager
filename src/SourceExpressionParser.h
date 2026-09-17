@@ -4,6 +4,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 namespace e2txt {
 
@@ -60,5 +61,10 @@ bool FindSourceTopLevelAssignment(
 bool SplitSourceCallArguments(
 	const std::string& text,
 	std::vector<std::string>& outArguments);
+
+// 按完整标识符重命名源码，保留字符串、注释及名称中的公共前缀；输入为本地编码。
+std::string RewriteSourceIdentifiers(
+	const std::string& source,
+	const std::unordered_map<std::string, std::string>& replacements);
 
 }  // namespace e2txt

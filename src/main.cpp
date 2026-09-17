@@ -152,6 +152,7 @@ struct UnpackOptions {
 	bool writeAgentsMarkdown = true;
 	bool writeDependencyArtifacts = true;
 	bool unpackDependencyModules = true;
+	bool compilerInput = false;
 	size_t dependencyExportThreadCount = e2txt::kDefaultDependencyExportThreadCount;
 	e2txt::ReadOptions readOptions;
 };
@@ -478,7 +479,8 @@ DependencyModuleExportResult ExportDependencyModules(
 	const std::filesystem::path& outputDir,
 	const e2txt::ProjectBundle& bundle,
 	const e2txt::ReadOptions& readOptions,
-	const size_t workerCount)
+	const size_t workerCount,
+	const bool compilerInput)
 {
 	DependencyModuleExportResult result;
 	std::filesystem::path ecomRoot = outputDir / "ecom";
@@ -563,6 +565,7 @@ DependencyModuleExportResult ExportDependencyModules(
 			.writeAgentsMarkdown = false,
 			.writeDependencyArtifacts = true,
 			.unpackDependencyModules = false,
+			.compilerInput = compilerInput,
 			.dependencyExportThreadCount = 1,
 			.readOptions = readOptions,
 		};
@@ -643,7 +646,8 @@ bool RefreshDependencyArtifacts(
 	const e2txt::ReadOptions& readOptions,
 	const size_t workerCount,
 	DependencyRefreshResult& outResult,
-	std::string& outError)
+	std::string& outError,
+	const bool compilerInput = false)
 {
 	outResult = {};
 	outError.clear();
@@ -658,7 +662,8 @@ bool RefreshDependencyArtifacts(
 			outputDir,
 			bundle,
 			readOptions,
-			workerCount);
+			workerCount,
+			compilerInput);
 		outResult.exportedEComModules = ecomResult.exportedCount;
 		outResult.annotations.insert(
 			outResult.annotations.end(),
@@ -698,7 +703,11 @@ bool DoUnpackInternal(
 	std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch) {
 		return static_cast<char>(std::tolower(ch));
 	});
-	if (!generator.GenerateBundle(PathToUtf8(effectiveInputPath), bundle, &outError, options.readOptions)) {
+	// 编译专用模块目录必须包含已嵌入的上游实现；普通拆包仍只导出可编辑页。
+	const bool generated = options.compilerInput && extension == ".ec"
+		? generator.GenerateCompilerBundle(PathToUtf8(effectiveInputPath), bundle, &outError, options.readOptions)
+		: generator.GenerateBundle(PathToUtf8(effectiveInputPath), bundle, &outError, options.readOptions);
+	if (!generated) {
 		return false;
 	}
 
@@ -721,7 +730,8 @@ bool DoUnpackInternal(
 				options.readOptions,
 				options.dependencyExportThreadCount,
 				dependencyRefreshResult,
-				outError)) {
+				outError,
+				options.compilerInput)) {
 			return false;
 		}
 	}
@@ -1478,6 +1488,10 @@ bool ParseUnpackOptions(
 		}
 		if (option.rfind("--password=", 0) == 0) {
 			outOptions.readOptions.password = option.substr(std::string("--password=").size());
+			continue;
+		}
+		if (option == "--compiler-input") {
+			outOptions.compilerInput = true;
 			continue;
 		}
 		if (option == "--main-only") {

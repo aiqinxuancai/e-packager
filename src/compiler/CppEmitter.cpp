@@ -28,6 +28,13 @@
 namespace ecompiler {
 namespace {
 
+// 编译时与运行时共享内存 PE 权限校验，避免两份兼容实现逐渐分叉。
+#define E_PACKAGER_MAPPED_PE_CODE(...) #__VA_ARGS__
+constexpr const char* kMappedPeCompatibilitySource =
+#include "../MappedPeCompatibility.inl"
+;
+#undef E_PACKAGER_MAPPED_PE_CODE
+
 constexpr std::uint16_t kCommandAllowAppendArgument = 1u << 5;
 constexpr std::uint16_t kCommandReturnsArray = 1u << 6;
 constexpr std::uint16_t kCommandObjectCopy = 1u << 7;
@@ -122,27 +129,10 @@ bool IsCompilePrimitive(const support_library_public_info::CommandMetadata& comm
 		// These are language/runtime primitives. Their FNE entries describe the
 		// source signature, while the generated Value runtime owns the actual
 		// array state and must perform the mutation consistently across cores.
-		"ReDim", "GetAryElementCount", "CopyAry", "AddElement", "InsElement",
+		"ReDim", "GetAryElementCount", "UBound", "CopyAry", "AddElement", "InsElement",
 		"RemoveElement", "RemoveAll", "dir", "not", "store",
 	};
 	return std::find(std::begin(names), std::end(names), command.englishName) != std::end(names);
-}
-
-bool IsPlatformImportModule(const std::string& moduleName)
-{
-	std::filesystem::path modulePath = Utf8PathToPath(moduleName);
-	std::string normalized = modulePath.filename().string();
-	if (normalized.empty()) normalized = moduleName;
-	std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](const unsigned char value) {
-		return static_cast<char>(std::tolower(value));
-	});
-	if (std::filesystem::path(normalized).extension().empty()) normalized += ".dll";
-	return normalized == "kernel32.dll" || normalized == "user32.dll" || normalized == "gdi32.dll" ||
-		normalized == "advapi32.dll" || normalized == "shell32.dll" || normalized == "ole32.dll" ||
-		normalized == "oleaut32.dll" || normalized == "comdlg32.dll" || normalized == "winmm.dll" ||
-		normalized == "gdiplus.dll" || normalized == "msimg32.dll" || normalized == "dwmapi.dll" ||
-		normalized == "imm32.dll" || normalized == "shlwapi.dll" || normalized == "uxtheme.dll" || normalized == "comctl32.dll" ||
-		normalized == "odbc32.dll" || normalized == "odbccp32.dll" || normalized == "ws2_32.dll";
 }
 
 // The runtime template is stored in this UTF-8 source file and is appended to
@@ -225,7 +215,6 @@ extern "C" int __cdecl LegacyVc6Swprintf(wchar_t* buffer,const wchar_t* format,.
 extern "C" int __argc=0;
 extern "C" char** __argv=nullptr;
 extern "C" unsigned char _mbctype[257]{};
-extern "C" unsigned char _iob[96]{};
 // A few VC6-era archives still reference the legacy timezone data symbol
 // rather than the modern CRT state-management accessor.  Keep the compatibility
 // object under a private name and provide linker aliases so UCRT's `_timezone`
@@ -249,18 +238,6 @@ static void InitializeLegacyCrtData() {
     if(int* value=__p___argc())__argc=*value;
     if(char*** value=__p___argv())__argv=*value;
     if(unsigned char* value=__p__mbctype())for(std::size_t index=0;index<257;++index)_mbctype[index]=value[index];
-    if(HMODULE module=GetModuleHandleA("msvcrt.dll")) {
-        if(auto* value=reinterpret_cast<unsigned char*>(GetProcAddress(module,"_iob")))for(std::size_t index=0;index<96;++index)_iob[index]=value[index];
-    }
-}
-static FILE* ResolveLegacyStandardStream(FILE* stream) {
-    auto* address=reinterpret_cast<unsigned char*>(stream);
-    if(address<_iob||address>=_iob+sizeof(_iob)) return stream;
-    const std::ptrdiff_t offset=address-_iob;
-    if((offset%32)!=0) return stream;
-    HMODULE module=GetModuleHandleA("msvcrt.dll");
-    auto* streams=module==nullptr?nullptr:reinterpret_cast<unsigned char*>(GetProcAddress(module,"_iob"));
-    return streams==nullptr?stream:reinterpret_cast<FILE*>(streams+offset);
 }
 #pragma comment(linker,"/alternatename:_fprintf=_ecompiler_legacy_fprintf")
 extern "C" int __cdecl ecompiler_legacy_fprintf(FILE* stream,const char* format,...) {
@@ -347,9 +324,11 @@ struct NativeStorage {
     Value* owner=nullptr;
     void* pointer=nullptr;
     std::vector<unsigned char> bytes;
+    unsigned char* dllMemory=nullptr;
+    std::size_t dllCapacity=0;
     bool storing=false;
     NativeStorage() { NativeObjects().push_back(this); }
-    ~NativeStorage() { auto& objects=NativeObjects();objects.erase(std::remove(objects.begin(),objects.end(),this),objects.end()); }
+    ~NativeStorage() { if(dllMemory)VirtualFree(dllMemory,0,MEM_RELEASE);auto& objects=NativeObjects();objects.erase(std::remove(objects.begin(),objects.end(),this),objects.end()); }
 };
 struct Value {
     std::uint32_t declared=T_NULL, type=T_NULL;
@@ -690,7 +669,7 @@ static Value Div(const Value& a,const Value& b) { const double d=ToNumber(b); re
 static Value IDiv(const Value& a,const Value& b) { const auto d=ToInteger(b); return Integer(d==0?0:ToInteger(a)/d); }
 static Value Mod(const Value& a,const Value& b) { const auto d=ToInteger(b); return Integer(d==0?0:ToInteger(a)%d); }
 static Value Neg(const Value& a) { return Number(-ToNumber(a)); }
-static Value Eq(const Value& a,const Value& b) { return Boolean((a.type==T_TEXT||b.type==T_TEXT)?ToText(a)==ToText(b):ToNumber(a)==ToNumber(b)); }
+static Value Eq(const Value& a,const Value& b) { if(a.type==T_BIN&&b.type==T_BIN)return Boolean(a.bytes==b.bytes);return Boolean((a.type==T_TEXT||b.type==T_TEXT)?ToText(a)==ToText(b):ToNumber(a)==ToNumber(b)); }
 static Value Ne(const Value& a,const Value& b) { return Boolean(!ToBool(Eq(a,b))); }
 static Value Lt(const Value& a,const Value& b) { return Boolean((a.type==T_TEXT||b.type==T_TEXT)?ToText(a)<ToText(b):ToNumber(a)<ToNumber(b)); }
 static Value Le(const Value& a,const Value& b) { return Boolean(ToBool(Lt(a,b))||ToBool(Eq(a,b))); }
@@ -700,6 +679,13 @@ static Value And(const Value& a,const Value& b) { return Boolean(ToBool(a)&&ToBo
 static Value Or(const Value& a,const Value& b) { return Boolean(ToBool(a)||ToBool(b)); }
 static Value Not(const Value& a) { return Boolean(!ToBool(a)); }
 
+// 混合 VC6 / UCRT 时不能将一套 CRT 的 FILE 指针交给另一套；诊断直接写系统句柄。
+[[noreturn]] static void RuntimeFatal(const char* message) {
+    OutputDebugStringA(message);
+    const HANDLE output=GetStdHandle(STD_ERROR_HANDLE);
+    if(output && output!=INVALID_HANDLE_VALUE) { DWORD written=0;WriteFile(output,message,static_cast<DWORD>(std::strlen(message)),&written,nullptr); }
+    ExitProcess(87);
+}
 static Value& Index(Value& value,long long index) {
     if(value.type==T_BIN && !value.declaredArray && index>=1 && static_cast<std::size_t>(index)<=value.bytes.size()) {
         if(value.elements.size()!=value.bytes.size())value.elements.resize(value.bytes.size());
@@ -709,7 +695,7 @@ static Value& Index(Value& value,long long index) {
         return element;
     }
     if(index<1||static_cast<std::size_t>(index)>value.elements.size()) {
-        std::fputs("ecompiler: array index out of bounds\r\n",stderr); OutputDebugStringA("ecompiler: array index out of bounds\r\n"); ExitProcess(87);
+        RuntimeFatal("ecompiler: array index out of bounds\r\n");
     }
     return value.elements[static_cast<std::size_t>(index-1)];
 }
@@ -717,7 +703,7 @@ static Value& IndexPath(Value& value,const std::vector<long long>& indexes) {
     if(indexes.empty()) return value;
     if(value.dimensions.empty() && indexes.size()==1) return Index(value,indexes.front());
     if(indexes.size()!=value.dimensions.size()) {
-        std::fputs("ecompiler: array dimension mismatch\r\n",stderr); OutputDebugStringA("ecompiler: array dimension mismatch\r\n"); ExitProcess(87);
+        RuntimeFatal("ecompiler: array dimension mismatch\r\n");
     }
     std::size_t flat=0;
     std::size_t stride=1;
@@ -725,15 +711,15 @@ static Value& IndexPath(Value& value,const std::vector<long long>& indexes) {
         const std::size_t dimensionIndex=indexes.size()-1-reverse;
         const long long index=indexes[dimensionIndex];
         const int dimension=value.dimensions[dimensionIndex];
-        if(index<1 || index>dimension) { std::fputs("ecompiler: array index out of bounds\r\n",stderr); OutputDebugStringA("ecompiler: array index out of bounds\r\n"); ExitProcess(87); }
+        if(index<1 || index>dimension) { RuntimeFatal("ecompiler: array index out of bounds\r\n"); }
         flat += static_cast<std::size_t>(index-1)*stride;
         stride*=static_cast<std::size_t>(dimension);
     }
-    if(flat>=value.elements.size()) { std::fputs("ecompiler: array index out of bounds\r\n",stderr); OutputDebugStringA("ecompiler: array index out of bounds\r\n"); ExitProcess(87); }
+    if(flat>=value.elements.size()) { RuntimeFatal("ecompiler: array index out of bounds\r\n"); }
     return value.elements[flat];
 }
 static Value& Field(Value& value,std::size_t index) {
-    if(index>=value.fields.size()) { std::fputs("ecompiler: compound field out of bounds\r\n",stderr); OutputDebugStringA("ecompiler: compound field out of bounds\r\n"); ExitProcess(87); }
+    if(index>=value.fields.size()) { RuntimeFatal("ecompiler: compound field out of bounds\r\n"); }
     return value.fields[index];
 }
 static void Redim(Value& value,const std::vector<int>& dimensions,bool preserve) {
@@ -748,6 +734,11 @@ static void Redim(Value& value,const std::vector<int>& dimensions,bool preserve)
     }
 }
 static Value AryCount(const Value& value) { return Integer(value.declaredArray?static_cast<long long>(value.elements.size()):-1); }
+static Value AryBound(const Value& value,long long dimension) {
+    if(!value.declaredArray || dimension<1) return Integer(0);
+    if(value.dimensions.empty()) return Integer(dimension==1?static_cast<long long>(value.elements.size()):0);
+    return Integer(static_cast<unsigned long long>(dimension)<=value.dimensions.size()?value.dimensions[static_cast<std::size_t>(dimension-1)]:0);
+}
 static Value CopyAry(Value& source,Value& target) { target.elements=source.elements; target.dimensions=source.dimensions; target.declared=source.declared; target.type=source.type; target.declaredArray=true; return Empty(); }
 static Value AddElement(Value& target,Value item) { Value value=MakeVar(target.declared); Assign(value,std::move(item)); target.elements.push_back(std::move(value)); target.declaredArray=true; if(target.dimensions.size()==1) target.dimensions[0]=static_cast<int>(target.elements.size()); else if(target.dimensions.empty()) target.dimensions={static_cast<int>(target.elements.size())}; return Empty(); }
 static Value InsertElement(Value& target,int position,Value item) {
@@ -964,7 +955,7 @@ static void MarshalValue(Value& value,std::uint32_t expected,MData& out,Arena& a
     case T_SUB:out.pointerValue=reinterpret_cast<void*>(static_cast<EPointer>(ToInteger(value)));break;
     case T_INT64:out.int64Value=ToInteger(value);break;
     case T_FLOAT:out.floatValue=static_cast<float>(ToNumber(value));break; case T_DOUBLE:case T_DATE:out.doubleValue=ToNumber(value);break;
-    case T_TEXT:out.textValue=value.text.empty()?nullptr:value.text.data();break;
+    case T_TEXT:out.textValue=value.text.data();break;
     case T_BIN: { auto* block=static_cast<unsigned char*>(RuntimeAlloc(8+value.bytes.size())); if(block==nullptr)break; *reinterpret_cast<int*>(block)=1; *reinterpret_cast<int*>(block+4)=static_cast<int>(value.bytes.size()); if(!value.bytes.empty())std::memcpy(block+8,value.bytes.data(),value.bytes.size()); out.pointerValue=block; arena.ownedValues.push_back(block); break; }
     default:
         PrepareObjectWithArena(value,arena); out.pointerValue=value.object.data();
@@ -1115,7 +1106,8 @@ static void ApplyWritebacks(Arena& arena) {
     }
 }
 static Value CopyReturned(MData& data,std::uint32_t fallback,bool returnsArray) {
-    std::uint32_t type=data.type?data.type:fallback; returnsArray=returnsArray||((type&T_ARRAY)!=0); type&=~T_ARRAY;
+    // 固定返回类型由声明决定；SDK 只要求通用型命令填写动态类型，数组由命令标志决定。
+    const std::uint32_t type=fallback==T_ALL?data.type:fallback;
     if(returnsArray) {
         Value result=MakeVar(type,true); auto* raw=static_cast<unsigned char*>(data.pointerValue); if(!raw)return result;
         int dimensions=*reinterpret_cast<int*>(raw), count=1;
@@ -1142,7 +1134,7 @@ static Value CopyReturned(MData& data,std::uint32_t fallback,bool returnsArray) 
     } return result;
 }
 __declspec(noinline) static bool InvokeCommand(ExecuteCommand command,MData* result,int count,MData* arguments) {
-    command(result,count,arguments);
+    mapped_pe_compatibility::Call(command,result,count,arguments);
     return true;
 }
 static thread_local std::function<Value()> currentStatement;
@@ -1181,10 +1173,45 @@ static void ReleaseArena(Arena& arena) {
     }
     for(void* pointer:arena.ownedValues) if(pointer!=nullptr) RuntimeFree(pointer);
 }
+struct DllByteBuffer { Value* value; unsigned char* memory; std::size_t size; };
+struct ArenaScope;
+static thread_local ArenaScope* activeDllArena=nullptr;
 struct ArenaScope {
     Arena arena;
-    ~ArenaScope() { ReleaseArena(arena); }
+    ArenaScope* parent=activeDllArena;
+    std::vector<DllByteBuffer> buffers;
+    ArenaScope() { activeDllArena=this; }
+    void FinishBuffers() {
+        for(auto& buffer:buffers)buffer.value->bytes.assign(buffer.memory,buffer.memory+buffer.size);
+    }
+    ~ArenaScope() {
+        activeDllArena=parent;
+        ReleaseArena(arena);
+    }
 };
+// 仅 DLL 实际执行本次传入的字节集时开放其独立页面，其他访问异常继续传播。
+static int DllExecuteFilter(EXCEPTION_POINTERS* exception) {
+#if defined(_M_IX86)
+    const auto& record=*exception->ExceptionRecord;
+    if(record.ExceptionCode!=EXCEPTION_ACCESS_VIOLATION || record.NumberParameters<2 || record.ExceptionInformation[0]!=8)return EXCEPTION_CONTINUE_SEARCH;
+    const auto address=record.ExceptionInformation[1];
+    for(auto* arena=activeDllArena;arena;arena=arena->parent)for(const auto& buffer:arena->buffers) {
+        const auto start=reinterpret_cast<std::uintptr_t>(buffer.memory);
+        if(address>=start && address-start<buffer.size) {
+            DWORD previous=0;
+            if(VirtualProtect(buffer.memory,buffer.size,PAGE_EXECUTE_READWRITE,&previous)) {
+                FlushInstructionCache(GetCurrentProcess(),buffer.memory,buffer.size);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+    }
+#endif
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+template<class Function,class... Args> static auto DllInvoke(Function function,Args... args)->decltype(function(args...)) {
+    __try { return function(args...); }
+    __except(DllExecuteFilter(GetExceptionInformation())) { __assume(0); }
+}
 
 static const char* DllText(Value& value) {
     static thread_local std::string converted;
@@ -1192,8 +1219,20 @@ static const char* DllText(Value& value) {
     converted=ToText(value);
     return converted.c_str();
 }
-static unsigned char* DllBinary(Value& value) {
-    return value.type==T_BIN && !value.bytes.empty()?value.bytes.data():nullptr;
+static unsigned char* DllBinary(Value& value,ArenaScope& arena) {
+    if(value.type!=T_BIN || value.bytes.empty())return nullptr;
+    if(!value.native)value.native=std::make_shared<NativeStorage>();
+    auto& storage=*value.native;storage.owner=&value;
+    if(storage.dllCapacity<value.bytes.size()) {
+        auto* allocated=static_cast<unsigned char*>(VirtualAlloc(nullptr,value.bytes.size(),MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE));
+        if(!allocated)RuntimeFatal("DLL binary buffer allocation failed\n");
+        if(storage.dllMemory)VirtualFree(storage.dllMemory,0,MEM_RELEASE);
+        storage.dllMemory=allocated;storage.dllCapacity=value.bytes.size();
+    }
+    auto* memory=storage.dllMemory;
+    std::memcpy(memory,value.bytes.data(),value.bytes.size());
+    arena.buffers.push_back({&value,memory,value.bytes.size()});
+    return memory;
 }
 static void* DllObject(Value& value) {
     PrepareObject(value);
@@ -1202,11 +1241,23 @@ static void* DllObject(Value& value) {
 static void* DllArray(Value& value,Arena& arena) {
     return MarshalArray(value,value.type|T_ARRAY,arena);
 }
-static char* DllTextReference(Value& value) { return RuntimeText(value.type==T_TEXT?value.text:ToText(value)); }
-static void DllCaptureText(Value& value,char* current,char* initial) {
-    value.text=current==nullptr?std::string():std::string(current);
-    if(current==initial) RuntimeFree(current);
-}
+struct DllScalarArrayReferences {
+    Arena& arena;
+    std::vector<std::pair<Value*,unsigned char*>> arrays;
+    void* Pointer(Value& array,Value& element) {
+        auto found=std::find_if(arrays.begin(),arrays.end(),[&](const auto& item){return item.first==&array;});
+        if(found==arrays.end()) {
+            arrays.push_back({&array,static_cast<unsigned char*>(DllArray(array,arena))});
+            found=arrays.end()-1;
+        }
+        const auto index=&element-array.elements.data();
+        const auto rank=*reinterpret_cast<const int*>(found->second);
+        return found->second+4+rank*4+index*ScalarSize(array.type);
+    }
+    void Finish() {
+        for(const auto& item:arrays)ReadArray(*item.first,item.first->type,item.second);
+    }
+};
 static Value DllTextResult(const char* value) { return Text(value==nullptr?std::string():std::string(value)); }
 static Value DllBinaryResult(const unsigned char* value) {
     if(value==nullptr) return Bytes({});
@@ -1360,7 +1411,10 @@ public:
 		if (program_.useLegacyX86RuntimeBridge) {
 			result.text = "#define ECOMPILER_LEGACY_X86_RUNTIME 1\n";
 		}
-		result.text += RuntimeSourceUtf8(kRuntimeSource);
+		std::string runtime = RuntimeSourceUtf8(kRuntimeSource);
+		const auto runtimeNamespace = runtime.find("namespace ert {");
+		runtime.insert(runtimeNamespace, std::string(kMappedPeCompatibilitySource) + "\n");
+		result.text += runtime;
 		result.text += kPlatformDllRuntime;
 		result.text += kBinaryValueRuntime;
 		if (program_.targetArchitecture == TargetArchitecture::X86) result.text += kNativeX86Runtime;
@@ -1371,6 +1425,7 @@ public:
 		const auto startup = program_.methodByName.find("_启动子程序");
 		if (startup == program_.methodByName.end()) return Fail("startup_method_not_found:_启动子程序");
 		QueueMethod(startup->second);
+		for (const auto& name : program_.moduleStartupNames) QueueMethod(program_.methodByName.at(name));
 		for (const auto& form : program_.windows) {
 			for (const auto& event : form.events) QueueMethod(event.methodId);
 			for (const auto& control : form.controls) {
@@ -1436,7 +1491,8 @@ private:
 		}
 		std::replace(normalized.begin(), normalized.end(), '\\', '/');
 		normalized.erase(std::remove(normalized.begin(), normalized.end(), '"'), normalized.end());
-		body_ << "#line " << line << " \"" << normalized << "\"\n";
+		// UTF-8 文件名以转义字节写入，避免与生成器的 CP936 运行时代码混合。
+		body_ << "#line " << line << ' ' << EscapeCppString(normalized) << "\n";
 	}
 
 	bool EmitTypes()
@@ -1564,8 +1620,23 @@ private:
 	std::optional<std::uint32_t> WindowTargetId(const Method& method, const std::string& name) const
 	{
 		if (const auto* control = WindowControlByName(method, name)) return control->id;
-		if (const auto* form = WindowForMethod(method)) {
-			if (name == form->name || name == form->className) return form->id;
+		for (const auto& form : program_.windows) {
+			if (name == form.name || name == form.className) return form.id;
+		}
+		return std::nullopt;
+	}
+
+	std::optional<std::uint32_t> WindowTargetId(
+		const Method& method, const e2txt::SourceExpressionNode& receiver) const
+	{
+		if (receiver.kind == e2txt::SourceExpressionKind::Name) return WindowTargetId(method, receiver.text);
+		if (receiver.kind != e2txt::SourceExpressionKind::Member || receiver.children.size() != 1) return std::nullopt;
+		const auto parent = WindowTargetId(method, *receiver.children.front());
+		if (!parent) return std::nullopt;
+		for (const auto& form : program_.windows) {
+			if (form.id != *parent) continue;
+			for (const auto& control : form.controls)
+				if (control.name == receiver.text && HasNativeWin32Class(control.typeName)) return control.id;
 		}
 		return std::nullopt;
 	}
@@ -1575,10 +1646,11 @@ private:
 		const e2txt::SourceExpressionNode& receiver,
 		const std::string& name) const
 	{
-		if (receiver.kind != e2txt::SourceExpressionKind::Name) return std::nullopt;
-		const auto* control = WindowControlByName(method, receiver.text);
-		const auto* form = WindowForMethod(method);
-		if (control == nullptr && (form == nullptr || (receiver.text != form->name && receiver.text != form->className))) return std::nullopt;
+		const auto targetId = WindowTargetId(method, receiver);
+		if (!targetId) return std::nullopt;
+		const WindowControl* control = nullptr;
+		for (const auto& form : program_.windows)
+			for (const auto& candidate : form.controls) if (candidate.id == *targetId) control = &candidate;
 		const auto matches = [&name](const std::initializer_list<const char*> aliases) {
 			return std::any_of(aliases.begin(), aliases.end(), [&name](const char* alias) { return name == alias; });
 		};
@@ -1715,19 +1787,6 @@ private:
 		return name == "标题" && WindowForMethod(method) != nullptr && !FindVariable(method, name).has_value();
 	}
 
-	const WindowControl* WindowPropertyTarget(
-		const Method& method,
-		const e2txt::SourceExpressionNode& node,
-		std::string& property) const
-	{
-		if (node.kind != e2txt::SourceExpressionKind::Member || node.children.empty() ||
-			node.children.front()->kind != e2txt::SourceExpressionKind::Name) return nullptr;
-		const auto* control = WindowControlByName(method, node.children.front()->text);
-		if (control == nullptr) return nullptr;
-		property = node.text;
-		return control;
-	}
-
 	bool IsWindowPropertyTarget(
 		const Method& method,
 		const e2txt::SourceExpressionNode& node,
@@ -1739,9 +1798,12 @@ private:
 			property = node.text;
 			return true;
 		}
-		if (const auto* control = WindowPropertyTarget(method, node, property)) {
-			unitId = control->id;
-			return true;
+		if (node.kind == e2txt::SourceExpressionKind::Member && !node.children.empty()) {
+			if (const auto id = WindowTargetId(method, *node.children.front())) {
+				unitId = *id;
+				property = node.text;
+				return true;
+			}
 		}
 		return false;
 	}
@@ -1867,11 +1929,37 @@ private:
 			const Method& method = program_.methods[indexed->second];
 			if (!method.ownerType.valid && argumentCount <= method.parameters.size()) return &method;
 		}
-		// Reconstructed bundles can contain methods whose qualified-name index was
-		// built before all source pages were loaded. Resolve ordinary assembly
-		// methods from the canonical method vector as a deterministic fallback.
+		// 模块私有实现只在自身作用域可见，不能抢先绑定其它模块的公开函数。
+		const auto scope = [](const std::string& file) {
+			if (!file.starts_with("ecom/")) return std::string();
+			return file.substr(0, file.find('/', 5));
+		};
+		const std::string ownerScope = scope(owner.sourceFile);
+		const Method* exported = nullptr;
 		for (const Method& method : program_.methods) {
-			if (!method.ownerType.valid && method.name == name && argumentCount <= method.parameters.size()) return &method;
+			if (method.ownerType.valid || method.name != name || argumentCount > method.parameters.size()) continue;
+			if (scope(method.sourceFile) == ownerScope) return &method;
+			if (method.isPublic && exported == nullptr) exported = &method;
+		}
+		return exported;
+	}
+
+	// 类型名限定的基类调用绑定当前对象；普通程序集限定名绑定静态方法。
+	const Method* ResolveQualifiedMethod(const Method& owner, const e2txt::SourceExpressionNode& receiver,
+		const std::string& name, const std::size_t argumentCount) const
+	{
+		if (receiver.kind != e2txt::SourceExpressionKind::Name || FindVariable(owner, receiver.text)) return nullptr;
+		for (const auto& assembly : program_.assemblies) {
+			if (assembly.name != receiver.text) continue;
+			if (assembly.isClass) {
+				const TypeInfo* type = program_.FindType(owner.ownerType.code);
+				while (type && type->name != receiver.text) type = program_.FindType(type->baseType.code);
+				return type ? ResolveMemberMethod(type->type, name, argumentCount) : nullptr;
+			}
+			for (const auto id : assembly.methodIds) {
+				const auto& method = program_.methods[id];
+				if (method.name == name && argumentCount <= method.parameters.size()) return &method;
+			}
 		}
 		return nullptr;
 	}
@@ -1909,10 +1997,11 @@ private:
 			type.isArray = false; return type;
 		}
 		case Kind::Member: {
+			if (WindowTargetId(method, node)) return { kTypeWindowUnit, false, true };
 			if (node.children.empty()) return {};
 			std::string property;
-			if (const auto* control = WindowPropertyTarget(method, node, property)) {
-				(void)control;
+			std::uint32_t unitId = 0;
+			if (IsWindowPropertyTarget(method, node, unitId, property)) {
 				if (property == "选中" || property == "可视" || property == "禁止" || property == "单选")
 					return { kTypeBool, false, true };
 				if (property == "今天" || property == "最小日期" || property == "最大日期" ||
@@ -2000,6 +2089,7 @@ private:
 				}
 			}
 			else if (callee.kind == Kind::Member && !callee.children.empty()) {
+				if (const auto* qualified = ResolveQualifiedMethod(method, *callee.children.front(), callee.text, count)) return qualified->returnType;
 				if (const auto operation = WindowMemberOperation(method, *callee.children.front(), callee.text))
 					return WindowMemberReturnType(*operation);
 				if (const Method* member = ResolveMemberMethod(Infer(method, *callee.children.front()), callee.text, count)) return member->returnType;
@@ -2043,9 +2133,11 @@ private:
 			return "IndexPath(" + EmitLvalue(method, *node.children.front()) + "," + indexes + ")";
 		}
 		if (node.kind == Kind::Member && !node.children.empty()) {
+			if (const auto id = WindowTargetId(method, node)) return "Integer(" + std::to_string(*id) + ",T_WINDOW_UNIT)";
 			std::string property;
-			if (const auto* control = WindowPropertyTarget(method, node, property)) {
-				return "WindowGetProperty(" + std::to_string(control->id) + "," + EscapeCppString(property) + ")";
+			std::uint32_t unitId = 0;
+			if (IsWindowPropertyTarget(method, node, unitId, property)) {
+				return "WindowGetProperty(" + std::to_string(unitId) + "," + EscapeCppString(property) + ")";
 			}
 			const TypeRef base = Infer(method, *node.children.front()); const TypeInfo* type = program_.FindType(base.code);
 			if (type != nullptr) {
@@ -2066,7 +2158,10 @@ private:
 		// A named constant is an expression, not a mutable variable.  This is
 		// important for generic all-type parameters such as console output.
 		if (node.kind == e2txt::SourceExpressionKind::Name && !FindVariable(method, node.text)) referenceable = false;
-		return byReference && referenceable ? "Arg::Ref(" + EmitLvalue(method, node) + ')' : "Arg::Temp(" + EmitExpression(method, node, expected) + ')';
+		// 语义形参仍按值复制；保留缓冲区实参身份，使原生取指针指向调用者的存储。
+		const bool bufferArgument = expected.valid && !expected.isArray &&
+			(expected.code == kTypeText || expected.code == kTypeBinary);
+		return (byReference || bufferArgument) && referenceable ? "Arg::Ref(" + EmitLvalue(method, node) + ')' : "Arg::Temp(" + EmitExpression(method, node, expected) + ')';
 	}
 
 	std::string EmitBuiltin(const Method& method, const CommandBinding& binding, const e2txt::SourceExpressionNode& call)
@@ -2144,6 +2239,11 @@ private:
 			return "(Redim(" + EmitLvalue(method, arg(0)) + ',' + dimensions + ",ToBool(" + EmitExpression(method, arg(1)) + ")),Empty())";
 		}
 		if (operation == "GetAryElementCount") return "AryCount(" + EmitLvalue(method, arg(0)) + ')';
+		if (operation == "UBound") {
+			const std::string dimension = call.children.size() <= 2 || arg(1).kind == e2txt::SourceExpressionKind::Missing
+				? "1" : "ToInteger(" + EmitExpression(method, arg(1)) + ")";
+			return "AryBound(" + EmitLvalue(method, arg(0)) + ',' + dimension + ')';
+		}
 		if (operation == "CopyAry") return "CopyAry(" + EmitLvalue(method, arg(0)) + ',' + EmitLvalue(method, arg(1)) + ')';
 		if (operation == "AddElement") return "AddElement(" + EmitLvalue(method, arg(0)) + ',' + EmitExpression(method, arg(1)) + ')';
 		if (operation == "InsElement") return "InsertElement(" + EmitLvalue(method, arg(0)) + ",static_cast<int>(ToInteger(" + EmitExpression(method, arg(1)) + "))," + EmitExpression(method, arg(2)) + ')';
@@ -2206,6 +2306,8 @@ private:
 
 	std::string DllParameterCType(const TypeRef type, const bool byReference) const
 	{
+		if (!type.isArray && type.code == kTypeText) return "char*";
+		if (!type.isArray && type.code == kTypeBinary) return "unsigned char*";
 		// 易语言按完整整数槽传递小整数；先截断，再由调用签名扩展。
 		if (!byReference && !type.isArray) {
 			if (type.code == kTypeByte) return "unsigned int";
@@ -2259,7 +2361,7 @@ private:
 		if (type.isArray) return valueName + ".missing?nullptr:__dll_array_" + valueName;
 		switch (type.code) {
 		case kTypeText: return valueName + ".missing?nullptr:DllText(" + valueName + ")";
-		case kTypeBinary: return valueName + ".missing?nullptr:DllBinary(" + valueName + ")";
+		case kTypeBinary: return valueName + ".missing?nullptr:DllBinary(" + valueName + ",__dll_scope)";
 		case kTypeSubroutine: return "reinterpret_cast<void*>(static_cast<std::uintptr_t>(ToInteger(" + valueName + ")))";
 		default:
 			if (program_.FindType(type.code) != nullptr) return "DllObject(" + valueName + ")";
@@ -2275,7 +2377,7 @@ private:
 		const std::size_t commandIndex = static_cast<std::size_t>(&command - program_.dllCommands.data());
 		const std::string importSymbol = RegisterDllImport(command, commandIndex);
 		std::ostringstream result;
-		result << "([&](){ ArenaScope __dll_scope;";
+		result << "([&](){ ArenaScope __dll_scope;DllScalarArrayReferences __dll_arrays{__dll_scope.arena};";
 		std::vector<std::string> callArguments;
 		std::vector<std::string> syncStatements;
 		for (std::size_t index = 0; index < command.parameters.size(); ++index) {
@@ -2287,8 +2389,22 @@ private:
 			const TypeRef effectiveType = parameter.type.code == kTypeAll && source != nullptr ? Infer(method, *source) : parameter.type;
 			const TypeRef type = effectiveType.valid ? effectiveType : TypeRef { kTypeInt, false, true };
 			const std::string valueName = "__dll_value_" + std::to_string(index);
+			// 数组元素传址必须保留后续元素的连续存储，且同一数组的多个地址共享缓冲区。
+			if (referenceable && parameter.byReference && source->kind == e2txt::SourceExpressionKind::Index &&
+				!source->children.empty() && Infer(method, *source->children.front()).isArray &&
+				!type.isArray && (type.code == kTypeByte || type.code == kTypeShort || type.code == kTypeInt ||
+					type.code == kTypeInt64 || type.code == kTypeFloat || type.code == kTypeDouble ||
+					type.code == kTypeBool || type.code == kTypeDateTime) && Infer(method, *source).code == type.code) {
+				const std::string pointer = "__dll_element_" + std::to_string(index);
+				result << "auto* " << pointer << "=static_cast<" << DllCType(type, false) << "*>(__dll_arrays.Pointer("
+					<< EmitLvalue(method, *source->children.front()) << ',' << EmitLvalue(method, *source) << "));";
+				callArguments.push_back(pointer);
+				continue;
+			}
 			if (referenceable && parameter.byReference) result << "Value& __dll_target_" << index << "=" << EmitLvalue(method, *source) << ";";
-			result << "Value " << valueName << "=" << (source == nullptr ? "Missing()" : EmitExpression(method, *source)) << ";";
+			const bool binaryVariable = referenceable && type.code == kTypeBinary && !type.isArray;
+			result << (binaryVariable ? "Value& " : "Value ") << valueName << "=" <<
+				(binaryVariable ? EmitLvalue(method, *source) : (source == nullptr ? "Missing()" : EmitExpression(method, *source))) << ";";
 			if (type.isArray) {
 				result << "void* __dll_array_" << valueName << "=" << valueName << ".missing?nullptr:DllArray(" << valueName << ",__dll_scope.arena);";
 				if (parameter.byReference) {
@@ -2299,14 +2415,20 @@ private:
 				else callArguments.push_back("__dll_array_" + valueName);
 				continue;
 			}
-			if (!parameter.byReference) {
-				if(referenceable && (type.code==kTypeBinary || type.code==kTypeText)) {
-					const std::string member=type.code==kTypeBinary?"bytes":"text";
-					result << "Value& __dll_target_" << index << "=" << EmitLvalue(method,*source) << ";auto __dll_before_" << index << "=" << valueName << '.' << member << ";";
-					syncStatements.push_back("if("+valueName+"."+member+"!=__dll_before_"+std::to_string(index)+") Assign(__dll_target_"+std::to_string(index)+","+valueName+");");
+			// DLL 文本和字节集参数始终传数据缓冲区；传址不再增加指针层级。
+			if (type.code == kTypeText || type.code == kTypeBinary) {
+				const std::string member = type.code == kTypeText ? "text" : "bytes";
+				if (referenceable) {
+					if (!parameter.byReference) result << "Value& __dll_target_" << index << "=" << EmitLvalue(method, *source) << ";";
+					result << "auto __dll_before_" << index << '=' << valueName << '.' << member << ';';
+					if (type.code == kTypeText) syncStatements.push_back(valueName + ".text.resize(std::strlen(" + valueName + ".text.c_str()));");
+					syncStatements.push_back("if(" + valueName + '.' + member + "!=__dll_before_" + std::to_string(index) + ") Assign(__dll_target_" + std::to_string(index) + ',' + valueName + ");");
 				}
-				const bool platformComposite = IsPlatformImportModule(command.fileName) &&
-					program_.FindType(type.code) != nullptr;
+				callArguments.push_back(valueName + ".missing?nullptr:" + (type.code == kTypeText ? valueName + ".text.data()" : "DllBinary(" + valueName + ",__dll_scope)"));
+				continue;
+			}
+			if (!parameter.byReference) {
+				const bool platformComposite = program_.FindType(type.code) != nullptr;
 				if (referenceable && platformComposite) {
 					result << "Value& __dll_target_" << index << "=" << EmitLvalue(method, *source) << ";";
 					syncStatements.push_back(
@@ -2317,26 +2439,12 @@ private:
 				continue;
 			}
 			const std::string cType = DllCType(type, false);
-			if (type.code == kTypeText) {
-				result << "char* __dll_ref_" << index << "=" << valueName << ".missing?nullptr:DllTextReference(" << valueName << "); char* __dll_initial_" << index << "=__dll_ref_" << index << ";";
-				callArguments.push_back("&__dll_ref_" + std::to_string(index));
-				if (referenceable) syncStatements.push_back("DllCaptureText(" + valueName + ",__dll_ref_" + std::to_string(index) + ",__dll_initial_" + std::to_string(index) + "); Assign(__dll_target_" + std::to_string(index) + "," + valueName + ");");
-				else syncStatements.push_back("if(__dll_ref_" + std::to_string(index) + "==__dll_initial_" + std::to_string(index) + ") RuntimeFree(__dll_initial_" + std::to_string(index) + ");");
-				continue;
-			}
-			if (type.code == kTypeBinary) {
-				result << "unsigned char* __dll_ref_" << index << "=DllBinary(" << valueName << ");";
-				callArguments.push_back("&__dll_ref_" + std::to_string(index));
-				if (referenceable) syncStatements.push_back("Assign(__dll_target_" + std::to_string(index) + "," + valueName + ");");
-				continue;
-			}
 			if (type.code != kTypeByte && type.code != kTypeShort && type.code != kTypeInt &&
 				type.code != kTypeBool && type.code != kTypeSubroutine && type.code != kTypeInt64 &&
 				type.code != kTypeFloat && type.code != kTypeDouble && type.code != kTypeDateTime) {
-				const bool platform = IsPlatformImportModule(command.fileName);
-				result << "void* __dll_ref_" << index << '=' << (platform ? "PlatformObject(" : "DllObject(") << valueName << ");";
-				callArguments.push_back(IsPlatformImportModule(command.fileName) ? "__dll_ref_" + std::to_string(index) : "&__dll_ref_" + std::to_string(index));
-				if (referenceable) syncStatements.push_back("if(__dll_ref_" + std::to_string(index) + ") " + (platform ? "ReadPlatformObject(" : "ReadObject(") + valueName + ",__dll_ref_" + std::to_string(index) + "); Assign(__dll_target_" + std::to_string(index) + "," + valueName + ");");
+				result << "void* __dll_ref_" << index << "=PlatformObject(" << valueName << ");";
+				callArguments.push_back("__dll_ref_" + std::to_string(index));
+				if (referenceable) syncStatements.push_back("if(__dll_ref_" + std::to_string(index) + ") ReadPlatformObject(" + valueName + ",__dll_ref_" + std::to_string(index) + "); Assign(__dll_target_" + std::to_string(index) + "," + valueName + ");");
 				continue;
 			}
 			result << cType << " __dll_ref_" << index << "=" << DllValueExpression(type, valueName) << ";";
@@ -2359,7 +2467,7 @@ private:
 		// PE import-library path.  The alias has the exact declaration assembled
 		// in RegisterDllImport and is mapped to the real import symbol by the
 		// generated linker directive.
-		const std::string invoked = importSymbol + "(" + joinedArguments + ")";
+		const std::string invoked = "DllInvoke(" + importSymbol + (joinedArguments.empty() ? "" : "," + joinedArguments) + ")";
 		result << "NativeExternalScope __native_call;";
 		if (returnType.code == kTypeNull) {
 			result << invoked << ";";
@@ -2367,7 +2475,7 @@ private:
 		else {
 			result << "auto __dll_result=" << invoked << ";";
 		}
-		result << "__native_call.Finish();";
+		result << "__native_call.Finish();__dll_scope.FinishBuffers();__dll_arrays.Finish();";
 		for (const std::string& statement : syncStatements) result << statement;
 		if (returnType.code == kTypeNull) result << "return Empty();";
 		else if (returnType.isArray) result << "MData __dll_data{}; __dll_data.type=" << Hex(returnType.code) << "|T_ARRAY; __dll_data.pointerValue=__dll_result; return CopyReturned(__dll_data," << Hex(returnType.code) << ",true);";
@@ -2396,11 +2504,8 @@ private:
 		for (std::size_t index = 0; index < command.parameters.size(); ++index) {
 			if (index != 0) declarations_ << ',';
 			const TypeRef type = command.parameters[index].type.valid ? command.parameters[index].type : TypeRef { kTypeInt, false, true };
-			// A by-reference composite passed to a Windows API is a pointer to
-			// the object storage, while an ordinary E DLL uses the pointer slot
-			// described by DllCType.  Keep this distinction in the declaration as
-			// well as in EmitDllCall's argument marshalling.
-			declarations_ << ((IsPlatformImportModule(command.fileName) && command.parameters[index].byReference && program_.FindType(type.code) != nullptr)
+			// DLL 结构参数传结构缓冲区，布局不由 DLL 文件名决定。
+			declarations_ << ((command.parameters[index].byReference && program_.FindType(type.code) != nullptr)
 				? "void*"
 				: DllParameterCType(type, command.parameters[index].byReference));
 		}
@@ -2563,8 +2668,19 @@ private:
 			return EmitFneCall(method, *binding, node, nullptr);
 		}
 		if (callee.kind == Kind::Member && !callee.children.empty()) {
+			if (const auto* qualified = ResolveQualifiedMethod(method, *callee.children.front(), callee.text, argumentCount)) {
+				QueueMethod(qualified->id);
+				std::string arguments = "{";
+				for (std::size_t index = 1; index < node.children.size(); ++index) {
+					const auto& parameter = qualified->parameters[index - 1];
+					arguments += EmitArg(method, *node.children[index], parameter.byReference, parameter.type) + ',';
+				}
+				arguments += '}';
+				return "method_" + std::to_string(qualified->id) + '(' + arguments +
+					(qualified->ownerType.valid ? ",self,false)" : ",nullptr,false)");
+			}
 			if (const auto operation = WindowMemberOperation(method, *callee.children.front(), callee.text)) {
-				const auto targetId = WindowTargetId(method, callee.children.front()->text);
+				const auto targetId = WindowTargetId(method, *callee.children.front());
 				if (!targetId) { Fail(method.sourceFile + ": unknown_window_target:" + callee.children.front()->text); return "Empty()"; }
 				std::string arguments = "{";
 				for (std::size_t index = 1; index < node.children.size(); ++index)
@@ -2658,9 +2774,11 @@ private:
 		case Kind::Call: return EmitCall(method, node);
 		case Kind::Member:
 			{
+				if (const auto id = WindowTargetId(method, node)) return "Integer(" + std::to_string(*id) + ",T_WINDOW_UNIT)";
 				std::string property;
-				if (const auto* control = WindowPropertyTarget(method, node, property)) {
-					return "WindowGetProperty(" + std::to_string(control->id) + "," + EscapeCppString(property) + ")";
+				std::uint32_t unitId = 0;
+				if (IsWindowPropertyTarget(method, node, unitId, property)) {
+					return "WindowGetProperty(" + std::to_string(unitId) + "," + EscapeCppString(property) + ")";
 				}
 			}
 			if (!node.children.empty() && node.children.front()->kind == Kind::Name && !node.children.front()->text.empty() && node.children.front()->text.front() == '#') {
@@ -2804,7 +2922,7 @@ private:
 		if (method.returnType.code != kTypeNull && !isIntegerType(method.returnType)) {
 			return Fail(method.sourceFile + ": x64_machine_code_return_type_not_supported");
 		}
-		body_ << "\nstatic Value method_" << method.id << "(std::vector<Arg> a,Value* self) {\n";
+		body_ << "\nstatic Value method_" << method.id << "(std::vector<Arg> a,Value* self,bool virtualDispatch) {\n";
 		EmitVirtualDispatch(method);
 		Line(1, "std::vector<Value> p; p.reserve(" + std::to_string(method.parameters.size()) + ");");
 		for (std::size_t index = 0; index < method.parameters.size(); ++index) {
@@ -2853,7 +2971,7 @@ private:
 			if (!ancestor) continue;
 			for (const auto id : type.memberMethodIds) if (id != method.id && program_.methods[id].name == method.name) {
 				QueueMethod(id);
-				Line(1, "if(self && self->type==" + Hex(type.type.code) + ")return method_" + std::to_string(id) + "(std::move(a),self);");
+				Line(1, "if(virtualDispatch && self && self->type==" + Hex(type.type.code) + ")return method_" + std::to_string(id) + "(std::move(a),self);");
 				break;
 			}
 		}
@@ -2891,7 +3009,7 @@ private:
 			}
 			return EmitX64MachineMethod(method, *machineStatement);
 		}
-		body_ << "\nstatic Value method_" << method.id << "(std::vector<Arg> a,Value* self) {\n";
+		body_ << "\nstatic Value method_" << method.id << "(std::vector<Arg> a,Value* self,bool virtualDispatch) {\n";
 		for (const auto& parameter : method.parameters) usedTypes_.insert(parameter.type.code);
 		EmitVirtualDispatch(method);
 		for (const auto& local : method.locals) usedTypes_.insert(local.type.code);
@@ -2954,8 +3072,9 @@ private:
 		for (const auto id : pendingMethods_) {
 			const auto& method = program_.methods[id];
 			if (!method.ownerType.valid) continue;
-			const std::string returnType = method.returnType.code == kTypeNull ? "void" : ExportCType(method.returnType, false);
-			body_ << "\nstatic " << returnType << (method.usesCdecl ? " __cdecl " : " __stdcall ") << "ecompiler_native_" << id << "(void* receiver";
+			const bool genericReturn = method.returnType.code == kTypeAll;
+			const std::string returnType = method.returnType.code == kTypeNull || genericReturn ? "void" : ExportCType(method.returnType, false);
+			body_ << "\nstatic " << returnType << (method.usesCdecl ? " __cdecl " : " __stdcall ") << "ecompiler_native_" << id << (genericReturn ? "_body(unsigned* output,void* receiver" : "(void* receiver");
 			std::vector<unsigned> offsets;
 			unsigned words = 0;
 			for (const auto& parameter : method.parameters) {
@@ -2973,7 +3092,7 @@ private:
 					body_ << "    p.back().missing=raw" << presence << "==0;\n";
 				}
 				body_ << "    if(!p.back().missing) NativeRead(p.back(),";
-				if (parameter.byReference || (!parameter.type.isArray && program_.FindType(parameter.type.code) && !program_.FindType(parameter.type.code)->isEnum)) body_ << "reinterpret_cast<const void*>(raw" << offsets[index] << ')';
+				if (parameter.byReference || (!parameter.type.isArray && (parameter.type.code == kTypeText || parameter.type.code == kTypeBinary || (program_.FindType(parameter.type.code) && !program_.FindType(parameter.type.code)->isEnum)))) body_ << "reinterpret_cast<const void*>(raw" << offsets[index] << ')';
 				else body_ << "&raw" << offsets[index];
 				body_ << ");\n    a.push_back(Arg::Ref(p.back()));\n";
 			}
@@ -2981,13 +3100,25 @@ private:
 			for (std::size_t index = 0; index < method.parameters.size(); ++index) {
 				if (method.parameters[index].byReference) body_ << "    if(raw" << offsets[index] << ") NativeStore(p[" << index << "],reinterpret_cast<void*>(raw" << offsets[index] << "));\n";
 			}
-			if (method.returnType.code == kTypeNull) body_ << "    return;\n";
+			if (genericReturn) body_ << "    output[0]=output[1]=0;output[2]=result.type;\n    if(result.type==T_TEXT) output[0]=reinterpret_cast<unsigned>(RuntimeText(result.text));\n    else if(result.type==T_BIN) output[0]=reinterpret_cast<unsigned>(RuntimeBinary(result.bytes));\n    else NativeStore(result,output);\n";
+			else if (method.returnType.code == kTypeNull) body_ << "    return;\n";
 			else if (method.returnType.code == kTypeFloat || method.returnType.code == kTypeDouble || method.returnType.code == kTypeDateTime) body_ << "    return static_cast<" << returnType << ">(ToNumber(result));\n";
 			else if (method.returnType.code == kTypeText) body_ << "    return RuntimeText(result.text);\n";
 			else if (method.returnType.code == kTypeBinary) body_ << "    return RuntimeBinary(result.bytes);\n";
 			else if (program_.FindType(method.returnType.code)) body_ << "    unsigned raw;NativeStore(result,&raw);auto* copy=RuntimeAlloc(FindType(result.type)->size);std::memcpy(copy,reinterpret_cast<void*>(raw),FindType(result.type)->size);return copy;\n";
+			else if (method.returnType.code == kTypeSubroutine) body_ << "    return reinterpret_cast<void*>(static_cast<std::uintptr_t>(ToInteger(result)));\n";
 			else body_ << "    return static_cast<" << returnType << ">(ToInteger(result));\n";
 			body_ << "}\n";
+			if (genericReturn) {
+				// 显式组装返回寄存器，避免 C++ 析构代码覆盖通用型的动态类型。
+				body_ << "static void __declspec(naked) ecompiler_native_" << id << "() { __asm {\n    sub esp,12\n    mov eax,esp\n";
+				for (unsigned word = 0; word <= words; ++word) body_ << "    push dword ptr [esp+" << 16 + words * 4 << "]\n";
+				body_ << "    push eax\n    call ecompiler_native_" << id << "_body\n";
+				if (method.usesCdecl) body_ << "    add esp," << (words + 2) * 4 << "\n";
+				body_ << "    pop eax\n    pop edx\n    pop ecx\n    ret";
+				if (!method.usesCdecl) body_ << ' ' << (words + 1) * 4;
+				body_ << "\n} }\n";
+			}
 		}
 		body_ << "namespace ert {\nconst void* const* NativeClassTable(std::uint32_t type) {\n    switch(type) {\n";
 		for (const auto& type : program_.types) {
@@ -6020,20 +6151,20 @@ static void SetProperty(unsigned int id,const char* property,const Value& value)
             ApplyUnitFont(window,*unit);
         }
     }
-    else if(PropertyEquals(property,L"\u8fb9\u6846"))if(Unit* unit=UnitFromWindow(window)){unit->borderStyle=static_cast<int>(ToInteger(value));SetWindowBorder(window,unit->borderStyle);}
-    else if(PropertyEquals(property,L"\u6a2a\u5411\u5bf9\u9f50\u65b9\u5f0f")||PropertyEquals(property,L"\u7eb5\u5411\u5bf9\u9f50\u65b9\u5f0f"))if(Unit* unit=UnitFromWindow(window)){if(PropertyEquals(property,L"\u6a2a\u5411\u5bf9\u9f50\u65b9\u5f0f"))unit->horizontalAlign=static_cast<int>(ToInteger(value));else unit->verticalAlign=static_cast<int>(ToInteger(value));InvalidateRect(window,nullptr,TRUE);}
+    else if(PropertyEquals(property,L"\u8fb9\u6846")){if(Unit* unit=UnitFromWindow(window)){unit->borderStyle=static_cast<int>(ToInteger(value));SetWindowBorder(window,unit->borderStyle);}}
+    else if(PropertyEquals(property,L"\u6a2a\u5411\u5bf9\u9f50\u65b9\u5f0f")||PropertyEquals(property,L"\u7eb5\u5411\u5bf9\u9f50\u65b9\u5f0f")){if(Unit* unit=UnitFromWindow(window)){if(PropertyEquals(property,L"\u6a2a\u5411\u5bf9\u9f50\u65b9\u5f0f"))unit->horizontalAlign=static_cast<int>(ToInteger(value));else unit->verticalAlign=static_cast<int>(ToInteger(value));InvalidateRect(window,nullptr,TRUE);}}
     else if(PropertyEquals(property,L"\u53ef\u89c6")){const int command=ToInteger(value)?SW_SHOW:SW_HIDE;if(Form* form=FindFormRecord(window))form->startupShowCommand=command;ShowWindow(window,command);}
     else if(PropertyEquals(property,L"\u9690\u85cf\u81ea\u8eab")) {
         if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"tab")==0)
             ShowWindow(window,ToBool(value)?SW_HIDE:SW_SHOW);
     }
     else if(PropertyEquals(property,L"\u7981\u6b62"))EnableWindow(window,ToInteger(value)?FALSE:TRUE);
-    else if(PropertyEquals(property,L"\u6807\u8bb0"))if(Unit* unit=UnitFromWindow(window))unit->tag=Wide(ToText(value).c_str());
-    else if(PropertyEquals(property,L"\u9f20\u6807\u6307\u9488"))if(Unit* unit=UnitFromWindow(window)) { ReplaceUnitCursor(*unit,value.bytes); SetCursor(unit->cursor!=nullptr?unit->cursor:LoadCursorW(nullptr,MAKEINTRESOURCEW(32512))); }
-    else if(PropertyEquals(property,L"\u9690\u85cf\u9009\u62e9"))if(Unit* unit=UnitFromWindow(window)){unit->hideSelection=ToBool(value);if(HWND edit=EditPart(window))SendMessageW(edit,0x043Fu,unit->hideSelection,FALSE);}
-    else if(PropertyEquals(property,L"\u5bc6\u7801\u906e\u76d6\u5b57\u7b26"))if(Unit* unit=UnitFromWindow(window)){unit->passwordChar=Wide(ToText(value).c_str());if(HWND edit=EditPart(window))SendMessageW(edit,EM_SETPASSWORDCHAR,unit->passwordChar.empty()?L'*':unit->passwordChar.front(),0);}
-    else if(PropertyEquals(property,L"\u8f93\u5165\u65b9\u5f0f"))if(Unit* unit=UnitFromWindow(window)){unit->inputMode=static_cast<int>(ToInteger(value));if(HWND edit=EditPart(window)){const int mode=unit->inputMode;SendMessageW(edit,EM_SETREADONLY,mode==1,0);if(mode==2)SendMessageW(edit,EM_SETPASSWORDCHAR,L'*',0);else SendMessageW(edit,EM_SETPASSWORDCHAR,0,0);}}
-    else if(PropertyEquals(property,L"\u5bf9\u9f50\u65b9\u5f0f"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"edit")==0){unit->horizontalAlign=static_cast<int>(ToInteger(value));HWND edit=EditPart(window);LONG_PTR style=GetWindowLongPtrW(edit!=nullptr?edit:window,GWL_STYLE);style&=~(ES_LEFT|ES_CENTER|ES_RIGHT);style|=unit->horizontalAlign==1?ES_CENTER:(unit->horizontalAlign==2?ES_RIGHT:ES_LEFT);SetWindowLongPtrW(edit!=nullptr?edit:window,GWL_STYLE,style);InvalidateRect(edit!=nullptr?edit:window,nullptr,TRUE);}
+    else if(PropertyEquals(property,L"\u6807\u8bb0")){if(Unit* unit=UnitFromWindow(window))unit->tag=Wide(ToText(value).c_str());}
+    else if(PropertyEquals(property,L"\u9f20\u6807\u6307\u9488")){if(Unit* unit=UnitFromWindow(window)) { ReplaceUnitCursor(*unit,value.bytes); SetCursor(unit->cursor!=nullptr?unit->cursor:LoadCursorW(nullptr,MAKEINTRESOURCEW(32512))); }}
+    else if(PropertyEquals(property,L"\u9690\u85cf\u9009\u62e9")){if(Unit* unit=UnitFromWindow(window)){unit->hideSelection=ToBool(value);if(HWND edit=EditPart(window))SendMessageW(edit,0x043Fu,unit->hideSelection,FALSE);}}
+    else if(PropertyEquals(property,L"\u5bc6\u7801\u906e\u76d6\u5b57\u7b26")){if(Unit* unit=UnitFromWindow(window)){unit->passwordChar=Wide(ToText(value).c_str());if(HWND edit=EditPart(window))SendMessageW(edit,EM_SETPASSWORDCHAR,unit->passwordChar.empty()?L'*':unit->passwordChar.front(),0);}}
+    else if(PropertyEquals(property,L"\u8f93\u5165\u65b9\u5f0f")){if(Unit* unit=UnitFromWindow(window)){unit->inputMode=static_cast<int>(ToInteger(value));if(HWND edit=EditPart(window)){const int mode=unit->inputMode;SendMessageW(edit,EM_SETREADONLY,mode==1,0);if(mode==2)SendMessageW(edit,EM_SETPASSWORDCHAR,L'*',0);else SendMessageW(edit,EM_SETPASSWORDCHAR,0,0);}}}
+    else if(PropertyEquals(property,L"\u5bf9\u9f50\u65b9\u5f0f")){if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"edit")==0){unit->horizontalAlign=static_cast<int>(ToInteger(value));HWND edit=EditPart(window);LONG_PTR style=GetWindowLongPtrW(edit!=nullptr?edit:window,GWL_STYLE);style&=~(ES_LEFT|ES_CENTER|ES_RIGHT);style|=unit->horizontalAlign==1?ES_CENTER:(unit->horizontalAlign==2?ES_RIGHT:ES_LEFT);SetWindowLongPtrW(edit!=nullptr?edit:window,GWL_STYLE,style);InvalidateRect(edit!=nullptr?edit:window,nullptr,TRUE);}}
     else if(PropertyEquals(property,L"\u8c03\u8282\u5668\u5e95\u9650\u503c")||PropertyEquals(property,L"\u8c03\u8282\u5668\u4e0a\u9650\u503c")) {
         if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"spin")==0) {
             if(PropertyEquals(property,L"\u8c03\u8282\u5668\u5e95\u9650\u503c"))unit->spinMin=static_cast<int>(ToInteger(value));
@@ -6042,8 +6173,8 @@ static void SetProperty(unsigned int id,const char* property,const Value& value)
             SendMessageW(window,UDM_SETRANGE32,unit->spinMin,unit->spinMax);
         }
     }
-    else if(PropertyEquals(property,L"\u6eda\u52a8\u6761"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"edit")==0){const int mode=static_cast<int>(ToInteger(value));HWND edit=EditPart(window);LONG_PTR style=GetWindowLongPtrW(edit!=nullptr?edit:window,GWL_STYLE);if(mode==1||mode==3)style|=WS_HSCROLL;else style&=~WS_HSCROLL;if(mode==2||mode==3)style|=WS_VSCROLL;else style&=~WS_VSCROLL;SetWindowLongPtrW(edit!=nullptr?edit:window,GWL_STYLE,style);SetWindowPos(edit!=nullptr?edit:window,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);}
-    else if(PropertyEquals(property,L"\u8f6c\u6362\u65b9\u5f0f"))if(Unit* unit=UnitFromWindow(window))unit->convertMode=static_cast<int>(ToInteger(value));
+    else if(PropertyEquals(property,L"\u6eda\u52a8\u6761")){if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"edit")==0){const int mode=static_cast<int>(ToInteger(value));HWND edit=EditPart(window);LONG_PTR style=GetWindowLongPtrW(edit!=nullptr?edit:window,GWL_STYLE);if(mode==1||mode==3)style|=WS_HSCROLL;else style&=~WS_HSCROLL;if(mode==2||mode==3)style|=WS_VSCROLL;else style&=~WS_VSCROLL;SetWindowLongPtrW(edit!=nullptr?edit:window,GWL_STYLE,style);SetWindowPos(edit!=nullptr?edit:window,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);}}
+    else if(PropertyEquals(property,L"\u8f6c\u6362\u65b9\u5f0f")){if(Unit* unit=UnitFromWindow(window))unit->convertMode=static_cast<int>(ToInteger(value));}
     else if(PropertyEquals(property,L"\u662f\u5426\u5141\u8bb8\u591a\u884c")) {
         if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"edit")==0) {
             HWND edit=EditPart(window); if(edit==nullptr)edit=window;
@@ -6055,7 +6186,7 @@ static void SetProperty(unsigned int id,const char* property,const Value& value)
             InvalidateRect(edit,nullptr,TRUE);
         }
     }
-    else if(PropertyEquals(property,L"\u8c03\u8282\u5668\u65b9\u5f0f"))if(Unit* unit=UnitFromWindow(window)) { unit->spinMode=(std::clamp)(static_cast<int>(ToInteger(value)),0,2); if(std::strcmp(unit->type,"edit")==0)ConfigureEditSpin(window,*unit,IsWindowVisible(window)!=FALSE,IsWindowEnabled(window)==FALSE); }
+    else if(PropertyEquals(property,L"\u8c03\u8282\u5668\u65b9\u5f0f")){if(Unit* unit=UnitFromWindow(window)) { unit->spinMode=(std::clamp)(static_cast<int>(ToInteger(value)),0,2); if(std::strcmp(unit->type,"edit")==0)ConfigureEditSpin(window,*unit,IsWindowVisible(window)!=FALSE,IsWindowEnabled(window)==FALSE); }}
     else if(PropertyEquals(property,L"\u6700\u5927\u5141\u8bb8\u957f\u5ea6")||PropertyEquals(property,L"\u6700\u5927\u6587\u672c\u957f\u5ea6")) { if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"combo")==0)unit->comboTextLimit=(std::max)(0,static_cast<int>(ToInteger(value))); if(HWND edit=EditPart(window);edit!=nullptr)SendMessageW(edit,EM_SETLIMITTEXT,static_cast<WPARAM>((std::max)(0,static_cast<int>(ToInteger(value)))),0); }
     else if(PropertyEquals(property,L"\u53ef\u505c\u7559\u7126\u70b9")) { LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE); if(ToBool(value))style|=WS_TABSTOP;else style&=~WS_TABSTOP; SetWindowLongPtrW(window,GWL_STYLE,style); }
     else if(PropertyEquals(property,L"\u81ea\u52a8\u6392\u5e8f")&&(ClassEquals(window,L"LISTBOX")||ClassEquals(window,L"COMBOBOX"))) { LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE); const LONG_PTR bit=ClassEquals(window,L"LISTBOX")?LBS_SORT:CBS_SORT; if(ToBool(value))style|=bit;else style&=~bit; SetWindowLongPtrW(window,GWL_STYLE,style); }
@@ -6116,16 +6247,16 @@ static void SetProperty(unsigned int id,const char* property,const Value& value)
     else if(PropertyEquals(property,L"\u663e\u793a\u65b9\u5f0f")) {
         if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"progress")==0) {unit->progressDrawMode=static_cast<int>(ToInteger(value));LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE);if(unit->progressDrawMode==1)style|=PBS_SMOOTH;else style&=~PBS_SMOOTH;SetWindowLongPtrW(window,GWL_STYLE,style);SetWindowPos(window,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);}
     }
-    else if(PropertyEquals(property,L"\u65b9\u5411"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&(std::strcmp(unit->type,"spin")==0||std::strcmp(unit->type,"progress")==0||std::strcmp(unit->type,"trackbar")==0)){LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE);if(std::strcmp(unit->type,"spin")==0){style&=~UDS_HORZ;if(ToInteger(value)==0)style|=UDS_HORZ;}else if(std::strcmp(unit->type,"progress")==0){if(ToInteger(value)!=0)style|=PBS_VERTICAL;else style&=~PBS_VERTICAL;}else{if(ToInteger(value)!=0)style|=TBS_VERT;else style&=~TBS_VERT;}SetWindowLongPtrW(window,GWL_STYLE,style);SetWindowPos(window,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);}
+    else if(PropertyEquals(property,L"\u65b9\u5411")){if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&(std::strcmp(unit->type,"spin")==0||std::strcmp(unit->type,"progress")==0||std::strcmp(unit->type,"trackbar")==0)){LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE);if(std::strcmp(unit->type,"spin")==0){style&=~UDS_HORZ;if(ToInteger(value)==0)style|=UDS_HORZ;}else if(std::strcmp(unit->type,"progress")==0){if(ToInteger(value)!=0)style|=PBS_VERTICAL;else style&=~PBS_VERTICAL;}else{if(ToInteger(value)!=0)style|=TBS_VERT;else style&=~TBS_VERT;}SetWindowLongPtrW(window,GWL_STYLE,style);SetWindowPos(window,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);}}
     else if(PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e")||PropertyEquals(property,L"\u6700\u5927\u4f4d\u7f6e")||PropertyEquals(property,L"\u4f4d\u7f6e")||PropertyEquals(property,L"\u9875\u6539\u53d8\u503c")||PropertyEquals(property,L"\u884c\u6539\u53d8\u503c")||PropertyEquals(property,L"\u9996\u9009\u62e9\u4f4d\u7f6e")||PropertyEquals(property,L"\u9009\u62e9\u957f\u5ea6")) {
         const int number=static_cast<int>(ToInteger(value));
         if(ClassEquals(window,UPDOWN_CLASSW)&&PropertyEquals(property,L"\u4f4d\u7f6e"))SendMessageW(window,UDM_SETPOS32,0,number);
         else if(ClassEquals(window,L"msctls_progress32")) { if(PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e")||PropertyEquals(property,L"\u6700\u5927\u4f4d\u7f6e")){PBRANGE range{};SendMessageW(window,PBM_GETRANGE,TRUE,reinterpret_cast<LPARAM>(&range));if(PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e"))range.iLow=number;else range.iHigh=number;SendMessageW(window,PBM_SETRANGE32,range.iLow,range.iHigh);}else if(PropertyEquals(property,L"\u4f4d\u7f6e"))SendMessageW(window,PBM_SETPOS,number,0); }
         else if(ClassEquals(window,L"msctls_trackbar32")) { if(PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e"))SendMessageW(window,TBM_SETRANGEMIN,TRUE,number);else if(PropertyEquals(property,L"\u6700\u5927\u4f4d\u7f6e"))SendMessageW(window,TBM_SETRANGEMAX,TRUE,number);else if(PropertyEquals(property,L"\u4f4d\u7f6e"))SendMessageW(window,TBM_SETPOS,TRUE,number);else if(PropertyEquals(property,L"\u9875\u6539\u53d8\u503c"))SendMessageW(window,TBM_SETPAGESIZE,0,number);else if(PropertyEquals(property,L"\u884c\u6539\u53d8\u503c"))SendMessageW(window,TBM_SETLINESIZE,0,number);else {const int start=PropertyEquals(property,L"\u9996\u9009\u62e9\u4f4d\u7f6e")?number:static_cast<int>(SendMessageW(window,TBM_GETSELSTART,0,0));const int length=PropertyEquals(property,L"\u9009\u62e9\u957f\u5ea6")?number:static_cast<int>(SendMessageW(window,TBM_GETSELEND,0,0))-start;SendMessageW(window,TBM_SETSELSTART,TRUE,start);SendMessageW(window,TBM_SETSELEND,TRUE,start+(std::max)(0,length));} }
         else if(ClassEquals(window,L"SCROLLBAR")) { Unit* unit=UnitFromWindow(window);if(unit!=nullptr){if(PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e"))unit->scrollMin=number;else if(PropertyEquals(property,L"\u6700\u5927\u4f4d\u7f6e"))unit->scrollMax=number;else if(PropertyEquals(property,L"\u9875\u6539\u53d8\u503c"))unit->scrollPage=number;else if(PropertyEquals(property,L"\u884c\u6539\u53d8\u503c"))unit->scrollLine=number;else if(PropertyEquals(property,L"\u4f4d\u7f6e"))SetScrollPos(window,SB_CTL,number,TRUE);SCROLLINFO info{sizeof(SCROLLINFO),SIF_RANGE|SIF_PAGE|SIF_POS,unit->scrollMin,unit->scrollMax,static_cast<UINT>(unit->scrollPage),number,0};SetScrollInfo(window,SB_CTL,&info,TRUE);}} }
-    else if(PropertyEquals(property,L"\u9664\u53bb\u91cd\u590d"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&(std::strcmp(unit->type,"list")==0||std::strcmp(unit->type,"checklist")==0||std::strcmp(unit->type,"combo")==0))unit->removeDuplicates=ToBool(value);
-    else if(PropertyEquals(property,L"\u5c45\u4e2d\u64ad\u653e")||PropertyEquals(property,L"\u900f\u660e\u80cc\u666f"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"animate")==0){if(PropertyEquals(property,L"\u5c45\u4e2d\u64ad\u653e"))unit->imageCenter=ToBool(value);else unit->imageTransparent=ToBool(value);LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE);style&=~(ACS_CENTER|ACS_TRANSPARENT);if(unit->imageCenter)style|=ACS_CENTER;if(unit->imageTransparent)style|=ACS_TRANSPARENT;SetWindowLongPtrW(window,GWL_STYLE,style);SetWindowPos(window,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);}
-    else if(PropertyEquals(property,L"\u64ad\u653e\u52a8\u753b"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"image")==0){unit->playImage=ToBool(value);}
+    else if(PropertyEquals(property,L"\u9664\u53bb\u91cd\u590d")){if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&(std::strcmp(unit->type,"list")==0||std::strcmp(unit->type,"checklist")==0||std::strcmp(unit->type,"combo")==0))unit->removeDuplicates=ToBool(value);}
+    else if(PropertyEquals(property,L"\u5c45\u4e2d\u64ad\u653e")||PropertyEquals(property,L"\u900f\u660e\u80cc\u666f")){if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"animate")==0){if(PropertyEquals(property,L"\u5c45\u4e2d\u64ad\u653e"))unit->imageCenter=ToBool(value);else unit->imageTransparent=ToBool(value);LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE);style&=~(ACS_CENTER|ACS_TRANSPARENT);if(unit->imageCenter)style|=ACS_CENTER;if(unit->imageTransparent)style|=ACS_TRANSPARENT;SetWindowLongPtrW(window,GWL_STYLE,style);SetWindowPos(window,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);}}
+    else if(PropertyEquals(property,L"\u64ad\u653e\u52a8\u753b")){if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"image")==0){unit->playImage=ToBool(value);}}
     else if(PropertyEquals(property,L"\u6309\u94ae\u5f62\u5f0f")||PropertyEquals(property,L"\u5e73\u9762")||PropertyEquals(property,L"\u6807\u9898\u5c45\u5de6")) {
         if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&(std::strcmp(unit->type,"checkbox")==0||std::strcmp(unit->type,"radio")==0)) {
             LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE);
@@ -6183,15 +6314,15 @@ static void SetProperty(unsigned int id,const char* property,const Value& value)
     else if(PropertyEquals(property,L"\u7535\u5b50\u90ae\u7bb1\u5730\u5740")||PropertyEquals(property,L"Internet\u5730\u5740")) {
         if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"hyperlink")==0)unit->hyperlinkTarget=Wide(ToText(value).c_str());
     }
-    else if(PropertyEquals(property,L"\u663e\u793a\u65b9\u5f0f"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"progress")!=0){unit->imageDrawMode=static_cast<int>(ToInteger(value));InvalidateRect(window,nullptr,TRUE);}
-    else if(PropertyEquals(property,L"\u5e95\u56fe\u65b9\u5f0f"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&& (std::strcmp(unit->type,"label")==0||std::strcmp(unit->type,"canvas")==0)){unit->backPicMode=static_cast<int>(ToInteger(value));InvalidateRect(window,nullptr,TRUE);}
-    else if(PropertyEquals(property,L"\u6548\u679c"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"label")==0){unit->labelEffect=static_cast<int>(ToInteger(value));InvalidateRect(window,nullptr,TRUE);}
-    else if(PropertyEquals(property,L"\u6e10\u53d8\u80cc\u666f\u65b9\u5f0f"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"label")==0){unit->gradientBackMode=static_cast<int>(ToInteger(value));InvalidateRect(window,nullptr,TRUE);}
-    else if(PropertyEquals(property,L"\u662f\u5426\u81ea\u52a8\u6298\u884c"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"label")==0){unit->labelWordWrap=ToBool(value);InvalidateRect(window,nullptr,TRUE);}
-    else if(PropertyEquals(property,L"\u6587\u4ef6\u540d"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"animate")==0){unit->imageFileName=Wide(ToText(value).c_str());Animate_Open(window,unit->imageFileName.c_str());if(unit->playImage)Animate_Play(window,0,-1,unit->imagePlayCount<0?static_cast<UINT>(-1):static_cast<UINT>(unit->imagePlayCount));}
-    else if(PropertyEquals(property,L"\u64ad\u653e"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"animate")==0){unit->playImage=ToBool(value);if(unit->playImage)Animate_Play(window,0,-1,unit->imagePlayCount<0?static_cast<UINT>(-1):static_cast<UINT>(unit->imagePlayCount));else Animate_Stop(window);}
-    else if(PropertyEquals(property,L"\u64ad\u653e\u6b21\u6570"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"animate")==0){unit->imagePlayCount=static_cast<int>(ToInteger(value));}
-    else if(PropertyEquals(property,L"\u5916\u5f62")||PropertyEquals(property,L"\u7ebf\u6761\u6548\u679c")||PropertyEquals(property,L"\u7ebf\u578b")||PropertyEquals(property,L"\u7ebf\u5bbd")||PropertyEquals(property,L"\u7ebf\u6761\u989c\u8272")||PropertyEquals(property,L"\u586b\u5145\u989c\u8272"))if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"shape")==0){if(PropertyEquals(property,L"\u5916\u5f62"))unit->shape=static_cast<int>(ToInteger(value));else if(PropertyEquals(property,L"\u7ebf\u6761\u6548\u679c"))unit->shapeEffect=static_cast<int>(ToInteger(value));else if(PropertyEquals(property,L"\u7ebf\u578b"))unit->lineStyle=static_cast<int>(ToInteger(value));else if(PropertyEquals(property,L"\u7ebf\u5bbd"))unit->lineWidth=(std::max)(1,static_cast<int>(ToInteger(value)));else if(PropertyEquals(property,L"\u7ebf\u6761\u989c\u8272")){unit->lineColor=static_cast<COLORREF>(ToInteger(value));unit->hasLineColor=true;}else{const long valueInt=ToInteger(value);if(valueInt==-16777216L){unit->hasFillColor=false;}else{unit->fillColor=static_cast<COLORREF>(valueInt);unit->hasFillColor=true;}}InvalidateRect(window,nullptr,TRUE);}
+    else if(PropertyEquals(property,L"\u663e\u793a\u65b9\u5f0f")){if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"progress")!=0){unit->imageDrawMode=static_cast<int>(ToInteger(value));InvalidateRect(window,nullptr,TRUE);}}
+    else if(PropertyEquals(property,L"\u5e95\u56fe\u65b9\u5f0f")){if(Unit* unit=UnitFromWindow(window);unit!=nullptr&& (std::strcmp(unit->type,"label")==0||std::strcmp(unit->type,"canvas")==0)){unit->backPicMode=static_cast<int>(ToInteger(value));InvalidateRect(window,nullptr,TRUE);}}
+    else if(PropertyEquals(property,L"\u6548\u679c")){if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"label")==0){unit->labelEffect=static_cast<int>(ToInteger(value));InvalidateRect(window,nullptr,TRUE);}}
+    else if(PropertyEquals(property,L"\u6e10\u53d8\u80cc\u666f\u65b9\u5f0f")){if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"label")==0){unit->gradientBackMode=static_cast<int>(ToInteger(value));InvalidateRect(window,nullptr,TRUE);}}
+    else if(PropertyEquals(property,L"\u662f\u5426\u81ea\u52a8\u6298\u884c")){if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"label")==0){unit->labelWordWrap=ToBool(value);InvalidateRect(window,nullptr,TRUE);}}
+    else if(PropertyEquals(property,L"\u6587\u4ef6\u540d")){if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"animate")==0){unit->imageFileName=Wide(ToText(value).c_str());Animate_Open(window,unit->imageFileName.c_str());if(unit->playImage)Animate_Play(window,0,-1,unit->imagePlayCount<0?static_cast<UINT>(-1):static_cast<UINT>(unit->imagePlayCount));}}
+    else if(PropertyEquals(property,L"\u64ad\u653e")){if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"animate")==0){unit->playImage=ToBool(value);if(unit->playImage)Animate_Play(window,0,-1,unit->imagePlayCount<0?static_cast<UINT>(-1):static_cast<UINT>(unit->imagePlayCount));else Animate_Stop(window);}}
+    else if(PropertyEquals(property,L"\u64ad\u653e\u6b21\u6570")){if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"animate")==0){unit->imagePlayCount=static_cast<int>(ToInteger(value));}}
+    else if(PropertyEquals(property,L"\u5916\u5f62")||PropertyEquals(property,L"\u7ebf\u6761\u6548\u679c")||PropertyEquals(property,L"\u7ebf\u578b")||PropertyEquals(property,L"\u7ebf\u5bbd")||PropertyEquals(property,L"\u7ebf\u6761\u989c\u8272")||PropertyEquals(property,L"\u586b\u5145\u989c\u8272")){if(Unit* unit=UnitFromWindow(window);unit!=nullptr&&std::strcmp(unit->type,"shape")==0){if(PropertyEquals(property,L"\u5916\u5f62"))unit->shape=static_cast<int>(ToInteger(value));else if(PropertyEquals(property,L"\u7ebf\u6761\u6548\u679c"))unit->shapeEffect=static_cast<int>(ToInteger(value));else if(PropertyEquals(property,L"\u7ebf\u578b"))unit->lineStyle=static_cast<int>(ToInteger(value));else if(PropertyEquals(property,L"\u7ebf\u5bbd"))unit->lineWidth=(std::max)(1,static_cast<int>(ToInteger(value)));else if(PropertyEquals(property,L"\u7ebf\u6761\u989c\u8272")){unit->lineColor=static_cast<COLORREF>(ToInteger(value));unit->hasLineColor=true;}else{const long valueInt=ToInteger(value);if(valueInt==-16777216L){unit->hasFillColor=false;}else{unit->fillColor=static_cast<COLORREF>(valueInt);unit->hasFillColor=true;}}InvalidateRect(window,nullptr,TRUE);}}
     else if(PropertyEquals(property,L"\u6587\u672c\u989c\u8272")) {
         if(ClassEquals(window,L"SysMonthCal32"))SendMessageW(window,MCM_SETCOLOR,MCSC_TEXT,static_cast<COLORREF>(ToInteger(value)));
         else if(Unit* unit=UnitFromWindow(window)){
@@ -6242,12 +6373,12 @@ static void SetProperty(unsigned int id,const char* property,const Value& value)
         const int valueInt=static_cast<int>(ToInteger(value));
         if(ClassEquals(window,L"msctls_progress32")) { PBRANGE range{};SendMessageW(window,PBM_GETRANGE,TRUE,reinterpret_cast<LPARAM>(&range)); const int minimum=PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e")?valueInt:range.iLow; const int maximum=PropertyEquals(property,L"\u6700\u5927\u4f4d\u7f6e")?valueInt:range.iHigh;SendMessageW(window,PBM_SETRANGE32,minimum,maximum); }
         else if(ClassEquals(window,L"msctls_trackbar32")) { const int minimum=PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e")?valueInt:static_cast<int>(SendMessageW(window,TBM_GETRANGEMIN,0,0)); const int maximum=PropertyEquals(property,L"\u6700\u5927\u4f4d\u7f6e")?valueInt:static_cast<int>(SendMessageW(window,TBM_GETRANGEMAX,0,0));SendMessageW(window,TBM_SETRANGE,TRUE,MAKELONG(minimum,maximum)); }
-        else if(ClassEquals(window,L"SCROLLBAR"))if(Unit* unit=UnitFromWindow(window)){if(PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e"))unit->scrollMin=valueInt;else unit->scrollMax=valueInt;SCROLLINFO info{sizeof(SCROLLINFO),SIF_RANGE|SIF_PAGE|SIF_POS,unit->scrollMin,unit->scrollMax,static_cast<UINT>(unit->scrollPage),0,0};GetScrollInfo(window,SB_CTL,&info);info.nMin=unit->scrollMin;info.nMax=unit->scrollMax;SetScrollInfo(window,SB_CTL,&info,TRUE);}
+        else if(ClassEquals(window,L"SCROLLBAR")){if(Unit* unit=UnitFromWindow(window)){if(PropertyEquals(property,L"\u6700\u5c0f\u4f4d\u7f6e"))unit->scrollMin=valueInt;else unit->scrollMax=valueInt;SCROLLINFO info{sizeof(SCROLLINFO),SIF_RANGE|SIF_PAGE|SIF_POS,unit->scrollMin,unit->scrollMax,static_cast<UINT>(unit->scrollPage),0,0};GetScrollInfo(window,SB_CTL,&info);info.nMin=unit->scrollMin;info.nMax=unit->scrollMax;SetScrollInfo(window,SB_CTL,&info,TRUE);}}
     }
     else if(PropertyEquals(property,L"\u9875\u6539\u53d8\u503c")||PropertyEquals(property,L"\u884c\u6539\u53d8\u503c")) {
         const int valueInt=(std::max)(0,static_cast<int>(ToInteger(value)));
         if(ClassEquals(window,L"msctls_trackbar32"))SendMessageW(window,PropertyEquals(property,L"\u9875\u6539\u53d8\u503c")?TBM_SETPAGESIZE:TBM_SETLINESIZE,0,valueInt);
-        else if(ClassEquals(window,L"SCROLLBAR"))if(Unit* unit=UnitFromWindow(window)){if(PropertyEquals(property,L"\u9875\u6539\u53d8\u503c"))unit->scrollPage=valueInt;else unit->scrollLine=valueInt;}
+        else if(ClassEquals(window,L"SCROLLBAR")){if(Unit* unit=UnitFromWindow(window)){if(PropertyEquals(property,L"\u9875\u6539\u53d8\u503c"))unit->scrollPage=valueInt;else unit->scrollLine=valueInt;}}
     }
     else if(PropertyEquals(property,L"\u73b0\u884c\u5b50\u5939")&&ClassEquals(window,L"SysTabControl32")) {
         const int selected=static_cast<int>(ToInteger(value));
@@ -6759,7 +6890,7 @@ static void EWindowRunLoop() {
 		prefix << "\n";
 		for (const std::size_t method : pendingMethods_) {
 			prefix << "static ert::Value method_" << method
-				<< "(std::vector<ert::Arg>,ert::Value* self=nullptr);\n";
+				<< "(std::vector<ert::Arg>,ert::Value* self=nullptr,bool virtualDispatch=true);\n";
 		}
 		for (const std::string& symbol : reachableSymbols_) {
 			prefix << "extern \"C\" void __cdecl " << symbol
@@ -6905,19 +7036,22 @@ extern "C" ert::EIntPtr __stdcall BlackMoonFuncForeLibNotifySys(
 		prefix << "enum : unsigned int { ecompiler_program_release = 3u };\n";
 		prefix << "extern \"C\" volatile unsigned int eapp_info_data[13]={ecompiler_program_release,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u};\n";
 		prefix << "extern \"C\" int __cdecl cominf_LoadLibrary(){return 0;}\nextern \"C\" int __cdecl cominf_GetProcAddress(){return 0;}\nextern \"C\" void __cdecl cominf_FreeLibrary(){}\n";
-		prefix << "extern \"C\" int __cdecl EStartup(){return 1;}\n";
+		prefix << "extern \"C\" int __cdecl EStartup(){";
+		for (const auto& name : program_.moduleStartupNames)
+			prefix << "(void)method_" << program_.methodByName.at(name) << "({},nullptr);";
+		prefix << "return 1;}\n";
 		prefix << "extern \"C\" int __cdecl ECodeStart(){return static_cast<int>(ert::ToInteger(method_" << program_.methodByName.at("_启动子程序") << "({},nullptr)));}\n";
 		if (program_.buildDll) {
 			prefix << "extern \"C\" void __cdecl E_Init(); extern \"C\" void __cdecl E_DestroyRes();\n";
 			prefix << "extern \"C\" BOOL WINAPI DllMain(HINSTANCE module,DWORD reason,LPVOID reserved){(void)reserved;if(reason==DLL_PROCESS_ATTACH){DisableThreadLibraryCalls(module);E_Init();ECodeStart();}else if(reason==DLL_PROCESS_DETACH){E_DestroyRes();}return TRUE;}\n";
 		}
-		prefix << "extern \"C\" void __cdecl E_Init(){hBlackMoonHeap=GetProcessHeap();using Notify=ert::EIntPtr(__stdcall*)(int,ert::EPointer,ert::EPointer);for(ert::EPointer* item=BlackMoonCalleLibList;item!=nullptr&&*item;++item)reinterpret_cast<Notify>(*item)(ecompiler_nl_sys_notify_function,BlackMoonFuncForeLib,BlackMoonFuncForeLib);}\n";
+		prefix << "extern \"C\" void __cdecl E_Init(){hBlackMoonHeap=GetProcessHeap();using Notify=ert::EIntPtr(__stdcall*)(int,ert::EPointer,ert::EPointer);for(ert::EPointer* item=BlackMoonCalleLibList;item!=nullptr&&*item;++item)mapped_pe_compatibility::Call(reinterpret_cast<Notify>(*item),ecompiler_nl_sys_notify_function,BlackMoonFuncForeLib,BlackMoonFuncForeLib);}\n";
 		prefix << "extern \"C\" void __cdecl E_DestroyRes(){";
 		for (std::size_t index = 0; index < program_.globals.size(); ++index) prefix << "ert::DestroyValue(g_global_" << index << "());";
 		for (std::size_t assemblyIndex = 0; assemblyIndex < program_.assemblies.size(); ++assemblyIndex)
 			for (std::size_t index = 0; index < program_.assemblies[assemblyIndex].variables.size(); ++index)
 				prefix << "ert::DestroyValue(g_" << assemblyIndex << '_' << index << "());";
-		prefix << "for(auto callback:ecompiler_runtime_host::destroyCallbacks)if(callback)callback();using Notify=ert::EIntPtr(__stdcall*)(int,ert::EPointer,ert::EPointer);for(ert::EPointer* item=BlackMoonCalleLibList;item!=nullptr&&*item;++item)reinterpret_cast<Notify>(*item)(ecompiler_nl_free_library_data,0,0);ecompiler_runtime_host::destroyCallbacks.clear();}\n";
+		prefix << "for(auto callback:ecompiler_runtime_host::destroyCallbacks)if(callback)callback();using Notify=ert::EIntPtr(__stdcall*)(int,ert::EPointer,ert::EPointer);for(ert::EPointer* item=BlackMoonCalleLibList;item!=nullptr&&*item;++item)mapped_pe_compatibility::Call(reinterpret_cast<Notify>(*item),ecompiler_nl_free_library_data,ert::EPointer(0),ert::EPointer(0));ecompiler_runtime_host::destroyCallbacks.clear();}\n";
 		prefix << "static void ecompiler_safe_destroy(){__try{E_DestroyRes();}__except(EXCEPTION_EXECUTE_HANDLER){}}\n";
 		if (!targetX64 && program_.useLegacyX86RuntimeBridge) {
 			prefix << "int __stdcall AfxWinInit(HINSTANCE,HINSTANCE,LPSTR,int);\n";

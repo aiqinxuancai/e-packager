@@ -1,4 +1,5 @@
-﻿#include "FormControlPropertyCodec.h"
+﻿#include "SupportLibraryRuntime.h"
+#include "FormControlPropertyCodec.h"
 
 // 通过 lib2.h 的公开窗口单元接口编解码核心及第三方控件属性。
 #include <Windows.h>
@@ -354,20 +355,7 @@ std::string ReadPublishedString(const char* text, const bool utf8)
 
 bool CallGetNewInfoSafely(const PFN_GET_LIB_INFO procedure, const LIB_INFO*& outInfo)
 {
-	outInfo = nullptr;
-	if (procedure == nullptr) {
-		return false;
-	}
-#if defined(_MSC_VER)
-	__try {
-		outInfo = procedure();
-	}
-	__except (EXCEPTION_EXECUTE_HANDLER) {
-		outInfo = nullptr;
-	}
-#else
-	outInfo = procedure();
-#endif
+	outInfo = support_library_runtime::CallGetLibInfo(procedure);
 	return outInfo != nullptr;
 }
 

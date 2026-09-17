@@ -195,6 +195,7 @@
 	<ClCompile Include="src\compiler\blackmoon\bm_string.cpp" />
     <ClCompile Include="src\PathHelper.cpp" />
     <ClCompile Include="src\SupportLibraryPublicInfo.cpp" />
+    <ClCompile Include="src\SupportLibraryRuntime.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\compiler\ExecutableResourceBuilder.h" />
@@ -230,6 +231,8 @@
 	<ClInclude Include="src\compiler\blackmoon\sdk\elib_sdk.h" />
     <ClInclude Include="src\PathHelper.h" />
     <ClInclude Include="src\SupportLibraryPublicInfo.h" />
+    <ClInclude Include="src\SupportLibraryRuntime.h" />
+    <ClInclude Include="src\MappedPeCompatibility.inl" />
     <ClInclude Include="elib\lib2.h" />
     <ClInclude Include="thirdparty\json.hpp" />
   </ItemGroup>

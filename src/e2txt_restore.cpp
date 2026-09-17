@@ -1,4 +1,5 @@
-﻿#include "e2txt.h"
+﻿#include "SupportLibraryRuntime.h"
+#include "e2txt.h"
 
 #include <Windows.h>
 #include "SourceExpressionParser.h"
@@ -1159,19 +1160,6 @@ size_t GetSafeCStringLength(const char* text, const size_t maxLength)
 #endif
 }
 
-const LIB_INFO* CallGetLibInfoSafely(const PFN_GET_LIB_INFO getInfoProc)
-{
-#if defined(_MSC_VER)
-	__try {
-		return getInfoProc == nullptr ? nullptr : getInfoProc();
-	}
-	__except (EXCEPTION_EXECUTE_HANDLER) {
-		return nullptr;
-	}
-#else
-	return getInfoProc == nullptr ? nullptr : getInfoProc();
-#endif
-}
 
 std::string ReadSupportLibraryName(const char* text)
 {
@@ -1438,9 +1426,6 @@ const std::vector<std::pair<std::string, std::int32_t>>& GetBuiltinTypes()
 		{ "对象", 65584 },
 		{ "变体型", 65585 },
 		{ "变体类型", 65586 },
-		{ "工具条", 196611 },
-		{ "超级列表框", 196612 },
-		{ "高级表格", 262145 },
 	};
 	return kTypes;
 }
@@ -2433,7 +2418,7 @@ private:
 			return;
 		}
 
-		const LIB_INFO* libInfo = CallGetLibInfoSafely(getInfoProc);
+		const LIB_INFO* libInfo = support_library_runtime::CallGetLibInfo(getInfoProc);
 		if (libInfo == nullptr ||
 			!IsReadableMemoryRange(libInfo, sizeof(LIB_INFO)) ||
 			libInfo->m_nDataTypeCount < 0 ||

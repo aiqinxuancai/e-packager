@@ -328,6 +328,8 @@ struct Program {
 	// 项目级全局变量页（与程序集变量使用同一类型模型）。
 	std::vector<Variable> globals;
 	std::vector<Method> methods;
+	// 模块入口使用独立名称，在主工程启动前按引用顺序执行。
+	std::vector<std::string> moduleStartupNames;
 	std::vector<TypeInfo> types;
 	std::unordered_map<std::string, TypeRef> typeByName;
 	std::unordered_map<std::uint32_t, std::size_t> typeByCode;

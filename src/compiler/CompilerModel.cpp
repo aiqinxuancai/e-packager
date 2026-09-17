@@ -110,12 +110,11 @@ void AppendPageText(std::string& destination, const std::string& source)
 	if (destination.empty() || destination.back() != '\n') destination += "\r\n";
 }
 
-std::string RemoveEcomStartupMethod(const std::string& text);
-
 bool ExpandEComDependencies(
 	e2txt::ProjectBundle& bundle,
 	const std::filesystem::path& inputRoot,
 	const e2txt::ReadOptions& readOptions,
+	std::vector<std::string>& moduleStartupNames,
 	std::string& error)
 {
 	std::vector<e2txt::Dependency> additionalDependencies;
@@ -210,7 +209,20 @@ bool ExpandEComDependencies(
 		collectDeclarations(bundle.dllDeclareText, ".DLL命令 ");
 		collectDeclarations(bundle.globalText, ".全局变量 ");
 		collectDeclarations(bundle.constantText, ".常量 ");
+		for (const auto& resource : bundle.resources) existingSymbols.insert(resource.logicalName);
 		std::unordered_map<std::string, std::string> symbolRenames;
+		for (const auto& source : module.sourceFiles) {
+			for (const auto& rawLine : SplitLines(source.content)) {
+				const auto line = Trim(StripComment(rawLine));
+				if (!StartsWith(line, ".子程序 ")) continue;
+				const auto declaration = Trim(line.substr(std::string(".子程序 ").size()));
+				if (Trim(declaration.substr(0, declaration.find(','))) == "_启动子程序") {
+					const auto name = moduleRenamePrefix + "startup";
+					if (symbolRenames.emplace("_启动子程序", name).second) moduleStartupNames.push_back(name);
+				}
+			}
+		}
+		symbolRenames.emplace("_临时子程序", moduleRenamePrefix + "temporary");
 		const auto collectConflictingDeclarations = [&](const std::string& text, const std::string& directive) {
 			for (const std::string& rawLine : SplitLines(text)) {
 				const std::string line = Trim(StripComment(rawLine));
@@ -232,22 +244,13 @@ bool ExpandEComDependencies(
 		collectConflictingDeclarations(
 			[&]() { std::string all; for (const auto& source : module.sourceFiles) all += source.content + "\r\n"; return all; }(),
 			".程序集 ");
-		std::vector<std::pair<std::string, std::string>> orderedRenames(symbolRenames.begin(), symbolRenames.end());
-		std::sort(orderedRenames.begin(), orderedRenames.end(),
-			[](const auto& left, const auto& right) { return left.first.size() > right.first.size(); });
-		const auto applyRenames = [&](std::string& text) {
-			for (const auto& [oldName, newName] : orderedRenames) {
-				const std::string constantOld = "#" + oldName;
-				const std::string constantNew = "#" + newName;
-				for (std::size_t offset = text.find(constantOld); offset != std::string::npos;
-					offset = text.find(constantOld, offset + constantNew.size())) {
-					text.replace(offset, constantOld.size(), constantNew);
-				}
-				for (std::size_t offset = text.find(oldName); offset != std::string::npos;
-					offset = text.find(oldName, offset + newName.size())) {
-					text.replace(offset, oldName.size(), newName);
-				}
+		for (const auto& resource : module.resources) {
+			if (existingSymbols.contains(resource.logicalName)) {
+				symbolRenames.try_emplace(resource.logicalName, moduleRenamePrefix + resource.logicalName);
 			}
+		}
+		const auto applyRenames = [&](std::string& text) {
+			text = e2txt::RewriteSourceIdentifiers(text, symbolRenames);
 		};
 		for (auto& source : module.sourceFiles) applyRenames(source.content);
 		applyRenames(module.dataTypeText);
@@ -261,7 +264,6 @@ bool ExpandEComDependencies(
 		for (auto source : module.sourceFiles) {
 			const std::string sourcePath = source.relativePath.empty() ? source.logicalName : source.relativePath;
 			source.relativePath = moduleSourcePrefix + "/" + sourcePath;
-			source.content = RemoveEcomStartupMethod(source.content);
 			if (source.content.find(".程序集 ") != std::string::npos) {
 				const auto sourceLines = SplitLines(source.content);
 				std::ostringstream renamed;
@@ -277,6 +279,11 @@ bool ExpandEComDependencies(
 				source.content = renamed.str();
 			}
 			if (!source.content.empty()) bundle.sourceFiles.push_back(std::move(source));
+		}
+		for (auto& resource : module.resources) {
+			if (const auto renamed = symbolRenames.find(resource.logicalName); renamed != symbolRenames.end())
+				resource.logicalName = renamed->second;
+			bundle.resources.push_back(std::move(resource));
 		}
 		AppendPageText(bundle.dataTypeText, module.dataTypeText);
 		AppendPageText(bundle.dllDeclareText, module.dllDeclareText);
@@ -351,24 +358,6 @@ bool ExpandEComDependencies(
 	}
 	for (auto& dependency : additionalDependencies) bundle.dependencies.push_back(std::move(dependency));
 	return true;
-}
-
-std::string RemoveEcomStartupMethod(const std::string& text)
-{
-	const auto lines = SplitLines(text);
-	std::ostringstream output;
-	bool skipping = false;
-	for (const std::string& line : lines) {
-		const std::string trimmed = Trim(StripComment(line));
-		if (StartsWith(trimmed, ".子程序 ")) {
-			const std::string declaration = Trim(trimmed.substr(std::string(".子程序 ").size()));
-			const std::size_t comma = declaration.find(',');
-			const std::string name = Trim(declaration.substr(0, comma));
-			skipping = name == "_启动子程序";
-		}
-		if (!skipping) output << line << "\r\n";
-	}
-	return output.str();
 }
 
 std::vector<std::string> SplitFields(const std::string& text)
@@ -575,6 +564,7 @@ bool ParseStatements(
 bool TryParseMachineCode(
 	const std::string& line,
 	std::vector<std::uint8_t>& outBytes,
+	std::unique_ptr<e2txt::SourceExpressionNode>& outConstant,
 	std::string& error,
 	const std::string& sourceFile,
 	std::size_t sourceLine);
@@ -744,7 +734,8 @@ bool ParseStatements(
 			if (!ParseLoop(StatementKind::ForLoop, ".变量循环尾", lines, index, end, sourceFile, outStatements, error)) return false;
 			continue;
 		}
-		if (StartsWith(line, "返回")) {
+		const std::string commandName = line.substr(0, line.find_first_of(" \t("));
+		if (commandName == "返回") {
 			Statement statement;
 			statement.kind = StatementKind::Return;
 			statement.sourceLine = sourceLine;
@@ -761,22 +752,22 @@ bool ParseStatements(
 			outStatements.push_back(std::move(statement));
 			continue;
 		}
-		if (StartsWith(line, "跳出循环")) {
+		if (commandName == "跳出循环") {
 			outStatements.push_back(Statement { StatementKind::Break, sourceLine });
 			++index;
 			continue;
 		}
-		if (StartsWith(line, "到循环尾")) {
+		if (commandName == "到循环尾") {
 			outStatements.push_back(Statement { StatementKind::Continue, sourceLine });
 			++index;
 			continue;
 		}
 		// 编译期机器码指令保留为专用语句，不能按普通 FNE 运行时调用处理。
-		if ((StartsWith(line, "置入代码") || StartsWith(line, ".置入代码")) && line.find('(') != std::string::npos) {
+		if ((commandName == "置入代码" || commandName == ".置入代码") && line.find('(') != std::string::npos) {
 			Statement statement;
 			statement.kind = StatementKind::MachineCode;
 			statement.sourceLine = sourceLine;
-			if (!TryParseMachineCode(line, statement.machineCode, error, sourceFile, sourceLine)) return false;
+			if (!TryParseMachineCode(line, statement.machineCode, statement.expression, error, sourceFile, sourceLine)) return false;
 			++index;
 			outStatements.push_back(std::move(statement));
 			continue;
@@ -900,7 +891,7 @@ bool IsConditionalCommentEnabled(const std::string& comment, const std::unordere
 	return true;
 }
 
-bool TryParseMachineCode(const std::string& line, std::vector<std::uint8_t>& outBytes, std::string& error, const std::string& sourceFile, const std::size_t sourceLine)
+bool TryParseMachineCode(const std::string& line, std::vector<std::uint8_t>& outBytes, std::unique_ptr<e2txt::SourceExpressionNode>& outConstant, std::string& error, const std::string& sourceFile, const std::size_t sourceLine)
 {
 	outBytes.clear();
 	std::unique_ptr<e2txt::SourceExpressionNode> expression;
@@ -911,6 +902,10 @@ bool TryParseMachineCode(const std::string& line, std::vector<std::uint8_t>& out
 		return false;
 	}
 	const auto& data = *expression->children[1];
+	if (data.kind == e2txt::SourceExpressionKind::Name && data.text.starts_with("#")) {
+		outConstant = std::move(expression->children[1]);
+		return true;
+	}
 	if (data.kind != e2txt::SourceExpressionKind::ByteSetLiteral) {
 		error = sourceFile + ":" + std::to_string(sourceLine) + ": machine_code_requires_byte_set_literal";
 		return false;
@@ -925,6 +920,29 @@ bool TryParseMachineCode(const std::string& line, std::vector<std::uint8_t>& out
 		}
 		outBytes.push_back(static_cast<std::uint8_t>(value));
 	}
+	return true;
+}
+
+// 语法解析只记录资源常量引用，待模块资源与常量表齐备后解析机器码。
+bool ResolveMachineCodeConstants(Program& program, std::string& error)
+{
+	const auto resolve = [&](auto&& visit, std::vector<Statement>& statements, const Method& method) -> bool {
+		for (auto& statement : statements) {
+			if (statement.kind == StatementKind::MachineCode && statement.expression) {
+				const auto constant = program.constants.find(statement.expression->text);
+				if (constant == program.constants.end() || constant->second.type != kTypeBinary) {
+					error = method.sourceFile + ":" + std::to_string(statement.sourceLine) +
+						": machine_code_binary_constant_required:" + statement.expression->text;
+					return false;
+				}
+				statement.machineCode = constant->second.binaryValue;
+			}
+			if (!visit(visit, statement.body, method) || !visit(visit, statement.elseBody, method)) return false;
+			for (auto& branch : statement.branches) if (!visit(visit, branch.body, method)) return false;
+		}
+		return true;
+	};
+	for (auto& method : program.methods) if (!resolve(resolve, method.body, method)) return false;
 	return true;
 }
 
@@ -2235,6 +2253,8 @@ bool ResolveVariables(Program& program, std::string& error)
 	for (Method& method : program.methods) {
 		for (Variable& variable : method.parameters) {
 			variable.type = ResolveTypeName(program, variable.typeName, variable.type.isArray);
+			// 易语言子程序数组参数隐式按引用传递，重定义和成员修改必须回写调用方。
+			if (variable.type.isArray) variable.byReference = true;
 			if (!variable.type.valid) {
 				error = method.sourceFile + ":" + std::to_string(variable.sourceLine) +
 					": unknown_parameter_type:" + variable.typeName + ":method=" + method.name +
@@ -2275,8 +2295,8 @@ bool ParseSources(Program& program, std::string& error)
 			if (StartsWith(line, ".程序集 ")) {
 				Assembly assembly;
 				const std::string declaration = Trim(line.substr(std::string(".程序集 ").size()));
-				assembly.isClass = declaration.find(',') != std::string::npos;
 				const auto assemblyFields = SplitFields(declaration);
+				assembly.isClass = assemblyFields.size() > 1 && !assemblyFields[1].empty();
 				if (assemblyFields.size() > 1 && assemblyFields[1] != "<对象>") assembly.baseClassName = assemblyFields[1];
 				assembly.name = declaration;
 				const std::size_t comma = assembly.name.find(',');
@@ -2538,7 +2558,7 @@ bool BuildCompilerModel(
 	e2txt::ReadOptions moduleReadOptions;
 	moduleReadOptions.supportLibrarySearchDirectories = supportLibrarySearchDirectories;
 	moduleReadOptions.restrictSupportLibrarySearch = restrictSupportLibrarySearch;
-	if (!ExpandEComDependencies(outProgram.bundle, inputRoot, moduleReadOptions, outError)) return false;
+	if (!ExpandEComDependencies(outProgram.bundle, inputRoot, moduleReadOptions, outProgram.moduleStartupNames, outError)) return false;
 	for (std::string macro : conditionMacros) {
 		std::transform(macro.begin(), macro.end(), macro.begin(), [](const unsigned char value) {
 			return static_cast<char>(std::toupper(value));
@@ -2549,12 +2569,20 @@ bool BuildCompilerModel(
 	RegisterSystemTypes(outProgram);
 	if (!LoadLibraries(outProgram, outError)) return false;
 	if (!RegisterLibraryTypes(outProgram, outError)) return false;
+	// 类与结构体共享类型空间，解析成员前先建立类名和方法声明。
+	if (!ParseSources(outProgram, outError)) return false;
+	for (auto& name : outProgram.moduleStartupNames) {
+		const auto method = std::find_if(outProgram.methods.begin(), outProgram.methods.end(),
+			[&](const Method& item) { return item.name == name; });
+		if (method == outProgram.methods.end()) { outError = "module_startup_not_found:" + name; return false; }
+		name = outProgram.assemblies[method->assemblyIndex].name + "." + method->name;
+	}
+	if (!RegisterClassTypes(outProgram, outError)) return false;
 	if (!RegisterProjectTypes(outProgram, outError)) return false;
 	if (!RegisterProjectGlobals(outProgram, outError)) return false;
 	if (!RegisterProjectConstants(outProgram, outError)) return false;
 	if (!RegisterDllCommands(outProgram, outError)) return false;
-	if (!ParseSources(outProgram, outError)) return false;
-	if (!RegisterClassTypes(outProgram, outError)) return false;
+
 	for (Method& method : outProgram.methods) {
 		if (method.returnTypeName.empty()) {
 			method.returnType = { kTypeNull, false, true };
@@ -2571,6 +2599,7 @@ bool BuildCompilerModel(
 	if (!PopulateClassTypeFields(outProgram, outError)) return false;
 	RegisterCommands(outProgram);
 	if (!RegisterConstants(outProgram, outError)) return false;
+	if (!ResolveMachineCodeConstants(outProgram, outError)) return false;
 	// ResolveVariables runs before library commands are registered, so class
 	// declarations that refer to support-library types need one final pass.
 	if (!ResolveVariables(outProgram, outError)) return false;

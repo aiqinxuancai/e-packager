@@ -663,4 +663,46 @@ bool SplitSourceCallArguments(const std::string& text, std::vector<std::string>&
 	return true;
 }
 
+std::string RewriteSourceIdentifiers(
+	const std::string& source,
+	const std::unordered_map<std::string, std::string>& replacements)
+{
+	std::string result;
+	const auto delimiter = [&](const std::size_t position) {
+		const unsigned char ch = static_cast<unsigned char>(source[position]);
+		return (ch < 0x80 && !std::isalnum(ch) && ch != '_') ||
+			IsOperatorStart(source, position) || StartsAt(source, position, kChineseLeftQuote);
+	};
+	for (std::size_t position = 0; position < source.size();) {
+		const std::size_t begin = position;
+		if (source[position] == '\'') {
+			const auto end = source.find_first_of("\r\n", position);
+			position = end == std::string::npos ? source.size() : end;
+		}
+		else if (source[position] == '"' || StartsAt(source, position, kChineseLeftQuote)) {
+			const bool chinese = source[position] != '"';
+			const std::string_view endQuote = chinese ? kChineseRightQuote : std::string_view("\"");
+			position += chinese ? kChineseLeftQuote.size() : 1;
+			while (position < source.size() && source[position] != '\r' && source[position] != '\n' &&
+				!StartsAt(source, position, endQuote))
+				position = NextCharacterIndex(source, position);
+			if (StartsAt(source, position, endQuote)) position += endQuote.size();
+		}
+		else if (delimiter(position)) {
+			position = NextCharacterIndex(source, position);
+		}
+		else {
+			do { position = NextCharacterIndex(source, position); }
+			while (position < source.size() && !delimiter(position));
+			const auto name = source.substr(begin, position - begin);
+			if (const auto replacement = replacements.find(name); replacement != replacements.end()) {
+				result += replacement->second;
+				continue;
+			}
+		}
+		result.append(source, begin, position - begin);
+	}
+	return result;
+}
+
 }  // namespace e2txt

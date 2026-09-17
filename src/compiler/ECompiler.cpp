@@ -21,6 +21,8 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -522,7 +524,10 @@ bool WriteUtf8Source(const std::filesystem::path& path, const std::string& text,
 			}
 		}
 	}
-	if (utf8Text.empty() && !text.empty()) utf8Text = text;
+	if (utf8Text.empty() && !text.empty()) {
+		error = "generated_source_encoding_invalid:" + PathToUtf8(path);
+		return false;
+	}
 	std::ofstream output(path, std::ios::binary | std::ios::trunc);
 	if (!output) {
 		error = "open_generated_source_failed:" + PathToUtf8(path);
@@ -583,31 +588,28 @@ bool WriteDllDefinition(
 
 bool WriteImportDefinition(
 	const std::filesystem::path& path,
-	const GeneratedSource::ImportedFunction& item,
-	const TargetArchitecture architecture,
+	const std::vector<const GeneratedSource::ImportedFunction*>& items,
 	std::string& error)
 {
+	if (items.empty()) { error = "empty_dll_import_group"; return false; }
 	std::ostringstream text;
-	text << "LIBRARY \"" << DefQuotedName(item.moduleName) << "\"\r\nEXPORTS\r\n";
-	(void)architecture;
-	(void)item.usesCdecl;
-	(void)item.stackBytes;
-	// LIB.EXE treats the left-hand side of a DEF entry as the name that
-	// Windows stores in the PE import table.  The generated C++ symbol is
-	// intentionally different, so the emitter adds an /alternatename mapping
-	// to the real symbol.  Emitting the local alias here would make the loader
-	// search for ecompiler_import_* in the target DLL.
-	if (item.entryName.starts_with('#')) {
-		unsigned int ordinal = 0;
-		const std::string number = item.entryName.substr(1);
-		const auto parsed = std::from_chars(number.data(), number.data() + number.size(), ordinal);
-		if (parsed.ec != std::errc() || parsed.ptr != number.data() + number.size() || ordinal == 0 || ordinal > 65535) {
-			error = "invalid_dll_import_ordinal:" + item.entryName;
-			return false;
+	text << "LIBRARY \"" << DefQuotedName(items.front()->moduleName) << "\"\r\nEXPORTS\r\n";
+	std::set<std::string> namedEntries;
+	for (const auto* entry : items) {
+		const auto& item = *entry;
+		// 导入名来自 DLL，C++ 别名由生成器的 alternatename 指令映射。
+		if (item.entryName.starts_with('#')) {
+			unsigned int ordinal = 0;
+			const std::string number = item.entryName.substr(1);
+			const auto parsed = std::from_chars(number.data(), number.data() + number.size(), ordinal);
+			if (parsed.ec != std::errc() || parsed.ptr != number.data() + number.size() || ordinal == 0 || ordinal > 65535) {
+				error = "invalid_dll_import_ordinal:" + item.entryName;
+				return false;
+			}
+			text << "    " << item.symbol << "_ordinal @" << ordinal << " NONAME\r\n";
 		}
-		text << "    " << item.symbol << "_ordinal @" << ordinal << " NONAME\r\n";
+		else if (namedEntries.insert(item.entryName).second) text << "    " << item.entryName << "\r\n";
 	}
-	else text << "    " << item.entryName << "\r\n";
 	return WriteTextFile(path, text.str(), error);
 }
 
@@ -836,7 +838,7 @@ bool DecodeSourceWithX86Helper(
 	std::string processOutput;
 	if (!RunProcess(
 		decoder,
-		{L"unpack", Quote(AbsolutePath(inputPath)), Quote(directory)},
+		{L"unpack", Quote(AbsolutePath(inputPath)), Quote(directory), L"--compiler-input"},
 		decoder.parent_path(),
 		directory / L"decode.log",
 		processOutput,
@@ -1378,13 +1380,21 @@ bool Compile(
 	std::string processOutput;
 	std::vector<std::filesystem::path> generatedImportLibraries;
 	const std::filesystem::path libraryManager = FindLibraryManager(compiler, linker);
+	// 同一 DLL 的声明共用导入库，避免大型模块产生数千个 LIB 进程和超长链接命令。
+	std::map<std::string, std::vector<const GeneratedSource::ImportedFunction*>> importGroups;
 	for (const auto& import : generated.imports) {
 		if (import.moduleName.empty() || import.entryName.empty()) continue;
+		std::string module = import.moduleName;
+		std::transform(module.begin(), module.end(), module.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+		importGroups[module].push_back(&import);
+	}
+	for (const auto& [module, imports] : importGroups) {
+		const auto& import = *imports.front();
 		const std::filesystem::path importDef = outputDirectory /
 			(outputPath.stem().wstring() + L".import." + std::to_wstring(import.commandIndex) + L".def");
 		const std::filesystem::path importLib = outputDirectory /
 			(outputPath.stem().wstring() + L".import." + std::to_wstring(import.commandIndex) + L".lib");
-		if (!WriteImportDefinition(importDef, import, targetArchitecture, error)) {
+		if (!WriteImportDefinition(importDef, imports, error)) {
 			result.message = error;
 			return false;
 		}
@@ -1410,7 +1420,7 @@ bool Compile(
 		}
 	}
 	std::vector<std::wstring> compilerArguments = {
-		L"/nologo", L"/c", L"/O2", L"/Gy", L"/Zl", L"/GS-", L"/GR-", L"/EHsc", L"/MT", L"/std:c++20",
+		L"/nologo", L"/c", L"/bigobj", L"/O2", L"/Gy", L"/Zl", L"/GS-", L"/GR-", L"/EHsc", L"/MT", L"/std:c++20",
 		L"/source-charset:utf-8", L"/execution-charset:.936", L"/Fo" + Quote(result.objectPath), Quote(result.sourcePath),
 	};
 	if (options.generatePdb) compilerArguments.push_back(L"/Z7");

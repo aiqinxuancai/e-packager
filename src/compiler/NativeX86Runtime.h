@@ -15,6 +15,7 @@ struct NativeRun {
     unsigned low=0, high=0, returned=0;
     unsigned floating=0;
     double real=0;
+    unsigned ax=0, cx=0, dx=0, bx=0, si=0, di=0;
 };
 static thread_local NativeRun* nativeRun=nullptr;
 extern "C" unsigned long _tls_index;
@@ -50,28 +51,49 @@ static void __declspec(naked) __cdecl NativeInvoke(NativeRun* state) {
         mov ebp, esp
         add ebp, [ebx+8]
         mov dword ptr [ebp+4], offset NativeMachineReturn
-        jmp dword ptr [ebx+12]
+        push dword ptr [ebx+12]
+        mov eax, [ebx+48]
+        mov ecx, [ebx+52]
+        mov edx, [ebx+56]
+        mov esi, [ebx+64]
+        mov edi, [ebx+68]
+        mov ebx, [ebx+60]
+        ret
     }
 }
 static void __declspec(naked) NativeMachineFallthrough() {
-    __asm { xor edi, edi }
+    __asm { push 0 }
     __asm { jmp NativeMachineComplete }
 }
 static void __declspec(naked) NativeMachineReturn() {
-    __asm { mov edi, 1 }
+    __asm { push 1 }
     __asm { jmp NativeMachineComplete }
 }
 static void __declspec(naked) NativeMachineComplete() {
     __asm {
+        pushad
         mov ecx, fs:[2Ch]
         mov ebx, _tls_index
         mov ecx, [ecx+ebx*4]
         mov ebx, offset nativeRun
         mov ebx, [ecx+ebx]
+        mov eax, [esp+28]
         mov [ebx+24], eax
-        mov [ebx+28], edx
-        mov [ebx+32], edi
-        test edi, edi
+        mov [ebx+48], eax
+        mov eax, [esp+24]
+        mov [ebx+52], eax
+        mov eax, [esp+20]
+        mov [ebx+28], eax
+        mov [ebx+56], eax
+        mov eax, [esp+16]
+        mov [ebx+60], eax
+        mov eax, [esp+4]
+        mov [ebx+64], eax
+        mov eax, [esp]
+        mov [ebx+68], eax
+        mov eax, [esp+32]
+        mov [ebx+32], eax
+        test eax, eax
         jz native_result_saved
         cmp dword ptr [ebx+36], 0
         je native_result_saved
@@ -90,7 +112,7 @@ static void __declspec(naked) NativeMachineComplete() {
         ret
     }
 }
-static_assert(offsetof(NativeRun,hostStack)==16 && offsetof(NativeRun,returned)==32);
+static_assert(offsetof(NativeRun,hostStack)==16 && offsetof(NativeRun,returned)==32 && offsetof(NativeRun,ax)==48 && offsetof(NativeRun,di)==68);
 struct NativeParameter { bool reference, nullable; };
 struct NativeFrame;
 static thread_local NativeFrame* nativeFrame=nullptr;
@@ -194,7 +216,7 @@ static void NativeRead(Value& value,const void* source) {
 }
 static bool NativeIndirect(const Value& value) {
     const auto* type=FindType(value.type);
-    return !value.declaredArray && type && !type->enumeration;
+    return !value.declaredArray && (value.type==T_TEXT || value.type==T_BIN || (type && !type->enumeration));
 }
 static void* NativeReference(Value& value) {
     if(value.byteReference)return value.byteReference;
@@ -251,6 +273,7 @@ struct NativeFrame {
     std::vector<void*> referencePointers;
     std::vector<unsigned char> storage;
     unsigned localSize=0;
+    unsigned registers[6]{};
     Value* self;
     NativeFrame(std::vector<Value>& p,std::initializer_list<Value*> v,std::vector<Arg>& a,
                 std::initializer_list<NativeParameter> s,Value* receiver):parent(nativeFrame),parameters(p),locals(v),arguments(a),specs(s),self(receiver) {
@@ -277,7 +300,16 @@ struct NativeFrame {
                 Value& target=i<arguments.size()?arguments[i].Get():parameters[i];
                 referencePointers[i]=NativeReference(target);
                 *reinterpret_cast<void**>(slot)=referencePointers[i];
-            } else if(NativeIndirect(parameters[i])) *reinterpret_cast<void**>(slot)=NativeReference(parameters[i]);
+            } else if(NativeIndirect(parameters[i])) {
+                Value* target=&parameters[i];
+                if(i<arguments.size() && arguments[i].reference) {
+                    Value& original=arguments[i].Get();
+                    if(original.type==target->type && !original.declaredArray &&
+                       ((target->type==T_TEXT && original.text==target->text) ||
+                        (target->type==T_BIN && original.bytes==target->bytes))) target=&original;
+                }
+                *reinterpret_cast<void**>(slot)=NativeReference(*target);
+            }
             else NativeStore(parameters[i],slot);
             if(specs[i].nullable) *reinterpret_cast<unsigned*>(slot+(specs[i].reference?4:NativeWidth(parameters[i])))=
                 i<arguments.size()&&!arguments[i].Get().missing?1:0;
@@ -297,15 +329,21 @@ struct NativeFrame {
         Store();
         NativeSyncObjects(true);
         NativeRun run{storage.data(),static_cast<unsigned>(storage.size()),localSize,code};
+        std::memcpy(&run.ax,registers,sizeof(registers));
         run.floating=type==T_FLOAT||type==T_DOUBLE||type==T_DATE;
         NativeRun* previous=nativeRun;
         nativeRun=&run;
         NativeInvoke(&run);
         nativeRun=previous;
+        std::memcpy(registers,&run.ax,sizeof(registers));
         Read(run.returned!=0);
         NativeSyncObjects(false);
-        result=run.floating?Number(run.real):Integer(type==T_INT64?static_cast<long long>((static_cast<unsigned long long>(run.high)<<32)|run.low):static_cast<int>(run.low),type);
-        result.type=result.declared=type;
+        if(run.returned) {
+            const auto actualType=type==T_ALL?run.cx:type;
+            result=MakeVar(actualType,false);
+            if(run.floating) { result.number=run.real;result.integer=static_cast<long long>(run.real); }
+            else { const unsigned raw[]={run.low,run.high};NativeRead(result,raw); }
+        }
         return run.returned!=0;
     }
 };

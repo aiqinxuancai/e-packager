@@ -1,4 +1,5 @@
-﻿#include "e2txt.h"
+﻿#include "SupportLibraryRuntime.h"
+#include "e2txt.h"
 
 #include <Windows.h>
 #include <wincrypt.h>
@@ -2785,9 +2786,6 @@ std::string GetBuiltinTypeName(std::int32_t typeValue)
 	case 65584: return "对象";
 	case 65585: return "变体型";
 	case 65586: return "变体类型";
-	case 196611: return "工具条";
-	case 196612: return "超级列表框";
-	case 262145: return "高级表格";
 	default: return std::string();
 	}
 }
@@ -2953,19 +2951,6 @@ size_t GetSafeCStringLength(const char* text, const size_t maxLength)
 #endif
 }
 
-const LIB_INFO* CallGetLibInfoSafely(const PFN_GET_LIB_INFO getInfoProc)
-{
-#if defined(_MSC_VER)
-	__try {
-		return getInfoProc == nullptr ? nullptr : getInfoProc();
-	}
-	__except (EXCEPTION_EXECUTE_HANDLER) {
-		return nullptr;
-	}
-#else
-	return getInfoProc == nullptr ? nullptr : getInfoProc();
-#endif
-}
 
 thread_local bool g_supportLibraryStringsAreUtf8 = false;
 
@@ -3916,7 +3901,7 @@ private:
 		if (module != nullptr) {
 			const auto* getInfoProc = reinterpret_cast<PFN_GET_LIB_INFO>(GetProcAddress(module, FUNCNAME_GET_LIB_INFO));
 			if (getInfoProc != nullptr) {
-				const LIB_INFO* libInfo = CallGetLibInfoSafely(getInfoProc);
+				const LIB_INFO* libInfo = support_library_runtime::CallGetLibInfo(getInfoProc);
 				if (libInfo != nullptr && IsReadableMemoryRange(libInfo, sizeof(LIB_INFO))) {
 					SupportLibraryStringEncodingScope stringEncoding(
 						DetectUtf8SupportLibraryStrings(libInfo));
@@ -8459,6 +8444,43 @@ bool Generator::GenerateBundleInternal(
 	ModuleSections sections;
 	if (!ParseModuleSectionsFromBytes(inputBytes, sections, outError)) {
 		return false;
+	}
+	if (options.includeImportedFunctions) {
+		// 同一 EC 可嵌入多个同名上游类型。先按原生 ID 消歧，再统一解码声明与引用，
+		// 不能在文本层合并名称，否则不同对象会绑定到同一份实现。
+		SymbolResolver names(sections.program, sections.resources, inputPath,
+			&sections.losable.removedDefinedItems);
+		std::unordered_set<std::string> occupied;
+		const auto uniqueName = [&](std::string& name, const std::int32_t id) {
+			std::string resolved = names.ResolveUserName(id);
+			if (!occupied.insert(resolved).second) {
+				resolved += "__native_" + std::to_string(static_cast<std::uint32_t>(id));
+				while (!occupied.insert(resolved).second) resolved += "_";
+			}
+			name = std::move(resolved);
+		};
+		// 公开类型保留原名，隐藏副本使用稳定 ID 后缀。
+		for (auto& page : sections.program.codePages)
+			if (IsProgramPagePublic(sections, page.header.dwId)) uniqueName(page.name, page.header.dwId);
+		for (auto& page : sections.program.codePages)
+			if (!IsProgramPagePublic(sections, page.header.dwId)) uniqueName(page.name, page.header.dwId);
+		for (auto& type : sections.program.dataTypes) uniqueName(type.name, type.header.dwId);
+		occupied.clear();
+		for (auto& item : sections.program.globals) uniqueName(item.name, item.marker);
+		occupied.clear();
+		for (auto& item : sections.program.dlls) uniqueName(item.name, item.header.dwId);
+		occupied.clear();
+		for (auto& item : sections.resources.constants) uniqueName(item.name, item.marker);
+		occupied.clear();
+		std::unordered_set<std::int32_t> ordinaryMethods;
+		for (const auto& page : sections.program.codePages)
+			if (page.baseClass == 0) ordinaryMethods.insert(page.functionIds.begin(), page.functionIds.end());
+		for (auto& function : sections.program.functions)
+			if (ordinaryMethods.contains(function.header.dwId) && (function.attr & 0x8) != 0)
+				uniqueName(function.name, function.header.dwId);
+		for (auto& function : sections.program.functions)
+			if (ordinaryMethods.contains(function.header.dwId) && (function.attr & 0x8) == 0)
+				uniqueName(function.name, function.header.dwId);
 	}
 	GenerateOptions effectiveOptions = options;
 	effectiveOptions.supportLibrarySearchDirectories = readOptions.supportLibrarySearchDirectories;

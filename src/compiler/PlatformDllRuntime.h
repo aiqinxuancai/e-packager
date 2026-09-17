@@ -2,7 +2,7 @@
 
 namespace ecompiler {
 
-// 系统 DLL 使用内联的结构成员和定长数组，不使用易语言对象中的指针槽。
+// 外部 DLL 使用内联的结构成员和定长数组，不按 DLL 名称改变参数布局。
 inline constexpr const char* kPlatformDllRuntime = R"CPP(
 namespace ert {
 static std::size_t PlatformSize(std::uint32_t type);
