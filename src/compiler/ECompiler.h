@@ -67,6 +67,8 @@ struct Options {
 	// 黑月编译方式用于生成原生易代码 PE 的易语言 IDE。
 	std::filesystem::path eIdePath;
 	unsigned int blackMoonTimeoutSeconds = 120;
+	// 默认生成 PDB 调试符号；可通过 --no-pdb 关闭。
+	bool generatePdb = true;
 	bool keepObject = true;
 	bool buildDll = false;
 	ExecutableSubsystem subsystem = ExecutableSubsystem::Auto;

@@ -602,6 +602,9 @@ bool Compile(
 		AppendUnique(linkedLibraries, artifact);
 	}
 
+	// 传统链接器同样默认输出 PDB，使用兼容旧版 LINK 的参数。
+	std::filesystem::path pdbPath = effectiveOutput;
+	pdbPath.replace_extension(L".pdb");
 	auto buildLinkArguments = [&]() {
 		std::vector<std::wstring> arguments;
 		arguments.push_back(Quote(entryObject));
@@ -610,6 +613,12 @@ bool Compile(
 		arguments.push_back(L"/OUT:" + Quote(effectiveOutput));
 		arguments.push_back(L"/NOLOGO");
 		arguments.push_back(L"/INCREMENTAL:NO");
+		if (options.generatePdb) {
+			arguments.push_back(L"/DEBUG");
+			arguments.push_back(L"/PDB:" + Quote(pdbPath));
+		}
+		arguments.push_back(L"/OPT:REF");
+		arguments.push_back(L"/OPT:ICF");
 		arguments.push_back(L"/MACHINE:I386");
 		for (const std::filesystem::path& directory : libraryDirectories) {
 			if (std::filesystem::is_directory(directory, filesystemError)) {
@@ -683,6 +692,7 @@ bool Compile(
 		";compile_mode=legacy-blackmoon;mode=" + ModeName(options.blackMoonMode) +
 		";effective_mode=" + ModeName(effectiveMode) +
 		(usedMfcFallback ? ";runtime_fallback=mfc" : "") +
+		";pdb=" + (options.generatePdb ? PathToUtf8(pdbPath) : std::string("<disabled>")) +
 		";artifact_bytes=" + std::to_string(outputBytes) +
 		";stage=" + stageResult.summary +
 		";object=" + (result.objectPath.empty() ? std::string("<discarded>") : PathToUtf8(result.objectPath));

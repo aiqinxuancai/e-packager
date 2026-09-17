@@ -6,6 +6,14 @@
 e-packager compile <input.e|input-dir> <output.exe|output.dll>
 ```
 
+默认在输出 EXE/DLL 的同目录生成同名 `.pdb`（例如 `out\MyApp.pdb`），用于调试和崩溃定位。语义编译包含生成 C++ 的调试信息；传统黑月模式的符号完整度取决于输入对象和库携带的信息。
+
+添加 `--no-pdb` 可关闭本次编译的 PDB 生成，适用于两种编译模式；不会删除之前已有的 PDB 文件：
+
+```bash
+e-packager compile MyApp.e out\MyApp.exe --no-pdb
+```
+
 > ⚠️ **试验性功能** — 已覆盖常用控件和核心库命令，但不是 IDE 的完整替代。交付前请用 `compile-check` 或 IDE 复核。
 
 ---

@@ -284,14 +284,17 @@ EXPORTS
 默认编译阶段使用以下关键选项：
 
 ```text
-/c /O2 /Gy /Zl /GS- /GR- /EHsc /arch:IA32 /MT /std:c++20
+/c /O2 /Z7 /Gy /Zl /GS- /GR- /EHsc /arch:IA32 /MT /std:c++20
 /source-charset:utf-8 /execution-charset:.936
 ```
+
+语义链接默认使用 `/DEBUG:FULL` 和显式 `/PDB` 路径，并保留 `/OPT:REF`、`/OPT:ICF` 优化；传统黑月使用兼容旧链接器的 `/DEBUG` 输出 PDB。传入 `--no-pdb` 时不添加调试信息及 PDB 生成参数，结果中的 `pdb=<disabled>` 表示已关闭；已有 PDB 文件不会被删除。
 
 语义链接阶段按目标架构选择 x86 或 x64，并加入对应 CRT、Windows SDK 导入库及可达支持库。使用现代 adapter 时，x86/x64 都只链接现代 CRT 与目标架构核心归档；传统 `legacy-blackmoon` 才额外使用 VC6/MFC 入口对象。默认会保留以下调试/审计产物：
 
 - `<output>.generated.cpp`：生成的 C++ 翻译单元；
 - `<output>.obj`：`cl.exe` 产生的 COFF 对象；
+- `<output>.pdb`：与 EXE/DLL 同目录、同名的调试符号文件，清理中间产物时仍保留；
 - `<output>.dll` 或 `<output>.exe`：最终 PE；
 - DLL 模式下的 `<output>.def`；
 - 外部 DLL 声明对应的临时 import `.lib`（可在保留产物时检查）。

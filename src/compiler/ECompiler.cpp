@@ -1413,6 +1413,7 @@ bool Compile(
 		L"/nologo", L"/c", L"/O2", L"/Gy", L"/Zl", L"/GS-", L"/GR-", L"/EHsc", L"/MT", L"/std:c++20",
 		L"/source-charset:utf-8", L"/execution-charset:.936", L"/Fo" + Quote(result.objectPath), Quote(result.sourcePath),
 	};
+	if (options.generatePdb) compilerArguments.push_back(L"/Z7");
 	if (!targetX64) compilerArguments.insert(compilerArguments.begin() + 8, L"/arch:IA32");
 	for (const auto& directory : includeDirectories) compilerArguments.push_back(L"/I" + Quote(directory));
 	if (!RunProcess(compiler, compilerArguments, outputDirectory, logPath, processOutput, error)) {
@@ -1565,6 +1566,14 @@ bool Compile(
 			Quote(result.objectPath), Quote(mfcLibrary),
 		};
 	}
+	// 默认写出独立 PDB，并显式保留 Release 链接优化。
+	std::filesystem::path pdbPath = outputPath;
+	pdbPath.replace_extension(L".pdb");
+	if (options.generatePdb) {
+		linkerArguments.push_back(L"/DEBUG:FULL");
+		linkerArguments.push_back(L"/PDB:" + Quote(pdbPath));
+	}
+	linkerArguments.push_back(L"/OPT:ICF");
 	if (!program.buildDll) linkerArguments.push_back(L"/MANIFEST:EMBED");
 	if (program.buildDll) {
 		linkerArguments.push_back(L"/DLL");
@@ -1639,7 +1648,8 @@ bool Compile(
 		";libraries=" + std::to_string(generated.reachableLibraries.size()) +
 		(usesBlackMoonCoreAdapter ? ";core_archive=blackmoon_kernel_adapter" : std::string()) +
 		";source=" + PathToUtf8(result.sourcePath) +
-		";object=" + PathToUtf8(result.objectPath);
+		";object=" + PathToUtf8(result.objectPath) +
+		";pdb=" + (options.generatePdb ? PathToUtf8(pdbPath) : std::string("<disabled>"));
 	return true;
 }
 
