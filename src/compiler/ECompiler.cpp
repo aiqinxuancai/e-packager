@@ -3,6 +3,7 @@
 #include "BlackMoonCompiler.h"
 #include "CompilerModel.h"
 #include "CppEmitter.h"
+#include "OptimizationReport.h"
 #include "ExecutableResourceBuilder.h"
 #include "../PathHelper.h"
 #include "../e2txt.h"
@@ -1214,6 +1215,17 @@ bool Compile(
 	const Options& options,
 	Result& result)
 {
+	const auto optimizationStart = std::chrono::steady_clock::now();
+	if (!options.optimizationReportPath.empty()) {
+		const auto report = std::filesystem::absolute(options.optimizationReportPath).lexically_normal().wstring();
+		for (const auto& protectedPath : {inputPath,outputPath}) {
+			const auto target = std::filesystem::absolute(protectedPath).lexically_normal().wstring();
+			std::error_code equivalentError;
+			if (_wcsicmp(report.c_str(),target.c_str()) == 0 || std::filesystem::equivalent(options.optimizationReportPath,protectedPath,equivalentError)) {
+				result = {}; result.message = "optimization_report_conflicts_with_input_or_output"; return false;
+			}
+		}
+	}
 	const TargetArchitecture targetArchitecture = options.targetArchitecture == TargetArchitecture::Host
 		? HostTargetArchitecture() : options.targetArchitecture;
 	const bool targetX64 = targetArchitecture == TargetArchitecture::X64;
@@ -1223,6 +1235,9 @@ bool Compile(
 			? CompileMode::LegacyBlackMoon : CompileMode::Semantic;
 	}
 	if (effectiveCompileMode == CompileMode::LegacyBlackMoon) {
+		if (options.semanticOptimizationExplicit || options.codegenOptimizationExplicit || !options.optimizationReportPath.empty()) {
+			result = {}; result.message = "semantic_optimization_requires_semantic_backend"; return false;
+		}
 		if (!options.executableConfigPath.empty() || !options.iconPath.empty()) {
 			result = {};
 			result.outputPath = outputPath;
@@ -1330,7 +1345,7 @@ bool Compile(
 	}
 	program.useLegacyX86RuntimeBridge = !targetX64 && !usesModernCoreAdapter;
 	GeneratedSource generated;
-	if (!EmitCppSource(program, generated, error)) {
+	if (!EmitCppSource(program, generated, error, options.semanticOptimization)) {
 		result.message = "source_generation_failed:" + error;
 		return false;
 	}
@@ -1420,7 +1435,7 @@ bool Compile(
 		}
 	}
 	std::vector<std::wstring> compilerArguments = {
-		L"/nologo", L"/c", L"/bigobj", L"/O2", L"/Gy", L"/Zl", L"/GS-", L"/GR-", L"/EHsc", L"/MT", L"/std:c++20",
+		L"/nologo", L"/c", L"/bigobj", options.optimizeForSize ? L"/O1" : L"/O2", L"/Gy", L"/Zl", L"/GS-", L"/GR-", L"/EHsc", L"/MT", L"/std:c++20",
 		L"/source-charset:utf-8", L"/execution-charset:.936", L"/Fo" + Quote(result.objectPath), Quote(result.sourcePath),
 	};
 	if (options.generatePdb) compilerArguments.push_back(L"/Z7");
@@ -1635,6 +1650,8 @@ bool Compile(
 		result.message = "linker_reported_success_without_output:" + PathToUtf8(outputPath);
 		return false;
 	}
+	if (!options.optimizationReportPath.empty() && !WriteOptimizationReport(options.optimizationReportPath,outputPath,program,generated,options.semanticOptimization,
+		std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-optimizationStart).count(),error,options.optimizeForSize)) { result.message=error; return false; }
 	if (!options.keepObject) {
 		std::filesystem::remove(executableResources.scriptPath, filesystemError);
 		std::filesystem::remove(executableResources.resourcePath, filesystemError);

@@ -1,4 +1,4 @@
-# e-packager
+﻿# e-packager
 
 让易语言项目享有现代开发体验：Git 版本管理、代码 Diff、AI 辅助编辑、命令行编译。
 
@@ -382,6 +382,9 @@ e-packager compile MyApp.e MyApp.exe \
 |------|------|
 | `--compile-mode semantic\|legacy-blackmoon` | 编译模式 |
 | `--arch host\|x86\|x64` | 目标架构 |
+| `--codegen-opt speed\|size` | C++ 速度优先（默认 /O2）或尺寸优先（/O1）；与语义优化独立 |
+| `--semantic-opt baseline\|reachable\|typed` | 方法可达性及标量生成；默认 typed，见[优化说明](docs/semantic-optimization.md) |
+| `--optimization-report <json>` | 输出方法保留/降级原因、编译耗时及未压缩 PE 大小 |
 | `--subsystem auto\|console\|windows` | 子系统类型 |
 | `--dll` | 编译为 DLL |
 | `--define <宏>` / `-D <宏>` | 条件编译宏 |

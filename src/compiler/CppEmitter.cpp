@@ -1,4 +1,6 @@
 ﻿#include "CppEmitter.h"
+#include "NativeMethodBridge.h"
+#include "TypedScalarEmitter.h"
 
 #include <Windows.h>
 #include "NativeWindowControl.h"
@@ -638,6 +640,10 @@ static bool CopyCompound(Value& target,const Value& source) {
     return true;
 }
 static Value& Assign(Value& target,Value value) {
+    if(value.missing && value.type==T_NULL && target.declared!=T_NULL) {
+        value=MakeVar(target.declared,target.declaredArray,false);
+        value.missing=true;
+    }
     if(target.byteReference) { *target.byteReference=static_cast<unsigned char>(ToInteger(value));target.integer=*target.byteReference;target.number=static_cast<double>(target.integer);return target; }
     auto native=target.native;
     struct PreserveNative { Value& target;std::shared_ptr<NativeStorage>& memory;~PreserveNative(){if(memory){target.native=std::move(memory);target.native->owner=&target;}} } preserve{target,native};
@@ -1401,13 +1407,17 @@ static Value CallFne(const char* name,ExecuteCommand command,std::uint32_t retur
 
 class Emitter {
 public:
-	explicit Emitter(const Program& program) : program_(program) {}
+	explicit Emitter(const Program& program, SemanticOptimization mode) : program_(program), mode_(mode) {}
 
 	bool Run(GeneratedSource& result, std::string& error)
 	{
 		error_ = &error;
 		result_ = &result;
 		result = {};
+		if (mode_ != SemanticOptimization::Baseline) {
+			analysis_ = AnalyzeSemanticReachability(program_, [this](const Method& m, const auto& n) { return BindCall(m,n); });
+			if (mode_ == SemanticOptimization::Typed) typed_ = GenerateTypedScalarMethods(program_,analysis_);
+		}
 		if (program_.useLegacyX86RuntimeBridge) {
 			result.text = "#define ECOMPILER_LEGACY_X86_RUNTIME 1\n";
 		}
@@ -1421,7 +1431,15 @@ public:
 		body_ << "\nusing namespace ert;\n";
 		body_ << "static void ConstructSemantic(Value& value);\n";
 		EmitGlobals();
-		for (const auto& method : program_.methods) if (method.ownerType.valid && method.name == "_初始化") QueueMethod(method.id);
+		if (mode_ != SemanticOptimization::Baseline) {
+			for (auto id : analysis_.reachable) QueueMethod(id);
+			if (mode_ == SemanticOptimization::Typed) {
+				body_ << typed_.declarations;
+				result.typedRejections=typed_.rejected;
+				for (const auto& [id,code] : typed_.definitions) result.typedMethods.insert(id);
+			}
+		}
+		if (mode_ == SemanticOptimization::Baseline) for (const auto& method : program_.methods) if (method.ownerType.valid && method.name == "_初始化") QueueMethod(method.id);
 		const auto startup = program_.methodByName.find("_启动子程序");
 		if (startup == program_.methodByName.end()) return Fail("startup_method_not_found:_启动子程序");
 		QueueMethod(startup->second);
@@ -1449,6 +1467,12 @@ public:
 		if (program_.targetArchitecture == TargetArchitecture::X86) EmitNativeClassWrappers();
 		if (!EmitTypes()) return false;
 		EmitDeclarationsAndStartup();
+		if (!error.empty()) return false;
+		result.optimization = analysis_;
+		if (mode_ == SemanticOptimization::Baseline) {
+			result.optimization.reachable.insert(emittedMethods_.begin(), emittedMethods_.end());
+			for (auto id : emittedMethods_) result.optimization.reasons[id].insert("baseline_emission");
+		}
 		result.reachableLibraries = reachableLibraries_;
 		result.exports = exports_;
 		result.imports = imports_;
@@ -1810,9 +1834,10 @@ private:
 
 	void QueueMethod(const std::size_t id)
 	{
+		if (mode_ != SemanticOptimization::Baseline && !analysis_.reachable.contains(id)) { Fail("reachability_binding_mismatch:" + std::to_string(id)); return; }
 		if (!emittedMethods_.insert(id).second) return;
 		pendingMethods_.push_back(id);
-		if (program_.targetArchitecture == TargetArchitecture::X86 && program_.methods[id].ownerType.valid) {
+		if (mode_ == SemanticOptimization::Baseline && program_.targetArchitecture == TargetArchitecture::X86 && program_.methods[id].ownerType.valid) {
 			if (const auto* type = program_.FindType(program_.methods[id].ownerType.code))
 				for (const auto member : type->memberMethodIds) QueueMethod(member);
 		}
@@ -2624,13 +2649,45 @@ private:
 		return "CallFne(\"" + command.executeSymbol + "\",&" + command.executeSymbol + ',' + Hex(returnType) + ',' + ((command.state & kCommandReturnsArray) != 0 ? "true" : "false") + ',' + arguments + ',' + specs + ')';
 	}
 
+	BoundCall BindCall(const Method& method, const e2txt::SourceExpressionNode& node)
+	{
+		using K = e2txt::SourceExpressionKind;
+		if (node.kind == K::AddressOf) {
+			if (node.children.size() == 1 && node.children[0]->kind == K::Name)
+				return {ResolveUnqualifiedMethod(method,node.children[0]->text,0),false,true};
+			return {nullptr,false,true};
+		}
+		if (node.children.empty()) return {};
+		const auto& c = *node.children[0]; const auto count = node.children.size()-1;
+		if (c.kind == K::Name) {
+			if (auto* m = ResolveOwnedMethod(method,c.text,count)) return {m,m->ownerType.valid,false,SemanticCallKind::Owned};
+			if (auto* m = ResolveUnqualifiedMethod(method,c.text,count)) return {m,false,false,SemanticCallKind::Unqualified};
+		}
+		if (c.kind == K::Member && !c.children.empty()) {
+			if (auto* m = ResolveQualifiedMethod(method,*c.children[0],c.text,count)) return {m,false,false,SemanticCallKind::Qualified};
+			if (WindowMemberOperation(method,*c.children[0],c.text)) return {nullptr,false,true};
+			if (auto* m = ResolveMemberMethod(Infer(method,*c.children[0]),c.text,count)) return {m,true,false,SemanticCallKind::Member};
+		}
+		return {nullptr,false,true};
+	}
+
+	BoundCall BoundNode(const Method& method, const e2txt::SourceExpressionNode& node)
+	{
+		if (mode_ == SemanticOptimization::Baseline) return BindCall(method,node);
+		const auto found = analysis_.calls.find(&node);
+		if (found != analysis_.calls.end()) return found->second;
+		Fail("reachability_call_binding_missing:" + std::to_string(method.id));
+		return {};
+	}
+
 	std::string EmitCall(const Method& method, const e2txt::SourceExpressionNode& node)
 	{
 		using Kind = e2txt::SourceExpressionKind;
 		if (node.children.empty()) { Fail("call_target_missing"); return "Empty()"; }
 		const auto& callee = *node.children.front(); const std::size_t argumentCount = node.children.size() - 1;
+		const auto bound = BoundNode(method,node);
 		if (callee.kind == Kind::Name) {
-			if (const Method* owned = ResolveOwnedMethod(method, callee.text, argumentCount)) {
+			if (const Method* owned = bound.kind == SemanticCallKind::Owned ? bound.target : nullptr) {
 				if (argumentCount > owned->parameters.size()) { Fail("too_many_owned_method_arguments:" + callee.text); return "Empty()"; }
 				QueueMethod(owned->id); std::string arguments = "{";
 				for (std::size_t index = 1; index < node.children.size(); ++index) {
@@ -2639,7 +2696,7 @@ private:
 				}
 				arguments += '}'; return "method_" + std::to_string(owned->id) + '(' + arguments + ',' + (method.ownerType.valid ? "self" : "nullptr") + ')';
 			}
-			if (const Method* targetMethod = ResolveUnqualifiedMethod(method, callee.text, argumentCount)) {
+			if (const Method* targetMethod = bound.kind == SemanticCallKind::Unqualified ? bound.target : nullptr) {
 				if (argumentCount > targetMethod->parameters.size()) { Fail("too_many_method_arguments:" + callee.text); return "Empty()"; }
 				QueueMethod(targetMethod->id); std::string arguments = "{";
 				for (std::size_t index = 1; index < node.children.size(); ++index) {
@@ -2668,7 +2725,7 @@ private:
 			return EmitFneCall(method, *binding, node, nullptr);
 		}
 		if (callee.kind == Kind::Member && !callee.children.empty()) {
-			if (const auto* qualified = ResolveQualifiedMethod(method, *callee.children.front(), callee.text, argumentCount)) {
+			if (const auto* qualified = bound.kind == SemanticCallKind::Qualified ? bound.target : nullptr) {
 				QueueMethod(qualified->id);
 				std::string arguments = "{";
 				for (std::size_t index = 1; index < node.children.size(); ++index) {
@@ -2690,7 +2747,7 @@ private:
 					EscapeCppString(*operation) + ",std::vector<Value>" + arguments + ")";
 			}
 			const TypeRef receiverType = Infer(method, *callee.children.front());
-			if (const Method* member = ResolveMemberMethod(receiverType, callee.text, argumentCount)) {
+			if (const Method* member = bound.kind == SemanticCallKind::Member ? bound.target : nullptr) {
 				if (argumentCount > member->parameters.size()) { Fail("too_many_member_method_arguments:" + callee.text); return "Empty()"; }
 				QueueMethod(member->id);
 				std::string arguments = "{";
@@ -2801,7 +2858,7 @@ private:
 			if (node.children.size() != 1 || node.children.front()->kind != Kind::Name) {
 				Fail(method.sourceFile + ": invalid_subroutine_address"); return "Empty()";
 			}
-			const Method* target = ResolveUnqualifiedMethod(method, node.children.front()->text, 0);
+			const Method* target = BoundNode(method,node).target;
 			if (target == nullptr || target->ownerType.valid) {
 				Fail(method.sourceFile + ": unknown_subroutine_address:" + node.children.front()->text); return "Empty()";
 			}
@@ -2970,6 +3027,7 @@ private:
 			while (ancestor && ancestor->type.code != method.ownerType.code) ancestor = program_.FindType(ancestor->baseType.code);
 			if (!ancestor) continue;
 			for (const auto id : type.memberMethodIds) if (id != method.id && program_.methods[id].name == method.name) {
+				if (mode_ != SemanticOptimization::Baseline && !analysis_.reachable.contains(id)) break;
 				QueueMethod(id);
 				Line(1, "if(virtualDispatch && self && self->type==" + Hex(type.type.code) + ")return method_" + std::to_string(id) + "(std::move(a),self);");
 				break;
@@ -2980,6 +3038,7 @@ private:
 	bool EmitMethod(const Method& method)
 	{
 		SourceLine(method.sourceFile, method.sourceLine);
+		if (auto it=typed_.definitions.find(method.id);it!=typed_.definitions.end()) { body_ << it->second; return true; }
 		for (std::size_t index = 0; index < method.locals.size(); ++index) {
 			const auto& local = method.locals[index];
 			if (!local.isStatic) continue;
@@ -3023,6 +3082,10 @@ private:
 				Line(1, "Redim(p.back()," + dimensions + ",false);");
 			}
 			Line(1, "if(a.size()>" + std::to_string(index) + ") Assign(p.back(),a[" + std::to_string(index) + "].Get());");
+			// 非可空形参不继承上游可空实参的缺省标记。
+			if (!parameter.nullable) Line(1, "p.back().missing=false;");
+			// 缺省引用实参也需要声明类型，供数组操作及继续传参使用。
+			if (parameter.byReference) Line(1, "if(a.size()>" + std::to_string(index) + "&&a[" + std::to_string(index) + "].Get().missing&&a[" + std::to_string(index) + "].Get().type==T_NULL) a[" + std::to_string(index) + "]=Arg::Temp(p.back());");
 		}
 		Line(1, "std::vector<Value> v; v.reserve(" + std::to_string(method.locals.size()) + ");");
 		for (const auto& local : method.locals) {
@@ -3059,7 +3122,7 @@ private:
 			for (auto current = hierarchy.rbegin(); current != hierarchy.rend(); ++current) {
 				for (const auto id : (*current)->memberMethodIds) {
 					const auto& method = program_.methods[id];
-					if (method.name == "_初始化" && method.ownerType.code == (*current)->type.code) body_ << "method_" << id << "({},&value);";
+					if (emittedMethods_.contains(id) && method.name == "_初始化" && method.ownerType.code == (*current)->type.code) body_ << "method_" << id << "({},&value);";
 				}
 			}
 			body_ << "break;\n";
@@ -3069,9 +3132,15 @@ private:
 
 	void EmitNativeClassWrappers()
 	{
+		if (mode_ != SemanticOptimization::Baseline && !analysis_.opaqueNativeAccess) {
+			body_ << "namespace ert { const void* const* NativeClassTable(std::uint32_t){return nullptr;} }\n";
+			return;
+		}
+		if (mode_ != SemanticOptimization::Baseline) body_ << kNativeMethodBridge;
 		for (const auto id : pendingMethods_) {
 			const auto& method = program_.methods[id];
 			if (!method.ownerType.valid) continue;
+			++result_->nativeWrapperCount;
 			const bool genericReturn = method.returnType.code == kTypeAll;
 			const std::string returnType = method.returnType.code == kTypeNull || genericReturn ? "void" : ExportCType(method.returnType, false);
 			body_ << "\nstatic " << returnType << (method.usesCdecl ? " __cdecl " : " __stdcall ") << "ecompiler_native_" << id << (genericReturn ? "_body(unsigned* output,void* receiver" : "(void* receiver");
@@ -3083,6 +3152,19 @@ private:
 				if (parameter.nullable) ++words;
 			}
 			for (unsigned word = 0; word < words; ++word) body_ << ",unsigned raw" << word;
+			if (mode_ != SemanticOptimization::Baseline) {
+				body_ << ") {\n    NativeCallbackScope callback;\n";
+				body_ << "    const unsigned argumentWords[]={";
+				for (unsigned i=0;i<words;++i) body_ << "raw" << i << ',';
+				body_ << "0};\n    static const NativeMethodParameter specs[]={";
+				for (std::size_t i=0;i<method.parameters.size();++i) {
+					const auto& parameter=method.parameters[i];
+					const bool indirect=parameter.byReference || (!parameter.type.isArray && (parameter.type.code==kTypeText || parameter.type.code==kTypeBinary || (program_.FindType(parameter.type.code) && !program_.FindType(parameter.type.code)->isEnum)));
+					const unsigned presence=parameter.nullable ? (i+1==offsets.size()?words:offsets[i+1])-1 : ~0u;
+					body_ << '{' << Hex(parameter.type.code) << ',' << offsets[i] << "u," << presence << "u," << (parameter.type.isArray?"true":"false") << ',' << (indirect?"true":"false") << ',' << (parameter.byReference?"true":"false") << "},";
+				}
+				body_ << "{}};\n    Value result=InvokeNativeMethod(&method_" << id << ",receiver,argumentWords,specs," << method.parameters.size() << ");\n";
+			} else {
 			body_ << ") {\n    NativeCallbackScope callback;\n    std::vector<Value> p; p.reserve(" << method.parameters.size() << ");\n    std::vector<Arg> a;\n";
 			for (std::size_t index = 0; index < method.parameters.size(); ++index) {
 				const auto& parameter = method.parameters[index];
@@ -3099,6 +3181,7 @@ private:
 			body_ << "    Value result=method_" << id << "(std::move(a),NativeResolveSelf(receiver));\n";
 			for (std::size_t index = 0; index < method.parameters.size(); ++index) {
 				if (method.parameters[index].byReference) body_ << "    if(raw" << offsets[index] << ") NativeStore(p[" << index << "],reinterpret_cast<void*>(raw" << offsets[index] << "));\n";
+			}
 			}
 			if (genericReturn) body_ << "    output[0]=output[1]=0;output[2]=result.type;\n    if(result.type==T_TEXT) output[0]=reinterpret_cast<unsigned>(RuntimeText(result.text));\n    else if(result.type==T_BIN) output[0]=reinterpret_cast<unsigned>(RuntimeBinary(result.bytes));\n    else NativeStore(result,output);\n";
 			else if (method.returnType.code == kTypeNull) body_ << "    return;\n";
@@ -7042,6 +7125,18 @@ extern "C" ert::EIntPtr __stdcall BlackMoonFuncForeLibNotifySys(
                 : HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,static_cast<SIZE_T>(param2)));
     case ecompiler_nrs_get_program_type:
         return 3;
+    case ecompiler_nrs_do_events: {
+        MSG message{};
+        while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {
+            if(message.message==WM_QUIT) {
+                PostQuitMessage(static_cast<int>(message.wParam));
+                break;
+            }
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        return 0;
+    }
     case ecompiler_nrs_exit_program:
         ExitProcess(static_cast<UINT>(param1));
         return 0;
@@ -7123,6 +7218,9 @@ extern "C" ert::EIntPtr __stdcall BlackMoonFuncForeLibNotifySys(
 		result_->text += prefix.str();
 	}
 	const Program& program_;
+	SemanticOptimization mode_;
+	OptimizationAnalysis analysis_;
+	TypedScalarOutput typed_;
 	GeneratedSource* result_ = nullptr;
 	std::string* error_ = nullptr;
 	std::ostringstream body_;
@@ -7142,10 +7240,10 @@ extern "C" ert::EIntPtr __stdcall BlackMoonFuncForeLibNotifySys(
 
 }  // namespace
 
-bool EmitCppSource(const Program& program, GeneratedSource& outSource, std::string& outError)
+bool EmitCppSource(const Program& program, GeneratedSource& outSource, std::string& outError, SemanticOptimization optimization)
 {
 	outError.clear();
-	Emitter emitter(program);
+	Emitter emitter(program, optimization);
 	return emitter.Run(outSource, outError);
 }
 

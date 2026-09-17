@@ -1,4 +1,5 @@
 ﻿param(
+    [ValidateSet("baseline","reachable","typed")][string]$SemanticOpt = "baseline",
     [string]$Compiler = "$PSScriptRoot/../temp/build/Win32/e-packager.exe",
     [string]$EDirectory = 'C:\Users\aiqin\OneDrive\e5.6',
     [string]$CoreDirectory = 'D:\git\BlackMoonKernelStaticLib\adapter',
@@ -10,10 +11,11 @@ $OutputRoot = [IO.Path]::GetFullPath($OutputRoot)
 $workspace = Join-Path $OutputRoot 'workspace'
 & $Compiler unpack (Join-Path $repo 'eproj/e-console-exe-new-proj.e') $workspace
 if ($LASTEXITCODE -ne 0) { throw 'ABI fixture unpack failed' }
-Get-ChildItem -LiteralPath "$PSScriptRoot/fixtures/native-x86-abi" -Force -File |
-    Copy-Item -Destination (Join-Path $workspace 'src')
+$fixtures = @(Get-ChildItem -LiteralPath "$PSScriptRoot/fixtures/native-x86-abi" -Force -File)
+if ($fixtures.Count -eq 0) { throw 'Native ABI fixtures are missing; refusing to report an empty template as a passing test' }
+$fixtures | Copy-Item -Destination (Join-Path $workspace 'src')
 $executable = Join-Path $OutputRoot 'native-abi.exe'
-& $Compiler compile $workspace $executable --arch x86 --e-dir $EDirectory --blackmoon-x86-dir $CoreDirectory --diagnostics json
+& $Compiler compile $workspace $executable --arch x86 --e-dir $EDirectory --semantic-opt $SemanticOpt --blackmoon-x86-dir $CoreDirectory --diagnostics json
 if ($LASTEXITCODE -ne 0) { throw 'ABI fixture compilation failed' }
 $process = Start-Process -FilePath $executable -WorkingDirectory $OutputRoot -WindowStyle Hidden -PassThru
 try {

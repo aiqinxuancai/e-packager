@@ -1,6 +1,7 @@
 ﻿#pragma once
 
 #include "CompilerModel.h"
+#include "SemanticOptimization.h"
 
 #include <cstddef>
 #include <set>
@@ -30,11 +31,15 @@ struct GeneratedSource {
 	std::vector<std::string> exportedNames;
 	std::vector<ExportedFunction> exports;
 	std::vector<ImportedFunction> imports;
+	OptimizationAnalysis optimization;
+	std::set<std::size_t> typedMethods;
+	std::map<std::size_t,std::string> typedRejections;
+	std::size_t nativeWrapperCount = 0;
 	std::size_t reachableMethodCount = 0;
 	std::size_t reachableCommandCount = 0;
 };
 
 // 将语义模型绑定到 FNE 的精确符号并生成可由 VC 编译的 C++ 源码。
-bool EmitCppSource(const Program& program, GeneratedSource& outSource, std::string& outError);
+bool EmitCppSource(const Program& program, GeneratedSource& outSource, std::string& outError, SemanticOptimization optimization = SemanticOptimization::Typed);
 
 }  // namespace ecompiler

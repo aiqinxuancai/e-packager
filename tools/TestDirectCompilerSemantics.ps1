@@ -1,4 +1,6 @@
 ﻿param(
+    [ValidateSet("speed","size")][string]$CodegenOpt = "speed",
+    [ValidateSet("baseline","reachable","typed")][string]$SemanticOpt = "baseline",
     [string]$Packager = "$PSScriptRoot/../bin/Win32/Release/e-packager.exe",
     [string]$EDirectory = 'C:\Users\aiqin\OneDrive\e5.6',
     [string]$OutputRoot = "$PSScriptRoot/../temp/direct-semantics-$([guid]::NewGuid().ToString('N'))"
@@ -16,6 +18,7 @@ function Write-Source([string]$Name, [string]$Content) {
 Write-Source '程序集1' @'
 .版本 2
 .程序集 程序集1, , , 普通程序集的注释不能使其成为类
+.程序集变量 定时回调次数, 整数型
 .子程序 _启动子程序, 整数型
 .局部变量 返回_结果, 整数型
 .局部变量 到循环尾_值, 整数型
@@ -114,7 +117,65 @@ Write-Source '程序集1' @'
 .如果真 (指针文本长度 (字节集取地址 (缓冲, 缓冲, 0)) ≠ 3)
     返回 (25)
 .如果真结束
+.如果真 (转发缺省字节集 () ≠ 1)
+    返回 (26)
+.如果真结束
+.如果真 (转发缺省数组 () ≠ 1)
+    返回 (27)
+.如果真结束
+.如果真 (验证事件派发 () ≠ 1)
+    返回 (28)
+.如果真结束
 返回 (0)
+.子程序 转发缺省数组, 整数型
+.参数 数据, 字节集, 可空 数组
+.如果真 (是否为空 (数据) ＝ 假 或 取数组成员数 (数据) ≠ 0)
+    返回 (0)
+.如果真结束
+填充缺省数组 (数据)
+.如果真 (取数组成员数 (数据) ≠ 2)
+    返回 (0)
+.如果真结束
+返回 (选择 (数据 [2] ＝ { 65, 66 }, 1, 0))
+.子程序 填充缺省数组
+.参数 数据, 字节集, 参考 可空 数组
+重定义数组 (数据, 假, 2)
+数据 [2] ＝ { 65, 66 }
+.子程序 验证事件派发, 整数型
+.局部变量 定时器, 整数型
+.局部变量 次数, 整数型
+定时回调次数 ＝ 0
+定时器 ＝ 创建测试定时器 (0, 0, 10, 到整数 (&测试定时回调))
+.如果真 (定时器 ＝ 0)
+    返回 (0)
+.如果真结束
+.计次循环首 (200, 次数)
+    处理事件 ()
+    .如果真 (定时回调次数 ＞ 0)
+        跳出循环 ()
+    .如果真结束
+    测试休眠 (10)
+.计次循环尾 ()
+销毁测试定时器 (0, 定时器)
+返回 (选择 (定时回调次数 ＞ 0, 1, 0))
+.子程序 测试定时回调
+.参数 窗口, 整数型
+.参数 消息, 整数型
+.参数 标识, 整数型
+.参数 时刻, 整数型
+定时回调次数 ＝ 定时回调次数 ＋ 1
+.子程序 转发缺省字节集, 整数型
+.参数 数据, 字节集, 可空
+.如果真 (是否为空 (数据) ＝ 假)
+    返回 (0)
+.如果真结束
+返回 (接收必需字节集 (数据))
+.子程序 接收必需字节集, 整数型
+.参数 数据, 字节集
+.如果真 (取字节集右边 (数据, 2) ≠ {})
+    返回 (0)
+.如果真结束
+返回 (1)
 .子程序 原生文本指针, 整数型
 .参数 文本, 文本型
 置入代码 ({139, 69, 8, 139, 0, 201, 194, 4, 0})
@@ -167,6 +228,10 @@ Write-Source '基类' @'
 .子程序 原生取值, 整数型, 公开
 置入代码 ({139, 85, 8, 139, 2, 139, 0, 82, 255, 80, 8, 186, 0, 0, 0, 0, 129, 249, 1, 3, 0, 128, 15, 69, 194, 201, 194, 4, 0})
 返回 (0)
+.子程序 取结构, 系统时间, 公开
+.局部变量 结果, 系统时间
+结果.年 ＝ 2026
+返回 (结果)
 '@
 Write-Source '派生类' @'
 .版本 2
@@ -194,6 +259,16 @@ Write-Source '.DLL声明' @'
     .参数 时间, 系统时间, 传址
 .DLL命令 指针文本长度, 整数型, "kernel32.dll", "lstrlenA"
     .参数 地址, 整数型
+.DLL命令 创建测试定时器, 整数型, "user32.dll", "SetTimer"
+    .参数 窗口, 整数型
+    .参数 标识, 整数型
+    .参数 间隔, 整数型
+    .参数 回调, 整数型
+.DLL命令 销毁测试定时器, 整数型, "user32.dll", "KillTimer"
+    .参数 窗口, 整数型
+    .参数 标识, 整数型
+.DLL命令 测试休眠, , "kernel32.dll", "Sleep"
+    .参数 毫秒, 整数型
 .DLL命令 调用字节集回调, 整数型, "user32.dll", "CallWindowProcA"
     .参数 回调, 字节集
     .参数 窗口, 整数型
@@ -255,7 +330,7 @@ $moduleManifest = Join-Path $workspace 'project/.module.json'
 $metadata = Get-Content -LiteralPath $moduleManifest -Raw | ConvertFrom-Json
 $metadata.dependencies += [pscustomobject]@{ kind='ecom'; name='初始化模块'; path='初始化模块.ec'; localWorkspace='ecom/初始化模块' }
 [IO.File]::WriteAllText($moduleManifest, ($metadata | ConvertTo-Json -Depth 30), [Text.UTF8Encoding]::new($true))
-& $Packager compile $workspace $output --arch x86 --e-dir $EDirectory
+& $Packager compile $workspace $output --arch x86 --e-dir $EDirectory --codegen-opt $CodegenOpt --semantic-opt $SemanticOpt
 if ($LASTEXITCODE -ne 0) { throw 'semantic fixture compilation failed' }
 $process = Start-Process -FilePath $output -WorkingDirectory $OutputRoot -WindowStyle Hidden -PassThru
 try {
@@ -265,4 +340,4 @@ try {
     }
     if ($process.ExitCode -ne 0) { throw "semantic fixture failed with check $($process.ExitCode)" }
 } finally { $process.Dispose() }
-Write-Host 'PASS ordinary assemblies, keyword boundaries, class members, qualified base calls, array bounds, resource machine code, native register preservation, generic returns and DLL text/binary buffers, implicit array references, binary equality, DLL array element buffers, DLL structs, pointer lifetime and module initialization'
+Write-Host 'PASS ordinary assemblies, keyword boundaries, class members, qualified base calls, array bounds, resource machine code, native register preservation, generic returns and DLL text/binary buffers, implicit array references, binary equality, DLL array element buffers, DLL structs, pointer lifetime, module initialization, omitted binary/array parameters and timer dispatch'

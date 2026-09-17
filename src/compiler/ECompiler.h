@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "CompilerTarget.h"
+#include "SemanticOptimization.h"
 
 namespace ecompiler {
 
@@ -69,6 +70,13 @@ struct Options {
 	unsigned int blackMoonTimeoutSeconds = 120;
 	// 默认生成 PDB 调试符号；可通过 --no-pdb 关闭。
 	bool generatePdb = true;
+	// 默认启用已验收的标量优化；可显式选择基线进行差分。
+	SemanticOptimization semanticOptimization = SemanticOptimization::Typed;
+	bool semanticOptimizationExplicit = false;
+	// 可选尺寸优先代码生成；不改变语义优化档位。
+	bool optimizeForSize = false;
+	bool codegenOptimizationExplicit = false;
+	std::filesystem::path optimizationReportPath;
 	bool keepObject = true;
 	bool buildDll = false;
 	ExecutableSubsystem subsystem = ExecutableSubsystem::Auto;
