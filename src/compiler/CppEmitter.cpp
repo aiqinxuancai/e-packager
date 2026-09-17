@@ -4186,6 +4186,33 @@ static LRESULT CALLBACK FormProc(HWND window,UINT message,WPARAM wParam,LPARAM l
     return DefWindowProcW(window,message,wParam,lParam);
 }
 static LRESULT CALLBACK UnitSubclassProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam,UINT_PTR,DWORD_PTR) {
+    if(message==WM_ERASEBKGND) {
+        const Unit* unit=UnitFromWindow(window);
+        // 分组框作为父窗口时，也必须为子控件的透明主题边角提供完整背景。
+        if(unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"group")==0) {
+            RECT rect{};GetClientRect(window,&rect);
+            HBRUSH brush=unit->hasBackColor?CreateSolidBrush(unit->backColor):GetSysColorBrush(COLOR_BTNFACE);
+            FillRect(reinterpret_cast<HDC>(wParam),&rect,brush);
+            if(unit->hasBackColor)DeleteObject(brush);
+            return 1;
+        }
+    }
+    if(message==WM_NCCALCSIZE) {
+        const LRESULT result=DefSubclassProc(window,message,wParam,lParam);
+        const Unit* unit=UnitFromWindow(window);
+        if(unit!=nullptr&&unit->type!=nullptr&&std::strcmp(unit->type,"edit")==0&&
+           (GetWindowLongPtrW(window,GWL_STYLE)&ES_MULTILINE)==0&&lParam!=0) {
+            RECT* rect=wParam!=FALSE?&reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam)->rgrc[0]:reinterpret_cast<RECT*>(lParam);
+            LOGFONTW font{};const HFONT handle=reinterpret_cast<HFONT>(SendMessageW(window,WM_GETFONT,0,0));
+            const int fontHeight=handle!=nullptr&&GetObjectW(handle,sizeof(font),&font)!=0?std::abs(font.lfHeight):0;
+            const int available=rect->bottom-rect->top;
+            if(fontHeight>0&&available>fontHeight) {
+                const int padding=available-fontHeight;
+                rect->top+=padding/2;rect->bottom-=padding-padding/2;
+            }
+        }
+        return result;
+    }
     if(message==WM_SETCURSOR) {
         if(const Unit* unit=UnitFromWindow(window);unit!=nullptr&&unit->cursor!=nullptr) { SetCursor(unit->cursor);return TRUE; }
     }
@@ -4747,6 +4774,12 @@ static bool GetMonthRange(HWND window,SYSTEMTIME* minimum,SYSTEMTIME* maximum) {
     if(maximum!=nullptr&&((flags&GDTR_MAX)!=0)){*maximum=range[1];found=true;}
     return found;
 }
+static DWORD WindowBorderStyle(int border) {
+    return border==5?WS_BORDER:0;
+}
+static DWORD WindowBorderExtendedStyle(int border) {
+    switch(border){case 1:case 3:return WS_EX_CLIENTEDGE;case 2:case 4:return WS_EX_STATICEDGE;default:return 0;}
+}
 static DWORD Style(const Spec& spec) {
     const char* type=spec.type;
     if(std::strcmp(type,"button")==0) {
@@ -4773,13 +4806,14 @@ static DWORD Style(const Spec& spec) {
     if(std::strcmp(type,"radio")==0)return WS_CHILD|WS_TABSTOP|BS_AUTORADIOBUTTON|BS_NOTIFY|BS_MULTILINE;
     if(std::strcmp(type,"group")==0)return WS_CHILD|BS_GROUPBOX;
     if(std::strcmp(type,"edit")==0) {
-        DWORD style=WS_CHILD|WS_BORDER|WS_TABSTOP|ES_LEFT;
+        DWORD style=WS_CHILD|WS_CLIPSIBLINGS|WS_TABSTOP|ES_LEFT|WindowBorderStyle(XmlAttributeInteger(spec,L"边框",1));
         if(XmlAttributeBoolean(spec,L"是否允许多行",false)) {
-            style|=ES_MULTILINE|ES_AUTOVSCROLL;
+            style|=ES_MULTILINE|ES_AUTOVSCROLL|ES_WANTRETURN;
             const int scrollBar=XmlAttributeInteger(spec,L"滚动条",2);
             if(scrollBar==1||scrollBar==3)style|=WS_HSCROLL|ES_AUTOHSCROLL;
             if(scrollBar==2||scrollBar==3)style|=WS_VSCROLL;
         }
+        else style|=ES_AUTOHSCROLL;
         const int inputMode=XmlAttributeInteger(spec,L"输入方式",0);
         if(inputMode==1)style|=ES_READONLY;
         if(inputMode==2)style|=ES_PASSWORD;
@@ -4939,8 +4973,8 @@ static void ConfigureEditSpin(HWND edit,Unit& unit,bool visible,bool disabled) {
     SetWindowPos(spin,nullptr,rect.right,rect.top,spinWidth,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE);
 }
 static void SetWindowBorder(HWND window,int border) {
-    if(window==nullptr)return;LONG_PTR ex=GetWindowLongPtrW(window,GWL_EXSTYLE);ex&=~(WS_EX_CLIENTEDGE|WS_EX_STATICEDGE);LONG_PTR style=GetWindowLongPtrW(window,GWL_STYLE);style&=~WS_BORDER;
-    switch(border){case 1:case 3:ex|=WS_EX_CLIENTEDGE;break;case 2:case 4:ex|=WS_EX_STATICEDGE;break;case 5:style|=WS_BORDER;break;default:break;}
+    if(window==nullptr)return;const LONG_PTR oldEx=GetWindowLongPtrW(window,GWL_EXSTYLE),oldStyle=GetWindowLongPtrW(window,GWL_STYLE);LONG_PTR ex=oldEx&~(WS_EX_CLIENTEDGE|WS_EX_STATICEDGE);LONG_PTR style=oldStyle&~WS_BORDER;
+    ex|=WindowBorderExtendedStyle(border);style|=WindowBorderStyle(border);if(ex==oldEx&&style==oldStyle)return;
     SetWindowLongPtrW(window,GWL_EXSTYLE,ex);SetWindowLongPtrW(window,GWL_STYLE,style);SetWindowPos(window,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_FRAMECHANGED);
 }
 static void ApplyAttributes(HWND window,const Spec& spec) {
@@ -5295,7 +5329,9 @@ static void CreateUnit(const Spec& spec) {
     if(style==0||className==nullptr)return;
     if(!spec.tabStop)style&=~WS_TABSTOP;
     if(spec.visible)style|=WS_VISIBLE;
-    const DWORD exStyle=strcmp(spec.type,"container")==0?WS_EX_TRANSPARENT:0;
+    DWORD exStyle=strcmp(spec.type,"container")==0?WS_EX_TRANSPARENT:0;
+    if(strcmp(spec.type,"edit")==0||strcmp(spec.type,"date")==0)
+        exStyle|=WindowBorderExtendedStyle(XmlAttributeInteger(spec,L"边框",1));
     const std::wstring caption=InitialCaption(spec);
     HWND window=CreateWindowExW(exStyle,className,caption.c_str(),style,
         spec.left,spec.top,spec.width,spec.height,parent,reinterpret_cast<HMENU>(static_cast<UINT_PTR>(spec.id)),instance,nullptr);
@@ -5335,7 +5371,9 @@ static void CreateUnit(const Spec& spec) {
         }
         ShowWindow(window,SW_HIDE);
     }
-    SetWindowPos(window,nullptr,spec.left,spec.top,spec.width,spec.height,SWP_NOZORDER|SWP_NOACTIVATE);
+    UINT positionFlags=SWP_NOZORDER|SWP_NOACTIVATE;
+    if(std::strcmp(spec.type,"edit")==0&&(GetWindowLongPtrW(window,GWL_STYLE)&ES_MULTILINE)==0)positionFlags|=SWP_FRAMECHANGED;
+    SetWindowPos(window,nullptr,spec.left,spec.top,spec.width,spec.height,positionFlags);
     if(!spec.visible)ShowWindow(window,SW_HIDE);
     if(spec.disabled)EnableWindow(window,FALSE);
     if(strcmp(spec.type,"tab")==0&&XmlAttributeBoolean(spec,L"隐藏自身",false))ShowWindow(window,SW_HIDE);
