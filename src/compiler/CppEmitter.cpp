@@ -5,6 +5,8 @@
 #include <Windows.h>
 #include "NativeWindowControl.h"
 #include "NativeX86Runtime.h"
+#include "NativeX86Access.h"
+#include "NativeX86Method.h"
 #include "PlatformDllRuntime.h"
 #include "BinaryValueRuntime.h"
 #include "../PathHelper.h"
@@ -315,13 +317,34 @@ static_assert(sizeof(MData)==12);
 using ExecuteCommand=void (__cdecl*)(MData*,int,MData*);
 
 struct FieldDesc { std::uint32_t type; std::size_t offset; bool array; std::initializer_list<int> dimensions; };
+struct Value;
 struct TypeDesc {
     std::uint32_t type; std::size_t size; const FieldDesc* fields; std::size_t fieldCount;
     ExecuteCommand constructor; ExecuteCommand destructor; ExecuteCommand copier; bool enumeration;
+    void (*nativeStoreFields)(Value&,unsigned char*);
+    void (*nativeReadFields)(Value&,const unsigned char*);
+    bool nativeScalarFields;
 };
 struct Value;
 struct NativeStorage;
-static std::vector<NativeStorage*>& NativeObjects() { static auto* objects=new std::vector<NativeStorage*>;return *objects; }
+// 稳定槽位允许同步期间删除嵌套存储，无需每次复制全表并增减全部 shared_ptr 引用。
+struct NativeObjectRegistry {
+    struct Slot { NativeStorage* memory;std::size_t next; };
+    static constexpr std::size_t none=static_cast<std::size_t>(-1);
+    std::vector<Slot> slots;
+    std::size_t freeHead=none;
+    unsigned iterations=0;
+    std::size_t Add(NativeStorage* memory) {
+        if(iterations==0 && freeHead!=none) {
+            const auto index=freeHead;freeHead=slots[index].next;slots[index].memory=memory;return index;
+        }
+        slots.push_back({memory,none});return slots.size()-1;
+    }
+    void Remove(std::size_t index) {
+        slots[index]={nullptr,freeHead};freeHead=index;
+    }
+};
+static NativeObjectRegistry& NativeObjects() { static auto* objects=new NativeObjectRegistry;return *objects; }
 struct NativeStorage {
     Value* owner=nullptr;
     void* pointer=nullptr;
@@ -331,8 +354,16 @@ struct NativeStorage {
     HLOCAL platformMemory=nullptr;
     std::size_t platformCapacity=0;
     bool storing=false;
-    NativeStorage() { NativeObjects().push_back(this); }
-    ~NativeStorage() { if(platformMemory)LocalFree(platformMemory);if(dllMemory)VirtualFree(dllMemory,0,MEM_RELEASE);auto& objects=NativeObjects();objects.erase(std::remove(objects.begin(),objects.end(),this),objects.end()); }
+    const TypeDesc* nativeDescriptor=nullptr;
+    unsigned nativePrefix=0;
+    const void* const* nativeTable=nullptr;
+    std::uint64_t nativeStorePass=0,nativeReadPass=0;
+    std::vector<unsigned char> nativeSnapshot;
+    // 支持库可跨命令保留字节集地址；其 ABI 缓冲随源 Value 存活。
+    std::vector<unsigned char> fneBinary;
+    std::size_t registryIndex;
+    NativeStorage():registryIndex(NativeObjects().Add(this)) {}
+    ~NativeStorage() { if(platformMemory)LocalFree(platformMemory);if(dllMemory)VirtualFree(dllMemory,0,MEM_RELEASE);NativeObjects().Remove(registryIndex); }
 };
 struct Value {
     std::uint32_t declared=T_NULL, type=T_NULL;
@@ -423,6 +454,24 @@ static double ToNumber(const Value& value) {
     if(value.byteReference)return *value.byteReference;
     if(value.type==T_TEXT) return value.text.empty()?0:std::strtod(value.text.c_str(),nullptr);
     return (value.type==T_FLOAT||value.type==T_DOUBLE||value.type==T_DATE)?value.number:static_cast<double>(value.integer);
+}
+// 编译期生成的原生标量字段转换器；不查询类型表，也不分配临时 Value。
+template<class T> static void NativeStoreFlatField(const Value& value,unsigned char* data) {
+    T number{};
+    if(!value.missing) {
+        if constexpr(std::is_floating_point_v<T>)number=static_cast<T>(ToNumber(value));
+        else number=static_cast<T>(ToInteger(value));
+    }
+    std::memcpy(data,&number,sizeof(number));
+}
+template<class T> static void NativeReadFlatField(Value& value,const unsigned char* data) {
+    T number;std::memcpy(&number,data,sizeof(number));
+    if(value.byteReference) {
+        *value.byteReference=static_cast<unsigned char>(number);
+        value.integer=*value.byteReference;value.number=static_cast<double>(value.integer);
+    } else {
+        value.integer=static_cast<long long>(number);value.number=static_cast<double>(number);
+    }
 }
 static std::string ToText(const Value& value);
 static std::wstring RuntimeWide(const std::string& text) {
@@ -980,7 +1029,17 @@ static void MarshalValue(Value& value,std::uint32_t expected,MData& out,Arena& a
     case T_INT64:out.int64Value=ToInteger(value);break;
     case T_FLOAT:out.floatValue=static_cast<float>(ToNumber(value));break; case T_DOUBLE:case T_DATE:out.doubleValue=ToNumber(value);break;
     case T_TEXT:out.textValue=value.text.data();break;
-    case T_BIN: { auto* block=static_cast<unsigned char*>(RuntimeAlloc(8+value.bytes.size())); if(block==nullptr)break; *reinterpret_cast<int*>(block)=1; *reinterpret_cast<int*>(block+4)=static_cast<int>(value.bytes.size()); if(!value.bytes.empty())std::memcpy(block+8,value.bytes.data(),value.bytes.size()); out.pointerValue=block; arena.ownedValues.push_back(block); break; }
+    case T_BIN: {
+        // 按值传递不等于临时缓冲：内存 ZIP 等对象会借用输入地址直到关闭。
+        if(!value.native)value.native=std::make_shared<NativeStorage>();
+        value.native->owner=&value;
+        auto& block=value.native->fneBinary;
+        block.resize(8+value.bytes.size());
+        const int header[]={1,static_cast<int>(value.bytes.size())};
+        std::memcpy(block.data(),header,sizeof(header));
+        if(!value.bytes.empty())std::memcpy(block.data()+8,value.bytes.data(),value.bytes.size());
+        out.pointerValue=block.data();break;
+    }
     default:
         PrepareObjectWithArena(value,arena); out.pointerValue=value.object.data();
         Writeback objectWriteback; objectWriteback.value=&value; objectWriteback.type=type; objectWriteback.objectData=value.object.data(); arena.writebacks.push_back(objectWriteback);
@@ -1593,6 +1652,47 @@ private:
 			}
 			body_ << "};\n";
 		}
+		// 字段布局在编译期已知，生成标量及嵌套引用读写器，避免运行时逐字段反射。
+		std::set<std::size_t> nativeFlatTypes, nativeLayoutTypes;
+		for (std::size_t typeIndex = 0; typeIndex < program_.types.size(); ++typeIndex) {
+			const auto& type = program_.types[typeIndex];
+			if (type.isEnum || program_.targetArchitecture != TargetArchitecture::X86) continue;
+			nativeLayoutTypes.insert(typeIndex);
+			if (std::all_of(type.elements.begin(), type.elements.end(), [](const TypeElement& field) {
+				if (field.type.isArray) return false;
+				switch (field.type.code) {
+				case kTypeByte: case kTypeShort: case kTypeInt: case kTypeInt64: case kTypeFloat:
+				case kTypeDouble: case kTypeBool: case kTypeDateTime: case kTypeSubroutine: return true;
+				default: return false;
+				}
+			})) nativeFlatTypes.insert(typeIndex);
+			for (const bool store : {true, false}) {
+				body_ << "static void native_" << (store ? "store_" : "read_") << typeIndex
+					<< (store ? "(Value& value,unsigned char* data){\n" : "(Value& value,const unsigned char* data){\n");
+				for (std::size_t i = 0; i < type.elements.size(); ++i) {
+					const auto& field = type.elements[i];
+					std::string scalar;
+					switch (field.type.code) {
+					case kTypeByte: scalar = "unsigned char"; break;
+					case kTypeShort: scalar = "short"; break;
+					case kTypeInt64: scalar = "long long"; break;
+					case kTypeFloat: scalar = "float"; break;
+					case kTypeDouble: case kTypeDateTime: scalar = "double"; break;
+					case kTypeInt: case kTypeBool: case kTypeSubroutine: scalar = "int"; break;
+					default: break;
+					}
+					if (field.type.isArray || scalar.empty()) {
+						if (store) body_ << "    {unsigned slot;NativeStore(value.fields[" << i
+							<< "],&slot);std::memcpy(data+" << field.offset << ",&slot,4);}" << '\n';
+						else body_ << "    NativeRead(value.fields[" << i << "],data+" << field.offset << ");\n";
+						continue;
+					}
+					body_ << "    Native" << (store ? "Store" : "Read") << "FlatField<" << scalar
+						<< ">(value.fields[" << i << "],data+" << field.offset << ");\n";
+				}
+				body_ << "}\n";
+			}
+		}
 		body_ << "static const TypeDesc type_table[]={\n";
 		for (std::size_t typeIndex = 0; typeIndex < program_.types.size(); ++typeIndex) {
 			const TypeInfo& type = program_.types[typeIndex];
@@ -1603,7 +1703,10 @@ private:
 			body_ << "," << (lifecycle.constructor.empty() ? "nullptr" : "&" + lifecycle.constructor)
 				<< "," << (lifecycle.destructor.empty() ? "nullptr" : "&" + lifecycle.destructor)
 				<< "," << (lifecycle.copier.empty() ? "nullptr" : "&" + lifecycle.copier)
-				<< "," << (type.isEnum ? "true" : "false");
+				<< "," << (type.isEnum ? "true" : "false")
+				<< "," << (nativeLayoutTypes.contains(typeIndex) ? "&native_store_" + std::to_string(typeIndex) : "nullptr")
+				<< "," << (nativeLayoutTypes.contains(typeIndex) ? "&native_read_" + std::to_string(typeIndex) : "nullptr")
+				<< "," << (nativeFlatTypes.contains(typeIndex) ? "true" : "false");
 			body_ << "},\n";
 		}
 		body_ << "};\nconst TypeDesc* TypeTable(){return type_table;}\n"
@@ -2678,7 +2781,13 @@ private:
 				arguments += "Arg::Temp(Missing()),";
 			}
 			else {
-				arguments += EmitArg(method, *call.children[index], byReference) + ',';
+                // 非参考字节集也保留变量身份；ABI 按值/传址仍由支持库元数据决定。
+                const auto actualType = Infer(method, *call.children[index]);
+                const bool binaryValue = argumentType == kTypeBinary ||
+                    ((argumentType == kTypeAll || argumentType == kTypeNull) && actualType.valid &&
+                        actualType.code == kTypeBinary && !actualType.isArray);
+                const TypeRef bufferType = binaryValue ? TypeRef{kTypeBinary, false, true} : TypeRef{};
+                arguments += EmitArg(method, *call.children[index], byReference, bufferType) + ',';
 			}
 		}
 		arguments += '}'; specs += '}';
@@ -2999,7 +3108,8 @@ private:
 			case StatementKind::MachineCode: {
 				if (program_.targetArchitecture != TargetArchitecture::X86) return Fail(method.sourceFile + ": machine_code_internal_error");
 				const std::string helper = "ecompiler_machine_" + std::to_string(method.id) + "_" + std::to_string(statement.sourceLine);
-				Line(indent, "{ Value result; if(__frame.Execute(reinterpret_cast<void*>(&" + helper + ")," + Hex(method.returnType.code) + ",result)) return result; }");
+				constexpr const char* accessNames[]={"NativeMemoryAccess::Full","NativeMemoryAccess::ReadOnly","NativeMemoryAccess::FrameOnly"};
+				Line(indent, "{ Value result; if(__frame.Execute(reinterpret_cast<void*>(&" + helper + ")," + Hex(method.returnType.code) + ",result," + std::string(accessNames[static_cast<int>(AnalyzeNativeX86Access(program_, method, statement.machineCode))]) + "," + (method.ownerType.valid ? "true" : "false") + ")) return result; }");
 				break;
 			}
 			}
@@ -3093,7 +3203,11 @@ private:
 			}
 			body_ << "return value;}();ConstructSemantic(value);return value;}\n";
 		}
-		if (program_.targetArchitecture == TargetArchitecture::X86) EmitNativeMachineBlocks(method, method.body);
+		const auto nativeMethod = GenerateNativeX86Method(program_, method);
+        if (nativeMethod) {
+            body_ << "\nstatic void __declspec(naked) ecompiler_native_method_" << method.id
+                << "(){\n    __asm {\n" << nativeMethod->assembly << "    }\n}\n";
+        } else if (program_.targetArchitecture == TargetArchitecture::X86) EmitNativeMachineBlocks(method, method.body);
 		const Statement* machineStatement = nullptr;
 		if (program_.targetArchitecture != TargetArchitecture::X86) for (const Statement& statement : method.body) {
 			if (statement.kind == StatementKind::MachineCode) {
@@ -3150,7 +3264,10 @@ private:
 			for (std::size_t index = 0; index < method.locals.size(); ++index) if (!method.locals[index].isStatic) locals += "&v[" + std::to_string(index) + "],";
 			Line(1, "NativeFrame __frame(p," + locals + "},a," + specs + "},self);");
 		}
-		if (!EmitStatements(method, method.body, 1)) return false;
+		if (nativeMethod) {
+            constexpr const char* accessNames[]={"NativeMemoryAccess::Full","NativeMemoryAccess::ReadOnly","NativeMemoryAccess::FrameOnly"};
+            Line(1, "{Value result;if(__frame.Execute(reinterpret_cast<void*>(&ecompiler_native_method_" + std::to_string(method.id) + ")," + Hex(method.returnType.code) + ",result," + accessNames[static_cast<int>(nativeMethod->access)] + "," + (method.ownerType.valid ? "true" : "false") + "))return result;}");
+        } else if (!EmitStatements(method, method.body, 1)) return false;
 		Line(1, "return Empty();"); body_ << "}\n"; return true;
 	}
 

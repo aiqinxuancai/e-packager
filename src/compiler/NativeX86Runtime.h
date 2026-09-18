@@ -113,6 +113,7 @@ static void __declspec(naked) NativeMachineComplete() {
     }
 }
 static_assert(offsetof(NativeRun,hostStack)==16 && offsetof(NativeRun,returned)==32 && offsetof(NativeRun,ax)==48 && offsetof(NativeRun,di)==68);
+enum class NativeMemoryAccess { Full, ReadOnly, FrameOnly };
 struct NativeParameter { bool reference, nullable; };
 struct NativeFrame;
 static thread_local NativeFrame* nativeFrame=nullptr;
@@ -122,6 +123,18 @@ static NativeStorage& NativeStorageFor(Value& value) {
     if(!value.native) value.native=std::make_shared<NativeStorage>();
     value.native->owner=&value;
     return *value.native;
+}
+// 每次边界同步只处理一个对象一次，包含栈发布和嵌套字段递归访问。
+static thread_local std::uint64_t nativeSyncSequence=0,nativeSyncPass=0;
+struct NativeSyncPassScope {
+    std::uint64_t previous=nativeSyncPass;
+    NativeSyncPassScope() { nativeSyncPass=++nativeSyncSequence; }
+    ~NativeSyncPassScope() { nativeSyncPass=previous; }
+};
+static const TypeDesc* NativeDescriptor(const Value& value) {
+    if(value.native && value.native->nativeDescriptor && value.native->nativeDescriptor->type==value.type)
+        return value.native->nativeDescriptor;
+    return FindType(value.type);
 }
 static void NativeStore(Value& value,void* destination);
 static void NativeRead(Value& value,const void* source);
@@ -149,8 +162,13 @@ template<class T> static void NativeReadNumbers(Value& value,const unsigned char
 static void NativeStore(Value& value,void* destination) {
     std::memset(destination,0,NativeWidth(value));
     if(value.missing)return;
-    if(value.declaredArray || value.type==T_BIN || value.type==T_TEXT || FindType(value.type)) {
+    const auto* descriptor=NativeDescriptor(value);
+    if(value.declaredArray || value.type==T_BIN || value.type==T_TEXT || descriptor) {
         auto& memory=NativeStorageFor(value);
+        if(nativeSyncPass && memory.nativeStorePass==nativeSyncPass) {
+            std::memcpy(destination,&memory.pointer,4);return;
+        }
+        memory.nativeStorePass=nativeSyncPass;
         if(!memory.storing) {
             memory.storing=true;
             if(value.type==T_TEXT && !value.declaredArray) memory.pointer=value.text.data();
@@ -185,13 +203,18 @@ static void NativeStore(Value& value,void* destination) {
                     }
                 }
                 memory.pointer=memory.bytes.data();
-            } else if(const auto* desc=FindType(value.type)) {
-                const auto* table=NativeClassTable(value.type);
+            } else if(const auto* desc=descriptor) {
+                const auto* table=memory.nativeDescriptor==desc?memory.nativeTable:NativeClassTable(value.type);
+                memory.nativeTable=table;
                 const unsigned prefix=table?4:0;
+                memory.nativeDescriptor=desc;memory.nativePrefix=prefix;
                 memory.bytes.resize(desc->size+prefix);
                 memory.pointer=memory.bytes.data();
                 if(table) *reinterpret_cast<const void* const**>(memory.bytes.data())=table;
-                for(std::size_t i=0;i<desc->fieldCount;++i) {
+                if(desc->nativeStoreFields) {
+                    desc->nativeStoreFields(value,memory.bytes.data()+prefix);
+                    if(desc->nativeScalarFields)memory.nativeSnapshot=memory.bytes;
+                } else for(std::size_t i=0;i<desc->fieldCount;++i) {
                     unsigned char slot[8]{};NativeStore(value.fields[i],slot);
                     const auto& field=desc->fields[i];
                     const auto size=(field.array||field.type==T_TEXT||field.type==T_BIN||FindType(field.type))?4:ScalarSize(field.type);
@@ -210,12 +233,24 @@ static void NativeStore(Value& value,void* destination) {
     }
 }
 static void NativeRead(Value& value,const void* source) {
+    if(nativeSyncPass && value.native && value.native->pointer &&
+       (value.declaredArray || value.type==T_TEXT || value.type==T_BIN || NativeDescriptor(value)) &&
+       *static_cast<void* const*>(source)==value.native->pointer) {
+        if(value.native->nativeReadPass==nativeSyncPass)return;
+        value.native->nativeReadPass=nativeSyncPass;
+    }
     if(value.byteReference) { *value.byteReference=*static_cast<const unsigned char*>(source);value.integer=*value.byteReference;value.number=static_cast<double>(value.integer);return; }
     if(value.declaredArray) {
         const auto* pointer=*static_cast<unsigned char* const*>(source);
         if(!pointer)return;
         const unsigned rank=*reinterpret_cast<const unsigned*>(pointer);
+        // 原生改维会销毁旧成员；先保留其存储，直到新成员完成从原生指针回读。
+        std::vector<std::shared_ptr<NativeStorage>> resizedStorage;
         if(value.dimensions.size()!=rank || std::memcmp(value.dimensions.data(),pointer+4,rank*4)!=0) {
+            for(const auto& slot:NativeObjects().slots) {
+                auto* memory=slot.memory;
+                if(memory && memory->owner)resizedStorage.push_back(memory->owner->native);
+            }
             std::vector<int> dimensions(rank);
             std::memcpy(dimensions.data(),pointer+4,rank*4);
             Redim(value,dimensions,false);
@@ -242,10 +277,16 @@ static void NativeRead(Value& value,const void* source) {
         else value.bytes.clear();
         return;
     }
-    if(const auto* desc=FindType(value.type)) {
+    if(const auto* desc=NativeDescriptor(value)) {
         const auto* pointer=*static_cast<unsigned char* const*>(source);
         if(!pointer)return;
-        const unsigned prefix=NativeClassTable(value.type)?4:0;
+        const unsigned prefix=value.native && value.native->nativeDescriptor==desc?value.native->nativePrefix:(NativeClassTable(value.type)?4:0);
+        if(desc->nativeReadFields) {
+            if(desc->nativeScalarFields && value.native && pointer==value.native->bytes.data() && value.native->nativeSnapshot==value.native->bytes)return;
+            desc->nativeReadFields(value,pointer+prefix);
+            if(desc->nativeScalarFields && value.native && pointer==value.native->bytes.data())value.native->nativeSnapshot=value.native->bytes;
+            return;
+        }
         for(std::size_t i=0;i<desc->fieldCount;++i) NativeRead(value.fields[i],pointer+prefix+desc->fields[i].offset);
         return;
     }
@@ -260,7 +301,7 @@ static void NativeRead(Value& value,const void* source) {
     value.number=static_cast<double>(value.integer);
 }
 static bool NativeIndirect(const Value& value) {
-    const auto* type=FindType(value.type);
+    const auto* type=NativeDescriptor(value);
     return !value.declaredArray && (value.type==T_TEXT || value.type==T_BIN || (type && !type->enumeration));
 }
 static void* NativeReference(Value& value) {
@@ -274,24 +315,52 @@ static void* NativeReference(Value& value) {
     return &value.integer;
 }
 static void NativeSyncObjects(bool store) {
-    std::vector<std::shared_ptr<NativeStorage>> objects;
-    for(auto* memory:NativeObjects()) if(memory->owner)objects.push_back(memory->owner->native);
-    // 机器码可将结构体、数组及缓冲区的地址传给 DLL；所有已发布的原生存储都要同步。
-    for(auto& memory:objects) if(memory->owner && memory->pointer &&
-        (NativeIndirect(*memory->owner) || memory->owner->declaredArray)) {
-        if(store) { unsigned slot;NativeStore(*memory->owner,&slot); }
-        else NativeRead(*memory->owner,&memory->pointer);
+    NativeSyncPassScope pass;
+    if(store)NativeSyncFrames();
+    auto& registry=NativeObjects();
+    struct Iteration {
+        NativeObjectRegistry& registry;
+        explicit Iteration(NativeObjectRegistry& value):registry(value) { ++registry.iterations; }
+        ~Iteration() { --registry.iterations; }
+    } iteration(registry);
+    const auto count=registry.slots.size();
+    for(std::size_t index=0;index<count;++index) {
+        auto* memory=registry.slots[index].memory;
+        if(!memory || !memory->owner || !memory->pointer)continue;
+        auto& value=*memory->owner;
+        if(store && value.missing)continue;
+        auto& lastPass=store?memory->nativeStorePass:memory->nativeReadPass;
+        if(lastPass==nativeSyncPass)continue;
+        const auto* desc=memory->nativeDescriptor;
+        if(desc && desc->type==value.type && !value.declaredArray && desc->nativeStoreFields) {
+            lastPass=nativeSyncPass;
+            if(store) {
+                memory->pointer=memory->bytes.data();
+                if(memory->nativeTable)*reinterpret_cast<const void* const**>(memory->bytes.data())=memory->nativeTable;
+                desc->nativeStoreFields(value,memory->bytes.data()+memory->nativePrefix);
+                if(desc->nativeScalarFields)memory->nativeSnapshot=memory->bytes;
+            } else if(!desc->nativeScalarFields || memory->pointer!=memory->bytes.data() || memory->nativeSnapshot!=memory->bytes) {
+                auto keepAlive=desc->nativeScalarFields?std::shared_ptr<NativeStorage>{}:value.native;
+                desc->nativeReadFields(value,static_cast<const unsigned char*>(memory->pointer)+memory->nativePrefix);
+                if(desc->nativeScalarFields && memory->pointer==memory->bytes.data())memory->nativeSnapshot=memory->bytes;
+            }
+        } else if(NativeIndirect(value) || value.declaredArray) {
+            if(store) { unsigned slot;NativeStore(value,&slot); }
+            else { auto keepAlive=value.native;NativeRead(value,&memory->pointer); }
+        }
     }
 }
 static Value* NativeResolveSelf(void* handle) {
     if(!handle)return nullptr;
     const void* pointer=*static_cast<void**>(handle);
-    for(auto* memory:NativeObjects()) if(memory->pointer==pointer && memory->owner && NativeClassTable(memory->owner->type)) return memory->owner;
+    for(const auto& slot:NativeObjects().slots) {
+        auto* memory=slot.memory;
+        if(memory && memory->pointer==pointer && memory->owner && NativeClassTable(memory->owner->type))return memory->owner;
+    }
     return nullptr;
 }
 static thread_local unsigned nativeExternalDepth=0;
 static void NativeEnterExternal() {
-    NativeSyncFrames();
     NativeSyncObjects(true);
     ++nativeExternalDepth;
 }
@@ -307,7 +376,6 @@ struct NativeCallbackScope {
         nativeExternalDepth=0;
     }
     ~NativeCallbackScope() {
-        NativeSyncFrames();
         NativeSyncObjects(true);
         nativeExternalDepth=previous;
     }
@@ -378,9 +446,13 @@ struct NativeFrame {
             } else if(!returned) NativeRead(parameters[i],NativeIndirect(parameters[i])?*reinterpret_cast<void* const*>(slot):slot);
         }
     }
-    bool Execute(void* code,std::uint32_t type,Value& result) {
-        NativeSyncFrames();
-        NativeSyncObjects(true);
+    bool Execute(void* code,std::uint32_t type,Value& result,NativeMemoryAccess access=NativeMemoryAccess::Full,bool expectedSelf=false) {
+        // 字节引用可能指向不足四字节的子缓冲区，不套用引用槽证明。
+        if(access==NativeMemoryAccess::FrameOnly && expectedSelf!=(self!=nullptr))access=NativeMemoryAccess::Full;
+        if(access==NativeMemoryAccess::FrameOnly)for(std::size_t i=0;i<parameters.size();++i)
+            if(specs[i].reference && (i<arguments.size()?arguments[i].Get():parameters[i]).byteReference)access=NativeMemoryAccess::Full;
+        if(access==NativeMemoryAccess::FrameOnly) { NativeSyncPassScope pass;Store(); }
+        else NativeSyncObjects(true);
         NativeRun run{storage.data(),static_cast<unsigned>(storage.size()),localSize,code};
         std::memcpy(&run.ax,registers,sizeof(registers));
         run.floating=type==T_FLOAT||type==T_DOUBLE||type==T_DATE;
@@ -390,7 +462,7 @@ struct NativeFrame {
         nativeRun=previous;
         std::memcpy(registers,&run.ax,sizeof(registers));
         Read(run.returned!=0);
-        NativeSyncObjects(false);
+        if(access==NativeMemoryAccess::Full)NativeSyncObjects(false);
         if(run.returned) {
             const auto actualType=type==T_ALL?run.cx:type;
             result=MakeVar(actualType,false);

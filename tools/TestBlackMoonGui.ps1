@@ -41,8 +41,8 @@ public static class BlackMoonGuiTest {
   IntPtr result;IntPtr buffer=text==null?Marshal.AllocHGlobal(2048):Marshal.StringToHGlobalUni(text);
   try {if(SendMessageTimeoutW((IntPtr)h,text==null?13u:12u,(IntPtr)1024,buffer,2,10000,out result)==IntPtr.Zero)throw new Exception("Edit timed out");return text??Marshal.PtrToStringUni(buffer);}finally{Marshal.FreeHGlobal(buffer);}
  }
- public static Window Read(IntPtr h) {var s=new StringBuilder(512);var c=new StringBuilder(256);GetWindowText(h,s,512);GetClassName(h,c,256);Rect r;GetWindowRect(h,out r);return new Window{Handle=h.ToInt64(),Title=s.ToString(),Class=c.ToString(),Left=r.Left,Top=r.Top,Width=r.Right-r.Left,Height=r.Bottom-r.Top};}
- public static Window[] Windows(int pid) {var a=new List<Window>();EnumWindows((h,l)=>{uint p;GetWindowThreadProcessId(h,out p);if(p==pid&&IsWindowVisible(h)){a.Add(Read(h));EnumChildWindows(h,(ch,cl)=>{if(IsWindowVisible(ch))a.Add(Read(ch));return true;},IntPtr.Zero);}return true;},IntPtr.Zero);return a.ToArray();}
+ public static Window Read(IntPtr h,bool readText=true) {var s=new StringBuilder(512);var c=new StringBuilder(256);if(readText)GetWindowText(h,s,512);GetClassName(h,c,256);Rect r;GetWindowRect(h,out r);return new Window{Handle=h.ToInt64(),Title=s.ToString(),Class=c.ToString(),Left=r.Left,Top=r.Top,Width=r.Right-r.Left,Height=r.Bottom-r.Top};}
+ public static Window[] Windows(int pid,bool readText=true) {var a=new List<Window>();EnumWindows((h,l)=>{uint p;GetWindowThreadProcessId(h,out p);if(p==pid&&IsWindowVisible(h)){a.Add(Read(h,readText));EnumChildWindows(h,(ch,cl)=>{if(IsWindowVisible(ch))a.Add(Read(ch,readText));return true;},IntPtr.Zero);}return true;},IntPtr.Zero);return a.ToArray();}
 }
 '@
 function Assert-Layout($Windows){
@@ -87,22 +87,26 @@ $result=[ordered]@{Executable=$Executable;Passed=$false}
 try{
     do {
         if($process.HasExited){throw "Exited during startup: $($process.ExitCode)"}
-        $windows=@([BlackMoonGuiTest]::Windows($process.Id))
+        # 启动轮询只读取窗口属性；完整文字与布局检查放到窗口响应之后。
+        $windows=@([BlackMoonGuiTest]::Windows($process.Id,$false))
         $main=$windows | Where-Object Class -eq 'zyWindow' | Select-Object -First 1
         $ready=$false
-        if($main){
-            try { $null=Assert-Layout $windows; $ready=$true } catch { $layoutError=$_.Exception.Message }
-        }
-        if($ready){
+        $expectedCount=if($Mode -eq 'workbench'){32}else{5}
+        if($main -and $windows.Count -ge $expectedCount){
             try {
                 [BlackMoonGuiTest]::Send($main.Handle,0,100)
-                $ready=$process.WaitForInputIdle(100)
-            } catch { $ready=$false }
+                if($process.WaitForInputIdle(100)){
+                    $windows=@([BlackMoonGuiTest]::Windows($process.Id))
+                    $null=Assert-Layout $windows
+                    $ready=$true
+                }
+            } catch { $layoutError=$_.Exception.Message }
         }
         if(-not $ready){Start-Sleep -Milliseconds 20}
     } while(-not $ready -and $startup.ElapsedMilliseconds -lt 60000)
     if(-not $ready){throw "Startup layout not ready: $layoutError"}
     $result.StartupIdleMilliseconds=$startup.ElapsedMilliseconds
+    $result.StartupCpuMilliseconds=$process.TotalProcessorTime.TotalMilliseconds
     $result.Initial=$windows
     [BlackMoonGuiTest]::SetWindowPos([IntPtr]$main.Handle,[IntPtr](-1),80,80,0,0,0x41)|Out-Null
     Start-Sleep -Milliseconds 500
@@ -128,10 +132,12 @@ try{
     }
     $width=if($Mode -eq 'workbench'){1280}else{640}
     $height=if($Mode -eq 'workbench'){800}else{400}
+    $resizeCpu=$process.TotalProcessorTime.TotalMilliseconds
     $resize=[Diagnostics.Stopwatch]::StartNew()
     [BlackMoonGuiTest]::SetWindowPos([IntPtr]$main.Handle,[IntPtr]::Zero,80,80,$width,$height,0x44)|Out-Null
     [BlackMoonGuiTest]::Send($main.Handle,0)
     $result.ResizeMilliseconds=$resize.ElapsedMilliseconds
+    $result.ResizeCpuMilliseconds=$process.TotalProcessorTime.TotalMilliseconds-$resizeCpu
     $windows=@([BlackMoonGuiTest]::Windows($process.Id))
     $result.Resized=$windows
     if((Assert-Layout $windows) -le $initialWidth){throw 'Resizing did not expand the controls'}
@@ -142,7 +148,7 @@ try{
     if($MaxStartupMilliseconds -gt 0 -and $result.StartupIdleMilliseconds -gt $MaxStartupMilliseconds){throw "Startup exceeded budget: $($result.StartupIdleMilliseconds) ms"}
     if($MaxResizeMilliseconds -gt 0 -and $result.ResizeMilliseconds -gt $MaxResizeMilliseconds){throw "Resize exceeded budget: $($result.ResizeMilliseconds) ms"}
     $result.Passed=$true
-    Write-Host "Startup idle: $($result.StartupIdleMilliseconds) ms; resize: $($result.ResizeMilliseconds) ms"
+    Write-Host "Startup idle: $($result.StartupIdleMilliseconds) ms (CPU $($result.StartupCpuMilliseconds) ms); resize: $($result.ResizeMilliseconds) ms (CPU $($result.ResizeCpuMilliseconds) ms)"
     Write-Host "PASS $Mode window, layout, control interaction, resizing and clean close"
 }catch{
     $result.Error=$_.Exception.Message
