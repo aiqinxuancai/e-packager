@@ -221,6 +221,7 @@
 	<ClInclude Include="src\compiler\CompilerModel.h" />
 	<ClInclude Include="src\compiler\WindowModel.h" />
 	<ClInclude Include="src\compiler\NativeWindowControl.h" />
+    <ClInclude Include="src\compiler\NativeDropTargetRuntime.h" />
 	<ClInclude Include="src\compiler\NativeX86Runtime.h" />
 	<ClInclude Include="src\compiler\NativeX86Access.h" />
 	<ClInclude Include="src\compiler\NativeX86Method.h" />

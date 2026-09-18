@@ -4,6 +4,7 @@
 
 #include <Windows.h>
 #include "NativeWindowControl.h"
+#include "NativeDropTargetRuntime.h"
 #include "NativeX86Runtime.h"
 #include "NativeX86Access.h"
 #include "NativeX86Method.h"
@@ -113,9 +114,11 @@ bool IsCppIdentifier(const std::string& value)
 
 bool IsLvalue(const e2txt::SourceExpressionNode& node)
 {
-	return node.kind == e2txt::SourceExpressionKind::Name ||
-		node.kind == e2txt::SourceExpressionKind::Index ||
-		node.kind == e2txt::SourceExpressionKind::Member;
+	using Kind = e2txt::SourceExpressionKind;
+	if (node.kind == Kind::Name) return true;
+	// 成员/下标本身不能保证可写；函数返回值上的访问必须保留临时值语义。
+	return (node.kind == Kind::Index || node.kind == Kind::Member || node.kind == Kind::Group) &&
+		!node.children.empty() && IsLvalue(*node.children.front());
 }
 
 struct CommandBinding {
@@ -1826,6 +1829,10 @@ private:
 		if (matches({ "取标记组件", "GetSpecTagUnit" })) return "GetSpecTagUnit";
 		if (matches({ "置外形图片", "SetShapePic" })) return "SetShapePic";
 		if (control == nullptr) return std::nullopt;
+		if (control->typeName == "拖放对象") {
+			if (matches({ "注册拖放控件", "RegisterDropTarget" })) return "RegisterDropTarget";
+			if (matches({ "撤消拖放控件", "撤销拖放控件", "UnRegisterDropTarget" })) return "UnRegisterDropTarget";
+		}
 		if (control->typeName == "画板") {
 			if (matches({ "取设备句柄", "GetHDC" })) return "GetHDC";
 			if (matches({ "取点", "GetPixel" })) return "GetPixel";
@@ -2264,6 +2271,7 @@ private:
 	std::string EmitLvalue(const Method& method, const e2txt::SourceExpressionNode& node)
 	{
 		using Kind = e2txt::SourceExpressionKind;
+		if (node.kind == Kind::Group && !node.children.empty()) return EmitLvalue(method, *node.children.front());
 		if (node.kind == Kind::Name) {
 			if (const auto variable = FindVariable(method, node.text)) return variable->first;
 			if (IsWindowRootProperty(method, node.text)) {
@@ -3002,7 +3010,15 @@ private:
 				}
 			}
 			return EmitLvalue(method, node);
-		case Kind::Index: return EmitLvalue(method, node);
+		case Kind::Index: {
+			if (IsLvalue(node)) return EmitLvalue(method, node);
+			if (node.children.size() < 2) { Fail("invalid_index_expression"); return "Empty()"; }
+			std::string indexes = "{";
+			for (std::size_t index = 1; index < node.children.size(); ++index)
+				indexes += "ToInteger(" + EmitExpression(method, *node.children[index]) + "),";
+			return "([&](){Value value=" + EmitExpression(method, *node.children.front()) +
+				";return Value(IndexPath(value," + indexes + "}));}())";
+		}
 		case Kind::Group: return node.children.empty() ? "Empty()" : '(' + EmitExpression(method, *node.children.front(), expected) + ')';
 		case Kind::AddressOf: {
 			if (node.children.size() != 1 || node.children.front()->kind != Kind::Name) {
@@ -3089,10 +3105,11 @@ private:
 				Line(indent, "do {"); if (!EmitStatements(method, statement.body, indent + 1)) return false; Line(indent, "} while(ToBool(" + EmitExpression(method, *statement.expression) + ")); "); break;
 			case StatementKind::CountLoop: {
 				if (statement.arguments.empty()) return Fail(method.sourceFile + ": count_loop_argument_missing");
-				const std::string counter = statement.arguments.size() >= 2 && statement.arguments[1]->kind != e2txt::SourceExpressionKind::Missing ? EmitLvalue(method, *statement.arguments[1]) : "__counter";
-				if (counter == "__counter") Line(indent, "Value __counter=MakeVar(T_INT);");
+				const bool hasCounter = statement.arguments.size() >= 2 && statement.arguments[1]->kind != e2txt::SourceExpressionKind::Missing;
+				const std::string counter = hasCounter ? EmitLvalue(method, *statement.arguments[1]) : std::string();
 				Line(indent, "for(int __limit=static_cast<int>(ToInteger(" + EmitExpression(method, *statement.arguments[0]) + ")),__i=1;__i<=__limit;++__i) {");
-				Line(indent + 1, "Assign(" + counter + ",Integer(__i));"); if (!EmitStatements(method, statement.body, indent + 1)) return false; Line(indent, "}"); break;
+				if (hasCounter) Line(indent + 1, "Assign(" + counter + ",Integer(__i));");
+				if (!EmitStatements(method, statement.body, indent + 1)) return false; Line(indent, "}"); break;
 			}
             case StatementKind::ForLoop: {
                 if (statement.arguments.size() < 3) return Fail(method.sourceFile + ": variable_loop_requires_three_arguments");
@@ -5135,12 +5152,14 @@ static DWORD Style(const Spec& spec) {
         return style;
     }
     if(std::strcmp(type,"container")==0)return WS_CHILD|WS_CLIPSIBLINGS|WS_CLIPCHILDREN;
+    if(std::strcmp(type,"drop_target")==0)return WS_CHILD;
     if(std::strcmp(type,"unsupported")==0)return 0;
     // Never manufacture a style for an unknown token.  The host-side model
     // only emits the explicitly mapped native controls above.
     return 0;
 }
 static const wchar_t* ClassName(const char* type) {
+    if(strcmp(type,"drop_target")==0)return L"STATIC";
     if(strcmp(type,"button")==0||strcmp(type,"checkbox")==0||strcmp(type,"radio")==0||strcmp(type,"group")==0)return L"BUTTON";
     if(strcmp(type,"edit")==0)return L"EDIT";
     if(strcmp(type,"list")==0||strcmp(type,"checklist")==0)return L"LISTBOX";
@@ -5563,6 +5582,9 @@ static void ApplyStructuredData(HWND window,const Spec& spec) {
     }
 }
 static void StoreSpecProperties(std::unordered_map<std::string,Value>& store,const XmlAttribute* attributes,std::size_t count);
+)CPP";
+        prefix << RuntimeSourceUtf8(kNativeDropTargetRuntime);
+        prefix << R"CPP(
 static void CreateUnit(const Spec& spec) {
     if(strcmp(spec.type,"unsupported")==0)return;
     HWND parent=nullptr;
@@ -5573,7 +5595,7 @@ static void CreateUnit(const Spec& spec) {
     const wchar_t* className=ClassName(spec.type);
     if(style==0||className==nullptr)return;
     if(!spec.tabStop)style&=~WS_TABSTOP;
-    if(spec.visible)style|=WS_VISIBLE;
+    if(spec.visible&&strcmp(spec.type,"drop_target")!=0)style|=WS_VISIBLE;
     DWORD exStyle=strcmp(spec.type,"container")==0?WS_EX_TRANSPARENT:0;
     if(strcmp(spec.type,"edit")==0||strcmp(spec.type,"date")==0)
         exStyle|=WindowBorderExtendedStyle(XmlAttributeInteger(spec,L"边框",1));
@@ -5653,6 +5675,11 @@ static bool WindowGeometry(HWND window,int& left,int& top,int& width,int& height
 static Value WindowInvokeMember(unsigned int id,const char* operation,std::vector<Value> args) {
     HWND window=WindowById(id);
     if(window==nullptr||operation==nullptr)return Empty();
+    if(const auto* unit=FindUnit(id);unit&&strcmp(unit->type,"drop_target")==0) {
+        const HWND target=args.empty()?nullptr:reinterpret_cast<HWND>(static_cast<std::uintptr_t>(ToInteger(args[0])));
+        if(strcmp(operation,"RegisterDropTarget")==0)return Boolean(RegisterNativeDropTarget(id,target));
+        if(strcmp(operation,"UnRegisterDropTarget")==0){UnregisterNativeDropTarget(id,target);return Empty();}
+    }
     const bool combo=ClassEquals(window,L"COMBOBOX");
     const bool list=ClassEquals(window,L"LISTBOX");
     const bool tab=ClassEquals(window,L"SysTabControl32");

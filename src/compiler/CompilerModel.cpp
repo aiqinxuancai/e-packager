@@ -210,6 +210,7 @@ bool ExpandEComDependencies(
 		collectDeclarations(bundle.globalText, ".全局变量 ");
 		collectDeclarations(bundle.constantText, ".常量 ");
 		for (const auto& resource : bundle.resources) existingSymbols.insert(resource.logicalName);
+		for (const auto& form : bundle.formFiles) existingSymbols.insert(form.logicalName);
 		std::unordered_map<std::string, std::string> symbolRenames;
 		for (const auto& source : module.sourceFiles) {
 			for (const auto& rawLine : SplitLines(source.content)) {
@@ -249,6 +250,10 @@ bool ExpandEComDependencies(
 				symbolRenames.try_emplace(resource.logicalName, moduleRenamePrefix + resource.logicalName);
 			}
 		}
+		for (const auto& form : module.formFiles) {
+			if (existingSymbols.contains(form.logicalName))
+				symbolRenames.try_emplace(form.logicalName, moduleRenamePrefix + form.logicalName);
+		}
 		const auto applyRenames = [&](std::string& text) {
 			text = e2txt::RewriteSourceIdentifiers(text, symbolRenames);
 		};
@@ -279,6 +284,18 @@ bool ExpandEComDependencies(
 				source.content = renamed.str();
 			}
 			if (!source.content.empty()) bundle.sourceFiles.push_back(std::move(source));
+		}
+		// 模块窗口与程序集一起导入；逻辑名称参与作用域重命名，不能只保留事件源码。
+		for (auto& form : module.formFiles) {
+			if (const auto renamed = symbolRenames.find(form.logicalName); renamed != symbolRenames.end())
+				form.logicalName = renamed->second;
+			form.relativePath = moduleSourcePrefix + "/" + form.relativePath;
+			bundle.formFiles.push_back(std::move(form));
+		}
+		for (auto binding : module.windowBindings) {
+			if (const auto renamed = symbolRenames.find(binding.formName); renamed != symbolRenames.end()) binding.formName = renamed->second;
+			if (const auto renamed = symbolRenames.find(binding.className); renamed != symbolRenames.end()) binding.className = renamed->second;
+			bundle.windowBindings.push_back(std::move(binding));
 		}
 		for (auto& resource : module.resources) {
 			if (const auto renamed = symbolRenames.find(resource.logicalName); renamed != symbolRenames.end())

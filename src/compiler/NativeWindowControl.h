@@ -62,6 +62,8 @@ inline constexpr NativeWindowControlMapping kNativeWindowControlMappings[] = {
 	{ "颜色选择器", "color" },
 	{ "超级链接框", "hyperlink" },
 	{ "调节器", "spin" },
+	// 非可视功能提供者使用隐藏宿主，注册目标由独立 OLE 管理器持有。
+	{ "拖放对象", "drop_target" },
 };
 
 inline constexpr std::string_view NativeWindowControlToken(const std::string_view easyName) noexcept
