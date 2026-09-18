@@ -116,6 +116,7 @@ static_assert(offsetof(NativeRun,hostStack)==16 && offsetof(NativeRun,returned)=
 struct NativeParameter { bool reference, nullable; };
 struct NativeFrame;
 static thread_local NativeFrame* nativeFrame=nullptr;
+static void NativeSyncFrames();
 extern const void* const* NativeClassTable(std::uint32_t type);
 static NativeStorage& NativeStorageFor(Value& value) {
     if(!value.native) value.native=std::make_shared<NativeStorage>();
@@ -126,6 +127,24 @@ static void NativeStore(Value& value,void* destination);
 static void NativeRead(Value& value,const void* source);
 static unsigned NativeWidth(const Value& value) {
     return !value.declaredArray && (value.type==T_INT64||value.type==T_DOUBLE||value.type==T_DATE)?8:4;
+}
+// 同型数值数组按连续 ABI 元素转换，避免逐元素递归查询类型和构造临时槽。
+template<class T> static void NativeStoreNumbers(const Value& value,unsigned char* data) {
+    for(const auto& item:value.elements) {
+        T number{};
+        if(!item.missing) {
+            if constexpr(std::is_floating_point_v<T>)number=static_cast<T>(ToNumber(item));
+            else number=static_cast<T>(ToInteger(item));
+        }
+        std::memcpy(data,&number,sizeof(number));data+=sizeof(number);
+    }
+}
+template<class T> static void NativeReadNumbers(Value& value,const unsigned char* data) {
+    for(auto& item:value.elements) {
+        T number;std::memcpy(&number,data,sizeof(number));data+=sizeof(number);
+        if(item.byteReference)*item.byteReference=static_cast<unsigned char>(number);
+        item.integer=static_cast<long long>(number);item.number=static_cast<double>(number);
+    }
 }
 static void NativeStore(Value& value,void* destination) {
     std::memset(destination,0,NativeWidth(value));
@@ -142,15 +161,28 @@ static void NativeStore(Value& value,void* destination) {
                 std::copy(value.bytes.begin(),value.bytes.end(),memory.bytes.begin()+8);
                 memory.pointer=memory.bytes.data();
             } else if(value.declaredArray) {
-                const auto dimensions=value.dimensions.empty()?std::vector<int>{static_cast<int>(value.elements.size())}:value.dimensions;
-                const unsigned header=4+static_cast<unsigned>(dimensions.size())*4;
+                const unsigned rank=value.dimensions.empty()?1:static_cast<unsigned>(value.dimensions.size());
+                const unsigned header=4+rank*4;
                 const unsigned width=(value.type==T_TEXT||value.type==T_BIN||FindType(value.type))?4:static_cast<unsigned>(ScalarSize(value.type));
                 memory.bytes.resize(header+width*value.elements.size());
-                *reinterpret_cast<unsigned*>(memory.bytes.data())=static_cast<unsigned>(dimensions.size());
-                std::memcpy(memory.bytes.data()+4,dimensions.data(),dimensions.size()*4);
-                for(std::size_t i=0;i<value.elements.size();++i) {
-                    unsigned char slot[8]{};NativeStore(value.elements[i],slot);
-                    std::memcpy(memory.bytes.data()+header+i*width,slot,width);
+                std::memcpy(memory.bytes.data(),&rank,4);
+                if(value.dimensions.empty()) {
+                    const unsigned count=static_cast<unsigned>(value.elements.size());
+                    std::memcpy(memory.bytes.data()+4,&count,4);
+                } else std::memcpy(memory.bytes.data()+4,value.dimensions.data(),rank*4);
+                auto* data=memory.bytes.data()+header;
+                switch(value.type) {
+                case T_BYTE:NativeStoreNumbers<unsigned char>(value,data);break;
+                case T_SHORT:NativeStoreNumbers<short>(value,data);break;
+                case T_INT:case T_BOOL:case T_SUB:NativeStoreNumbers<int>(value,data);break;
+                case T_INT64:NativeStoreNumbers<long long>(value,data);break;
+                case T_FLOAT:NativeStoreNumbers<float>(value,data);break;
+                case T_DOUBLE:case T_DATE:NativeStoreNumbers<double>(value,data);break;
+                default:
+                    for(std::size_t i=0;i<value.elements.size();++i) {
+                        unsigned char slot[8]{};NativeStore(value.elements[i],slot);
+                        std::memcpy(data+i*width,slot,width);
+                    }
                 }
                 memory.pointer=memory.bytes.data();
             } else if(const auto* desc=FindType(value.type)) {
@@ -183,11 +215,24 @@ static void NativeRead(Value& value,const void* source) {
         const auto* pointer=*static_cast<unsigned char* const*>(source);
         if(!pointer)return;
         const unsigned rank=*reinterpret_cast<const unsigned*>(pointer);
-        std::vector<int> dimensions(rank);
-        std::memcpy(dimensions.data(),pointer+4,rank*4);
-        if(value.dimensions!=dimensions)Redim(value,dimensions,false);
-        const auto width=(value.type==T_TEXT||value.type==T_BIN||FindType(value.type))?4:ScalarSize(value.type);
-        for(std::size_t i=0;i<value.elements.size();++i)NativeRead(value.elements[i],pointer+4+rank*4+i*width);
+        if(value.dimensions.size()!=rank || std::memcmp(value.dimensions.data(),pointer+4,rank*4)!=0) {
+            std::vector<int> dimensions(rank);
+            std::memcpy(dimensions.data(),pointer+4,rank*4);
+            Redim(value,dimensions,false);
+        }
+        const auto* data=pointer+4+rank*4;
+        switch(value.type) {
+        case T_BYTE:NativeReadNumbers<unsigned char>(value,data);break;
+        case T_SHORT:NativeReadNumbers<short>(value,data);break;
+        case T_INT:case T_BOOL:case T_SUB:NativeReadNumbers<int>(value,data);break;
+        case T_INT64:NativeReadNumbers<long long>(value,data);break;
+        case T_FLOAT:NativeReadNumbers<float>(value,data);break;
+        case T_DOUBLE:case T_DATE:NativeReadNumbers<double>(value,data);break;
+        default: {
+            const auto width=(value.type==T_TEXT||value.type==T_BIN||FindType(value.type))?4:ScalarSize(value.type);
+            for(std::size_t i=0;i<value.elements.size();++i)NativeRead(value.elements[i],data+i*width);
+        }
+        }
         return;
     }
     if(value.type==T_TEXT) { const auto* pointer=*static_cast<char* const*>(source);value.text=pointer?pointer:"";return; }
@@ -231,7 +276,9 @@ static void* NativeReference(Value& value) {
 static void NativeSyncObjects(bool store) {
     std::vector<std::shared_ptr<NativeStorage>> objects;
     for(auto* memory:NativeObjects()) if(memory->owner)objects.push_back(memory->owner->native);
-    for(auto& memory:objects) if(memory->owner && NativeClassTable(memory->owner->type)) {
+    // 机器码可将结构体、数组及缓冲区的地址传给 DLL；所有已发布的原生存储都要同步。
+    for(auto& memory:objects) if(memory->owner && memory->pointer &&
+        (NativeIndirect(*memory->owner) || memory->owner->declaredArray)) {
         if(store) { unsigned slot;NativeStore(*memory->owner,&slot); }
         else NativeRead(*memory->owner,&memory->pointer);
     }
@@ -244,6 +291,7 @@ static Value* NativeResolveSelf(void* handle) {
 }
 static thread_local unsigned nativeExternalDepth=0;
 static void NativeEnterExternal() {
+    NativeSyncFrames();
     NativeSyncObjects(true);
     ++nativeExternalDepth;
 }
@@ -259,6 +307,7 @@ struct NativeCallbackScope {
         nativeExternalDepth=0;
     }
     ~NativeCallbackScope() {
+        NativeSyncFrames();
         NativeSyncObjects(true);
         nativeExternalDepth=previous;
     }
@@ -273,6 +322,7 @@ struct NativeFrame {
     std::vector<void*> referencePointers;
     std::vector<unsigned char> storage;
     unsigned localSize=0;
+    bool dirty=true;
     unsigned registers[6]{};
     Value* self;
     NativeFrame(std::vector<Value>& p,std::initializer_list<Value*> v,std::vector<Arg>& a,
@@ -287,11 +337,14 @@ struct NativeFrame {
         referencePointers.resize(p.size());
         *reinterpret_cast<void**>(storage.data()+localSize)=parent?parent->Base():nullptr;
         nativeFrame=this;
-        Store();
     }
     ~NativeFrame() { nativeFrame=parent; }
     void* Base() { return storage.data()+localSize; }
+    // 普通语句只标记变化；跨原生边界时才物化栈，保留调用者 EBP 链。
+    void MarkDirty() { dirty=true; }
+    void Publish() { if(parent)parent->Publish();if(dirty)Store(); }
     void Store() {
+        dirty=false;
         if(self) *reinterpret_cast<void**>(storage.data()+localSize+8)=NativeReference(*self);
         for(std::size_t i=0;i<locals.size();++i) NativeStore(*locals[i],storage.data()+localSize-localOffsets[i]);
         for(std::size_t i=0;i<parameters.size();++i) {
@@ -326,7 +379,7 @@ struct NativeFrame {
         }
     }
     bool Execute(void* code,std::uint32_t type,Value& result) {
-        Store();
+        NativeSyncFrames();
         NativeSyncObjects(true);
         NativeRun run{storage.data(),static_cast<unsigned>(storage.size()),localSize,code};
         std::memcpy(&run.ax,registers,sizeof(registers));
@@ -347,6 +400,9 @@ struct NativeFrame {
         return run.returned!=0;
     }
 };
+static void NativeSyncFrames() {
+    if(nativeFrame)nativeFrame->Publish();
+}
 } // namespace ert
 #endif
 )CPP";

@@ -8448,6 +8448,13 @@ bool Generator::GenerateBundleInternal(
 	if (options.includeImportedFunctions) {
 		// 同一 EC 可嵌入多个同名上游类型。先按原生 ID 消歧，再统一解码声明与引用，
 		// 不能在文本层合并名称，否则不同对象会绑定到同一份实现。
+		// 匿名类型先确定统一名称，再按原生 ID 消歧，保证声明和所有引用一致。
+		const auto anonymousAliases = BuildLocalAnonymousTypeAliasMap(sections);
+		for (auto& type : sections.program.dataTypes) {
+			if (!IsAnonymousPlaceholderTypeName(TrimAsciiCopy(type.name))) continue;
+			if (const auto alias = anonymousAliases.find(type.header.dwId); alias != anonymousAliases.end())
+				type.name = alias->second;
+		}
 		SymbolResolver names(sections.program, sections.resources, inputPath,
 			&sections.losable.removedDefinedItems);
 		std::unordered_set<std::string> occupied;

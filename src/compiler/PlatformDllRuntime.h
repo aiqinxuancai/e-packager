@@ -55,9 +55,20 @@ static void PlatformTransfer(Value& value,unsigned char* memory,bool read) {
 }
 static void* PlatformObject(Value& value) {
     if(value.missing && !FindType(value.type))return nullptr;
-    value.object.resize((std::max)(PlatformSize(value.type),std::size_t(64)));
-    PlatformTransfer(value,value.object.data(),false);
-    return value.object.data();
+    const auto size=(std::max)(PlatformSize(value.type),std::size_t(1));
+    if(!value.native){value.native=std::make_shared<NativeStorage>();value.native->owner=&value;}
+    auto& memory=*value.native;
+    if(!memory.platformMemory || memory.platformCapacity!=size) {
+        if(memory.platformMemory)LocalFree(memory.platformMemory);
+        memory.platformMemory=LocalAlloc(LMEM_FIXED|LMEM_ZEROINIT,size);
+        memory.platformCapacity=size;
+        if(!memory.platformMemory)RuntimeFatal("DLL structure allocation failed\n");
+    }
+    PlatformTransfer(value,static_cast<unsigned char*>(memory.platformMemory),false);
+    return memory.platformMemory;
+}
+static void* PlatformObjectData(const Value& value) {
+    return value.native?value.native->platformMemory:nullptr;
 }
 static void ReadPlatformObject(Value& value,const void* source) {
     PlatformTransfer(value,static_cast<unsigned char*>(const_cast<void*>(source)),true);

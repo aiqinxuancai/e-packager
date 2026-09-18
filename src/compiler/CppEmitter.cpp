@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cctype>
 #include <cmath>
 #include <iomanip>
@@ -86,19 +87,18 @@ std::string Hex(const std::uint32_t value)
 std::string DateTimeValue(const std::string& text)
 {
 	int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
-	if (sscanf_s(text.c_str(), "[%d年%d月%d日%d时%d分%d秒]", &year, &month, &day, &hour, &minute, &second) < 3) return "0.0";
-	SYSTEMTIME value{};
-	value.wYear = static_cast<WORD>(year); value.wMonth = static_cast<WORD>(month); value.wDay = static_cast<WORD>(day);
-	value.wHour = static_cast<WORD>(hour); value.wMinute = static_cast<WORD>(minute); value.wSecond = static_cast<WORD>(second);
-	FILETIME fileTime{};
-	if (!SystemTimeToFileTime(&value, &fileTime)) return "0.0";
-	SYSTEMTIME epochValue{}; epochValue.wYear = 1899; epochValue.wMonth = 12; epochValue.wDay = 30;
-	FILETIME epochFileTime{};
-	if (!SystemTimeToFileTime(&epochValue, &epochFileTime)) return "0.0";
-	ULARGE_INTEGER ticks{}; ticks.LowPart = fileTime.dwLowDateTime; ticks.HighPart = fileTime.dwHighDateTime;
-	ULARGE_INTEGER epochTicks{}; epochTicks.LowPart = epochFileTime.dwLowDateTime; epochTicks.HighPart = epochFileTime.dwHighDateTime;
-	const double oleDate = static_cast<double>(static_cast<long long>(ticks.QuadPart - epochTicks.QuadPart)) / 864000000000.0;
-	return "Number(" + std::to_string(oleDate) + ")";
+	if (sscanf_s(text.c_str(), "[%d年%d月%d日%d时%d分%d秒]", &year, &month, &day, &hour, &minute, &second) < 3) return "Number(0.0)";
+	// 易语言日期采用 OLE DATE，合法下限为公元 100 年，不能使用从 1601 年开始的 FILETIME。
+	const std::chrono::year_month_day date{std::chrono::year{year}, std::chrono::month{static_cast<unsigned>(month)}, std::chrono::day{static_cast<unsigned>(day)}};
+	if (year < 100 || year > 9999 || !date.ok() || hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59)
+		return "Number(0.0)";
+	const auto epoch = std::chrono::sys_days{std::chrono::year{1899}/12/30};
+	const auto days = (std::chrono::sys_days{date} - epoch).count();
+	const double fraction = static_cast<double>(hour * 3600 + minute * 60 + second) / 86400.0;
+	const double oleDate = static_cast<double>(days) + (days < 0 ? -fraction : fraction);
+	std::ostringstream value;
+	value << std::setprecision(17) << oleDate;
+	return "Number(" + value.str() + ")";
 }
 
 bool IsCppIdentifier(const std::string& value)
@@ -127,7 +127,7 @@ bool IsCompilePrimitive(const support_library_public_info::CommandMetadata& comm
 {
 	static constexpr std::string_view names[] = {
 		"MachineCode", "hex", "binary", "GetAppName", "XchgVar", "ForceXchgVar",
-		"GetRuntimeDataType", "IsCondMacroDefined", "IsDebugVer", "IsMissing", "iif", "this", "GetBinElement", "pbin",
+		"GetRuntimeDataType", "IsCondMacroDefined", "IsDebugVer", "IsMissing", "iif", "choose", "this", "GetBinElement", "pbin",
 		// These are language/runtime primitives. Their FNE entries describe the
 		// source signature, while the generated Value runtime owns the actual
 		// array state and must perform the mutation consistently across cores.
@@ -328,9 +328,11 @@ struct NativeStorage {
     std::vector<unsigned char> bytes;
     unsigned char* dllMemory=nullptr;
     std::size_t dllCapacity=0;
+    HLOCAL platformMemory=nullptr;
+    std::size_t platformCapacity=0;
     bool storing=false;
     NativeStorage() { NativeObjects().push_back(this); }
-    ~NativeStorage() { if(dllMemory)VirtualFree(dllMemory,0,MEM_RELEASE);auto& objects=NativeObjects();objects.erase(std::remove(objects.begin(),objects.end(),this),objects.end()); }
+    ~NativeStorage() { if(platformMemory)LocalFree(platformMemory);if(dllMemory)VirtualFree(dllMemory,0,MEM_RELEASE);auto& objects=NativeObjects();objects.erase(std::remove(objects.begin(),objects.end(),this),objects.end()); }
 };
 struct Value {
     std::uint32_t declared=T_NULL, type=T_NULL;
@@ -364,9 +366,21 @@ extern const TypeDesc* TypeTable();
 extern std::size_t TypeCount();
 static const TypeDesc* FindType(std::uint32_t type) {
     type &= ~T_ARRAY;
-    const TypeDesc* table=TypeTable();
-    for(std::size_t index=0;index<TypeCount();++index) if(table[index].type==type) return &table[index];
-    return nullptr;
+    // 原生同步会逐个访问数组成员；基础类型无需扫描复合类型表。
+    switch(type) {
+    case T_NULL:case T_ALL:case T_BYTE:case T_SHORT:case T_INT:case T_INT64:
+    case T_FLOAT:case T_DOUBLE:case T_BOOL:case T_DATE:case T_TEXT:case T_BIN:case T_SUB:
+        return nullptr;
+    }
+    static const auto types=[] {
+        std::unordered_map<std::uint32_t,const TypeDesc*> result;
+        result.reserve(TypeCount());
+        const TypeDesc* table=TypeTable();
+        for(std::size_t index=0;index<TypeCount();++index)result.emplace(table[index].type,&table[index]);
+        return result;
+    }();
+    const auto found=types.find(type);
+    return found==types.end()?nullptr:found->second;
 }
 static bool Numeric(std::uint32_t type) {
     type &= ~T_ARRAY;
@@ -625,6 +639,10 @@ static Value Convert(Value value,std::uint32_t type) {
     if(type==T_TEXT) return Text(ToText(value));
     if(type==T_BOOL) return Boolean(ToBool(value));
     if(type==T_FLOAT||type==T_DOUBLE||type==T_DATE) { Value result=MakeVar(type); result.number=ToNumber(value); result.integer=static_cast<long long>(result.number); return result; }
+    // 语义容器使用 64 位存储，赋值仍须遵守易语言整数类型的实际位宽。
+    if(type==T_BYTE) return Integer(static_cast<std::uint8_t>(ToInteger(value)),type);
+    if(type==T_SHORT) return Integer(static_cast<std::int16_t>(ToInteger(value)),type);
+    if(type==T_INT) return Integer(static_cast<std::int32_t>(ToInteger(value)),type);
     if(Numeric(type)) return Integer(ToInteger(value),type);
     value.declared=type; value.type=type; return value;
 }
@@ -2222,6 +2240,13 @@ private:
 			if (call.children.size() != 4) { Fail("conditional_expression_requires_three_arguments"); return "Empty()"; }
 			return "(ToBool(" + EmitExpression(method, arg(0)) + ")?" + EmitExpression(method, arg(1)) + ":" + EmitExpression(method, arg(2)) + ")";
 		}
+		if (operation == "choose") {
+			if (call.children.size() < 3) { Fail("choose_requires_index_and_choices"); return "Empty()"; }
+			std::string value = "([&]()->Value{switch(ToInteger(" + EmitExpression(method, arg(0)) + ")){";
+			for (std::size_t index = 2; index < call.children.size(); ++index)
+				value += "case " + std::to_string(index - 1) + ":return " + EmitExpression(method, *call.children[index]) + ';';
+			return value + "default:RuntimeFatal(\"ecompiler: choice index out of bounds\\r\\n\");}}())";
+		}
 		if (operation == "MachineCode") {
 			Fail(method.sourceFile + ":" + std::to_string(method.sourceLine) + ": machine_code_must_be_statement");
 			return "Empty()";
@@ -2396,10 +2421,18 @@ private:
 		}
 	}
 
-	std::string EmitDllCall(const Method& method, const DllCommand& command, const e2txt::SourceExpressionNode& call)
+	std::string EmitDllCall(const Method& method, const DllCommand& declaration, const e2txt::SourceExpressionNode& call)
 	{
+		const std::size_t commandIndex = static_cast<std::size_t>(&declaration - program_.dllCommands.data());
+		// 通用型 DLL 参数的 ABI 由调用点决定，导入签名和实参封送必须共用解析结果。
+		DllCommand command = declaration;
+		for (std::size_t index = 0; index < command.parameters.size(); ++index) {
+			auto& type = command.parameters[index].type;
+			if (type.code != kTypeAll) continue;
+			type = index + 1 < call.children.size() ? Infer(method, *call.children[index + 1]) : TypeRef{};
+			if (!type.valid) type = { kTypeInt, false, true };
+		}
 		const TypeRef returnType = command.returnType;
-		const std::size_t commandIndex = static_cast<std::size_t>(&command - program_.dllCommands.data());
 		const std::string importSymbol = RegisterDllImport(command, commandIndex);
 		std::ostringstream result;
 		result << "([&](){ ArenaScope __dll_scope;DllScalarArrayReferences __dll_arrays{__dll_scope.arena};";
@@ -2457,7 +2490,7 @@ private:
 				if (referenceable && platformComposite) {
 					result << "Value& __dll_target_" << index << "=" << EmitLvalue(method, *source) << ";";
 					syncStatements.push_back(
-						"if(!" + valueName + ".object.empty()) { ReadPlatformObject(" + valueName + "," + valueName + ".object.data()); Assign(__dll_target_" +
+						"if(PlatformObjectData(" + valueName + ")) { ReadPlatformObject(" + valueName + ",PlatformObjectData(" + valueName + ")); Assign(__dll_target_" +
 						std::to_string(index) + "," + valueName + "); }");
 				}
 				callArguments.push_back(platformComposite ? "PlatformObject(" + valueName + ")" : DllValueExpression(type, valueName));
@@ -2517,12 +2550,15 @@ private:
 
 	std::string RegisterDllImport(const DllCommand& command, const std::size_t commandIndex)
 	{
-		const auto found = dllImportSymbols_.find(commandIndex);
+		std::string signature = std::to_string(commandIndex);
+		for (const auto& parameter : command.parameters)
+			signature += ":" + std::to_string(parameter.type.code) + (parameter.type.isArray ? "[]" : "");
+		const auto found = dllImportSymbols_.find(signature);
 		if (found != dllImportSymbols_.end()) return found->second;
 		// Keep the local name independent from the DLL entry name.  Besides
 		// avoiding collisions with C/C++ declarations, this makes platform and
 		// third-party DLLs follow one import-table contract.
-		const std::string symbol = "ecompiler_import_" + std::to_string(commandIndex);
+		const std::string symbol = "ecompiler_import_" + std::to_string(commandIndex) + "_" + std::to_string(dllImportSymbols_.size());
 		const std::string returnType = DllReturnCType(command.returnType);
 		declarations_ << "extern \"C\" __declspec(dllimport) " << returnType << ' '
 			<< (command.usesCdecl ? "__cdecl" : "__stdcall") << ' ' << symbol << "(";
@@ -2552,7 +2588,7 @@ private:
 		declarations_ << "#pragma comment(linker,\"/alternatename:" << LinkerDirectiveName(localSymbol)
 			<< "=" << LinkerDirectiveName(targetSymbol) << "\")\n";
 		imports_.push_back({commandIndex, command.fileName, command.entryName, symbol, command.usesCdecl, AbiParameterBytes(command.parameters)});
-		dllImportSymbols_.emplace(commandIndex, symbol);
+		dllImportSymbols_.emplace(signature, symbol);
 		return symbol;
 	}
 
@@ -2756,7 +2792,12 @@ private:
 					arguments += EmitArg(method, *node.children[index], byReference, member->parameters[index - 1].type) + ',';
 				}
 				arguments += '}';
-				return "method_" + std::to_string(member->id) + '(' + arguments + ",&" + EmitLvalue(method, *callee.children.front()) + ')';
+				const auto& receiver = *callee.children.front();
+				if (IsLvalue(receiver))
+					return "method_" + std::to_string(member->id) + '(' + arguments + ",&" + EmitLvalue(method, receiver) + ')';
+				// 链式调用的返回对象只求值一次，并存活到当前成员调用完成。
+				return "([&](){Value __receiver=" + EmitExpression(method, receiver) + ";return method_" +
+					std::to_string(member->id) + '(' + arguments + ",&__receiver);}())";
 			}
 			const auto binding = ResolveMemberCommand(receiverType, callee.text, argumentCount);
 			if (!binding) { Fail(method.sourceFile + ": unknown_member_call:" + callee.text + "/" + std::to_string(argumentCount)); return "Empty()"; }
@@ -2907,7 +2948,7 @@ private:
 	{
 		for (const Statement& statement : statements) {
 			SourceLine(method.sourceFile, statement.sourceLine);
-			if (program_.targetArchitecture == TargetArchitecture::X86) Line(indent, "__frame.Store();");
+			if (program_.targetArchitecture == TargetArchitecture::X86) Line(indent, "__frame.MarkDirty();");
 			switch (statement.kind) {
 			case StatementKind::Expression: Line(indent, "(void)" + EmitExpression(method, *statement.expression) + ";"); break;
 			case StatementKind::Assignment: {
@@ -2917,7 +2958,9 @@ private:
 					Line(indent, "WindowSetProperty(" + std::to_string(unitId) + "," + EscapeCppString(property) + "," + EmitExpression(method, *statement.expression) + ");");
 				}
 				else {
-					Line(indent, "Assign(" + EmitLvalue(method, *statement.target) + ',' + EmitExpression(method, *statement.expression, Infer(method, *statement.target)) + ");");
+					// 右侧可能回写或重建包含左值的对象，必须先求值，再获取成员或数组元素引用。
+					Line(indent, "{Value __assigned=" + EmitExpression(method, *statement.expression, Infer(method, *statement.target)) +
+						";Assign(" + EmitLvalue(method, *statement.target) + ",__assigned);}");
 				}
 				break;
 			}
@@ -3258,6 +3301,8 @@ private:
 			body_ << ExportCType(method.parameters[index].type, method.parameters[index].byReference) << " arg" << index;
 		}
 		body_ << ") {\n";
+		// DLL 和机器码通过子程序地址进入时，也必须切换原生对象的同步方向。
+		if (program_.targetArchitecture == TargetArchitecture::X86) body_ << "    NativeCallbackScope callback;\n";
 		body_ << "    std::vector<Arg> args; args.reserve(" << method.parameters.size() << ");\n";
 		for (std::size_t index = 0; index < method.parameters.size(); ++index) {
 			const Variable& parameter = method.parameters[index];
@@ -7233,7 +7278,7 @@ extern "C" ert::EIntPtr __stdcall BlackMoonFuncForeLibNotifySys(
 	std::vector<GeneratedSource::ExportedFunction> exports_;
 	std::vector<GeneratedSource::ImportedFunction> imports_;
 	std::ostringstream declarations_;
-	std::unordered_map<std::size_t, std::string> dllImportSymbols_;
+	std::unordered_map<std::string, std::string> dllImportSymbols_;
 	std::unordered_set<std::uint32_t> usedTypes_;
 	std::unordered_set<std::size_t> callbackMethods_;
 };
