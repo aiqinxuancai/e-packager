@@ -169,6 +169,7 @@
     <ClCompile Include="src\AutoLinkerCompileCheck.cpp" />
     <ClCompile Include="src\BundlePathUtils.cpp" />
     <ClCompile Include="src\DependencyDownloader.cpp" />
+    <ClCompile Include="src\VcToolchainSetup.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\EFolderCodec.cpp">
       <ObjectFileName>$(IntDir)EFolderCodecCore.obj</ObjectFileName>
@@ -205,6 +206,7 @@
     <ClInclude Include="src\AutoLinkerCompileCheck.h" />
     <ClInclude Include="src\BundlePathUtils.h" />
     <ClInclude Include="src\DependencyDownloader.h" />
+    <ClInclude Include="src\VcToolchainSetup.h" />
     <ClInclude Include="src\EFolderCodec.h" />
     <ClInclude Include="src\FormControlPropertyCodec.h" />
     <ClInclude Include="src\SelfUpdater.h" />

@@ -6,6 +6,7 @@
 #include "OptimizationReport.h"
 #include "ExecutableResourceBuilder.h"
 #include "../PathHelper.h"
+#include "../VcToolchainSetup.h"
 #include "../e2txt.h"
 #include "../EFolderCodec.h"
 #include "../../thirdparty/json.hpp"
@@ -234,8 +235,15 @@ bool IsVcToolsDirectory(const std::filesystem::path& directory)
 bool HasCompilerForArchitecture(const std::filesystem::path& vcTools, const TargetArchitecture architecture)
 {
 	const std::filesystem::path target = architecture == TargetArchitecture::X64 ? L"x64" : L"x86";
-	return IsRegularFile(vcTools / L"bin" / L"Hostx64" / target / L"cl.exe") ||
-		IsRegularFile(vcTools / L"bin" / L"Hostx86" / target / L"cl.exe");
+	const auto usableHost = [&](const wchar_t* host) {
+		const auto bin = vcTools / L"bin" / host / target;
+		return IsRegularFile(bin / L"cl.exe") && IsRegularFile(bin / L"link.exe");
+	};
+	return (usableHost(L"Hostx64") || usableHost(L"Hostx86")) &&
+		IsRegularFile(vcTools / L"include" / L"vcruntime.h") &&
+		IsRegularFile(vcTools / L"lib" / target / L"libcmt.lib") &&
+		IsRegularFile(vcTools / L"lib" / target / L"libcpmt.lib") &&
+		IsRegularFile(vcTools / L"lib" / target / L"libvcruntime.lib");
 }
 
 std::filesystem::path NormalizeVcToolsDirectory(const std::filesystem::path& configured)
@@ -299,6 +307,7 @@ void AddVisualStudioToolchainCandidates(std::vector<std::filesystem::path>& cand
 {
 	std::vector<std::filesystem::path> roots;
 	AddVisualStudioRegistryInstances(roots);
+	for (const auto& root : vc_toolchain_setup::FindVisualStudioInstallations()) AppendUniquePath(roots, root);
 	for (const wchar_t* variable : { L"VSINSTALLDIR", L"VCINSTALLDIR", L"VCToolsInstallDir" })
 		AppendUniquePath(roots, EnvironmentPath(variable));
 	std::vector<std::filesystem::path> filesystemRoots;
@@ -317,6 +326,12 @@ void AddVisualStudioToolchainCandidates(std::vector<std::filesystem::path>& cand
 	for (const auto& root : roots) {
 		const std::filesystem::path normalized = NormalizeVcToolsDirectory(root);
 		if (!normalized.empty()) AppendUniquePath(candidates, normalized);
+		for (const auto& versionsRoot : {root / L"VC" / L"Tools" / L"MSVC", root / L"Tools" / L"MSVC", root / L"MSVC", root}) {
+			std::error_code error;
+			for (const auto& version : std::filesystem::directory_iterator(versionsRoot, error)) {
+				if (IsVcToolsDirectory(version.path())) AppendUniquePath(candidates, version.path());
+			}
+		}
 	}
 }
 
@@ -335,7 +350,11 @@ bool SelectWindowsSdk(
 		if (!IsRegularFile(include / L"um" / L"windows.h")) return false;
 		const std::filesystem::path base = include.parent_path().parent_path();
 		const std::filesystem::path version = include.filename();
-		return IsRegularFile(base / L"Lib" / version / L"um" / machine / L"kernel32.lib") &&
+		return std::filesystem::is_directory(include / L"winrt") &&
+			IsRegularFile(include / L"ucrt" / L"stdio.h") &&
+			IsRegularFile(include / L"shared" / L"sdkddkver.h") &&
+			IsRegularFile(base / L"Lib" / version / L"ucrt" / machine / L"libucrt.lib") &&
+			IsRegularFile(base / L"Lib" / version / L"um" / machine / L"kernel32.lib") &&
 			IsRegularFile(base / L"bin" / version / machine / L"rc.exe");
 	};
 	if (usableVersion(root)) {
@@ -392,7 +411,8 @@ bool DiscoverBuildEnvironment(
 	if (vcTools.empty() && GetEnvironmentVariableW(L"VCToolsInstallDir", configured, std::size(configured)) > 0) {
 		vcTools = NormalizeVcToolsDirectory(std::filesystem::path(configured));
 	}
-	if (vcTools.empty() || !std::filesystem::is_directory(vcTools)) {
+	if (configuredVcToolsDirectory.empty() && (vcTools.empty() || !HasCompilerForArchitecture(vcTools, architecture))) {
+		vcTools.clear();
 		std::vector<std::filesystem::path> candidates;
 		AddVisualStudioToolchainCandidates(candidates);
 		if (!candidates.empty()) {
@@ -403,7 +423,7 @@ bool DiscoverBuildEnvironment(
 					break;
 				}
 			}
-			if (vcTools.empty()) vcTools = candidates.front();
+
 		}
 	}
 	std::filesystem::path windowsSdkRoot;
@@ -450,6 +470,10 @@ bool DiscoverBuildEnvironment(
 			if (SelectWindowsSdk(candidate, architecture, windowsSdkRoot, windowsKit)) break;
 		}
 	}
+	if (!vcTools.empty() && !HasCompilerForArchitecture(vcTools, architecture)) {
+		error = "vc_toolchain_incomplete:" + PathToUtf8(vcTools);
+		return false;
+	}
 	if (vcTools.empty() || windowsKit.empty()) {
 		error = "visual_cpp_or_windows_sdk_not_found";
 		return false;
@@ -464,7 +488,7 @@ bool DiscoverBuildEnvironment(
 			vcTools / L"bin" / L"Hostx64" / L"x86" / L"cl.exe",
 		};
 	for (const auto& candidate : compilerCandidates) {
-		if (IsRegularFile(candidate)) {
+		if (IsRegularFile(candidate) && IsRegularFile(candidate.parent_path() / L"link.exe")) {
 			matchingCompiler = candidate;
 			break;
 		}

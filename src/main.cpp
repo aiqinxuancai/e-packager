@@ -22,6 +22,7 @@
 #include "..\thirdparty\json.hpp"
 #include "AutoLinkerCompileCheck.h"
 #include "DependencyDownloader.h"
+#include "VcToolchainSetup.h"
 #include "compiler/ECompiler.h"
 #include "EFolderCodec.h"
 #include "PathHelper.h"
@@ -2196,7 +2197,7 @@ bool AskToDownloadDependency(const std::string& dependency, const ecompiler::Tar
 	const char* architectureName = architecture == ecompiler::TargetArchitecture::X64 ? "x64" : "x86";
 	std::cerr << Utf8Literal(u8"缺少直接编译依赖：") << dependency
 		<< " (" << architectureName << ")\n"
-		<< Utf8Literal(u8"是否自动下载并重试？ [Y/n] ") << std::flush;
+		<< Utf8Literal(u8"是否自动下载并重试？ [y/N] ") << std::flush;
 	std::string answer;
 	if (!std::getline(std::cin, answer)) {
 		std::cerr << Utf8Literal(u8"\n未读取到确认，已取消自动下载。") << std::endl;
@@ -2204,7 +2205,7 @@ bool AskToDownloadDependency(const std::string& dependency, const ecompiler::Tar
 	}
 	std::cerr << std::endl;
 	answer = TrimAsciiCopy(std::move(answer));
-	return answer.empty() || answer[0] == 'y' || answer[0] == 'Y';
+	return answer == "y" || answer == "Y";
 }
 
 void AppendDownloadedDependencyRoot(
@@ -2228,37 +2229,57 @@ int RunCompile(
 {
 	const std::filesystem::path effectiveInputPath = ResolveAbsolutePath(std::filesystem::path(inputPath));
 	const std::filesystem::path effectiveOutputPath = ResolveAbsolutePath(std::filesystem::path(outputPath));
-	ecompiler::Result result;
-	if (ecompiler::Compile(effectiveInputPath, effectiveOutputPath, options, result)) {
-		return PrintCompileResult(true, result.message, effectiveInputPath, format);
-	}
-
-	std::string missingDependency;
-	const bool canOfferDownload = IsDirectECompileInput(effectiveInputPath) &&
-		ParseMissingCompileDependency(result.message, missingDependency);
-	if (!canOfferDownload) {
-		return PrintCompileResult(false, result.message, effectiveInputPath, format);
-	}
 	const ecompiler::TargetArchitecture architecture = options.targetArchitecture == ecompiler::TargetArchitecture::Host
 		? HostCompileArchitecture() : options.targetArchitecture;
-	if (!AskToDownloadDependency(missingDependency, architecture)) {
-		const std::string message = result.message + "\nauto_download_declined:" + missingDependency;
-		return PrintCompileResult(false, message, effectiveInputPath, format);
+	bool attemptedToolchainInstall = false;
+	std::unordered_set<std::string> attemptedDependencies;
+	for (;;) {
+		ecompiler::Result result;
+		if (ecompiler::Compile(effectiveInputPath, effectiveOutputPath, options, result)) {
+			return PrintCompileResult(true, result.message, effectiveInputPath, format);
+		}
+		const bool automaticToolchain = options.vcToolsDirectory.empty() && options.windowsSdkDirectory.empty() &&
+			options.compilerPath.empty() && options.linkerPath.empty();
+		if (automaticToolchain && vc_toolchain_setup::IsMissingToolchain(result.message)) {
+			if (attemptedToolchainInstall) {
+				return PrintCompileResult(false, result.message + "\nvc_toolchain_install_verification_failed",
+					effectiveInputPath, format);
+			}
+			attemptedToolchainInstall = true;
+			std::cerr << Utf8Literal(u8"未检测到完整的 VC/MSVC 编译工具链和 Windows SDK（自动检测 VS2022 / VS2026）。\n"
+				u8"是否自动下载安装 VS2026 Build Tools（仅 VC x86/x64 工具及 Windows SDK，不安装 IDE）并重试？ [y/N] ") << std::flush;
+			std::string answer;
+			const bool received = static_cast<bool>(std::getline(std::cin, answer));
+			answer = TrimAsciiCopy(std::move(answer));
+			std::cerr << std::endl;
+			if (!received || (answer != "y" && answer != "Y")) {
+				return PrintCompileResult(false, result.message + "\nvc_toolchain_install_declined", effectiveInputPath, format);
+			}
+			std::cerr << Utf8Literal(u8"正在下载并安装微软 VC 工具链，可能需要较长时间；请确认 Windows 管理员权限提示。不会自动重启。") << std::endl;
+			std::string error;
+			if (!vc_toolchain_setup::InstallBuildTools(error)) {
+				return PrintCompileResult(false, result.message + "\n" + error, effectiveInputPath, format);
+			}
+			std::cerr << Utf8Literal(u8"VC 工具链安装完成，正在重新检测并重试编译。") << std::endl;
+			continue;
+		}
+		std::string dependency;
+		if (!IsDirectECompileInput(effectiveInputPath) || !ParseMissingCompileDependency(result.message, dependency)) {
+			return PrintCompileResult(false, result.message, effectiveInputPath, format);
+		}
+		if (!attemptedDependencies.insert(dependency).second) {
+			return PrintCompileResult(false, result.message + "\nauto_download_retry_failed:" + dependency, effectiveInputPath, format);
+		}
+		if (!AskToDownloadDependency(dependency, architecture)) {
+			return PrintCompileResult(false, result.message + "\nauto_download_declined:" + dependency, effectiveInputPath, format);
+		}
+		std::filesystem::path root;
+		std::string error;
+		if (!dependency_download::EnsureDependency(dependency, architecture, root, error)) {
+			return PrintCompileResult(false, result.message + "\nauto_download_failed:" + error, effectiveInputPath, format);
+		}
+		AppendDownloadedDependencyRoot(options, architecture, root);
 	}
-	std::filesystem::path downloadedRoot;
-	std::string downloadError;
-	if (!dependency_download::EnsureDependency(
-			missingDependency, architecture, downloadedRoot, downloadError)) {
-		const std::string message = result.message + "\nauto_download_failed:" + downloadError;
-		return PrintCompileResult(false, message, effectiveInputPath, format);
-	}
-	AppendDownloadedDependencyRoot(options, architecture, downloadedRoot);
-	result = {};
-	if (!ecompiler::Compile(effectiveInputPath, effectiveOutputPath, options, result)) {
-		const std::string message = result.message + "\nauto_download_retry_failed:" + PathToUtf8(downloadedRoot);
-		return PrintCompileResult(false, message, effectiveInputPath, format);
-	}
-	return PrintCompileResult(true, result.message, effectiveInputPath, format);
 }
 
 int RunDefaultPack()

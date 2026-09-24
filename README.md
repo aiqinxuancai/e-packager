@@ -122,6 +122,13 @@ e-packager compile MyApp.e MyApp-gui.exe --subsystem windows
 
 #### 环境要求
 
+无 IDE 编译会自动检查 VS2022 / VS2026（含 Build Tools、自定义安装目录）的 VC 编译器、链接器、静态运行库和 Windows SDK。缺失时询问是否自动下载安装 **VS2026 Build Tools**：只选择 VC x86/x64 工具与 Windows SDK，不安装完整 IDE。仅输入 `y` 或 `Y` 确认，默认 `N`；空行、`n` 或标准输入 EOF 取消；此提示仅在用户主动使用实验性 `compile` 时触发。
+
+安装需要联网，可能请求 Windows 管理员权限；下载后校验微软签名及 VS2026 版本。安装成功后重新检测并重试编译，随后仍可按原逻辑询问下载缺失的现代黑月依赖。安装失败、取消或要求重启时停止并显示原因，不会自动重启或循环安装。`.e` 与目录输入均支持工具链安装提示（目录输入仍需提前准备现代黑月 adapter）。
+
+显式传入 `--vc-tools-dir`、`--windows-sdk-dir`、`--compiler` 或 `--linker` 时，以用户配置为准，不触发自动安装。CI 应预装依赖并关闭标准输入。已有 VS2026 Build Tools 会补充所需组件；已有完整 VS2022 工具链可直接复用。
+
+
 1. **Visual Studio C++ 工具链**（编译器会自动探测）
    - 下载地址：https://visualstudio.microsoft.com/zh-hans/downloads/
    - 选择 **Visual Studio Community**（免费）
