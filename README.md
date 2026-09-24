@@ -98,7 +98,7 @@ e-packager decrypt-fne MyLib.fne MyLib.txt
 
 无需打开 IDE，一条命令把 `.e` 编译成 `.exe` 或 `.dll`。
 
-> ⚠️ **试验性功能** — 已覆盖常用控件和核心库命令，但不是 IDE 的完整替代。交付前请用 `compile-check` 或 IDE 复核。
+> ⚠️ **实验性功能，不保证稳定性或与 IDE 的兼容性。只有用户明确要求使用无 IDE 编译 / `compile` 时才可调用**；不要自动用于日常源码编辑、回包或验证，也不要作为其它检查失败后的自动替代。需要完整的 VC/MSVC 工具链和 Windows SDK，建议通过 Visual Studio 安装“使用 C++ 的桌面开发”。`compile-check` 是依赖 IDE / AutoLinker 的另一条检查链路。
 
 #### 🚀 从零上手教程
 
