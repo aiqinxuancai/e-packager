@@ -10817,8 +10817,14 @@ bool BuildRestoreModel(
 			}
 		}
 		else {
+			// 依赖模块的「普通程序集」导入:不能要求程序集自身带 公开 标记。
+			// 易语言里普通程序集(无基类、非用户类)的子程序本来就以全局函数导出,
+			// 公开与否只标在【子程序】上(见下方逐方法的 isPublic 过滤)。
+			// 若在此处再要求 parsedClass.isPublic,则形如 ".程序集 Foo, , , _-@M<Foo>"
+			// 的程序集会被整体跳过,导致其全部公开子程序无法解析 →
+			// 工程侧调用时报 function_not_found(且仅在完整语义重建路径暴露)。
 			for (const auto& parsedClass : dependencyClasses) {
-				if (!parsedClass.isPublic || parsedClass.isFormClass || parsedClass.isUserClass) {
+				if (parsedClass.isFormClass || parsedClass.isUserClass) {
 					continue;
 				}
 				DependencyNativeClassBinding* nativeClass = findNativeClassBinding(parsedClass);
