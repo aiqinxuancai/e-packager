@@ -239,6 +239,10 @@ struct RestoreDocumentModel {
 	std::string projectName;
 	std::string versionText;
 	ProjectSubsystem projectSubsystem = ProjectSubsystem::Unknown;
+	// 「系统信息段」原始字节(来自目录化工程包)。非空时回包直接原样写回,
+	// 因为段内 compileType(易模块为 1000)、compileMajor/Minor 及 8 个保留 int32
+	// 均无法由本工程的语义模型表达,重建会丢失信息(易模块会被写成普通程序)。
+	std::vector<std::uint8_t> nativeSystemInfoBytes;
 	std::vector<RestoreDependencyInfo> dependencies;
 	std::vector<RestoreClass> classes;
 	std::vector<RestoreMethod> methods;
@@ -9464,6 +9468,7 @@ bool BuildRestoreModel(
 	model.versionText = document.versionText.empty() ? "1.0" : document.versionText;
 	if (bundle != nullptr) {
 		model.projectSubsystem = bundle->projectSubsystem;
+		model.nativeSystemInfoBytes = bundle->nativeSystemInfoBytes;
 	}
 	for (const auto& dependency : document.dependencies) {
 		RestoreDependencyInfo item;
@@ -12491,6 +12496,12 @@ std::int32_t ComputeAllocatedIdNum(const RestoreDocumentModel& model)
 
 std::vector<std::uint8_t> BuildSystemInfoSection(const RestoreDocumentModel& model)
 {
+	// 优先原样写回原始段:段内 compileType 除 0(窗口)/1(控制台)外还有其它取值
+	// (实测易模块为 1000),且 compileMajor/Minor 与 8 个保留 int32 都无法语义化表达。
+	// 仅当拿不到原始字节(例如从零新建的工程)时,才按下述固定布局兜底生成。
+	if (!model.nativeSystemInfoBytes.empty()) {
+		return model.nativeSystemInfoBytes;
+	}
 	ByteWriter writer;
 	writer.WriteI16(5);
 	writer.WriteI16(6);

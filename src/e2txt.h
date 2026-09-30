@@ -365,6 +365,10 @@ struct ProjectBundle {
 	std::vector<BundleNativeConstantSnapshot> nativeConstantSnapshots;
 	std::string nativeBundleDigest;
 	std::vector<std::uint8_t> nativeSourceBytes;
+	// 原始「系统信息段」的完整字节。该段含若干本工程无法语义化表达的字段
+	// (如 compileType:易模块为 1000,普通程序为 0;以及 compileMajor/Minor、
+	// 8 个保留 int32),回包时若重建这些字段会丢失信息,故原样保存、原样写回。
+	std::vector<std::uint8_t> nativeSystemInfoBytes;
 	// `.ec` 导出目录使用的公开接口头文本。
 	std::string publicHeaderText;
 };

@@ -853,6 +853,8 @@ struct ModuleSections {
 	bool hasFolders = false;
 	bool hasLosable = false;
 	RawSystemInfoSection systemInfo = {};
+	// 「系统信息段」的原始字节(原样保留,供回包时无损写回)
+	std::vector<std::uint8_t> rawSystemInfoBytes;
 	UserInfoSection userInfo;
 	ProgramSection program;
 	ResourceSection resources;
@@ -2397,6 +2399,8 @@ bool ParseModuleSectionsFromBytes(
 			}
 			std::memcpy(&outSections.systemInfo, sectionBytes.data(), sizeof(RawSystemInfoSection));
 			outSections.hasSystemInfo = true;
+			// 原样保留整段字节:段内多数字段无法语义化表达,重建会丢失信息
+			outSections.rawSystemInfoBytes = sectionBytes;
 		}
 		else if (sectionName == "用户信息段") {
 			if (!ParseUserInfoSection(sectionBytes, outSections.userInfo)) {
@@ -7504,6 +7508,9 @@ bool BuildBundleFromSections(
 		if (sections.systemInfo.compileType == 0) bundle.projectSubsystem = ProjectSubsystem::WindowsGui;
 		else if (sections.systemInfo.compileType == 1) bundle.projectSubsystem = ProjectSubsystem::Console;
 	}
+	// 原样保留系统信息段字节:compileType 除 0/1 外还有其它取值(实测易模块为 1000),
+	// 且 compileMajor/Minor 与 8 个保留 int32 均无法语义化表达,重建会丢失
+	bundle.nativeSystemInfoBytes = sections.rawSystemInfoBytes;
 	bundle.dependencies = document.dependencies;
 	bundle.nativeProgramHeader = BundleNativeProgramHeaderSnapshot{
 		sections.program.header.versionFlag1,

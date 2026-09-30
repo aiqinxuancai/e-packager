@@ -1379,6 +1379,7 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 	persistedBundle.nativeStructSnapshots = bundle.nativeStructSnapshots;
 	persistedBundle.nativeDllSnapshots = bundle.nativeDllSnapshots;
 	persistedBundle.nativeConstantSnapshots = bundle.nativeConstantSnapshots;
+	persistedBundle.nativeSystemInfoBytes = bundle.nativeSystemInfoBytes;
 
 	for (auto file : bundle.sourceFiles) {
 		const std::string desiredRelativePath = NormalizeSourceRelativePathForWrite(file);
@@ -1513,6 +1514,11 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 	}
 
 	metaJson["nativeBundleDigest"] = LocalToUtf8Text(ComputeBundleDigest(persistedBundle));
+	// 系统信息段原始字节(base64):段内 compileType/compileMajor/Minor 等无法语义化表达,
+	// 回包时原样写回,避免易模块被改写成普通程序
+	if (!persistedBundle.nativeSystemInfoBytes.empty()) {
+		metaJson["nativeSystemInfoSection"] = EncodeBase64(persistedBundle.nativeSystemInfoBytes);
+	}
 
 	if (!WriteUtf8TextFileBom(GetMetaJsonPath(root), NormalizeCrLf(DumpJson(metaJson)))) {
 		if (outError != nullptr) {
@@ -1667,6 +1673,12 @@ bool BundleDirectoryCodec::ReadBundle(const std::string& inputDir, ProjectBundle
 	}
 	if (const auto it = metaJson.find("nativeBundleDigest"); it != metaJson.end() && it->is_string()) {
 		bundle.nativeBundleDigest = Utf8ToLocalText(it->get<std::string>());
+	}
+	if (const auto it = metaJson.find("nativeSystemInfoSection"); it != metaJson.end() && it->is_string()) {
+		std::vector<std::uint8_t> decoded = DecodeBase64(Utf8ToLocalText(it->get<std::string>()));
+		if (!decoded.empty()) {
+			bundle.nativeSystemInfoBytes = std::move(decoded);
+		}
 	}
 	(void)ReadFileBytes(GetNativeSourceSnapshotPath(root), bundle.nativeSourceBytes);
 	json nativeSourceMapJson;
