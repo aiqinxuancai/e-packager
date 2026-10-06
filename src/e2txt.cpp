@@ -30,6 +30,7 @@
 
 #include "BundlePathUtils.h"
 #include "FormControlPropertyCodec.h"
+#include "CommonWindowEvents.h"
 #include "PathHelper.h"
 
 namespace e2txt {
@@ -3526,6 +3527,8 @@ public:
 
 	std::string ResolveLibTypeEventName(std::int32_t typeValue, std::int32_t eventId)
 	{
+		if (eventId < 0 && eventId >= -static_cast<std::int32_t>(kCommonWindowEvents.size()))
+			return std::string(kCommonWindowEvents[static_cast<size_t>(-eventId - 1)]);
 		if (!epl_system_id::IsLibDataType(typeValue)) {
 			return std::string("事件") + std::to_string(eventId);
 		}
@@ -6424,6 +6427,10 @@ bool AppendFormControlPropertyXmlChildren(
 	const bool tabControl)
 {
 	bool appended = false;
+	for (const auto& node : semantic.structured) {
+		AppendXmlLine(formXml, indent, BuildXmlOpenTag(tagName + "." + node.name, node.attributes, true));
+		appended = true;
+	}
 	for (const auto& collection : semantic.collections) {
 		const std::string propertyName = !collection.definition.xmlName.empty()
 			? collection.definition.xmlName : collection.definition.name;
@@ -6561,6 +6568,23 @@ void BuildFormXmlEntries(
 		}
 		AppendXmlLine(formXml, 0, BuildXmlOpenTag("窗口", rootAttributes, false));
 		AppendFormControlPropertyXmlChildren(formXml, "窗口", 1, rootSemantic, false);
+		std::unordered_set<std::int32_t> listedEventTypes;
+		for (const auto& element : form.elements) {
+			if (element.isMenu || !listedEventTypes.insert(element.dataType).second) continue;
+			std::vector<FormControlEventDefinition> events;
+			if (!propertyCodec.ReadEvents(element.dataType, events, nullptr) || events.empty()) continue;
+			AppendXmlLine(formXml, 1, BuildXmlOpenTag("窗口.事件定义", {{"控件类型", resolver.ResolveType(element.dataType)}}, false));
+			for (const auto& event : events) {
+				AppendXmlLine(formXml, 2, BuildXmlOpenTag("事件", {{"名称", event.name}, {"索引", std::to_string(event.index)},
+					{"返回类型", event.returnType == 0 ? "" : resolver.ResolveType(event.returnType)}}, false));
+				for (const auto& parameter : event.parameters) {
+					AppendXmlLine(formXml, 3, BuildXmlOpenTag("参数", {{"名称", parameter.name},
+						{"类型", resolver.ResolveType(parameter.type)}, {"参考", BoolToEText(parameter.byReference)}}, true));
+				}
+				AppendXmlLine(formXml, 2, "</事件>");
+			}
+			AppendXmlLine(formXml, 1, "</窗口.事件定义>");
+		}
 		if (formSelf != nullptr) {
 			AppendFormControlEventXmlLines(formXml, *formSelf, "窗口", 1, resolver);
 		}
@@ -6667,7 +6691,7 @@ void BuildFormXmlEntries(
 			const bool isTabControl = resolver.IsTabControlDataType(item.dataType);
 			const bool hasChildren = !item.children.empty();
 			const bool hasEventBindings = !item.events.empty();
-			const bool hasSemanticProperties = !semantic.collections.empty();
+			const bool hasSemanticProperties = !semantic.collections.empty() || !semantic.structured.empty();
 			if (!hasChildren && !hasEventBindings && !hasSemanticProperties) {
 				AppendXmlLine(formXml, indent, BuildXmlOpenTag(tagName, attributes, true));
 				return;

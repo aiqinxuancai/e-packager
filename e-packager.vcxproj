@@ -209,6 +209,7 @@
     <ClInclude Include="src\VcToolchainSetup.h" />
     <ClInclude Include="src\EFolderCodec.h" />
     <ClInclude Include="src\FormControlPropertyCodec.h" />
+    <ClInclude Include="src\CommonWindowEvents.h" />
     <ClInclude Include="src\SelfUpdater.h" />
     <ClInclude Include="src\SimpleXmlDocument.h" />
     <ClInclude Include="src\SourceExpressionParser.h" />

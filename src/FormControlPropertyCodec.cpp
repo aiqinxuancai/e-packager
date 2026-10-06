@@ -1,5 +1,6 @@
 ﻿#include "SupportLibraryRuntime.h"
 #include "FormControlPropertyCodec.h"
+#include "CommonWindowEvents.h"
 
 // 通过 lib2.h 的公开窗口单元接口编解码核心及第三方控件属性。
 #include <Windows.h>
@@ -484,20 +485,21 @@ bool CallNotifyPropertyChangedSafely(
 	UNIT_PROPERTY_VALUE& value,
 	bool& outNeedsRecreate)
 {
+	LPCSTR tip = nullptr;
 	outNeedsRecreate = false;
 	if (procedure == nullptr || unit == 0) {
 		return false;
 	}
 #if defined(_MSC_VER)
 	__try {
-		outNeedsRecreate = procedure(unit, callbackIndex, &value, nullptr) != FALSE;
+		outNeedsRecreate = procedure(unit, callbackIndex, &value, &tip) != FALSE;
 		return true;
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {
 		return false;
 	}
 #else
-	outNeedsRecreate = procedure(unit, callbackIndex, &value, nullptr) != FALSE;
+	outNeedsRecreate = procedure(unit, callbackIndex, &value, &tip) != FALSE;
 	return true;
 #endif
 }
@@ -1434,11 +1436,53 @@ bool TryInferCollectionKind(
 		outKind = FormControlPropertyCollectionKind::Text;
 		return true;
 	}
-	if (DecodeInt32Array(value.binaryValue, integers)) {
-		outKind = FormControlPropertyCollectionKind::Integer;
-		return true;
-	}
+	// 私有结构不能仅凭长度被解释为整数数组；保留原始二进制属性。
 	return false;
+}
+
+// LOGFONTA 是支持库公开的字体二进制格式，导出可编辑字段而非私有字节数组。
+constexpr std::array<const char*, 13> kFontFields = {
+    "高度", "宽度", "倾斜角度", "方向", "粗细", "斜体", "下划线", "删除线",
+    "字符集", "输出精度", "裁剪精度", "质量", "间距和字体族"
+};
+bool DecodeFontNode(const FormControlPropertyValue& value, FormControlPropertyXmlNode& node)
+{
+    if (value.binaryValue.size() != sizeof(LOGFONTA)) return false;
+    node.name = value.definition.xmlName;
+    for (size_t field = 0; field < kFontFields.size(); ++field) {
+        std::int32_t number = 0;
+        if (field < 5) std::memcpy(&number, value.binaryValue.data() + field * 4, 4);
+        else number = value.binaryValue[20 + field - 5];
+        node.attributes.emplace_back(kFontFields[field], std::to_string(number));
+    }
+    const auto* face = reinterpret_cast<const char*>(value.binaryValue.data() + 28);
+    const auto* end = static_cast<const char*>(std::memchr(face, 0, LF_FACESIZE));
+    if (!end) return false;
+    node.attributes.emplace_back("字体名", std::string(face, end));
+    return true;
+}
+bool EncodeFontNode(const FormControlPropertyXmlNode& node, std::vector<std::uint8_t>& data)
+{
+    if (data.size() != sizeof(LOGFONTA)) data.assign(sizeof(LOGFONTA), 0);
+    for (const auto& [name, value] : node.attributes) {
+        if (name == "字体名") {
+            if (value.size() >= LF_FACESIZE || value.find('\0') != std::string::npos) return false;
+            std::memset(data.data() + 28, 0, LF_FACESIZE);
+            std::memcpy(data.data() + 28, value.data(), value.size());
+            continue;
+        }
+        const auto field = std::find(kFontFields.begin(), kFontFields.end(), name);
+        if (field == kFontFields.end()) return false;
+        const size_t index = static_cast<size_t>(field - kFontFields.begin());
+        std::int32_t number = 0;
+        if (!TryParseInt32(value, number)) return false;
+        if (index < 5) std::memcpy(data.data() + index * 4, &number, 4);
+        else {
+            if (number < 0 || number > 255 || (index < 8 && number > 1)) return false;
+            data[20 + index - 5] = static_cast<std::uint8_t>(number);
+        }
+    }
+    return node.children.empty();
 }
 
 bool HasXmlNodeAttribute(
@@ -1510,7 +1554,15 @@ bool AreValuesEquivalent(const FormControlPropertyValue& left, const FormControl
 	case FormControlPropertyValueKind::Double: return left.doubleValue == right.doubleValue;
 	case FormControlPropertyValueKind::Boolean: return left.booleanValue == right.booleanValue;
 	case FormControlPropertyValueKind::Text: return left.textValue == right.textValue;
-	case FormControlPropertyValueKind::Binary: return left.binaryValue == right.binaryValue;
+	case FormControlPropertyValueKind::Binary:
+		if (left.definition.dataType == UD_FONT && left.binaryValue.size() == sizeof(LOGFONTA) &&
+			right.binaryValue.size() == sizeof(LOGFONTA)) {
+			// LOGFONT 字体名终止符后的填充字节不参与语义比较。
+			return std::memcmp(left.binaryValue.data(), right.binaryValue.data(), 28) == 0 &&
+				std::strncmp(reinterpret_cast<const char*>(left.binaryValue.data() + 28),
+					reinterpret_cast<const char*>(right.binaryValue.data() + 28), LF_FACESIZE) == 0;
+		}
+		return left.binaryValue == right.binaryValue;
 	default: return false;
 	}
 }
@@ -1558,12 +1610,8 @@ bool ParseXmlPropertyValue(
 		return TryParseInt32(text, outValue.integerValue);
 	}
 
-	// Unknown property editor types are preserved as text unless their public
-	// metadata supplied a concrete type above.  This keeps a new FNE's
-	// extension attributes editable without guessing a private numeric code.
-	outValue.kind = FormControlPropertyValueKind::Text;
-	outValue.textValue = text;
-	return true;
+	// 未知编辑器必须有 getter 提供的已知类型，不能猜测 union 的活动成员。
+	return false;
 }
 
 bool ReadUnitPropertyValue(
@@ -1929,6 +1977,62 @@ bool FormControlPropertyCodec::BuildTypeContext(
 	return true;
 }
 
+bool FormControlPropertyCodec::ReadEvents(const std::int32_t dataType,
+    std::vector<FormControlEventDefinition>& events, std::string* outError)
+{
+    events.clear();
+    TypeContext context;
+    if (!BuildTypeContext(dataType, context, outError)) return false;
+    const auto& type = *context.dataType;
+    const auto resolveType = [dataType](const DATA_TYPE value) -> std::int32_t {
+        if (value == 0 || static_cast<std::int32_t>(value) < 0) return static_cast<std::int32_t>(value);
+        return (dataType & 0xffff0000) | (static_cast<std::int32_t>(value) + 1);
+    };
+    if (type.m_nEventCount < 0 || type.m_nEventCount > 4096) return false;
+    if (type.m_nEventCount != 0) {
+        if (!IsReadableMemoryRange(type.m_pEventBegin, sizeof(EVENT_INFO))) return false;
+        const bool version2 = (reinterpret_cast<const EVENT_INFO*>(type.m_pEventBegin)->m_dwState & EV_IS_VER2) != 0;
+        const size_t stride = version2 ? sizeof(EVENT_INFO2) : sizeof(EVENT_INFO);
+        const size_t argStride = version2 ? sizeof(EVENT_ARG_INFO2) : sizeof(EVENT_ARG_INFO);
+        if (!IsReadableMemoryRange(type.m_pEventBegin, stride * type.m_nEventCount)) return false;
+        for (int index = 0; index < type.m_nEventCount; ++index) {
+            const auto* event = reinterpret_cast<const EVENT_INFO*>(
+                reinterpret_cast<const std::uint8_t*>(type.m_pEventBegin) + stride * index);
+            FormControlEventDefinition definition;
+            definition.index = index;
+            definition.name = ReadPublishedString(event->m_szName, context.utf8);
+            definition.returnType = version2 ? resolveType(reinterpret_cast<const EVENT_INFO2*>(event)->m_dtRetDataType)
+                : ((event->m_dwState & EV_RETURN_INT) ? static_cast<std::int32_t>(SDT_INT) : ((event->m_dwState & EV_RETURN_BOOL) ? static_cast<std::int32_t>(SDT_BOOL) : 0));
+            if (event->m_nArgCount < 0 || event->m_nArgCount > 64) return false;
+            if (event->m_nArgCount && !IsReadableMemoryRange(event->m_pEventArgInfo, argStride * event->m_nArgCount)) return false;
+            for (int arg = 0; arg < event->m_nArgCount; ++arg) {
+                const auto* parameter = reinterpret_cast<const EVENT_ARG_INFO*>(
+                    reinterpret_cast<const std::uint8_t*>(event->m_pEventArgInfo) + argStride * arg);
+                definition.parameters.push_back({ReadPublishedString(parameter->m_szName, context.utf8),
+                    version2 ? resolveType(reinterpret_cast<const EVENT_ARG_INFO2*>(parameter)->m_dtDataType)
+                        : ((parameter->m_dwState & EAS_IS_BOOL_ARG) ? static_cast<std::int32_t>(SDT_BOOL) : static_cast<std::int32_t>(SDT_INT)),
+                    version2 && (parameter->m_dwState & EAS_BY_REF) != 0});
+            }
+            events.push_back(std::move(definition));
+        }
+    }
+    // 非可视功能提供者不支持通用窗口消息事件。
+    if ((type.m_dwState & LDT_IS_FUNCTION_PROVIDER) == 0) {
+        for (size_t index = 0; index < kCommonWindowEvents.size(); ++index) {
+            FormControlEventDefinition event;
+            event.index = -static_cast<std::int32_t>(index) - 1;
+            event.name = kCommonWindowEvents[index];
+            event.returnType = index == 10 ? static_cast<std::int32_t>(SDT_INT) : ((index < 6 || index == 8 || index == 9 || index == 11) ? static_cast<std::int32_t>(SDT_BOOL) : 0);
+            if (index < 6) event.parameters = {{"横向位置", static_cast<std::int32_t>(SDT_INT)}, {"纵向位置", static_cast<std::int32_t>(SDT_INT)}, {"功能键状态", static_cast<std::int32_t>(SDT_INT)}};
+            else if (index == 8 || index == 9) event.parameters = {{"键代码", static_cast<std::int32_t>(SDT_INT)}, {"功能键状态", static_cast<std::int32_t>(SDT_INT)}};
+            else if (index == 10) event.parameters = {{"字符代码", static_cast<std::int32_t>(SDT_INT)}};
+            else if (index == 11) event.parameters = {{"滚动距离", static_cast<std::int32_t>(SDT_INT)}, {"功能键状态", static_cast<std::int32_t>(SDT_INT)}};
+            events.push_back(std::move(event));
+        }
+    }
+    return true;
+}
+
 bool FormControlPropertyCodec::EnsureParentWindow()
 {
 	if (m_parentWindow != nullptr) {
@@ -2094,6 +2198,10 @@ bool FormControlPropertyCodec::Decode(
 		if (!valueRead) {
 			continue;
 		}
+		if (outSemantic != nullptr && value.definition.dataType == UD_FONT) {
+			FormControlPropertyXmlNode node;
+			if (DecodeFontNode(value, node)) outSemantic->structured.push_back(std::move(node));
+		}
 		if (outSemantic != nullptr && value.definition.dataType == UD_CUSTOMIZE) {
 			FormControlPropertyCollectionKind collectionKind;
 			if (TryInferCollectionKind(value, collectionKind)) {
@@ -2166,10 +2274,11 @@ bool FormControlPropertyCodec::Apply(
 					(!definition.englishName.empty() && definition.englishName == attribute.first);
 			});
 		if (definitionIt == context.properties.end()) {
-			continue;
+			if (outError) *outError = "window_control_property_unknown: " + attribute.first;
+			return false;
 		}
 		bool duplicateStructuredNode = false;
-		const auto* structuredNode = definitionIt->dataType == UD_CUSTOMIZE
+		const auto* structuredNode = (definitionIt->dataType == UD_CUSTOMIZE || definitionIt->dataType == UD_FONT)
 			? FindPropertyXmlNode(xmlChildren, *definitionIt, duplicateStructuredNode) : nullptr;
 		if (structuredNode != nullptr) {
 			if (duplicateStructuredNode) {
@@ -2186,6 +2295,12 @@ bool FormControlPropertyCodec::Apply(
 			// preserve it as bytes without needing to know the private payload ABI.
 			unknownKind = FormControlPropertyValueKind::Binary;
 		}
+		for (const auto& original : originalValues) {
+			if (original.definition.metadataIndex == definitionIt->metadataIndex) {
+				unknownKind = original.kind;
+				break;
+			}
+		}
 		if (!ParseXmlPropertyValue(*definitionIt, attribute.second, parsed, unknownKind)) {
 			if (outError != nullptr) {
 				*outError = "window_control_property_value_invalid: " + attribute.first;
@@ -2201,11 +2316,15 @@ bool FormControlPropertyCodec::Apply(
 		if (canReadOriginal && originalIt != originalValues.end() && AreValuesEquivalent(*originalIt, parsed)) {
 			continue;
 		}
+		if ((parsed.definition.state & (UW_ONLY_READ | UW_CANNOT_INIT)) != 0) {
+			if (outError) *outError = "window_control_property_not_design_writable: " + parsed.definition.xmlName;
+			return false;
+		}
 		updates.push_back(std::move(parsed));
 	}
 
 	for (const auto& definition : context.properties) {
-		if (definition.dataType != UD_CUSTOMIZE) continue;
+		if (definition.dataType != UD_CUSTOMIZE && definition.dataType != UD_FONT) continue;
 		bool duplicateStructuredNode = false;
 		const FormControlPropertyXmlNode* structuredNode = FindPropertyXmlNode(
 			xmlChildren, definition, duplicateStructuredNode);
@@ -2218,16 +2337,19 @@ bool FormControlPropertyCodec::Apply(
 			}
 			return false;
 		}
-		FormControlPropertyCollectionKind collectionKind;
-		if (!TryInferXmlCollectionKind(*structuredNode, collectionKind)) {
-			if (outError != nullptr) {
-				*outError = "window_control_customize_data_invalid: " + definition.xmlName;
-			}
-			return false;
-		}
 		std::vector<std::uint8_t> structuredData;
-		if (!EncodeStructuredProperty(*structuredNode, collectionKind, context.utf8, structuredData)) {
-			if (outError != nullptr) *outError = "window_control_customize_data_invalid: " + definition.xmlName;
+		bool encoded = false;
+		if (definition.dataType == UD_FONT) {
+			for (const auto& original : originalValues)
+				if (original.definition.metadataIndex == definition.metadataIndex) structuredData = original.binaryValue;
+			encoded = EncodeFontNode(*structuredNode, structuredData);
+		} else {
+			FormControlPropertyCollectionKind collectionKind;
+			encoded = TryInferXmlCollectionKind(*structuredNode, collectionKind) &&
+				EncodeStructuredProperty(*structuredNode, collectionKind, context.utf8, structuredData);
+		}
+		if (!encoded) {
+			if (outError) *outError = "window_control_structured_property_invalid: " + definition.xmlName;
 			return false;
 		}
 		FormControlPropertyValue parsed;
@@ -2243,6 +2365,10 @@ bool FormControlPropertyCodec::Apply(
 		if (canReadOriginal && originalIt != originalValues.end() && AreValuesEquivalent(*originalIt, parsed)) {
 			continue;
 		}
+		if ((parsed.definition.state & (UW_ONLY_READ | UW_CANNOT_INIT)) != 0) {
+			if (outError) *outError = "window_control_property_not_design_writable: " + parsed.definition.xmlName;
+			return false;
+		}
 		updates.push_back(std::move(parsed));
 	}
 
@@ -2253,7 +2379,7 @@ bool FormControlPropertyCodec::Apply(
 		if (outError != nullptr) *outError = "window_control_property_update_interface_unavailable";
 		return false;
 	}
-	const HUNIT unit = static_cast<HUNIT>(CreateUnit(context, originalData, formId, unitId));
+	HUNIT unit = static_cast<HUNIT>(CreateUnit(context, originalData, formId, unitId));
 	if (unit == 0) {
 		if (outError != nullptr) *outError = "window_control_create_failed";
 		return false;
@@ -2272,6 +2398,16 @@ bool FormControlPropertyCodec::Apply(
 			if (outError != nullptr) *outError = "window_control_property_update_failed: " + update.definition.xmlName;
 			return false;
 		}
+		if (needsRecreate) {
+			const HGLOBAL saved = CallGetAllPropertyDataSafely(context.getAll, unit);
+			std::vector<std::uint8_t> data;
+			const bool copied = saved != nullptr && CopyGlobalBytes(saved, data);
+			if (saved) GlobalFree(saved);
+			if (!copied || (unit = static_cast<HUNIT>(CreateUnit(context, data, formId, unitId))) == 0) {
+				if (outError) *outError = "window_control_property_recreate_failed: " + update.definition.xmlName;
+				return false;
+			}
+		}
 	}
 
 	const HGLOBAL globalData = CallGetAllPropertyDataSafely(context.getAll, unit);
@@ -2284,6 +2420,18 @@ bool FormControlPropertyCodec::Apply(
 	if (!copied) {
 		if (outError != nullptr) *outError = "window_control_property_save_data_invalid";
 		return false;
+	}
+	// setter 可能拒绝值却正常返回；以序列化后重新创建的读数判断是否真正保存。
+	std::vector<FormControlPropertyValue> persisted;
+	if (!Decode(dataType, outData, formId, unitId, persisted, outError)) return false;
+	for (const auto& update : updates) {
+		const auto found = std::find_if(persisted.begin(), persisted.end(), [&](const auto& value) {
+			return value.definition.metadataIndex == update.definition.metadataIndex;
+		});
+		if (found == persisted.end() || !AreValuesEquivalent(update, *found)) {
+			if (outError) *outError = "window_control_property_not_persisted: " + update.definition.xmlName;
+			return false;
+		}
 	}
 	return true;
 }

@@ -8709,6 +8709,7 @@ std::int32_t ResolveHandlerMethodId(
 		}
 	}
 
+	if (!ownerName.empty() && resolvedOwnerClassId == 0) return 0;
 	if (resolvedOwnerClassId == 0 && preferredOwnerClassId != 0) {
 		for (const auto& method : model.methods) {
 			if (method.ownerClass == preferredOwnerClassId &&
@@ -8727,6 +8728,7 @@ std::int32_t ResolveHandlerMethodId(
 		}
 	}
 
+	if (!ownerName.empty()) return 0;
 	std::int32_t uniqueMatch = 0;
 	for (const auto& method : model.methods) {
 		if (TypeResolver::NormalizeTypeName(method.name) != methodName) {
@@ -8740,39 +8742,85 @@ std::int32_t ResolveHandlerMethodId(
 	return uniqueMatch;
 }
 
-std::vector<std::pair<std::int32_t, std::int32_t>> ReadFormControlEventsFromXml(
-	const SimpleXmlNode& node,
-	const std::string& eventNodeName,
-	const std::int32_t preferredOwnerClassId,
-	const RestoreDocumentModel& model)
+bool ReadFormControlEventsFromXml(
+    const SimpleXmlNode& node, const std::string& eventNodeName,
+    const std::int32_t preferredOwnerClassId, const RestoreDocumentModel& model,
+    FormControlPropertyCodec& codec, const std::int32_t dataType,
+    std::vector<std::pair<std::int32_t, std::int32_t>>& events, std::string* outError)
 {
-	std::vector<std::pair<std::int32_t, std::int32_t>> events;
-	for (const auto& child : node.children) {
-		if (child.name != eventNodeName) {
-			continue;
-		}
-		// 通用窗口事件使用负索引（例如被双击为 -3），同样需要保留绑定。
-		std::int32_t eventKey = 0;
-		if (!TryParseInt32(GetXmlAttribute(child, "索引"), eventKey)) {
-			continue;
-		}
-		const std::int32_t handlerId = ResolveHandlerMethodId(GetXmlAttribute(child, "处理器"), preferredOwnerClassId, model);
-		events.emplace_back(eventKey, handlerId);
-	}
-	return events;
+    events.clear();
+    std::vector<FormControlEventDefinition> definitions;
+    bool loaded = false;
+    const auto fail = [&](const std::string& reason) {
+        if (outError) *outError = "window_event[" + GetXmlAttribute(node, "名称") + "]: " + reason;
+        return false;
+    };
+    for (const auto& child : node.children) {
+        if (child.name != eventNodeName) continue;
+        if (!loaded) {
+            if (!codec.ReadEvents(dataType, definitions, outError)) return fail("event_metadata_unavailable");
+            loaded = true;
+        }
+        const auto name = GetXmlAttribute(child, "名称");
+        const auto indexText = GetXmlAttribute(child, "索引");
+        std::int32_t index = 0;
+        auto definition = definitions.end();
+        if (!indexText.empty()) {
+            if (!TryParseInt32(indexText, index)) return fail("invalid_index: " + indexText);
+            definition = std::find_if(definitions.begin(), definitions.end(), [&](const auto& item) { return item.index == index; });
+        } else {
+            definition = std::find_if(definitions.begin(), definitions.end(), [&](const auto& item) { return item.name == name; });
+        }
+        if (definition == definitions.end()) return fail("unknown_event: " + name + " / " + indexText);
+        index = definition->index;
+        // 兼容旧拆包器导出的占位名称；可读名称必须与索引一致。
+        if (!name.empty() && name != definition->name && !StartsWith(name, "_Lib"))
+            return fail("name_index_mismatch: " + name);
+        if (std::any_of(events.begin(), events.end(), [&](const auto& item) { return item.first == index; }))
+            return fail("duplicate_event: " + name);
+        const auto handlerName = GetXmlAttribute(child, "处理器");
+        const auto handler = ResolveHandlerMethodId(handlerName, preferredOwnerClassId, model);
+        if (handler == 0) return fail("handler_not_found_or_ambiguous: " + handlerName);
+        const auto method = std::find_if(model.methods.begin(), model.methods.end(), [&](const auto& item) { return item.id == handler; });
+        if (method == model.methods.end() || method->params.size() != definition->parameters.size())
+            return fail("handler_parameter_count_mismatch: " + handlerName);
+        if (method->returnType != 0 && method->returnType != definition->returnType)
+            return fail("handler_return_type_mismatch: " + handlerName);
+        for (size_t arg = 0; arg < definition->parameters.size(); ++arg) {
+            const auto& expected = definition->parameters[arg];
+            const auto& actual = method->params[arg];
+            if (actual.dataType != expected.type || ((actual.attr & kVarAttrByRef) != 0) != expected.byReference ||
+                (actual.attr & (kVarAttrArray | kVarAttrNullable)) != 0)
+                return fail("handler_parameter_type_mismatch: " + handlerName + " / " + expected.name);
+        }
+        events.emplace_back(index, handler);
+    }
+    return true;
 }
 
-std::int32_t ReadFormMenuClickEventFromXml(
-	const SimpleXmlNode& node,
-	const std::int32_t preferredOwnerClassId,
-	const RestoreDocumentModel& model)
+bool ReadFormMenuClickEventFromXml(const SimpleXmlNode& node,
+    const std::int32_t preferredOwnerClassId, const RestoreDocumentModel& model,
+    std::int32_t& handlerId, std::string* outError)
 {
-	for (const auto& child : node.children) {
-		if (child.name == "菜单.事件") {
-			return ResolveHandlerMethodId(GetXmlAttribute(child, "处理器"), preferredOwnerClassId, model);
-		}
-	}
-	return 0;
+    handlerId = 0;
+    for (const auto& child : node.children) {
+        if (child.name != "菜单.事件") continue;
+        const auto name = GetXmlAttribute(child, "名称");
+        const auto index = GetXmlAttribute(child, "索引");
+        if (handlerId != 0 || (!name.empty() && name != "单击" && name != "被单击") ||
+            (!index.empty() && index != "0")) {
+            if (outError) *outError = "window_menu_event_invalid_or_duplicate: " + GetXmlAttribute(node, "名称");
+            return false;
+        }
+        const auto handler = GetXmlAttribute(child, "处理器");
+        handlerId = ResolveHandlerMethodId(handler, preferredOwnerClassId, model);
+        const auto method = std::find_if(model.methods.begin(), model.methods.end(), [&](const auto& item) { return item.id == handlerId; });
+        if (handlerId == 0 || method == model.methods.end() || !method->params.empty() || method->returnType != 0) {
+            if (outError) *outError = "window_menu_handler_invalid: " + handler;
+            return false;
+        }
+    }
+    return true;
 }
 
 std::int16_t BuildVariableAttr(const ParsedVariableDef& definition, const bool allowStatic, const bool allowPublic)
@@ -8879,7 +8927,8 @@ bool BuildFormControlTree(
 		return false;
 	}
 	element.extensionData = std::move(updatedPropertyData);
-	element.events = ReadFormControlEventsFromXml(node, node.name + ".事件", preferredOwnerClassId, model);
+	if (!ReadFormControlEventsFromXml(node, node.name + ".事件", preferredOwnerClassId, model,
+		propertyCodec, element.dataType, element.events, outError)) return false;
 
 	std::vector<std::int32_t> childIds;
 	const bool isTabControl = resolver.IsTabControlType(element.dataType);
@@ -8952,13 +9001,14 @@ bool BuildFormControlTree(
 	return true;
 }
 
-void BuildFormMenus(
+bool BuildFormMenus(
 	const SimpleXmlNode& node,
 	const int level,
 	const std::int32_t preferredOwnerClassId,
 	const RestoreDocumentModel& model,
 	IdAllocator& allocator,
-	std::vector<RestoreFormElement>& outElements)
+	std::vector<RestoreFormElement>& outElements,
+	std::string* outError)
 {
 	for (const auto& child : node.children) {
 		if (child.name != "菜单") {
@@ -8975,10 +9025,11 @@ void BuildFormMenus(
 		element.selected = GetXmlBoolAttribute(child, "选中", false);
 		element.hotKey = GetXmlIntAttribute(child, "快捷键", 0);
 		element.level = level;
-		element.clickEvent = ReadFormMenuClickEventFromXml(child, preferredOwnerClassId, model);
+		if (!ReadFormMenuClickEventFromXml(child, preferredOwnerClassId, model, element.clickEvent, outError)) return false;
 		outElements.push_back(std::move(element));
-		BuildFormMenus(child, level + 1, preferredOwnerClassId, model, allocator, outElements);
+		if (!BuildFormMenus(child, level + 1, preferredOwnerClassId, model, allocator, outElements, outError)) return false;
 	}
+	return true;
 }
 
 bool BuildFormsFromXml(
@@ -9088,12 +9139,13 @@ bool BuildFormsFromXml(
 				return false;
 			}
 			selfElement.extensionData = std::move(updatedRootPropertyData);
-			selfElement.events = ReadFormControlEventsFromXml(root, "窗口.事件", form.classId, model);
+			if (!ReadFormControlEventsFromXml(root, "窗口.事件", form.classId, model,
+				propertyCodec, selfElement.dataType, selfElement.events, outError)) return false;
 
 			form.elements.push_back(selfElement);
 			for (const auto& child : root.children) {
 				if (child.name == "窗口.菜单") {
-					BuildFormMenus(child, 0, form.classId, model, allocator, form.elements);
+					if (!BuildFormMenus(child, 0, form.classId, model, allocator, form.elements, outError)) return false;
 				}
 			}
 			std::vector<std::int32_t> rootChildren;
@@ -11161,6 +11213,12 @@ bool BuildRestoreModel(
 			declaration.ownerClass = model.classes[localClassModelIndices[classIndex]].id;
 			declaration.name = parsedMethod.name;
 			declaration.returnType = ensureTypeId(parsedMethod.returnTypeName);
+			for (const auto& parameter : parsedMethod.params) {
+				RestoreVariable variable;
+				variable.dataType = ensureTypeId(parameter.typeName);
+				variable.attr = BuildVariableAttr(parameter, false, false);
+				declaration.params.push_back(std::move(variable));
+			}
 			model.methods.push_back(std::move(declaration));
 			preparedMethods.push_back(prepared);
 		}

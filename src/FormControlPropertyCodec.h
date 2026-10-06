@@ -15,6 +15,19 @@ struct FormControlSupportLibrary {
 	std::string resolvedPath;
 };
 
+// 公开事件签名；类型编号已转换成工程支持库类型编号。
+struct FormControlEventParameter {
+    std::string name;
+    std::int32_t type = 0;
+    bool byReference = false;
+};
+struct FormControlEventDefinition {
+    std::int32_t index = 0;
+    std::string name;
+    std::int32_t returnType = 0;
+    std::vector<FormControlEventParameter> parameters;
+};
+
 // 窗口组件属性的公开定义。
 struct FormControlPropertyDefinition {
 	std::string name;
@@ -70,6 +83,7 @@ struct FormControlPropertyXmlNode {
 // 可从公开属性数据中无损识别的重复值集合。
 struct FormControlPropertySemanticData {
 	std::vector<FormControlPropertyCollection> collections;
+	std::vector<FormControlPropertyXmlNode> structured;
 };
 
 // 使用支持库公开的窗口单元接口读取和更新专属属性。
@@ -105,6 +119,9 @@ public:
 		std::vector<std::uint8_t>& outData,
 		std::string* outError = nullptr,
 		const std::vector<FormControlPropertyXmlNode>& xmlChildren = {});
+
+	// 从支持库公开事件表读取名称和原生索引，包含 IDE 通用事件。
+	bool ReadEvents(std::int32_t dataType, std::vector<FormControlEventDefinition>& events, std::string* outError);
 
 	// 将读取到的属性值转换成 XML 属性文本。
 	static std::string ValueToXmlText(const FormControlPropertyValue& value);

@@ -668,7 +668,9 @@ void CollectFormControlSymbols(
 				}
 			}
 		}
-		CollectFormControlSymbols(child, program, path, report);
+		// 只有子夹和菜单元数据容器包含控件；属性、事件定义里的名称不是控件符号。
+		if (!IsFormMetadataNode(child.name) || child.name.ends_with(".子夹") || child.name.ends_with(".菜单"))
+			CollectFormControlSymbols(child, program, path, report);
 	}
 }
 
