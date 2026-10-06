@@ -8751,8 +8751,9 @@ std::vector<std::pair<std::int32_t, std::int32_t>> ReadFormControlEventsFromXml(
 		if (child.name != eventNodeName) {
 			continue;
 		}
-		const std::int32_t eventKey = GetXmlIntAttribute(child, "索引", -1);
-		if (eventKey < 0) {
+		// 通用窗口事件使用负索引（例如被双击为 -3），同样需要保留绑定。
+		std::int32_t eventKey = 0;
+		if (!TryParseInt32(GetXmlAttribute(child, "索引"), eventKey)) {
 			continue;
 		}
 		const std::int32_t handlerId = ResolveHandlerMethodId(GetXmlAttribute(child, "处理器"), preferredOwnerClassId, model);
@@ -9886,6 +9887,7 @@ bool BuildRestoreModel(
 		const ParsedMethodDef* originalParsedMethod = nullptr;
 	};
 	struct PreparedLocalMethod {
+		size_t modelIndex = 0;
 		NativeMethodSnapshotMatch reusableMatch;
 		NativeMethodSnapshotMatch identityMatch;
 		std::int32_t id = 0;
@@ -11152,6 +11154,14 @@ bool BuildRestoreModel(
 			else {
 				prepared.id = allocator.Alloc(epl_system_id::kTypeMethod);
 			}
+			// 方法声明先进入模型，窗口事件和方法体共享同一组稳定 ID。
+			prepared.modelIndex = model.methods.size();
+			RestoreMethod declaration;
+			declaration.id = prepared.id;
+			declaration.ownerClass = model.classes[localClassModelIndices[classIndex]].id;
+			declaration.name = parsedMethod.name;
+			declaration.returnType = ensureTypeId(parsedMethod.returnTypeName);
+			model.methods.push_back(std::move(declaration));
 			preparedMethods.push_back(prepared);
 		}
 	}
@@ -11175,6 +11185,33 @@ bool BuildRestoreModel(
 					: ensureTypeId(parsedClass.baseClassName));
 		}
 	}
+	std::unordered_map<std::string, std::int32_t> formClassIds;
+	std::unordered_map<std::string, std::int32_t> preferredFormIds;
+	for (const auto& [formName, classIndex] : formClassMatches) {
+		if (classIndex < localClassModelIndices.size()) {
+			const auto& matchedClass = model.classes[localClassModelIndices[classIndex]];
+			formClassIds.insert_or_assign(formName, matchedClass.id);
+			if (matchedClass.formId != 0) {
+				preferredFormIds.insert_or_assign(formName, matchedClass.formId);
+			}
+		}
+	}
+	if (!BuildFormsFromXml(parsedForms, formClassIds, preferredFormIds, model, resolver, allocator, model.forms, outError)) {
+		return false;
+	}
+
+	for (auto& item : model.classes) {
+		if (!item.isFormClass) {
+			continue;
+		}
+		for (const auto& form : model.forms) {
+			if (form.classId == item.id) {
+				item.formId = form.id;
+				break;
+			}
+		}
+	}
+
 	// Resolve the complete inheritance graph before encoding any method;
 	// base classes can occur after their callers in the source file order.
 	for (size_t classIndex = 0; classIndex < parsedClasses.size(); ++classIndex) {
@@ -11372,6 +11409,16 @@ bool BuildRestoreModel(
 			for (size_t constantIndex = 0; constantIndex < parsedConstants.size() && constantIndex < localConstantIds.size(); ++constantIndex) {
 				addNativeConstant(parsedConstants[constantIndex].name, localConstantIds[constantIndex]);
 			}
+			// 窗口先于方法体重建，控件引用必须使用本次生成的控件 ID。
+			for (const auto& form : model.forms) {
+				addNativeObjectVariable(form.name, form.id, 65537);
+				for (const auto& element : form.elements) {
+					if (form.classId == targetClass.id &&
+						(element.id & epl_system_id::kMaskType) == epl_system_id::kTypeFormControl) {
+						addNativeObjectVariable(element.name, element.id, element.dataType);
+					}
+				}
+			}
 			for (const auto& global : model.globals) {
 				addNativeObjectVariable(global.name, global.id, global.dataType);
 			}
@@ -11387,14 +11434,6 @@ bool BuildRestoreModel(
 			}
 			for (size_t localIndex = 0; localIndex < parsedMethod.locals.size() && localIndex < method.locals.size(); ++localIndex) {
 				addNativeObjectVariable(parsedMethod.locals[localIndex].name, method.locals[localIndex].id, method.locals[localIndex].dataType);
-			}
-			for (const auto& [formName, matchedClassIndex] : formClassMatches) {
-				if (matchedClassIndex != classIndex ||
-					nativeSourceSnapshot == nullptr ||
-					nativeSourceSnapshot->formId == 0) {
-					continue;
-				}
-				addNativeObjectVariable(formName, nativeSourceSnapshot->formId, 65537);
 			}
 			for (size_t sourceClassIndex = 0; sourceClassIndex < parsedClasses.size(); ++sourceClassIndex) {
 				const BundleNativeSourceFileSnapshot* sourceSnapshot =
@@ -11560,34 +11599,7 @@ bool BuildRestoreModel(
 				}
 			}
 			targetClass.functionIds.push_back(method.id);
-			model.methods.push_back(std::move(method));
-		}
-	}
-
-	std::unordered_map<std::string, std::int32_t> formClassIds;
-	std::unordered_map<std::string, std::int32_t> preferredFormIds;
-	for (const auto& [formName, classIndex] : formClassMatches) {
-		if (classIndex < localClassModelIndices.size()) {
-			const auto& matchedClass = model.classes[localClassModelIndices[classIndex]];
-			formClassIds.insert_or_assign(formName, matchedClass.id);
-			if (matchedClass.formId != 0) {
-				preferredFormIds.insert_or_assign(formName, matchedClass.formId);
-			}
-		}
-	}
-	if (!BuildFormsFromXml(parsedForms, formClassIds, preferredFormIds, model, resolver, allocator, model.forms, outError)) {
-		return false;
-	}
-
-	for (auto& item : model.classes) {
-		if (!item.isFormClass) {
-			continue;
-		}
-		for (const auto& form : model.forms) {
-			if (form.classId == item.id) {
-				item.formId = form.id;
-				break;
-			}
+			model.methods[preparedMethod.modelIndex] = std::move(method);
 		}
 	}
 

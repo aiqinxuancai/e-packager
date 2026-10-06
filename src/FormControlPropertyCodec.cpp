@@ -561,6 +561,13 @@ bool CopyDirectBytes(const std::uint8_t* data, const std::int32_t size, std::vec
 	return true;
 }
 
+// lib2.h 明确规定这些编辑器通过整数成员传值，不能把数字文本当作指针传入。
+bool IsIntegerPropertyType(const std::int16_t type)
+{
+	return type == UD_INT || type == UD_PICK_INT || type == UD_PICK_SPEC_INT ||
+		type == UD_COLOR || type == UD_COLOR_TRANS || type == UD_COLOR_BACK;
+}
+
 bool IsTextPropertyType(const std::int16_t type)
 {
 	return type == UD_TEXT || type == UD_PICK_TEXT || type == UD_EDIT_PICK_TEXT ||
@@ -1516,6 +1523,10 @@ bool ParseXmlPropertyValue(
 {
 	outValue = {};
 	outValue.definition = definition;
+	if (IsIntegerPropertyType(definition.dataType)) {
+		outValue.kind = FormControlPropertyValueKind::Integer;
+		return TryParseInt32(text, outValue.integerValue);
+	}
 	if (IsBooleanPropertyType(definition.dataType)) {
 		outValue.kind = FormControlPropertyValueKind::Boolean;
 		return TryParseBoolean(text, outValue.booleanValue);
@@ -1563,6 +1574,11 @@ bool ReadUnitPropertyValue(
 {
 	outValue = {};
 	outValue.definition = definition;
+	if (IsIntegerPropertyType(definition.dataType)) {
+		outValue.kind = FormControlPropertyValueKind::Integer;
+		outValue.integerValue = raw.m_int;
+		return true;
+	}
 	if (IsBooleanPropertyType(definition.dataType)) {
 		outValue.kind = FormControlPropertyValueKind::Boolean;
 		outValue.booleanValue = raw.m_bool != FALSE;
