@@ -41,7 +41,9 @@ _启动窗口.标题 ＝ “点击成功”
 
 封包使用支持库的属性通知接口，按要求重新创建控件，并从保存数据重新读取修改值。未知属性、非法值、修改只读／非设计期属性，以及不能持久化的赋值会明确失败，不会静默丢弃。
 
-第三方 `UD_CUSTOMIZE` 数据可能是支持库私有结构，只能通过专属编辑对话框生成。当前不能承诺将所有此类结构转换成可读字段；未确认格式的数据保留 Base64。支持库缺少 getter、setter 或拒绝持久化时会限制编辑。不要将“原始数据可以保留”理解为“所有字段均可编辑”。
+属性支持范围以 `lib2.h` 为准：20 种 `UD_*` 类型均按 `UNIT_PROPERTY_VALUE` 的规定成员读写。`UD_CUSTOMIZE` 使用 `m_data`（指针和长度），XML 以 Base64 表示，可以替换有效字节数据，不需要解析库私有的内部字段。修改经 setter、保存、重建及 getter 回读核对后才算成功。
+
+`ITF_DLG_INIT_CUSTOMIZE_DATA` 是支持库自带的交互编辑对话框接口，`lib2.h` 没有定义通用的自定义属性字节 setter；部分库另外允许通过 `ITF_NOTIFY_PROPERTY_CHANGED` 写入自定义数据，这种情况可直接验证。仅允许对话框编辑的库不能保证无头写入，工具会明确报赋值未持久化，原始全量属性数据仍保留。`ITF_PROPERTY_UPDATE_UI` 是设计器界面的可操作性判断，不作为能否保存字节数据的额外限制。
 
 ## 验证
 
@@ -65,20 +67,20 @@ python tools/TestUniqueControlEvents.py `
 
 该测试从 Win32 支持库导出的事件目录生成处理器，新增窗口程序集变量和 27 个事件绑定，回包、重新拆包，再通过真实 IDE 编译和运行。测试会短暂显示测试窗口、移动鼠标以检查手动调节器，结束后恢复鼠标位置。原始 `.e` 不修改。
 
-已验证的 19 种控件独有事件：
+已验证的 20 种控件独有事件：
 
 | 控件 | 运行验证 |
 | --- | --- |
 | 列表框 | 列表项被选择、双击选择 |
 | 组合框 | 列表项被选择、将弹出列表、列表被关闭 |
 | 选择夹 | 将改变子夹、子夹被改变；返回假阻止切换，真允许切换 |
-| 高级选择夹（iext3） | 将改变子夹、子夹被改变、子夹头被单击、子夹头被右击；验证子夹索引和返回值 |
+| 高级选择夹（iext3） | 将改变子夹、子夹被改变、子夹头被单击、子夹头被右击、子夹头被点燃；验证子夹索引和返回值 |
 | 动画框（iext2） | 动画框鼠标位置改变、物体位置将改变、物体位置已改变、物体将销毁；验证物体 ID、坐标、允许／否决移动 |
 | 滑块条、日期框 | 位置被改变、选择日期被改变 |
 | 编辑框 | 调节钮被按下，向上按钮参数为 1；XML 的调节器方式设为 2（手动） |
 | 标签 | 反馈事件接收 `(37,9)` 并返回 `379`；调用反馈事件的第三参数须为真以同步取得返回值 |
 
-报告包含 30 次运行结果检查。高级选择夹“子夹头被点燃”仅通过绑定、回读和 IDE 编译，鼠标跟踪探测未触发，单独记录于 `hover-probe.json`，不计入运行通过数。`iext3` 使用 `EVENT_INFO2`；本测试覆盖其整数参数及逻辑返回值，尚未覆盖参考参数事件。
+报告包含 33 次运行结果检查。“子夹头被点燃”连续验证索引 `0 → 1 → 0`，结果记录于 `hover-probe.json`。支持库会使用 `WindowFromPoint` 排除被遮挡的控件；测试必须显示窗口并确保目标点真实命中高级选择夹。64 位 Python 调用 `SetWindowPos` 时需显式声明句柄参数类型，否则 `HWND_TOPMOST=-1` 传参错误会使置顶失败。`iext3` 使用 `EVENT_INFO2`；本测试覆盖其整数参数及逻辑返回值，尚未覆盖参考参数事件。
 
 窗口程序集的原生基类字段应为 0，不能将窗口控件类型 ID 65537 写入该字段；否则新增程序集变量虽能回读，IDE 编译引用它们时仍会崩溃。本测试同时覆盖该语义重建回归。
 
@@ -98,4 +100,17 @@ python tools/TestUniqueControlEvents.py `
 mkdir temp\fne-export-check
 cl /nologo /LD /utf-8 /std:c++20 /Ielib tools\fixtures\FnePublicInfoTest.cpp /Fotemp\fne-export-check\fixture.obj /Fetemp\fne-export-check\fixture.fne /link /EXPORT:GetNewInf=_GetNewInf@0
 python tools/TestFnePublicInfoExport.py --fixture temp/fne-export-check/fixture.fne --lib-dir C:/path/to/e/lib --output temp/fne-export-check/results
+```
+
+## lib2.h 全属性类型 ABI 验证
+
+`tools/fixtures/Lib2PropertyTest.cpp` 提供真实 Win32 FNE，发布全部 20 种 `UD_*` 类型。`Lib2PropertyCodecTest.cpp` 通过生产代码的 `Apply/Decode` 验证整数、限定选择、普通选择、双精度、逻辑、日期、三种文本编辑器、文件名、图片、图标、光标、音乐、字体、三种颜色、图片组和自定义字节。另验证 setter 要求重建，以及 setter 拒绝赋值时返回 `window_control_property_not_persisted`。该夹具验证 ABI，不代替实际支持库对图片、字体等载荷格式的校验。
+
+在 VS x86 开发者命令提示符中运行：
+
+```bat
+mkdir temp\lib2-property-check
+cl /nologo /LD /utf-8 /std:c++20 /EHsc /Ielib tools\fixtures\Lib2PropertyTest.cpp /Fotemp\lib2-property-check\fixture.obj /Fetemp\lib2-property-check\fixture.fne /link user32.lib /EXPORT:GetNewInf=_GetNewInf@0
+cl /nologo /utf-8 /std:c++20 /EHsc /Ielib /Isrc tools\fixtures\Lib2PropertyCodecTest.cpp src\FormControlPropertyCodec.cpp src\SupportLibraryRuntime.cpp src\PathHelper.cpp /Fotemp\lib2-property-check\ /Fetemp\lib2-property-check\test.exe /link user32.lib advapi32.lib
+temp\lib2-property-check\test.exe %CD%\temp\lib2-property-check\fixture.fne
 ```

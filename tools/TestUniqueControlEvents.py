@@ -146,6 +146,9 @@ def prepare(repo, output):
 
 def verify(output):
     u = C.windll.user32
+    u.SetWindowPos.argtypes = [W.HWND, W.HWND, C.c_int, C.c_int, C.c_int, C.c_int, W.UINT]
+    u.WindowFromPoint.argtypes = [W.POINT]
+    u.WindowFromPoint.restype = W.HWND
     u.SendMessageW.argtypes = [C.c_void_p, C.c_uint, C.c_size_t, C.c_ssize_t]
     u.SendMessageW.restype = C.c_ssize_t
     rows = []
@@ -286,7 +289,7 @@ def verify(output):
         u.SendMessageW(spin, 0x46F, 0, 100)
         u.SendMessageW(spin, 0x471, 0, 50)
         u.ShowWindow(main, 4)
-        u.SetWindowPos(main, -1, 0, 0, 0, 0, 0x13)
+        assert u.SetWindowPos(main, -1, 0, 0, 0, 0, 0x13)
         point = W.POINT(5, 5)
         u.ClientToScreen(spin, C.byref(point))
         u.SetCursorPos(point.x, point.y)
@@ -294,20 +297,17 @@ def verify(output):
         time.sleep(.15)
         u.PostMessageW(spin, 0x202, 0, (5 << 16) | 5)
         expect('spin', '1')
-        # 点燃事件依赖支持库自己的鼠标跟踪；单独记录探索结果，不冒充已覆盖。
-        clear('advanced-hover')
-        u.SetCursorPos(1, 1)
-        time.sleep(.2)
-        point = W.POINT(25, 10)
-        u.ClientToScreen(advanced, C.byref(point))
-        u.SetCursorPos(point.x, point.y)
-        u.PostMessageW(advanced, 0x200, 0, (10 << 16) | 25)
-        time.sleep(1)
-        hover = output / 'advanced-hover.txt'
+        # 支持库用 WindowFromPoint 排除被遮挡窗口；必须让控件真正位于鼠标下。
+        for index, x in [(0, 25), (1, 95), (0, 25)]:
+            clear('advanced-hover')
+            point = W.POINT(x, 10)
+            u.ClientToScreen(advanced, C.byref(point))
+            u.SetCursorPos(point.x, point.y)
+            assert u.WindowFromPoint(point) == advanced, 'advanced tab is obscured'
+            u.PostMessageW(advanced, 0x200, 0, (10 << 16) | x)
+            expect('advanced-hover', str(index))
         (output / 'hover-probe.json').write_text(json.dumps({
-            'event': '子夹头被点燃', 'triggered': hover.exists(),
-            'value': hover.read_text(encoding='gbk') if hover.exists() else None,
-            'note': '绑定及 IDE 编译已验证；未触发时不计入运行通过数。'},
+            'event': '子夹头被点燃', 'triggered': True, 'indices': [0, 1, 0]},
             ensure_ascii=False, indent=2), encoding='utf-8')
         u.PostMessageW(main, 0x10, 0, 0)
         assert process.wait(timeout=10) == 0
