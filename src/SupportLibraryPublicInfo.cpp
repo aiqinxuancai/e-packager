@@ -892,6 +892,22 @@ std::vector<std::string> BuildEventArgumentStateLabels(const DWORD state)
 	return labels;
 }
 
+std::string FormatMetadataBits(const std::uint32_t value)
+{
+	std::ostringstream text;
+	text << "0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << value;
+	return text.str();
+}
+
+std::string DecodeMetadataPlatforms(const std::uint32_t state, const unsigned shift)
+{
+	std::vector<std::string> platforms;
+	AppendFlagLabel(platforms, (state & (0x80000000u >> shift)) != 0, "Windows");
+	AppendFlagLabel(platforms, (state & (0x40000000u >> shift)) != 0, "Linux");
+	AppendFlagLabel(platforms, (state & (0x20000000u >> shift)) != 0, "Unix");
+	return platforms.empty() ? "未声明" : JoinTextParts(platforms, "|");
+}
+
 std::string DecodeUnitPropertyType(const SHORT type)
 {
 	switch (type) {
@@ -974,28 +990,45 @@ std::vector<std::string> ReadNullSeparatedStringList(const char* text, const int
 	return items;
 }
 
-std::string DecodeUnitPropertyPickValues(const UNIT_PROPERTY& property)
+void AppendPropertyPickFields(std::vector<std::string>& fields, const UNIT_PROPERTY& property)
 {
-	const auto items = ReadNullSeparatedStringList(property.m_szzPickStr, 128);
-	if (items.empty()) {
-		return std::string();
+	if (property.m_szzPickStr == nullptr) return;
+	const char* current = property.m_szzPickStr;
+	if (property.m_shtType == UD_FILE_NAME) {
+		// 文件对话框配置固定为四段，空标题或空后缀不代表配置结束。
+		static constexpr const char* names[] = {"对话框标题", "文件过滤器", "默认后缀", "保存文件标志"};
+		for (const char* name : names) {
+			const size_t length = GetSafeCStringLength(current, kMaxSupportLibraryStringLength);
+			if (length == static_cast<size_t>(-1)) {
+				fields.emplace_back("文件配置=<无法完整读取>");
+				return;
+			}
+			AppendNamedField(fields, name, BuildReadableTextLiteral(ReadAnsiText(current)));
+			current += length + 1;
+		}
+		return;
 	}
-
 	std::vector<std::string> values;
-	if (property.m_shtType == UD_PICK_SPEC_INT) {
-		for (size_t index = 0; index + 1 < items.size(); index += 2) {
-			values.push_back(items[index] + ":" + items[index + 1]);
+	bool complete = false;
+	for (int index = 0; index < kMaxSupportLibraryArrayCount; ++index) {
+		const size_t length = GetSafeCStringLength(current, kMaxSupportLibraryStringLength);
+		if (length == static_cast<size_t>(-1)) break;
+		if (length == 0) { complete = true; break; }
+		std::string value = ReadAnsiText(current);
+		current += length + 1;
+		if (property.m_shtType == UD_PICK_SPEC_INT) {
+			const size_t labelLength = GetSafeCStringLength(current, kMaxSupportLibraryStringLength);
+			if (labelLength == static_cast<size_t>(-1)) break;
+			value += ":" + ReadAnsiText(current);
+			current += labelLength + 1;
 		}
-	}
-	else if (property.m_shtType == UD_PICK_INT) {
-		for (size_t index = 0; index < items.size(); ++index) {
-			values.push_back(std::to_string(index) + ":" + items[index]);
+		else if (property.m_shtType == UD_PICK_INT) {
+			value = std::to_string(index) + ":" + value;
 		}
+		values.push_back(std::move(value));
 	}
-	else {
-		values = items;
-	}
-	return JoinTextParts(values, "|");
+	AppendNamedField(fields, "可选值", JoinTextParts(values, "|"));
+	if (!complete) fields.emplace_back("选项表=<无法完整读取或超过安全上限>");
 }
 
 std::string DecodeDataTypeKind(const LIB_DATA_TYPE_INFO& dataType)
@@ -1141,6 +1174,7 @@ void AppendCommandDetails(
 void AppendPropertyMemberLine(
 	std::vector<std::string>& lines,
 	const UNIT_PROPERTY& property,
+	const int propertyIndex,
 	const std::string& indent)
 {
 	const std::string propertyName = ReadAnsiText(property.m_szName);
@@ -1157,7 +1191,11 @@ void AppendPropertyMemberLine(
 	if (editorTypeText != dataTypeText) {
 		AppendNamedField(fields, "属性类型", editorTypeText);
 	}
-	AppendNamedField(fields, "可选值", DecodeUnitPropertyPickValues(property));
+	fields.emplace_back("属性索引=" + std::to_string(propertyIndex));
+	fields.emplace_back("属性类型编号=" + std::to_string(property.m_shtType));
+	AppendNamedField(fields, "状态标志", FormatMetadataBits(property.m_wState));
+	AppendNamedField(fields, "支持平台", DecodeMetadataPlatforms(property.m_wState, 16));
+	AppendPropertyPickFields(fields, property);
 	if (!stateLabels.empty()) {
 		AppendNamedField(fields, "属性", JoinTextParts(stateLabels, "|"));
 	}
@@ -1202,6 +1240,7 @@ void AppendEventDetails(
 	std::vector<std::string>& lines,
 	const EVENT_INFO2& eventInfo,
 	const LIB_INFO* libInfo,
+	const int eventIndex,
 	const std::string& indent)
 {
 	const std::string eventName = ReadAnsiText(eventInfo.m_szName);
@@ -1212,6 +1251,12 @@ void AppendEventDetails(
 	fields.emplace_back(indent + ".事件 " + DisplayNameOrPlaceholder(eventName));
 	AppendNamedField(fields, "返回值", DecodeEventReturnType(eventInfo, libInfo));
 	fields.emplace_back("参数数=" + std::to_string(eventInfo.m_nArgCount));
+	fields.emplace_back("事件索引=" + std::to_string(eventIndex));
+	AppendNamedField(fields, "状态标志", FormatMetadataBits(eventInfo.m_dwState));
+	AppendNamedField(fields, "支持平台", DecodeMetadataPlatforms(eventInfo.m_dwState, 1));
+	fields.emplace_back((eventInfo.m_dwState & EV_IS_VER2) != 0 ? "接口版本=2" : "接口版本=1");
+	if ((eventInfo.m_dwState & EV_IS_VER2) != 0)
+		AppendNamedField(fields, "返回类型编号", FormatMetadataBits(eventInfo.m_dtRetDataType));
 	if (!stateLabels.empty()) {
 		AppendNamedField(fields, "属性", JoinTextParts(stateLabels, "|"));
 	}
@@ -1220,11 +1265,11 @@ void AppendEventDetails(
 	if (!eventExplain.empty()) {
 		lines.push_back(indent + "  说明：" + eventExplain);
 	}
-	if (eventInfo.m_nArgCount <= 0) {
+	if (eventInfo.m_nArgCount == 0) {
 		return;
 	}
 	if (eventInfo.m_pEventArgInfo == nullptr ||
-		eventInfo.m_nArgCount > kMaxSupportLibraryArrayCount) {
+		eventInfo.m_nArgCount < 0 || eventInfo.m_nArgCount > kMaxSupportLibraryArrayCount) {
 		lines.push_back(indent + "  参数：<无法读取>");
 		return;
 	}
@@ -1243,6 +1288,9 @@ void AppendEventDetails(
 			std::vector<std::string> argFields;
 			argFields.emplace_back(indent + "  .参数 " + DisplayNameOrPlaceholder(ReadAnsiText(arg.m_szName)));
 			argFields.emplace_back(DecodeSupportLibraryDataType(arg.m_dtDataType, libInfo));
+			argFields.emplace_back("参数索引=" + std::to_string(argIndex));
+			AppendNamedField(argFields, "类型编号", FormatMetadataBits(arg.m_dtDataType));
+			AppendNamedField(argFields, "状态标志", FormatMetadataBits(arg.m_dwState));
 			if (!argStateLabels.empty()) {
 				AppendNamedField(argFields, "属性", JoinTextParts(argStateLabels, "|"));
 			}
@@ -1264,6 +1312,8 @@ void AppendEventDetails(
 		std::vector<std::string> argFields;
 		argFields.emplace_back(indent + "  .参数 " + DisplayNameOrPlaceholder(ReadAnsiText(arg.m_szName)));
 		argFields.emplace_back((arg.m_dwState & EAS_IS_BOOL_ARG) != 0 ? "逻辑型" : "整数型");
+		argFields.emplace_back("参数索引=" + std::to_string(argIndex));
+		AppendNamedField(argFields, "状态标志", FormatMetadataBits(arg.m_dwState));
 		AppendNamedField(argFields, "说明", ReadAnsiText(arg.m_szExplain));
 		lines.push_back(JoinCommaFields(argFields));
 	}
@@ -1310,6 +1360,10 @@ void AppendDataTypeDetails(
 	std::vector<std::string> headerFields;
 	headerFields.emplace_back(".数据类型 " + DisplayNameOrPlaceholder(typeName));
 	AppendNamedField(headerFields, "类型", DecodeDataTypeKind(dataType));
+	headerFields.emplace_back("类型索引=" + std::to_string(&dataType - libInfo->m_pDataType));
+	AppendNamedField(headerFields, "状态标志", FormatMetadataBits(dataType.m_dwState));
+	AppendNamedField(headerFields, "支持平台", DecodeMetadataPlatforms(dataType.m_dwState, 0));
+	if (isWinUnit) headerFields.emplace_back("属性数=" + std::to_string(dataType.m_nPropertyCount));
 	headerFields.emplace_back("成员数=" + std::to_string(isWinUnit ? dataType.m_nPropertyCount : dataType.m_nElementCount));
 	headerFields.emplace_back("事件数=" + std::to_string(dataType.m_nEventCount));
 	headerFields.emplace_back("成员命令数=" + std::to_string(dataType.m_nCmdCount));
@@ -1331,27 +1385,11 @@ void AppendDataTypeDetails(
 				dataType.m_pPropertyBegin,
 				sizeof(UNIT_PROPERTY) * static_cast<size_t>(dataType.m_nPropertyCount))) {
 			for (int propertyIndex = 0; propertyIndex < dataType.m_nPropertyCount; ++propertyIndex) {
-				AppendPropertyMemberLine(lines, dataType.m_pPropertyBegin[propertyIndex], "  ");
+				AppendPropertyMemberLine(lines, dataType.m_pPropertyBegin[propertyIndex], propertyIndex, "  ");
 			}
 		}
-		else {
-			struct FixedProperty {
-				const char* name;
-				const char* type;
-			};
-			static constexpr std::array<FixedProperty, FIXED_WIN_UNIT_PROPERTY_COUNT> kFixedWinUnitProperties = {{
-				{"左边", "整数型"},
-				{"顶边", "整数型"},
-				{"宽度", "整数型"},
-				{"高度", "整数型"},
-				{"标记", "文本型"},
-				{"可视", "逻辑型"},
-				{"禁止", "逻辑型"},
-				{"鼠标指针", "光标"},
-			}};
-			for (const auto& property : kFixedWinUnitProperties) {
-				lines.push_back("  .成员 " + std::string(property.name) + ", " + property.type);
-			}
+		else if (dataType.m_nPropertyCount != 0) {
+			lines.push_back("  属性表：<无法读取>，声明数量=" + std::to_string(dataType.m_nPropertyCount));
 		}
 	}
 	else if (dataType.m_nElementCount > 0 &&
@@ -1377,8 +1415,13 @@ void AppendDataTypeDetails(
 				lines,
 				*reinterpret_cast<const EVENT_INFO2*>(address),
 				libInfo,
+				eventIndex,
 				"  ");
 		}
+	}
+
+	else if (dataType.m_nEventCount != 0) {
+		lines.push_back("  事件表：<无法读取>，声明数量=" + std::to_string(dataType.m_nEventCount));
 	}
 
 	if (dataType.m_nCmdCount > 0 &&

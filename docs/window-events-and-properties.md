@@ -53,3 +53,49 @@ python tools/TestWindowEventsAndProperties.py `
 ```
 
 测试复制 `e-window-exe-full+otherFne.e` 到新目录，按导出的真实签名批量新增事件，经 IDE 编译后重新拆包核对。另一个可运行工程验证按钮、编辑框、键盘、第三方双击和菜单事件，以及字体、图片、日期、列表项目，包含非法输入回归。原始工程不会被修改。
+
+## 独有事件运行测试
+
+```powershell
+python tools/TestUniqueControlEvents.py `
+  --ide C:/path/to/e5.95.exe `
+  --launcher D:/git/AutoLinker/bin/fne_release/AutoLinkerTest.exe `
+  --output temp/unique-events-run
+```
+
+该测试从 Win32 支持库导出的事件目录生成处理器，新增窗口程序集变量和 27 个事件绑定，回包、重新拆包，再通过真实 IDE 编译和运行。测试会短暂显示测试窗口、移动鼠标以检查手动调节器，结束后恢复鼠标位置。原始 `.e` 不修改。
+
+已验证的 19 种控件独有事件：
+
+| 控件 | 运行验证 |
+| --- | --- |
+| 列表框 | 列表项被选择、双击选择 |
+| 组合框 | 列表项被选择、将弹出列表、列表被关闭 |
+| 选择夹 | 将改变子夹、子夹被改变；返回假阻止切换，真允许切换 |
+| 高级选择夹（iext3） | 将改变子夹、子夹被改变、子夹头被单击、子夹头被右击；验证子夹索引和返回值 |
+| 动画框（iext2） | 动画框鼠标位置改变、物体位置将改变、物体位置已改变、物体将销毁；验证物体 ID、坐标、允许／否决移动 |
+| 滑块条、日期框 | 位置被改变、选择日期被改变 |
+| 编辑框 | 调节钮被按下，向上按钮参数为 1；XML 的调节器方式设为 2（手动） |
+| 标签 | 反馈事件接收 `(37,9)` 并返回 `379`；调用反馈事件的第三参数须为真以同步取得返回值 |
+
+报告包含 30 次运行结果检查。高级选择夹“子夹头被点燃”仅通过绑定、回读和 IDE 编译，鼠标跟踪探测未触发，单独记录于 `hover-probe.json`，不计入运行通过数。`iext3` 使用 `EVENT_INFO2`；本测试覆盖其整数参数及逻辑返回值，尚未覆盖参考参数事件。
+
+窗口程序集的原生基类字段应为 0，不能将窗口控件类型 ID 65537 写入该字段；否则新增程序集变量虽能回读，IDE 编译引用它们时仍会崩溃。本测试同时覆盖该语义重建回归。
+
+属性和事件的公开定义来自 `elib/lib2.h` 对应的 `LIB_DATA_TYPE_INFO`、`UNIT_PROPERTY`、`EVENT_INFO/2` 表。属性枚举值、只读／设计期限制及事件签名应以实际加载的支持库为准；接口公开了私有属性的类型和读写入口，并不意味着同时公开了 `UD_CUSTOMIZE` 内部二进制布局。
+
+## 引用支持库的 TXT 表
+
+工程引用生成的 `elib/*.txt` 与 `decrypt-fne` 共用导出逻辑。控件属性仍使用 `.成员` 行以兼容现有阅读方式，并导出零起始的 `类型索引`、`属性索引`、`事件索引`、`参数索引`。属性包含英文名、说明、数据类型、属性编辑器类型编号、全部枚举选项、状态标志和平台；隐藏及未命名的占位表项也保留索引。事件包含 V1/V2 版本、返回值、参数顺序和类型、V2 参考传递标志、原始状态及平台。
+
+`UD_FILE_NAME` 的配置单独导出为对话框标题、文件过滤器、默认后缀和保存文件标志，空字段不会截断后续配置。枚举不再静默截断为 128 段。读取失败或超过安全上限会明确标注；属性表损坏时不会伪造八个固定属性。平台位为零输出“未声明”，不猜测兼容平台。
+
+这里的事件数对应 FNE 自己的事件表；IDE 提供的负索引通用窗口事件仍查阅窗口 XML 的 `窗口.事件定义`。TXT 是定义表，不包含某个窗口实例的当前属性值，私有自定义数据格式也不由该表推断。
+
+`tools/TestFnePublicInfoExport.py` 核对四个实际支持库及独立 FNE 测试夹具，检查数量、连续索引、事件参数，以及引用导出与独立导出正文一致。在 VS 的 x86 开发者命令提示符中构建夹具后运行（输出目录须不存在）：
+
+```bat
+mkdir temp\fne-export-check
+cl /nologo /LD /utf-8 /std:c++20 /Ielib tools\fixtures\FnePublicInfoTest.cpp /Fotemp\fne-export-check\fixture.obj /Fetemp\fne-export-check\fixture.fne /link /EXPORT:GetNewInf=_GetNewInf@0
+python tools/TestFnePublicInfoExport.py --fixture temp/fne-export-check/fixture.fne --lib-dir C:/path/to/e/lib --output temp/fne-export-check/results
+```

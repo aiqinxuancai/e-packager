@@ -11234,8 +11234,9 @@ bool BuildRestoreModel(
 		}
 		else {
 			const std::string normalizedBaseClassName = TypeResolver::NormalizeTypeName(parsedClass.baseClassName);
+			// 窗口程序集是静态程序集；窗口控件类型 65537 不是程序集的基类。
 			targetClass.baseClass = parsedClass.isFormClass && normalizedBaseClassName.empty()
-				? 65537
+				? 0
 				: ((parsedClass.isUserClass && normalizedBaseClassName.empty()) ||
 					normalizedBaseClassName == "对象" ||
 					normalizedBaseClassName == "<对象>"
