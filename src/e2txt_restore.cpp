@@ -1175,7 +1175,7 @@ std::string ReadSupportLibraryName(const char* text)
 std::span<const UNIT_PROPERTY> GetSupportTypeProperties(const LIB_DATA_TYPE_INFO& dataType)
 {
 	constexpr int kMaxSupportLibraryArrayCount = 16384;
-	if ((dataType.m_dwState & LDT_WIN_UNIT) == 0 || (dataType.m_dwState & LDT_ENUM) != 0) {
+	if (!support_library_runtime::UsesPropertyTable(dataType)) {
 		return {};
 	}
 	if (dataType.m_nPropertyCount > 0 &&
@@ -1185,6 +1185,9 @@ std::span<const UNIT_PROPERTY> GetSupportTypeProperties(const LIB_DATA_TYPE_INFO
 			dataType.m_pPropertyBegin,
 			sizeof(UNIT_PROPERTY) * static_cast<size_t>(dataType.m_nPropertyCount))) {
 		return { dataType.m_pPropertyBegin, static_cast<size_t>(dataType.m_nPropertyCount) };
+	}
+	if ((dataType.m_dwState & LDT_WIN_UNIT) == 0) {
+		return {};
 	}
 	// SDK 规定无独立属性表的窗口组件仍具有八个公共属性。
 	static const UNIT_PROPERTY fixedProperties[] = { FIXED_WIN_UNIT_PROPERTY };
@@ -11480,8 +11483,11 @@ bool BuildRestoreModel(
 			for (const auto& form : model.forms) {
 				addNativeObjectVariable(form.name, form.id, 65537);
 				for (const auto& element : form.elements) {
+					const auto elementKind = element.id & epl_system_id::kMaskType;
+					// 菜单与控件都是所属窗口程序集可直接引用的对象。
 					if (form.classId == targetClass.id &&
-						(element.id & epl_system_id::kMaskType) == epl_system_id::kTypeFormControl) {
+						(elementKind == epl_system_id::kTypeFormControl ||
+						 elementKind == epl_system_id::kTypeFormMenu)) {
 						addNativeObjectVariable(element.name, element.id, element.dataType);
 					}
 				}

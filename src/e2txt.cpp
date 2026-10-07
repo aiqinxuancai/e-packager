@@ -3078,7 +3078,7 @@ std::vector<std::string> BuildSupportTypeMemberNames(const LIB_DATA_TYPE_INFO& d
 	const bool isWinUnit =
 		(dataType.m_dwState & LDT_WIN_UNIT) != 0 &&
 		(dataType.m_dwState & LDT_ENUM) == 0;
-	if (isWinUnit) {
+	if (support_library_runtime::UsesPropertyTable(dataType)) {
 		if (dataType.m_nPropertyCount > 0 &&
 			dataType.m_nPropertyCount <= kMaxSupportLibraryArrayCount &&
 			dataType.m_pPropertyBegin != nullptr &&
@@ -3092,6 +3092,9 @@ std::vector<std::string> BuildSupportTypeMemberNames(const LIB_DATA_TYPE_INFO& d
 			return memberNames;
 		}
 
+		if (!isWinUnit) {
+			return memberNames;
+		}
 		memberNames.reserve(kFixedWinUnitPropertyNames.size());
 		for (const char* name : kFixedWinUnitPropertyNames) {
 			memberNames.emplace_back(name == nullptr ? "" : name);

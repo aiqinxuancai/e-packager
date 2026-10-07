@@ -1353,9 +1353,7 @@ void AppendDataTypeDetails(
 	const std::string typeExplain = ReadAnsiText(dataType.m_szExplain);
 	const std::string typeEnglishName = ReadAnsiText(dataType.m_szEgName);
 	const auto stateLabels = BuildDataTypeStateLabels(dataType.m_dwState);
-	const bool isWinUnit =
-		(dataType.m_dwState & LDT_WIN_UNIT) != 0 &&
-		(dataType.m_dwState & LDT_ENUM) == 0;
+	const bool usesProperties = support_library_runtime::UsesPropertyTable(dataType);
 
 	std::vector<std::string> headerFields;
 	headerFields.emplace_back(".数据类型 " + DisplayNameOrPlaceholder(typeName));
@@ -1363,8 +1361,8 @@ void AppendDataTypeDetails(
 	headerFields.emplace_back("类型索引=" + std::to_string(&dataType - libInfo->m_pDataType));
 	AppendNamedField(headerFields, "状态标志", FormatMetadataBits(dataType.m_dwState));
 	AppendNamedField(headerFields, "支持平台", DecodeMetadataPlatforms(dataType.m_dwState, 0));
-	if (isWinUnit) headerFields.emplace_back("属性数=" + std::to_string(dataType.m_nPropertyCount));
-	headerFields.emplace_back("成员数=" + std::to_string(isWinUnit ? dataType.m_nPropertyCount : dataType.m_nElementCount));
+	if (usesProperties) headerFields.emplace_back("属性数=" + std::to_string(dataType.m_nPropertyCount));
+	headerFields.emplace_back("成员数=" + std::to_string(usesProperties ? dataType.m_nPropertyCount : dataType.m_nElementCount));
 	headerFields.emplace_back("事件数=" + std::to_string(dataType.m_nEventCount));
 	headerFields.emplace_back("成员命令数=" + std::to_string(dataType.m_nCmdCount));
 	AppendNamedField(headerFields, "英文名", typeEnglishName);
@@ -1377,7 +1375,7 @@ void AppendDataTypeDetails(
 		lines.push_back("  说明：" + typeExplain);
 	}
 
-	if (isWinUnit) {
+	if (usesProperties) {
 		if (dataType.m_nPropertyCount > 0 &&
 			dataType.m_nPropertyCount <= kMaxSupportLibraryArrayCount &&
 			dataType.m_pPropertyBegin != nullptr &&
