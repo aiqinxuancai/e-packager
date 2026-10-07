@@ -1512,7 +1512,14 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 		persistedBundle.resources.push_back(resource);
 	}
 
-	metaJson["nativeBundleDigest"] = LocalToUtf8Text(ComputeBundleDigest(persistedBundle));
+	// 只有输入仍匹配原生快照，才可把摘要迁移到规范化后的目录表示。
+	// update 不会重建原生字节，不能替已修改的源码重新签发快照摘要。
+	const bool sourceMatchesNativeSnapshot =
+		!bundle.nativeSourceBytes.empty() && !bundle.nativeBundleDigest.empty() &&
+		ComputeBundleDigest(bundle) == bundle.nativeBundleDigest;
+	metaJson["nativeBundleDigest"] = sourceMatchesNativeSnapshot
+		? LocalToUtf8Text(ComputeBundleDigest(persistedBundle))
+		: std::string();
 
 	if (!WriteUtf8TextFileBom(GetMetaJsonPath(root), NormalizeCrLf(DumpJson(metaJson)))) {
 		if (outError != nullptr) {

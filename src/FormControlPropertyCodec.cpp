@@ -2345,8 +2345,16 @@ bool FormControlPropertyCodec::Apply(
 			encoded = EncodeFontNode(*structuredNode, structuredData);
 		} else {
 			FormControlPropertyCollectionKind collectionKind;
-			encoded = TryInferXmlCollectionKind(*structuredNode, collectionKind) &&
-				EncodeStructuredProperty(*structuredNode, collectionKind, context.utf8, structuredData);
+			bool hasKind = TryInferXmlCollectionKind(*structuredNode, collectionKind);
+			// 空集合没有子项可供推断，沿用原属性已确认的集合格式；也支持清空现有列表。
+			if (!hasKind && structuredNode->children.empty()) {
+				const auto original = std::find_if(originalValues.begin(), originalValues.end(),
+					[&definition](const auto& value) {
+						return value.definition.metadataIndex == definition.metadataIndex;
+					});
+				hasKind = original != originalValues.end() && TryInferCollectionKind(*original, collectionKind);
+			}
+			encoded = hasKind && EncodeStructuredProperty(*structuredNode, collectionKind, context.utf8, structuredData);
 		}
 		if (!encoded) {
 			if (outError) *outError = "window_control_structured_property_invalid: " + definition.xmlName;

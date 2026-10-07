@@ -10872,7 +10872,8 @@ bool BuildRestoreModel(
 		}
 		else {
 			for (const auto& parsedClass : dependencyClasses) {
-				if (!parsedClass.isPublic || parsedClass.isFormClass || parsedClass.isUserClass) {
+				// 普通程序集按子程序的公开属性导出，不要求程序集自身公开。
+				if (parsedClass.isFormClass || parsedClass.isUserClass) {
 					continue;
 				}
 				DependencyNativeClassBinding* nativeClass = findNativeClassBinding(parsedClass);
