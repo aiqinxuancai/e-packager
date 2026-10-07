@@ -239,6 +239,7 @@ struct RestoreDocumentModel {
 	std::string projectName;
 	std::string versionText;
 	ProjectSubsystem projectSubsystem = ProjectSubsystem::Unknown;
+	ProjectSystemInfo systemInfo;
 	std::vector<RestoreDependencyInfo> dependencies;
 	std::vector<RestoreClass> classes;
 	std::vector<RestoreMethod> methods;
@@ -9517,6 +9518,7 @@ bool BuildRestoreModel(
 	model.versionText = document.versionText.empty() ? "1.0" : document.versionText;
 	if (bundle != nullptr) {
 		model.projectSubsystem = bundle->projectSubsystem;
+		if (!ResolveProjectSystemInfo(bundle->systemInfo, bundle->projectSubsystem, model.systemInfo, outError)) return false;
 	}
 	for (const auto& dependency : document.dependencies) {
 		RestoreDependencyInfo item;
@@ -12557,20 +12559,7 @@ std::int32_t ComputeAllocatedIdNum(const RestoreDocumentModel& model)
 
 std::vector<std::uint8_t> BuildSystemInfoSection(const RestoreDocumentModel& model)
 {
-	ByteWriter writer;
-	writer.WriteI16(5);
-	writer.WriteI16(6);
-	writer.WriteI32(1);
-	writer.WriteI32(1);
-	writer.WriteI16(1);
-	writer.WriteI16(7);
-	writer.WriteI32(1);
-	writer.WriteI32(0);
-	writer.WriteI32(model.projectSubsystem == ProjectSubsystem::WindowsGui ? 0 : 1);
-	for (int i = 0; i < 8; ++i) {
-		writer.WriteI32(0);
-	}
-	return writer.TakeBytes();
+	return EncodeProjectSystemInfo(model.systemInfo);
 }
 
 std::vector<std::uint8_t> BuildProjectConfigSection(const RestoreDocumentModel& model)
@@ -13220,12 +13209,7 @@ bool SerializeToModuleBytes(
 		sectionsToEmit.insert_or_assign(snapshot.key, std::move(info));
 	};
 
-	if (originalSystemSection != nullptr) {
-		addRawSection(*originalSystemSection);
-	}
-	else {
-		addBuiltSection(kSectionSystemInfo, "系统信息段", 0, nullptr, systemBytes);
-	}
+	addBuiltSection(kSectionSystemInfo, "系统信息段", 0, originalSystemSection, systemBytes);
 
 	if (reuseProjectConfigSection) {
 		addRawSection(*originalProjectConfigSection);

@@ -13,6 +13,8 @@
 #include <thread>
 #include <vector>
 
+#include "ProjectSystemInfo.h"
+
 namespace e2txt {
 
 // 依赖派生内容导出默认使用的线程数。
@@ -82,13 +84,6 @@ void RunFixedThreadTasks(
 enum class SourceFileKind {
 	E,
 	EC,
-};
-
-// 易语言工程在系统信息段中声明的可执行子系统。
-enum class ProjectSubsystem {
-	Unknown,
-	Console,
-	WindowsGui,
 };
 
 // 依赖项类型。
@@ -344,6 +339,8 @@ struct ProjectBundle {
 	bool projectNameStored = false;
 	std::string versionText;
 	ProjectSubsystem projectSubsystem = ProjectSubsystem::Unknown;
+	// 工程类型与编译环境元数据，源码重建时仍须保留。
+	std::optional<ProjectSystemInfo> systemInfo;
 	std::int32_t bundleFormatVersion = 0;
 	std::vector<Dependency> dependencies;
 	std::vector<BundleSourceFile> sourceFiles;
@@ -371,6 +368,8 @@ struct ProjectBundle {
 
 // 计算目录工程包可见内容的稳定摘要。
 std::string ComputeBundleDigest(const ProjectBundle& bundle);
+// 仅用于验证旧目录的摘要，再迁移到包含系统信息的新摘要。
+std::string ComputeLegacyBundleDigest(const ProjectBundle& bundle);
 // 计算除程序集源码外其它目录工程内容的稳定摘要。
 std::string ComputeBundleDigestWithoutSourceFiles(const ProjectBundle& bundle);
 // 计算文本内容的稳定摘要。

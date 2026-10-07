@@ -77,18 +77,6 @@ SourceFileKind DetectSourceFileKindFromPath(const std::string& sourcePath)
 }
 
 #pragma pack(push, 1)
-struct RawSystemInfoSection {
-	std::int16_t compileMajor = 0;
-	std::int16_t compileMinor = 0;
-	std::int32_t unknown1 = 0;
-	std::int32_t unknown2 = 0;
-	std::int32_t unknownType = 0;
-	std::int32_t fileType = 0;
-	std::int32_t unknown3 = 0;
-	std::int32_t compileType = 0;
-	std::int32_t unknown9[8] = {};
-};
-
 struct RawSectionHeader {
 	std::uint32_t magic = 0;
 	std::uint32_t infoChecksum = 0;
@@ -853,7 +841,7 @@ struct ModuleSections {
 	bool hasClassPublicity = false;
 	bool hasFolders = false;
 	bool hasLosable = false;
-	RawSystemInfoSection systemInfo = {};
+	ProjectSystemInfo systemInfo = {};
 	UserInfoSection userInfo;
 	ProgramSection program;
 	ResourceSection resources;
@@ -2390,13 +2378,9 @@ bool ParseModuleSectionsFromBytes(
 		}
 
 		if (sectionName == "系统信息段") {
-			if (sectionBytes.size() < sizeof(RawSystemInfoSection)) {
-				if (outError != nullptr) {
-					*outError = "system_info_section_too_small";
-				}
+			if (!DecodeProjectSystemInfo(sectionBytes, outSections.systemInfo, outError)) {
 				return false;
 			}
-			std::memcpy(&outSections.systemInfo, sectionBytes.data(), sizeof(RawSystemInfoSection));
 			outSections.hasSystemInfo = true;
 		}
 		else if (sectionName == "用户信息段") {
@@ -7523,10 +7507,8 @@ bool BuildBundleFromSections(
 	bundle.projectNameStored = sections.hasUserInfo && !TrimAsciiCopy(sections.userInfo.programName).empty();
 	bundle.versionText = document.versionText;
 	if (sections.hasSystemInfo) {
-		// 易语言系统信息段的 compileType=0 表示窗口子系统，1 表示控制台子系统。
-		// 未知值保留为 Unknown，编译器不会臆测为窗口程序。
-		if (sections.systemInfo.compileType == 0) bundle.projectSubsystem = ProjectSubsystem::WindowsGui;
-		else if (sections.systemInfo.compileType == 1) bundle.projectSubsystem = ProjectSubsystem::Console;
+		bundle.systemInfo = sections.systemInfo;
+		bundle.projectSubsystem = GetProjectSubsystem(sections.systemInfo);
 	}
 	bundle.dependencies = document.dependencies;
 	bundle.nativeProgramHeader = BundleNativeProgramHeaderSnapshot{
@@ -8350,7 +8332,7 @@ std::string ComputeTextDigest(const std::string& text)
 
 namespace {
 
-std::string ComputeBundleDigestInternal(const ProjectBundle& bundle, const bool includeSourceFiles)
+std::string ComputeBundleDigestInternal(const ProjectBundle& bundle, const bool includeSourceFiles, const bool includeSystemInfo = true)
 {
 	BundleDigestWriter writer;
 	writer.WriteString(bundle.projectName);
@@ -8425,10 +8407,19 @@ std::string ComputeBundleDigestInternal(const ProjectBundle& bundle, const bool 
 		writer.WriteString(item.formName);
 		writer.WriteString(item.className);
 	}
+	if (includeSystemInfo) {
+		writer.WriteBool(bundle.systemInfo.has_value());
+		if (bundle.systemInfo) writer.WriteBytes(EncodeProjectSystemInfo(*bundle.systemInfo));
+	}
 	return writer.FinishHex();
 }
 
 }  // namespace
+
+std::string ComputeLegacyBundleDigest(const ProjectBundle& bundle)
+{
+	return ComputeBundleDigestInternal(bundle, true, false);
+}
 
 std::string ComputeBundleDigest(const ProjectBundle& bundle)
 {

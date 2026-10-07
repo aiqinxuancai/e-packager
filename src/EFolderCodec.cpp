@@ -14,6 +14,7 @@
 #include "..\thirdparty\json.hpp"
 #include "BundlePathUtils.h"
 #include "PathHelper.h"
+#include "ProjectSystemInfoCodec.h"
 
 namespace e2txt {
 
@@ -1346,6 +1347,8 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 	metaJson["formatVersion"] = kBundleDirectoryFormatVersion;
 	metaJson["sourceFileKind"] = SourceFileKindToText(bundle.sourceFileKind);
 	metaJson["projectSubsystem"] = ProjectSubsystemToText(bundle.projectSubsystem);
+	if (bundle.systemInfo) metaJson["systemInfo"] = ProjectSystemInfoToJson(*bundle.systemInfo);
+	metaJson["nativeBundleDigestVersion"] = 2;
 	metaJson["projectNameStored"] = bundle.projectNameStored;
 	metaJson["sourceFiles"] = json::array();
 	metaJson["formFiles"] = json::array();
@@ -1364,6 +1367,7 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 	persistedBundle.projectNameStored = bundle.projectNameStored;
 	persistedBundle.versionText = bundle.versionText;
 	persistedBundle.projectSubsystem = bundle.projectSubsystem;
+	persistedBundle.systemInfo = bundle.systemInfo;
 	persistedBundle.bundleFormatVersion = kBundleDirectoryFormatVersion;
 	persistedBundle.dependencies = bundle.dependencies;
 	persistedBundle.dataTypeText = NormalizeCrLf(bundle.dataTypeText);
@@ -1597,9 +1601,6 @@ bool BundleDirectoryCodec::ReadBundle(const std::string& inputDir, ProjectBundle
 	if (const auto it = metaJson.find("projectSubsystem"); it != metaJson.end() && it->is_string()) {
 		bundle.projectSubsystem = ProjectSubsystemFromText(it->get<std::string>());
 	}
-	if (bundle.projectSubsystem == ProjectSubsystem::Unknown && !bundle.formFiles.empty()) {
-		bundle.projectSubsystem = ProjectSubsystem::WindowsGui;
-	}
 	if (const auto it = moduleJson.find("dependencies"); it != moduleJson.end() && it->is_array()) {
 		for (const auto& dependencyItem : *it) {
 			Dependency dependency = DependencyFromJson(dependencyItem);
@@ -1676,6 +1677,22 @@ bool BundleDirectoryCodec::ReadBundle(const std::string& inputDir, ProjectBundle
 		bundle.nativeBundleDigest = Utf8ToLocalText(it->get<std::string>());
 	}
 	(void)ReadFileBytes(GetNativeSourceSnapshotPath(root), bundle.nativeSourceBytes);
+	std::optional<ProjectSystemInfo> originalSystemInfo;
+	const auto systemInfoIt = metaJson.find("systemInfo");
+	const bool legacyDigest = !metaJson.contains("nativeBundleDigestVersion");
+	if (!bundle.nativeSourceBytes.empty() && (systemInfoIt == metaJson.end() || legacyDigest)) {
+		if (!ExtractProjectSystemInfo(bundle.nativeSourceBytes, originalSystemInfo, outError)) return false;
+	}
+	if (systemInfoIt != metaJson.end()) {
+		ProjectSystemInfo info;
+		if (!ProjectSystemInfoFromJson(*systemInfoIt, info, outError)) return false;
+		bundle.systemInfo = std::move(info);
+	}
+	else {
+		// 旧目录缺少系统信息字段时，从已保存的原生文件升级，不能猜成控制台。
+		bundle.systemInfo = originalSystemInfo;
+	}
+
 	json nativeSourceMapJson;
 	if (ReadJsonFile(GetNativeSourceMapPath(root), nativeSourceMapJson) && nativeSourceMapJson.is_array()) {
 		for (const auto& item : nativeSourceMapJson) {
@@ -1767,6 +1784,17 @@ bool BundleDirectoryCodec::ReadBundle(const std::string& inputDir, ProjectBundle
 		return false;
 	}
 
+	// 旧摘要只有在原有可见内容和系统信息都未改变时，才允许迁移。
+	const bool migrateDigest = legacyDigest && !bundle.nativeBundleDigest.empty() &&
+		bundle.systemInfo == originalSystemInfo &&
+		ComputeLegacyBundleDigest(bundle) == bundle.nativeBundleDigest;
+	if (!metaJson.contains("projectSubsystem") && bundle.systemInfo) {
+		bundle.projectSubsystem = GetProjectSubsystem(*bundle.systemInfo);
+	}
+	ProjectSystemInfo resolvedInfo;
+	if (!ResolveProjectSystemInfo(bundle.systemInfo, bundle.projectSubsystem, resolvedInfo, outError)) return false;
+	if (bundle.systemInfo) bundle.systemInfo = std::move(resolvedInfo);
+	if (migrateDigest) bundle.nativeBundleDigest = ComputeBundleDigest(bundle);
 	outBundle = std::move(bundle);
 	return true;
 }
