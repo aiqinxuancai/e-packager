@@ -4257,6 +4257,7 @@ struct NativeObjectMethodEncodeContext {
 	std::unordered_map<std::int32_t, std::int32_t> baseTypes;
 	const TypeResolver* typeResolver = nullptr;
 	std::int32_t currentOwnerTypeId = 0;
+	NativeObjectVariableSymbol currentWindowSelf;
 };
 
 bool StartsWithAt(const std::string& text, const size_t offset, const std::string_view token)
@@ -4768,24 +4769,28 @@ bool TryResolveNativeMember(
 	const NativeObjectMethodEncodeContext& context,
 	NativeObjectMemberSymbol& outMember)
 {
-	const auto ownerIt = context.membersByOwnerType.find(ownerTypeId);
-	if (ownerIt == context.membersByOwnerType.end()) {
+	const auto name = TypeResolver::NormalizeTypeName(rawMemberName);
+	std::unordered_set<std::int32_t> visited;
+	for (auto owner = ownerTypeId; owner > 0 && visited.insert(owner).second;) {
+		if (const auto members = context.membersByOwnerType.find(owner);
+			members != context.membersByOwnerType.end()) {
+			if (const auto member = members->second.find(name); member != members->second.end()) {
+				outMember = member->second;
+				return outMember.id != 0;
+			}
+		}
 		SupportLibraryTypeInfo::Member member;
 		if (context.typeResolver != nullptr &&
-			context.typeResolver->TryResolveSupportTypeMember(ownerTypeId, rawMemberName, member)) {
-			outMember = NativeObjectMemberSymbol{ member.id, ownerTypeId, member.typeId };
+			context.typeResolver->TryResolveSupportTypeMember(owner, rawMemberName, member)) {
+			outMember = NativeObjectMemberSymbol{ member.id, owner, member.typeId };
 			return true;
 		}
-		outMember = {};
-		return false;
+		const auto base = context.baseTypes.find(owner);
+		if (base == context.baseTypes.end()) break;
+		owner = base->second;
 	}
-	const auto memberIt = ownerIt->second.find(TypeResolver::NormalizeTypeName(rawMemberName));
-	if (memberIt == ownerIt->second.end()) {
-		outMember = {};
-		return false;
-	}
-	outMember = memberIt->second;
-	return outMember.id != 0;
+	outMember = {};
+	return false;
 }
 
 bool ParseNativeVariableAccessExpression(
@@ -4813,16 +4818,26 @@ bool ParseNativeVariableAccessExpression(
 	}
 	const std::string baseName = TrimAsciiCopy(expression.substr(baseBegin, pos - baseBegin));
 	const auto variableIt = context.variablesByName.find(TypeResolver::NormalizeTypeName(baseName));
-	if (variableIt == context.variablesByName.end() || variableIt->second.id == 0) {
-		if (outError != nullptr) {
-			*outError = "access_base_variable_not_found: " + baseName;
-		}
-		return false;
-	}
-
-	outAccess.base = variableIt->second;
 	outAccess.baseName = baseName;
-	outAccess.typeId = variableIt->second.typeId;
+	if (variableIt != context.variablesByName.end() && variableIt->second.id != 0) {
+		outAccess.base = variableIt->second;
+		outAccess.typeId = variableIt->second.typeId;
+	}
+	else {
+		// 无声明变量遮蔽时，允许省略当前窗口的属性限定名称。
+		NativeObjectMemberSymbol member;
+		if (context.currentWindowSelf.id == 0 ||
+			!TryResolveNativeMember(context.currentWindowSelf.typeId, baseName, context, member)) {
+			if (outError != nullptr) *outError = "access_base_variable_not_found: " + baseName;
+			return false;
+		}
+		outAccess.base = context.currentWindowSelf;
+		outAccess.typeId = member.typeId;
+		ParsedNativeVariableAccessStep step;
+		step.kind = ParsedNativeVariableAccessStep::Kind::Member;
+		step.member = member;
+		outAccess.steps.push_back(std::move(step));
+	}
 	while (pos < expression.size()) {
 		while (pos < expression.size() && std::isspace(static_cast<unsigned char>(expression[pos]))) {
 			++pos;
@@ -4884,59 +4899,6 @@ bool ParseNativeVariableAccessExpression(
 		return false;
 	}
 	return true;
-}
-
-bool FindTopLevelNativeAssignmentOperator(const std::string& text, size_t& outOffset, size_t& outLength)
-{
-	constexpr const char* kFullWidthAssign = "＝";
-	outOffset = std::string::npos;
-	outLength = 0;
-	int parenDepth = 0;
-	bool inChineseQuote = false;
-	bool inAsciiQuote = false;
-	for (size_t index = 0; index < text.size(); ++index) {
-		size_t quoteLength = 0;
-		if (!inAsciiQuote && TryGetNativeTextQuoteLength(text, index, quoteLength)) {
-			inChineseQuote = !inChineseQuote;
-			index += quoteLength - 1;
-			continue;
-		}
-		if (!inChineseQuote && text[index] == '"') {
-			inAsciiQuote = !inAsciiQuote;
-			continue;
-		}
-		if (inChineseQuote || inAsciiQuote) {
-			continue;
-		}
-		if (text[index] == '(') {
-			++parenDepth;
-			continue;
-		}
-		if (text[index] == ')' && parenDepth > 0) {
-			--parenDepth;
-			continue;
-		}
-		if (parenDepth != 0) {
-			continue;
-		}
-		if (StartsWithAt(text, index, kFullWidthAssign)) {
-			outOffset = index;
-			outLength = std::strlen(kFullWidthAssign);
-			return true;
-		}
-		if (text[index] != '=') {
-			continue;
-		}
-		const char previous = index == 0 ? '\0' : text[index - 1];
-		const char next = index + 1 >= text.size() ? '\0' : text[index + 1];
-		if (previous == '=' || previous == '!' || previous == '<' || previous == '>' || next == '=') {
-			continue;
-		}
-		outOffset = index;
-		outLength = 1;
-		return true;
-	}
-	return false;
 }
 
 void WriteNativeCallHeader(
@@ -5029,6 +4991,12 @@ bool TryResolveNativeFunction(
 	if (context.typeResolver != nullptr) {
 		SupportLibraryCommandInfo commandInfo;
 		if (context.typeResolver->TryResolveSupportCommand(rawName, commandInfo)) {
+			outSymbol = NativeFunctionSymbol{ commandInfo.libraryId, commandInfo.commandId, commandInfo.returnType };
+			return true;
+		}
+		// 省略窗口限定名的命令不得遮蔽用户子程序、DLL 或全局支持库命令。
+		if (context.currentWindowSelf.id != 0 &&
+			context.typeResolver->TryResolveSupportTypeMethod(context.currentWindowSelf.typeId, rawName, commandInfo)) {
 			outSymbol = NativeFunctionSymbol{ commandInfo.libraryId, commandInfo.commandId, commandInfo.returnType };
 			return true;
 		}
@@ -5814,7 +5782,7 @@ bool TryEncodeNativeAssignmentLine(
 
 	size_t assignOffset = std::string::npos;
 	size_t assignLength = 0;
-	if (!FindTopLevelNativeAssignmentOperator(statement.code, assignOffset, assignLength)) {
+	if (!FindSourceTopLevelAssignment(statement.code, assignOffset, assignLength)) {
 		if (outError != nullptr) {
 			*outError = "assignment_parse_failed: " + statement.code;
 		}
@@ -5885,7 +5853,7 @@ bool TryEncodeNativeRawStatementLine(
 	if (outError != nullptr) {
 		size_t assignmentOffset = std::string::npos;
 		size_t assignmentLength = 0;
-		if (FindTopLevelNativeAssignmentOperator(statement.code, assignmentOffset, assignmentLength) &&
+		if (FindSourceTopLevelAssignment(statement.code, assignmentOffset, assignmentLength) &&
 			!assignmentError.empty()) {
 			*outError = assignmentError;
 		}
@@ -11481,9 +11449,20 @@ bool BuildRestoreModel(
 			}
 			// 窗口先于方法体重建，控件引用必须使用本次生成的控件 ID。
 			for (const auto& form : model.forms) {
-				addNativeObjectVariable(form.name, form.id, 65537);
+				// 窗口程序集继承窗口命令，允许省略当前窗口限定名称。
+				nativeObjectEncodeContext.baseTypes.insert_or_assign(form.classId, 65537);
+				// 每个窗口有独立的控件成员表，同时继承核心窗口的公共属性。
+				nativeObjectEncodeContext.baseTypes.insert_or_assign(form.id, 65537);
+				addNativeObjectVariable(form.name, form.id, form.id);
 				for (const auto& element : form.elements) {
 					const auto elementKind = element.id & epl_system_id::kMaskType;
+					if (form.classId == targetClass.id && elementKind == epl_system_id::kTypeFormSelf) {
+						nativeObjectEncodeContext.currentWindowSelf = { element.id, element.dataType };
+					}
+					if (elementKind == epl_system_id::kTypeFormControl ||
+						elementKind == epl_system_id::kTypeFormMenu) {
+						addNativeObjectMember(form.id, element.name, element.id, element.dataType);
+					}
 					// 菜单与控件都是所属窗口程序集可直接引用的对象。
 					if (form.classId == targetClass.id &&
 						(elementKind == epl_system_id::kTypeFormControl ||

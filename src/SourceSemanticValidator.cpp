@@ -98,11 +98,14 @@ struct ProgramSource {
 	bool formSymbolsComplete = false;
 	std::string formBaseType;
 	std::unordered_map<std::string, Symbol> classSymbols;
+	// 窗口对象与声明变量分开保存，避免改变变量作用域的查找优先级。
+	std::unordered_map<std::string, Symbol> formSymbols;
 	std::vector<MethodSymbol> methods;
 };
 
 struct SemanticModel {
 	std::unordered_map<std::string, Symbol> globals;
+	std::unordered_map<std::string, Symbol> formObjects;
 	std::unordered_map<std::string, TypeSymbol> types;
 	std::unordered_map<std::string, std::vector<Callable>> functions;
 	std::unordered_map<std::string, std::vector<Callable>> memberFunctions;
@@ -662,8 +665,8 @@ void CollectFormControlSymbols(
 		if (!IsFormMetadataNode(child.name)) {
 			const std::string name = XmlAttribute(child, "名称");
 			if (!name.empty()) {
-				const auto [it, inserted] = program.classSymbols.emplace(name, Symbol { .type = TypeInfo { .name = child.name } });
-				if (!inserted) {
+				const auto [it, inserted] = program.formSymbols.emplace(name, Symbol { .type = TypeInfo { .name = child.name } });
+				if (!inserted || program.classSymbols.contains(name)) {
 					AddSemanticError(report, path, 1, "form_symbol_duplicate", "form controls and assembly variables must not use the same name");
 				}
 			}
@@ -750,11 +753,14 @@ void CollectFormSymbols(
 		}
 
 		program.formBaseType = root.name;
+		model.formObjects.emplace(formName, Symbol { .type = TypeInfo { .name = program.assemblyName } });
 		CollectFormControlSymbols(root, program, path, report);
 		ValidateFormEventHandlers(root, program, path, report);
 		program.formSymbolsComplete = true;
 		TypeSymbol& classType = model.types[program.assemblyName];
+		classType.baseType = root.name;
 		for (const auto& [name, symbol] : program.classSymbols) classType.members.emplace(name, symbol);
+		for (const auto& [name, symbol] : program.formSymbols) classType.members.emplace(name, symbol);
 	}
 }
 
@@ -961,6 +967,9 @@ const Symbol* FindSymbol(const std::string& name, const EvaluationContext& conte
 	if (const auto it = context.method.symbols.find(name); it != context.method.symbols.end()) return &it->second;
 	if (const auto it = context.program.classSymbols.find(name); it != context.program.classSymbols.end()) return &it->second;
 	if (const auto it = context.model.globals.find(name); it != context.model.globals.end()) return &it->second;
+	// 与原生回包一致：局部变量、程序集变量、全局变量优先于窗口对象。
+	if (const auto it = context.program.formSymbols.find(name); it != context.program.formSymbols.end()) return &it->second;
+	if (const auto it = context.model.formObjects.find(name); it != context.model.formObjects.end()) return &it->second;
 	return nullptr;
 }
 
@@ -1738,6 +1747,10 @@ void ValidateDeclaredTypes(const SemanticModel& model, SourcePreflightReport& re
 	for (const ProgramSource& program : model.programs) {
 		for (const auto& [name, symbol] : program.classSymbols) {
 			if (!symbol.type.name.empty() && !IsKnownBuiltinType(symbol.type.name) && !model.types.contains(symbol.type.name) && model.externalMetadataComplete) AddSemanticError(report, program.path, 1, "type_not_found", "assembly variable type is not declared: " + LocalTextToUtf8(symbol.type.name));
+		}
+
+		for (const auto& [name, symbol] : program.formSymbols) {
+			if (!symbol.type.name.empty() && !IsKnownBuiltinType(symbol.type.name) && !model.types.contains(symbol.type.name) && model.externalMetadataComplete) AddSemanticError(report, program.path, 1, "type_not_found", "form object type is not declared: " + LocalTextToUtf8(symbol.type.name));
 		}
 		for (const MethodSymbol& method : program.methods) {
 			if (!method.callable.returnType.name.empty() && !IsKnownBuiltinType(method.callable.returnType.name) && !model.types.contains(method.callable.returnType.name) && model.externalMetadataComplete) AddSemanticError(report, program.path, method.headerLine, "type_not_found", "subprogram return type is not declared: " + LocalTextToUtf8(method.callable.returnType.name));
