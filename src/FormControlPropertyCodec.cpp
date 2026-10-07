@@ -1421,7 +1421,8 @@ bool TryInferCollectionKind(
 	const FormControlPropertyValue& value,
 	FormControlPropertyCollectionKind& outKind)
 {
-	if (value.kind != FormControlPropertyValueKind::Binary || value.binaryValue.empty()) return false;
+	// 空整数数组编码为零字节，仍可由公开属性定义确定类型。
+	if (value.kind != FormControlPropertyValueKind::Binary) return false;
 	std::vector<std::string> strings;
 	std::vector<std::int32_t> integers;
 	// A raw integer array can begin with bytes that look like a valid string
@@ -2348,11 +2349,21 @@ bool FormControlPropertyCodec::Apply(
 			bool hasKind = TryInferXmlCollectionKind(*structuredNode, collectionKind);
 			// 空集合没有子项可供推断，沿用原属性已确认的集合格式；也支持清空现有列表。
 			if (!hasKind && structuredNode->children.empty()) {
+				// XML 的二进制属性也能提供集合格式，但只使用其类型，不复用旧项目内容。
+				for (const auto& attribute : propertyAttributes) {
+					if (attribute.first != definition.xmlName && attribute.first != definition.name &&
+						attribute.first != definition.englishName) continue;
+					FormControlPropertyValue scalar;
+					if (ParseXmlPropertyValue(definition, attribute.second, scalar, FormControlPropertyValueKind::Binary)) {
+						hasKind = TryInferCollectionKind(scalar, collectionKind);
+					}
+					break;
+				}
 				const auto original = std::find_if(originalValues.begin(), originalValues.end(),
 					[&definition](const auto& value) {
 						return value.definition.metadataIndex == definition.metadataIndex;
 					});
-				hasKind = original != originalValues.end() && TryInferCollectionKind(*original, collectionKind);
+				if (!hasKind) hasKind = original != originalValues.end() && TryInferCollectionKind(*original, collectionKind);
 			}
 			encoded = hasKind && EncodeStructuredProperty(*structuredNode, collectionKind, context.utf8, structuredData);
 		}

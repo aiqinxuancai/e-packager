@@ -8923,7 +8923,7 @@ bool BuildFormControlTree(
 				outError,
 				xmlChildren)) {
 		if (outError != nullptr && !outError->empty()) {
-			*outError = "window_control[" + node.name + "]: " + *outError;
+			*outError = "window_control[" + node.name + ", name=" + element.name + "]: " + *outError;
 		}
 		return false;
 	}
@@ -9135,7 +9135,8 @@ bool BuildFormsFromXml(
 						outError,
 						rootPropertyChildren)) {
 				if (outError != nullptr && !outError->empty()) {
-					*outError = "window_control[窗口]: " + *outError;
+					*outError = LocalTextToUtf8("window_control[窗口, name=" + selfElement.name +
+						"], file=" + formDef.formXml->sourcePath + ": " + *outError);
 				}
 				return false;
 			}
@@ -9166,6 +9167,10 @@ bool BuildFormsFromXml(
 						form.elements,
 						rootChildren,
 						outError)) {
+					if (outError != nullptr && !outError->empty()) {
+						*outError = LocalTextToUtf8("window_form[" + formDef.name +
+							"], file=" + formDef.formXml->sourcePath + ": " + *outError);
+					}
 					return false;
 				}
 			}
