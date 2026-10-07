@@ -2183,10 +2183,12 @@ void ApplyEventIndicesToForms(ModuleSections& sections)
 			continue;
 		}
 
-		const auto eventPair = std::make_pair(item.eventId, item.methodId);
-		if (std::find(elementIt->events.begin(), elementIt->events.end(), eventPair) == elementIt->events.end()) {
-			elementIt->events.push_back(eventPair);
-		}
+		// IDE 保存的辅助索引按控件和事件标识绑定；资源段可能残留重建前的子程序 ID。
+		// 同一事件以辅助索引为准，不能把新旧 ID 当作两个独立事件导出。
+		std::erase_if(elementIt->events, [&item](const auto& event) {
+			return event.first == item.eventId;
+		});
+		elementIt->events.emplace_back(item.eventId, item.methodId);
 	}
 }
 

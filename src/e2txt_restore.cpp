@@ -12267,7 +12267,8 @@ void WriteFormElements(ByteWriter& writer, const std::vector<RestoreFormElement>
 			std::int32_t showStatus = (element.visible ? 0 : 0x1) | (element.disable ? 0x2 : 0) | (element.selected ? 0x4 : 0);
 			itemWriter.WriteI32(showStatus);
 			itemWriter.WriteStandardText(element.text);
-			itemWriter.WriteI32(element.clickEvent);
+			// 事件统一写入辅助索引段，避免 IDE 重建子程序后资源段残留旧 ID。
+			itemWriter.WriteI32(0);
 			itemWriter.WriteBytes(std::vector<std::uint8_t>(16, 0));
 			return;
 		}
@@ -12291,11 +12292,8 @@ void WriteFormElements(ByteWriter& writer, const std::vector<RestoreFormElement>
 			(element.tabStop ? 0x4 : 0) | (element.locked ? 0x10 : 0);
 		itemWriter.WriteI32(showStatus);
 		itemWriter.WriteI32(element.tabIndex);
-		itemWriter.WriteI32(static_cast<std::int32_t>(element.events.size()));
-		for (const auto& [key, value] : element.events) {
-			itemWriter.WriteI32(key);
-			itemWriter.WriteI32(value);
-		}
+		// 与 IDE 保存格式一致：控件事件只写辅助索引段，资源段事件数为零。
+		itemWriter.WriteI32(0);
 		itemWriter.WriteBytes(std::vector<std::uint8_t>(20, 0));
 		itemWriter.WriteBytes(element.extensionData);
 	});
