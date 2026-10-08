@@ -22,3 +22,7 @@ python -X utf8 tools/TestSamplesSemanticAudit.py `
 - `--merge-audits <旧目录> <新目录>` 合并结果，同编号以最后一个目录为准，保留真实日志路径和来源。合并结果代表不同批次，不应描述为同一二进制的一轮测试。
 
 编号取决于完整样例列表；使用 `--blackmoon-ids` 前应核对 `manifest.json`/`results.json`。此批样例的 322 是“黑月例程/调试静态库/调试静态库测试.e”。
+
+只测试根目录可增加 `--samples D:/git/e-packager/eproj --top-level-only`。该选项只限定测试对象；依赖目录仍复制到临时输入目录，以保留相对路径。
+
+普通静态编译可用 `--static-ids 9,10` 按编号指定；不必因工程使用黑月模块就切换黑月编译器。

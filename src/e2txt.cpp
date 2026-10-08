@@ -3704,6 +3704,8 @@ private:
 			if (functionName.empty() && function.header.dwId == m_program.header.flag2) {
 				functionName = "_启动子程序";
 			}
+			if (functionName.empty())
+				functionName = "匿名子程序_" + std::to_string(static_cast<std::uint32_t>(function.header.dwId));
 			m_userNameCache[function.header.dwId] = functionName;
 
 			int anonymousParamCount = 0;
@@ -6881,6 +6883,32 @@ std::string BuildPublicHeaderText(
 			current = found == sections.program.codePages.end() ? nullptr : &*found;
 		}
 	}
+	// 公开接口引用的私有结构仍是 ABI 的一部分，递归补齐其成员类型。
+	std::unordered_set<std::int32_t> headerStructs;
+	const auto requireStruct = [&](const std::int32_t id) {
+		if (std::any_of(sections.program.dataTypes.begin(), sections.program.dataTypes.end(),
+			[&](const auto& item) { return item.header.dwId == id; })) headerStructs.insert(id);
+	};
+	for (const auto& item : sections.program.dataTypes)
+		if (IsStructPublic(item) && !IsStructHidden(item)) requireStruct(item.header.dwId);
+	for (const auto& item : sections.program.globals)
+		if ((item.attr & 0x0100) != 0) requireStruct(item.dataType);
+	for (const auto& item : sections.program.functions) {
+		if ((item.attr & 0x8) == 0) continue;
+		requireStruct(item.returnType);
+		for (const auto& param : item.params) requireStruct(param.dataType);
+	}
+	for (const auto& item : sections.program.dlls) {
+		if ((item.attr & 0x2) == 0) continue;
+		requireStruct(item.returnType);
+		for (const auto& param : item.params) requireStruct(param.dataType);
+	}
+	for (size_t previous = 0; previous != headerStructs.size();) {
+		previous = headerStructs.size();
+		for (const auto& item : sections.program.dataTypes)
+			if (headerStructs.contains(item.header.dwId))
+				for (const auto& member : item.members) requireStruct(member.dataType);
+	}
 	const auto appendProgramPages = [&](const bool classPagesOnly) {
 		for (const auto& pageInfo : sections.program.codePages) {
 			const auto functions = CollectPageFunctions(sections.program, pageInfo);
@@ -6941,8 +6969,7 @@ std::string BuildPublicHeaderText(
 
 	for (const auto& item : sections.program.dataTypes) {
 		if (IsTxt2EPlaceholderStruct(item) ||
-			!IsStructPublic(item) ||
-			IsStructHidden(item) ||
+			!headerStructs.contains(item.header.dwId) ||
 			IsDependencyDefinedId(dependencyRecords, item.header.dwId)) {
 			continue;
 		}

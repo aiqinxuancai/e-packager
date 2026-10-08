@@ -10231,6 +10231,24 @@ bool BuildRestoreModel(
 			}
 		}
 
+		// 常规源码页隐藏导入结构；公开接口闭包仍须参加依赖类型注册。
+		Page interfaceStructPage;
+		interfaceStructPage.typeName = "自定义数据类型";
+		bool inStruct = false;
+		for (const auto& rawLine : SplitLines(dependencyBundle.publicHeaderText)) {
+			const auto line = TrimAsciiCopy(rawLine);
+			if (line.starts_with(".数据类型 ")) inStruct = true;
+			else if (line.starts_with(".") && !line.starts_with(".成员 ")) inStruct = false;
+			if (inStruct) interfaceStructPage.lines.push_back(rawLine);
+		}
+		std::vector<ParsedStructDef> interfaceStructs;
+		ParseStructPage(interfaceStructPage, interfaceStructs);
+		for (auto& item : interfaceStructs) {
+			if (std::none_of(dependencyStructs.begin(), dependencyStructs.end(),
+				[&](const auto& existing) { return existing.name == item.name; }))
+				dependencyStructs.push_back(std::move(item));
+		}
+
 		std::unordered_map<std::string, const ParsedStructDef*> dependencyStructByName;
 		for (const auto& parsedStruct : dependencyStructs) {
 			const std::string normalizedName = TypeResolver::NormalizeTypeName(parsedStruct.name);
@@ -11618,7 +11636,7 @@ bool BuildRestoreModel(
 					.methodsByOwnerType[existingMethod.ownerClass]
 					.insert_or_assign(
 						TypeResolver::NormalizeTypeName(existingMethod.name),
-						NativeFunctionSymbol{ -2, existingMethod.id });
+						NativeFunctionSymbol{ -2, existingMethod.id, existingMethod.returnType });
 			}
 			for (size_t sourceClassIndex = 0; sourceClassIndex < parsedClasses.size(); ++sourceClassIndex) {
 				const auto& sourceClass = parsedClasses[sourceClassIndex];

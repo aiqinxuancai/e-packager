@@ -73,12 +73,12 @@ def compile_file(args, source, root, label, static=False, blackmoon=None):
             'report': str(report), 'details': data}
 
 
-def compile_repacked(args, edited, copied, root, label, blackmoon=None):
+def compile_repacked(args, edited, copied, root, label, blackmoon=None, static=False):
     # 编译插件可能校验工程文件名；在输入副本原位临时替换，完成后恢复。
     original = copied.read_bytes()
     try:
         copied.write_bytes(edited.read_bytes())
-        return compile_file(args, copied, root, label, blackmoon=blackmoon)
+        return compile_file(args, copied, root, label, blackmoon=blackmoon, static=static)
     finally:
         copied.write_bytes(original)
 
@@ -220,9 +220,9 @@ def audit(args, index, original, copied, root, repo):
                             row['mismatches'].append(str(relative))
             # 旧 IDE 模块代理按工程所在目录查找 .ec；在输入副本旁编译以保留真实依赖环境。
             row['compile'] = compile_repacked(args, output, copied, arch_root, 'compile',
-                                               blackmoon='asm' if index in args.blackmoon_ids else None)
+                                               blackmoon='asm' if index in args.blackmoon_ids else None, static=index in args.static_ids)
         result['baseline_compile'] = compile_file(args, copied, root, 'baseline-compile',
-                                                 blackmoon='asm' if index in args.blackmoon_ids else None)
+                                                 blackmoon='asm' if index in args.blackmoon_ids else None, static=index in args.static_ids)
         result['status'] = classify(result)
     except Exception as exc:
         result['status'] = 'audit_error'
@@ -237,20 +237,24 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     repo = Path(__file__).resolve().parent.parent
     parser.add_argument('--samples', type=Path, default=repo / 'eproj/samples')
+    parser.add_argument('--top-level-only', action='store_true', help='仅测试输入目录根层的 .e，不递归子目录')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--ide', type=Path, required=True)
     parser.add_argument('--launcher', type=Path, required=True)
     parser.add_argument('--ids', help='只运行逗号分隔的样例编号，编号仍按完整文件列表计算')
     parser.add_argument('--bin-root', type=Path, default=repo / 'bin')
     parser.add_argument('--merge-audits', type=Path, nargs='+', help='按先后顺序合并审计结果，保留实际日志目录')
+    parser.add_argument('--static-ids', default='', help='明确使用普通静态编译的样例编号')
     parser.add_argument('--blackmoon-ids', default='', help='明确使用黑月汇编模式的样例编号')
     parser.add_argument('--workers', type=int, default=2)
     parser.add_argument('--timeout', type=int, default=60)
     parser.add_argument('--retry-compile-failures', action='store_true',
                         help='保留首次结果，在已有审计目录中用独立 TEMP 重试失败的编译')
     args = parser.parse_args()
+    args.samples = args.samples.resolve()
     args.output = args.output.resolve()
     args.bin_root = args.bin_root.resolve()
+    args.static_ids = {int(i) for i in args.static_ids.split(',') if i}
     args.blackmoon_ids = {int(i) for i in args.blackmoon_ids.split(',') if i}
     if args.merge_audits:
         args.output.mkdir(parents=True, exist_ok=False)
@@ -293,9 +297,9 @@ def main():
                 retry_number = len(row.get('compile_history', []))
                 mode = 'asm' if result['id'] in args.blackmoon_ids else None
                 if label == 'baseline-compile':
-                    row['compile'] = compile_file(args, source, case_root, label + f'-retry-{retry_number}', blackmoon=mode)
+                    row['compile'] = compile_file(args, source, case_root, label + f'-retry-{retry_number}', blackmoon=mode, static=result['id'] in args.static_ids)
                 else:
-                    row['compile'] = compile_repacked(args, source, copied, case_root, label + f'-retry-{retry_number}', blackmoon=mode)
+                    row['compile'] = compile_repacked(args, source, copied, case_root, label + f'-retry-{retry_number}', blackmoon=mode, static=result['id'] in args.static_ids)
                 if label == 'baseline-compile':
                     result.setdefault('initial_baseline_compile', result['baseline_compile'])
                     result.setdefault('baseline_compile_history', []).append(result['baseline_compile'])
@@ -317,7 +321,7 @@ def main():
             args.bin_root / 'x64/Release/e-packager-x86.exe') if p.is_file()})
     copied_root = args.output / 'inputs'
     shutil.copytree(args.samples, copied_root)
-    files = sorted(args.samples.rglob('*.e'))
+    files = sorted(args.samples.glob('*.e') if args.top_level_only else args.samples.rglob('*.e'))
     save(args.output / 'manifest.json', [{'path': str(p), 'sha256': digest(p)} for p in files])
     selected = {int(i) for i in args.ids.split(',')} if args.ids else None
     results = []
