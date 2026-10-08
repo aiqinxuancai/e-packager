@@ -1,4 +1,5 @@
-﻿#include "SourceSemanticValidator.h"
+﻿#include "ConditionalDeclarations.h"
+#include "SourceSemanticValidator.h"
 
 #include "SourceExpressionParser.h"
 #include "SourcePreflightValidator.h"
@@ -322,7 +323,17 @@ bool Compatible(const TypeInfo& target, const TypeInfo& source, const SemanticMo
 		const bool sourceEnum = sourceType != model->types.end() && sourceType->second.enumeration;
 		if ((targetEnum && IsNumeric(source)) || (sourceEnum && IsNumeric(target))) return true;
 	}
+	if (model != nullptr && !target.array && !source.array) {
+		std::unordered_set<std::string> visited;
+		for (std::string name = source.name; !name.empty() && visited.insert(name).second;) {
+			if (name == target.name) return true;
+			const auto found = model->types.find(name);
+			if (found == model->types.end()) break;
+			name = found->second.baseType;
+		}
+	}
 	if (IsNumeric(target) && IsNumeric(source)) return true;
+	if ((IsNumeric(target) && IsLogical(source)) || (IsLogical(target) && IsNumeric(source))) return true;
 	return target.name == source.name;
 }
 
@@ -666,8 +677,8 @@ void CollectFormControlSymbols(
 			const std::string name = XmlAttribute(child, "名称");
 			if (!name.empty()) {
 				const auto [it, inserted] = program.formSymbols.emplace(name, Symbol { .type = TypeInfo { .name = child.name } });
-				if (!inserted || program.classSymbols.contains(name)) {
-					AddSemanticError(report, path, 1, "form_symbol_duplicate", "form controls and assembly variables must not use the same name");
+				if (!inserted) {
+					AddSemanticError(report, path, 1, "form_symbol_duplicate", "form controls must not use the same name");
 				}
 			}
 		}
@@ -717,6 +728,18 @@ void CollectFormSymbols(
 		else if (root.name != "窗口") {
 			AddSemanticError(report, path, 1, "form_root_invalid", "form XML root element must be 窗口");
 		}
+		else {
+			// 无事件程序集的窗口也可以被载入并通过窗口名访问控件。
+			const auto name = XmlAttribute(root, "名称");
+			const auto typeName = "窗口::" + name;
+			ProgramSource controls;
+			CollectFormControlSymbols(root, controls, path, report);
+			auto& type = model.types[typeName];
+			type.type.name = typeName;
+			type.baseType = "窗口";
+			type.members = std::move(controls.formSymbols);
+			model.formObjects.insert_or_assign(name, Symbol{ .type = TypeInfo{ .name = typeName } });
+		}
 	}
 	for (ProgramSource& program : model.programs) {
 		const auto bindingIt = std::find_if(
@@ -753,7 +776,7 @@ void CollectFormSymbols(
 		}
 
 		program.formBaseType = root.name;
-		model.formObjects.emplace(formName, Symbol { .type = TypeInfo { .name = program.assemblyName } });
+		model.formObjects.insert_or_assign(formName, Symbol { .type = TypeInfo { .name = program.assemblyName } });
 		CollectFormControlSymbols(root, program, path, report);
 		ValidateFormEventHandlers(root, program, path, report);
 		program.formSymbolsComplete = true;
@@ -796,7 +819,8 @@ void ParseElibText(const std::string& text, SemanticModel& model)
 			const std::string name = Field(declaration, 0);
 			if (!name.empty()) {
 				model.types[currentType].members[name] = Symbol {
-					.type = model.types[currentType].enumeration ? TypeInfo { .name = currentType } : ParseDeclaredType(Field(declaration, 1)),
+					.type = model.types[currentType].enumeration ? TypeInfo { .name = "整数型" } : ParseDeclaredType(Field(declaration, 1),
+						std::any_of(declaration.fields.begin() + 2, declaration.fields.end(), [](const auto& field) { return Trim(field) == "数组"; })),
 					.lvalue = !Contains(GetValueField(declaration, "属性"), "只读"),
 				};
 			}
@@ -948,7 +972,21 @@ void CollectDependencies(const ProjectBundle& bundle, SemanticModel& model)
 				model.externalMetadataComplete = false;
 				continue;
 			}
-			ParseElibText(text, model);
+			// 支持库名称空间独立于用户类；同名类型通过“库名::类型”显式引用。
+			SemanticModel libraryModel;
+			ParseElibText(text, libraryModel);
+			for (const auto& [name, type] : libraryModel.types) {
+				model.types.insert_or_assign(dependency.fileName + "::" + name, type);
+				model.types.try_emplace(name, type);
+			}
+			for (auto& [name, calls] : libraryModel.functions) {
+				model.functions[dependency.fileName + "::" + name] = calls;
+				model.functions[name].insert(model.functions[name].end(), calls.begin(), calls.end());
+			}
+			for (auto& [name, calls] : libraryModel.memberFunctions)
+				model.memberFunctions[name].insert(model.memberFunctions[name].end(), calls.begin(), calls.end());
+			for (auto& [name, type] : libraryModel.constants) model.constants.try_emplace(name, type);
+			model.anyExternalMetadata |= libraryModel.anyExternalMetadata;
 		}
 		else {
 			std::filesystem::path header = workspace / "header" / "header.txt";
@@ -1017,6 +1055,9 @@ std::vector<const Callable*> FindCallableCandidates(
 			for (const Callable& callable : sharedIt->second) result.push_back(&callable);
 		}
 		return result;
+	}
+	if (const auto* owner = FindMemberOwner(context.program.assemblyName, name, context.model, true)) {
+		for (const Callable& callable : owner->methods.at(name)) result.push_back(&callable);
 	}
 	if (const auto it = context.model.functions.find(name); it != context.model.functions.end()) {
 		for (const Callable& callable : it->second) result.push_back(&callable);
@@ -1125,6 +1166,7 @@ EvaluatedExpression EvaluateCall(
 		// 类名.静态方法() 的左侧是类型名而不是运行时对象。
 		// 先按类型名查找，避免把类名当作未声明变量。
 		if (callee.children.front()->kind == SourceExpressionKind::Name &&
+			FindSymbol(callee.children.front()->text, context) == nullptr &&
 			context.model.types.contains(callee.children.front()->text)) {
 			ownerType = callee.children.front()->text;
 			receiverName = ownerType;
@@ -1346,10 +1388,8 @@ EvaluatedExpression EvaluateExpression(
 			type = TypeInfo { .name = "字节型" };
 			return { state, type, base.lvalue, base.name, true };
 		}
-		if (base.type.arrayRank.has_value() && suppliedRank < *base.type.arrayRank) {
-			type.arrayRank = *base.type.arrayRank - suppliedRank;
-		}
-		else {
+		// 易语言允许用单个线性下标访问多维数组，结果仍为元素。
+		{
 			type.array = false;
 			type.arrayRank.reset();
 			if (!base.type.arrayRank.has_value() && base.state == ResolveState::Valid) state = ResolveState::Unknown;
@@ -1621,7 +1661,7 @@ void ValidateFlowStatement(
 	};
 	const auto requireLogical = [&](const std::size_t index) {
 		const EvaluatedExpression value = evaluateArgument(index);
-		if (value.state == ResolveState::Valid && !IsLogical(value.type)) AddSemanticError(report, context.path, context.line, "flow_condition_type_mismatch", "flow condition must be a logical expression");
+		if (value.state == ResolveState::Valid && !IsLogical(value.type) && !IsNumeric(value.type)) AddSemanticError(report, context.path, context.line, "flow_condition_type_mismatch", "flow condition must be a logical expression");
 	};
 	const auto requireNumeric = [&](const std::size_t index) {
 		const EvaluatedExpression value = evaluateArgument(index);
@@ -1761,20 +1801,18 @@ void ValidateDeclaredTypes(const SemanticModel& model, SourcePreflightReport& re
 
 void ValidateCrossPageNames(const ProjectBundle& bundle, SourcePreflightReport& report)
 {
-	struct Origin { std::string path; std::size_t line = 0; };
-	std::unordered_map<std::string, Origin> constantNames;
+	ConditionalDeclarationNames constantNames;
 	const std::vector<std::string> constantLines = SplitLines(bundle.constantText);
 	for (std::size_t index = 0; index < constantLines.size(); ++index) {
 		const std::string line = Trim(StripComment(constantLines[index]));
 		std::string rest;
 		if (!MatchDirective(line, "常量", &rest)) continue;
 		const std::string name = Field(SplitFields(rest), 0);
-		if (!name.empty()) constantNames.emplace(name, Origin { "src/.常量.txt", index + 1 });
+		if (!name.empty()) constantNames.Insert(name, DeclarationComment(SplitFields(rest).fields, 3));
 	}
 	for (const BundleBinaryResource& resource : bundle.resources) {
 		if (resource.logicalName.empty()) continue;
-		if (constantNames.contains(resource.logicalName)) AddSemanticError(report, resource.relativePath, 1, "constant_resource_name_conflict", "constant and binary resource names share the same #name namespace");
-		else constantNames.emplace(resource.logicalName, Origin { resource.relativePath, 1 });
+		if (!constantNames.Insert(resource.logicalName, resource.comment)) AddSemanticError(report, resource.relativePath, 1, "constant_resource_name_conflict", "constant and binary resource names share the same #name namespace");
 	}
 }
 
@@ -1812,6 +1850,62 @@ void ValidateProjectBundleSemantics(const ProjectBundle& bundle, SourcePreflight
 	ValidateDeclaredTypes(model, report);
 	for (const ProgramSource& program : model.programs) {
 		for (const MethodSymbol& method : program.methods) ValidateMethodBody(program, method, model, report);
+	}
+	// 旧工程可能保留 IDE 不编译的历史函数。保留声明未变的已有标量下标语句，
+	// 仍按文本语义重新编码，并明确警告；新写入或改动过的代码继续严格检查。
+	if (!bundle.nativeSourceBytes.empty() && std::any_of(report.errors.begin(), report.errors.end(),
+		[](const auto& item) { return item.code == "index_target_not_array"; })) {
+		ProjectBundle original;
+		Generator generator;
+		if (generator.GenerateBundleFromBytes(bundle.nativeSourceBytes, bundle.sourcePath, original, nullptr)) {
+			const auto executableText = [](const std::string& text) {
+				std::string result;
+				for (const auto& line : SplitLines(text)) {
+					const auto code = Trim(StripComment(line));
+					if (!code.empty()) result += code + "\n";
+				}
+				return result;
+			};
+			SemanticModel originalModel;
+			for (const auto& file : original.sourceFiles) CollectProgramSource(file, originalModel);
+			const auto sameSymbols = [](const auto& left, const auto& right) {
+				if (left.size() != right.size()) return false;
+				for (const auto& [name, symbol] : left) {
+					const auto found = right.find(name);
+					if (found == right.end() || symbol.type.name != found->second.type.name ||
+						symbol.type.array != found->second.type.array || symbol.type.arrayRank != found->second.type.arrayRank) return false;
+				}
+				return true;
+			};
+			const auto existingStatement = [&](const SourcePreflightDiagnostic& diagnostic) {
+				if (executableText(bundle.globalText) != executableText(original.globalText) ||
+					executableText(bundle.dataTypeText) != executableText(original.dataTypeText)) return false;
+				for (const auto& program : model.programs) {
+					if (LocalTextToUtf8(program.path) != diagnostic.filePath || diagnostic.line > program.lines.size()) continue;
+					for (const auto& oldProgram : originalModel.programs) {
+						if (oldProgram.path != program.path || !sameSymbols(program.classSymbols, oldProgram.classSymbols)) continue;
+						for (const auto& method : program.methods) {
+							if (diagnostic.line < method.firstBodyLine || diagnostic.line > method.lastBodyLine) continue;
+							for (const auto& oldMethod : oldProgram.methods) {
+								if (oldMethod.callable.name != method.callable.name || !sameSymbols(method.symbols, oldMethod.symbols)) continue;
+								const auto code = Trim(StripComment(program.lines[diagnostic.line - 1]));
+								for (size_t line = oldMethod.firstBodyLine; line <= oldMethod.lastBodyLine; ++line)
+									if (Trim(StripComment(oldProgram.lines[line - 1])) == code) return true;
+							}
+						}
+					}
+				}
+				return false;
+			};
+			std::erase_if(report.errors, [&](const auto& item) {
+				if (item.code != "index_target_not_array" || !existingStatement(item)) return false;
+				auto warning = item;
+				warning.code = "native_legacy_scalar_index";
+				warning.message = "unchanged native source indexes a scalar; preserved for IDE compiler validation";
+				report.warnings.push_back(std::move(warning));
+				return true;
+			});
+		}
 	}
 	if (!model.externalMetadataComplete) {
 		// 保留语法和结构错误，丢弃必须依赖完整原生元数据才能确定的诊断。

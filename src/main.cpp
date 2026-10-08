@@ -25,6 +25,7 @@
 #include "VcToolchainSetup.h"
 #include "compiler/ECompiler.h"
 #include "EFolderCodec.h"
+#include "FormControlPropertyBridge.h"
 #include "PathHelper.h"
 #include "SelfUpdater.h"
 #include "SourcePreflightValidator.h"
@@ -2789,6 +2790,8 @@ int RunCommand(int argc, char* argv[])
 	}
 
 	const std::string command = argv[1];
+	if (command == "--form-control-worker" && argc == 4)
+		return e2txt::RunFormControlWorker(Utf8PathToPath(argv[2]), Utf8PathToPath(argv[3]));
 	if (IsVersionCommand(command)) {
 		PrintVersion();
 		return EXIT_SUCCESS;
@@ -3243,6 +3246,9 @@ int RunCommand(int argc, char* argv[])
 
 int MainImpl(int argc, char* argv[])
 {
+	// 缺少旧系统 DLL 时直接返回加载错误，避免弹出系统功能安装对话框。
+	SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
+	if (argc == 4 && std::string(argv[1]) == "--form-control-worker") return RunCommand(argc, argv);
 	ConfigureConsoleForUtf8();
 	const bool versionInvocation = IsVersionInvocation(argc, argv);
 	if (!versionInvocation) {

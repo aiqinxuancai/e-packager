@@ -62,6 +62,8 @@ $source = @"
 
 文本数组 ＝ 分割文本 (“甲,乙”, “,”, )
 数量 ＝ 取数组成员数 (文本数组)
+数量 ＝ krnln::打开文件 (“sample.txt”, , )
+打开文件 (“sample.txt”)
 返回 (0)
 "@
 
@@ -75,6 +77,12 @@ try {
 	# Win32 reads the native .fne metadata; x64 must fall back to this exported text workspace.
 	Invoke-Packager -Executable $Win32PackagerPath -Arguments @("unpack", $TemplatePath, $workspace) | Out-Null
 	Write-Utf8BomFile -Path (Join-Path $workspace "src\程序集1.txt") -Content $source
+	Write-Utf8BomFile -Path (Join-Path $workspace "src\.DLL声明.txt") -Content @"
+.版本 2
+.DLL命令 打开文件, 逻辑型, "example.dll", "OpenF"
+    .参数 文件名, 文本型
+"@
+
 
 	Invoke-Packager -Executable $Win32PackagerPath -Arguments @("pack", $workspace, $win32Output) | Out-Null
 	Invoke-Packager -Executable $X64PackagerPath -Arguments @("pack", $workspace, $x64Output) | Out-Null
@@ -87,6 +95,10 @@ try {
 
 	Invoke-Packager -Executable $Win32PackagerPath -Arguments @("unpack", $win32Output, (Join-Path $tempRoot "win32-roundtrip"), "--main-only") | Out-Null
 	Invoke-Packager -Executable $X64PackagerPath -Arguments @("unpack", $x64Output, (Join-Path $tempRoot "x64-roundtrip"), "--main-only") | Out-Null
+	$decoded = [IO.File]::ReadAllText((Join-Path $tempRoot "win32-roundtrip\src\程序集1.txt"), [Text.Encoding]::UTF8)
+	if (-not $decoded.Contains('krnln::打开文件 (“sample.txt”, , )') -or -not $decoded.Contains('打开文件 (“sample.txt”)')) {
+		throw '同名 DLL 与支持库命令的调用身份未保留'
+	}
 	Write-Host "PASS support command resolution parity SHA256=$win32Hash"
 }
 finally {

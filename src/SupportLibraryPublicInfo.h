@@ -53,6 +53,9 @@ struct DataTypeMetadata {
 	std::uint32_t state = 0;
 	std::vector<std::size_t> commandIndexes;
 	std::vector<DataTypeElementMetadata> elements;
+	// 设计器属性与事件名称按原生索引排列。
+	std::vector<std::string> propertyNames;
+	std::vector<std::string> eventNames;
 };
 
 // 支持库常量值描述。

@@ -355,6 +355,8 @@ struct ProjectBundle {
 	std::vector<std::string> rootChildKeys;
 	std::vector<WindowBinding> windowBindings;
 	std::vector<BundleNativeSourceFileSnapshot> nativeSourceSnapshots;
+	// 原生程序段的方法顺序，用于按位置关联易包链接条目。
+	std::vector<std::int32_t> nativeMethodOrder;
 	std::optional<BundleNativeProgramHeaderSnapshot> nativeProgramHeader;
 	std::vector<BundleNativeGlobalSnapshot> nativeGlobalSnapshots;
 	std::vector<BundleNativeStructSnapshot> nativeStructSnapshots;

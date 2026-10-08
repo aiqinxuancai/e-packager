@@ -27,6 +27,9 @@ std::string DecodeXmlEntities(const std::string& text)
 		else if (StartsWith(remaining, "&gt;")) { out.push_back('>'); index += 3; }
 		else if (StartsWith(remaining, "&quot;")) { out.push_back('"'); index += 5; }
 		else if (StartsWith(remaining, "&apos;")) { out.push_back('\''); index += 5; }
+		else if (StartsWith(remaining, "&#13;")) { out.push_back('\r'); index += 4; }
+		else if (StartsWith(remaining, "&#10;")) { out.push_back('\n'); index += 4; }
+		else if (StartsWith(remaining, "&#9;")) { out.push_back('\t'); index += 3; }
 		else out.push_back(text[index]);
 	}
 	return out;

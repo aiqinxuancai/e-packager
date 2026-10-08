@@ -1,4 +1,5 @@
-﻿#include "SupportLibraryPublicInfo.h"
+﻿#include "BuiltinTypeNames.h"
+#include "SupportLibraryPublicInfo.h"
 #include "SupportLibraryRuntime.h"
 
 #include <Windows.h>
@@ -642,7 +643,8 @@ bool ShouldRetrySupportLibraryWithDllInitialization(const LIB_INFO* libInfo)
 	// startup.  The lightweight loader sees non-null table addresses together
 	// with zero counts.  That combination is not a valid empty declaration and
 	// is a generic signal that the initialized load is required.
-	if ((libInfo->m_nCmdCount == 0 && libInfo->m_pBeginCmdInfo != nullptr) ||
+	if ((libInfo->m_nCmdCount == 0 && libInfo->m_nDataTypeCount == 0 && libInfo->m_nLibConstCount == 0) ||
+		(libInfo->m_nCmdCount == 0 && libInfo->m_pBeginCmdInfo != nullptr) ||
 		(libInfo->m_nDataTypeCount == 0 && libInfo->m_pDataType != nullptr) ||
 		(libInfo->m_nLibConstCount == 0 && libInfo->m_pLibConst != nullptr)) {
 		return true;
@@ -654,6 +656,21 @@ bool ShouldRetrySupportLibraryWithDllInitialization(const LIB_INFO* libInfo)
 	// library declares commands before accepting the lightweight load.
 	if (libInfo->m_nCmdCount > 0 && !HasReadableCommands(libInfo)) {
 		return true;
+	}
+	if (HasReadableCommands(libInfo) && libInfo->m_nCmdCount > 0) {
+		int namedCommands = 0;
+		for (int index = 0; index < libInfo->m_nCmdCount; ++index)
+			if (!ReadAnsiText(libInfo->m_pBeginCmdInfo[index].m_szName).empty()) ++namedCommands;
+		if (namedCommands == 0) return true;
+	}
+	if (HasReadableDataTypes(libInfo)) {
+		for (int index = 0; index < libInfo->m_nDataTypeCount; ++index) {
+			const auto& type = libInfo->m_pDataType[index];
+			if (libInfo->m_nCmdCount == 0 && type.m_nCmdCount > 0) return true;
+			// 可视控件至少有公共窗口属性；空表通常由 DLL 初始化后补齐。
+			if ((type.m_dwState & LDT_WIN_UNIT) != 0 &&
+				type.m_nPropertyCount == 0) return true;
+		}
 	}
 	if (libInfo->m_nDataTypeCount <= 1) {
 		return false;
@@ -669,7 +686,11 @@ bool ShouldRetrySupportLibraryWithDllInitialization(const LIB_INFO* libInfo)
 
 std::optional<std::string> ResolveLocalLibraryTypeName(const DATA_TYPE baseType, const LIB_INFO* libInfo)
 {
-	if (!HasReadableDataTypes(libInfo)) {
+	if (HIWORD(baseType) == 1) {
+		const auto name = e2txt::GetBuiltinTypeName(baseType);
+		return name.empty() ? std::nullopt : std::optional<std::string>(name);
+	}
+	if (HIWORD(baseType) != 0 || !HasReadableDataTypes(libInfo)) {
 		return std::nullopt;
 	}
 
@@ -955,6 +976,12 @@ std::string DecodeUnitPropertyDataType(const SHORT type)
 	case UD_PICK_TEXT:
 	case UD_EDIT_PICK_TEXT:
 	case UD_FILE_NAME:
+	// 核心库的文本、数据提供者、列、连接串和 SQL 编辑器仍返回文本。
+	case 1018:
+	case 1019:
+	case 1020:
+	case 1021:
+	case 1022:
 		return "文本型";
 	case UD_PIC:
 	case UD_ICON:
@@ -965,7 +992,7 @@ std::string DecodeUnitPropertyDataType(const SHORT type)
 	case UD_FONT:
 		return "字体";
 	case UD_CUSTOMIZE:
-		return "自定义";
+		return "字节集";
 	default:
 		return "属性类型(" + std::to_string(type) + ")";
 	}
@@ -1720,6 +1747,21 @@ bool TryLoadSupportLibraryDump(
 						element.isArray = elementSource.m_pArySpec != nullptr;
 						dataType.elements.push_back(std::move(element));
 					}
+				}
+				if (support_library_runtime::UsesPropertyTable(source) && source.m_nPropertyCount > 0 &&
+					source.m_nPropertyCount <= kMaxSupportLibraryArrayCount && IsReadableMemoryRange(
+						source.m_pPropertyBegin, sizeof(UNIT_PROPERTY) * source.m_nPropertyCount)) {
+					for (int index = 0; index < source.m_nPropertyCount; ++index)
+						dataType.propertyNames.push_back(ReadAnsiText(source.m_pPropertyBegin[index].m_szName));
+				}
+				if (source.m_nEventCount > 0 && source.m_nEventCount <= kMaxSupportLibraryArrayCount &&
+					IsReadableMemoryRange(source.m_pEventBegin, sizeof(EVENT_INFO))) {
+					const auto* first = reinterpret_cast<const EVENT_INFO*>(source.m_pEventBegin);
+					const size_t stride = (first->m_dwState & EV_IS_VER2) ? sizeof(EVENT_INFO2) : sizeof(EVENT_INFO);
+					if (IsReadableMemoryRange(first, stride * source.m_nEventCount))
+						for (int index = 0; index < source.m_nEventCount; ++index)
+							dataType.eventNames.push_back(ReadAnsiText(reinterpret_cast<const EVENT_INFO*>(
+								reinterpret_cast<const BYTE*>(first) + index * stride)->m_szName));
 				}
 				outMetadata->dataTypes.push_back(std::move(dataType));
 			}

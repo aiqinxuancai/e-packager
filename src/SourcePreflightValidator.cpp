@@ -1,4 +1,5 @@
-﻿#include "SourcePreflightValidator.h"
+﻿#include "ConditionalDeclarations.h"
+#include "SourcePreflightValidator.h"
 
 #include <Windows.h>
 #include "SourceExpressionParser.h"
@@ -42,6 +43,7 @@ struct VariableSymbol {
 	std::string typeName;
 	bool isArray = false;
 	bool arrayRankKnown = false;
+	std::vector<std::string> conditions;
 };
 
 struct ParsedDeclaration {
@@ -969,11 +971,15 @@ void InsertVariableSymbol(
 			.isArray = IsQuotedArrayField(declaration, 3) ||
 				FieldOrEmpty(declaration, 2).find("数组") != std::string::npos,
 			.arrayRankKnown = !HasZeroArrayDimension(declaration, 3),
+			.conditions = { DeclarationCondition(DeclarationComment(declaration.fields, 4)) },
 		});
 	(void)it;
-	if (!inserted) {
+	const auto condition = DeclarationCondition(DeclarationComment(declaration.fields, 4));
+	if (!inserted && std::any_of(it->second.conditions.begin(), it->second.conditions.end(),
+		[&](const auto& existing) { return condition.empty() || existing.empty() || condition == existing; })) {
 		AddError(report, path, lineNumber, duplicateCode, "duplicate declaration name in the same scope");
 	}
+	if (!inserted) it->second.conditions.push_back(condition);
 }
 
 void ValidateVersionLine(
@@ -1141,7 +1147,7 @@ void ValidateConstantPage(
 	++report.checkedFiles;
 	report.checkedLines += lines.size();
 	ValidateVersionLine(lines, path, true, report);
-	std::unordered_set<std::string> names;
+	ConditionalDeclarationNames names;
 	for (size_t index = 0; index < lines.size(); ++index) {
 		const std::string line = TrimAsciiCopy(lines[index]);
 		if (line.empty() || StartsWith(line, "'") || line == ".版本 2") {
@@ -1166,7 +1172,7 @@ void ValidateConstantPage(
 		}
 		ValidateExactField(declaration, 2, { "", "公开" }, path, index + 1, "constant_public_attribute_invalid", report);
 		const std::string name = FieldOrEmpty(declaration, 0);
-		if (!name.empty() && !names.insert(name).second) {
+		if (!name.empty() && !names.Insert(name, DeclarationComment(declaration.fields, 3))) {
 			AddError(report, path, index + 1, "constant_duplicate", "duplicate constant name");
 		}
 	}
@@ -1187,7 +1193,7 @@ void ValidateProgramPage(
 	bool sawAssembly = false;
 	bool sawMethod = false;
 	std::unordered_map<std::string, VariableSymbol> classSymbols;
-	std::unordered_set<std::string> methodNames;
+	ConditionalDeclarationNames methodNames;
 	MethodState method;
 	for (size_t index = 0; index < lines.size(); ++index) {
 		const size_t lineNumber = index + 1;
@@ -1224,7 +1230,9 @@ void ValidateProgramPage(
 				CloseMethodFlows(method, path, report);
 			}
 			const ParsedDeclaration declaration = ParseDeclaration(line, "程序集", path, lineNumber, report);
-			ValidateNameField(declaration, path, lineNumber, report);
+			// 普通程序集是代码页标签，IDE 导入模块时允许标签包含空格；类名仍为类型标识符。
+			if (!FieldOrEmpty(declaration, 1).empty() || FieldOrEmpty(declaration, 0).empty())
+				ValidateNameField(declaration, path, lineNumber, report);
 			ValidateTypeField(declaration, 1, false, path, lineNumber, report);
 			ValidateExactField(declaration, 2, { "", "公开" }, path, lineNumber, "assembly_public_attribute_invalid", report);
 			sawAssembly = true;
@@ -1259,7 +1267,7 @@ void ValidateProgramPage(
 			ValidateExactField(declaration, 2, { "", "公开" }, path, lineNumber, "subprogram_public_attribute_invalid", report);
 			method.name = FieldOrEmpty(declaration, 0);
 			method.returnType = FieldOrEmpty(declaration, 1);
-			if (!method.name.empty() && !methodNames.insert(method.name).second) {
+			if (!method.name.empty() && !methodNames.Insert(method.name, DeclarationComment(declaration.fields, 3))) {
 				AddError(report, path, lineNumber, "subprogram_duplicate", "duplicate subprogram name in the same source page");
 			}
 			sawMethod = true;

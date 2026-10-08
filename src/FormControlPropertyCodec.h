@@ -127,14 +127,18 @@ public:
 	static std::string ValueToXmlText(const FormControlPropertyValue& value);
 
 private:
+	// x64 通过 Win32 工作进程访问原生控件接口。
+	std::string BridgeContext() const;
 	struct LibraryState;
 	struct TypeContext;
 
-	LibraryState* EnsureLibrary(std::uint16_t supportIndex);
+	LibraryState* EnsureLibrary(std::uint16_t supportIndex, bool initialize = false);
 	bool BuildTypeContext(
 		std::int32_t dataType,
 		TypeContext& out,
-		std::string* outError);
+		std::string* outError, bool metadataOnly = false);
+	// 及时释放只读映射，避免影响后续 DLL 正常初始化。
+	void ReleaseMetadataMappings();
 	bool EnsureParentWindow();
 	std::uint32_t CreateUnit(
 		const TypeContext& context,
@@ -148,6 +152,8 @@ private:
 	const bool m_restrictSearch = false;
 	std::vector<LibraryState> m_libraryStates;
 	void* m_parentWindow = nullptr;
+	// ActiveX 控件需要当前线程初始化 OLE。
+	bool m_oleInitialized = false;
 };
 
 }  // namespace e2txt

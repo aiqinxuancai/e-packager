@@ -1,4 +1,6 @@
-﻿#include "SupportLibraryRuntime.h"
+﻿#include "SupportLibraryPublicInfo.h"
+#include "BuiltinTypeNames.h"
+#include "SupportLibraryRuntime.h"
 #include "e2txt.h"
 
 #include <Windows.h>
@@ -19,6 +21,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -1091,6 +1094,25 @@ std::string BuildDumpTextLiteral(const std::string& rawText, const bool isLongTe
 
 	const char* prefix = isLongText ? kEscapedLongTextLiteralPrefix : kEscapedTextLiteralPrefix;
 	return std::string(kTextLiteralLeftQuote) + prefix + EscapeTextLiteralPayload(rawText) + kTextLiteralRightQuote;
+}
+
+// 旧版 IDE 会把含真实换行的文本表达式保存在未解析语句中。
+// 将文本内容转为标准转义字面量，使其仍能进入语义解析。
+std::string NormalizeUnexaminedTextLiterals(const std::string& code)
+{
+	std::string result;
+	size_t offset = 0;
+	while (offset < code.size()) {
+		const size_t begin = code.find(kTextLiteralLeftQuote, offset);
+		if (begin == std::string::npos) { result += code.substr(offset); break; }
+		const size_t content = begin + std::strlen(kTextLiteralLeftQuote);
+		const size_t end = code.find(kTextLiteralRightQuote, content);
+		if (end == std::string::npos) { result += code.substr(offset); break; }
+		result += code.substr(offset, begin - offset);
+		result += BuildDumpTextLiteral(code.substr(content, end - content), false);
+		offset = end + std::strlen(kTextLiteralRightQuote);
+	}
+	return result;
 }
 
 bool NeedsEscapedBodyLine(const std::string& text)
@@ -2707,75 +2729,6 @@ std::string BuildArraySuffix(const std::vector<std::int32_t>& bounds)
 	return "\"" + JoinStrings(parts, ",") + "\"";
 }
 
-std::string GetBuiltinTypeName(std::int32_t typeValue)
-{
-	switch (typeValue) {
-	case 0: return "";
-	case -1: return "";
-	case static_cast<std::int32_t>(0x80000000u): return "通用型";
-	case static_cast<std::int32_t>(0x80000101u): return "字节型";
-	case static_cast<std::int32_t>(0x80000201u): return "短整数型";
-	case static_cast<std::int32_t>(0x80000301u): return "整数型";
-	case static_cast<std::int32_t>(0x80000401u): return "长整数型";
-	case static_cast<std::int32_t>(0x80000501u): return "小数型";
-	case static_cast<std::int32_t>(0x80000601u): return "双精度小数型";
-	case static_cast<std::int32_t>(0x80000002u): return "逻辑型";
-	case static_cast<std::int32_t>(0x80000003u): return "日期时间型";
-	case static_cast<std::int32_t>(0x80000004u): return "文本型";
-	case static_cast<std::int32_t>(0x80000005u): return "字节集";
-	case static_cast<std::int32_t>(0x80000006u): return "子程序指针";
-	case static_cast<std::int32_t>(0x80000008u): return "条件语句型";
-	case 65537: return "窗口";
-	case 65539: return "菜单";
-	case 65540: return "字体";
-	case 65541: return "编辑框";
-	case 65542: return "图片框";
-	case 65543: return "外形框";
-	case 65544: return "画板";
-	case 65545: return "分组框";
-	case 65546: return "标签";
-	case 65547: return "按钮";
-	case 65548: return "选择框";
-	case 65549: return "单选框";
-	case 65550: return "组合框";
-	case 65551: return "列表框";
-	case 65552: return "选择列表框";
-	case 65553: return "横向滚动条";
-	case 65554: return "纵向滚动条";
-	case 65555: return "进度条";
-	case 65556: return "滑块条";
-	case 65557: return "选择夹";
-	case 65558: return "影像框";
-	case 65559: return "日期框";
-	case 65560: return "月历";
-	case 65561: return "驱动器框";
-	case 65562: return "目录框";
-	case 65563: return "文件框";
-	case 65564: return "颜色选择器";
-	case 65565: return "超级链接框";
-	case 65566: return "调节器";
-	case 65567: return "通用对话框";
-	case 65568: return "时钟";
-	case 65569: return "打印机";
-	case 65570: return "字段信息";
-	case 65572: return "数据报";
-	case 65573: return "客户";
-	case 65574: return "服务器";
-	case 65575: return "端口";
-	case 65576: return "打印设置信息";
-	case 65577: return "表格";
-	case 65578: return "数据源";
-	case 65579: return "通用提供者";
-	case 65580: return "数据库提供者";
-	case 65581: return "图形按钮";
-	case 65582: return "外部数据库";
-	case 65583: return "外部数据提供者";
-	case 65584: return "对象";
-	case 65585: return "变体型";
-	case 65586: return "变体类型";
-	default: return std::string();
-	}
-}
 
 namespace epl_system_id {
 
@@ -3379,6 +3332,13 @@ public:
 
 		const std::string builtin = GetBuiltinTypeName(typeValue);
 		if (!builtin.empty()) {
+			if (epl_system_id::IsLibDataType(typeValue)) {
+				for (const auto& [id, name] : m_userNameCache) {
+					const auto kind = epl_system_id::GetType(id);
+					if (name == builtin && (kind == epl_system_id::kTypeClass || kind == epl_system_id::kTypeStruct))
+						return ResolveSupportLibraryType(typeValue);
+				}
+			}
 			return builtin;
 		}
 		if (epl_system_id::IsLibDataType(typeValue)) {
@@ -3423,6 +3383,39 @@ public:
 		return stream.str();
 	}
 
+	void SetCurrentFunction(const FunctionInfo* function) { m_currentFunction = function; }
+
+	std::string ResolveVariableReferenceName(std::int32_t id) const
+	{
+		const auto name = ResolveUserName(id);
+		const auto kind = epl_system_id::GetType(id);
+		const auto matchesName = [&](const auto& item) { return ResolveUserName(item.marker) == name; };
+		const bool localCollision = m_currentFunction != nullptr &&
+			(std::any_of(m_currentFunction->locals.begin(), m_currentFunction->locals.end(), matchesName) ||
+			 std::any_of(m_currentFunction->params.begin(), m_currentFunction->params.end(), matchesName));
+		if (kind == epl_system_id::kTypeClassMember) {
+			if (localCollision) for (const auto& page : m_program.codePages) {
+				if (std::none_of(page.pageVars.begin(), page.pageVars.end(), [&](const auto& item) { return item.marker == id; })) continue;
+				for (const auto& form : m_resources.forms)
+					if (form.header.dwId == page.unk1) return ResolveUserName(form.header.dwId) + "." + name;
+			}
+		}
+		if (kind != epl_system_id::kTypeFormControl && kind != epl_system_id::kTypeFormMenu) return name;
+		// 控件与变量同名时显式限定窗口，保留原生 ID 所指的对象身份。
+		const bool collision = localCollision || std::any_of(m_userNameCache.begin(), m_userNameCache.end(), [&](const auto& item) {
+			const auto other = epl_system_id::GetType(item.first);
+			return item.second == name && (other == epl_system_id::kTypeGlobal ||
+				other == epl_system_id::kTypeClassMember);
+		});
+		if (collision) for (const auto& form : m_resources.forms) for (const auto& element : form.elements) {
+			auto elementId = element.id;
+			if (epl_system_id::GetType(elementId) == 0)
+				elementId |= element.isMenu ? epl_system_id::kTypeFormMenu : epl_system_id::kTypeFormControl;
+			if (elementId == id) return ResolveUserName(form.header.dwId) + "." + name;
+		}
+		return name;
+	}
+
 	bool TryGetMethodOwnerName(std::int32_t methodId, std::string& outName) const
 	{
 		if (const auto it = m_methodOwnerNameCache.find(methodId); it != m_methodOwnerNameCache.end()) {
@@ -3433,7 +3426,7 @@ public:
 		return false;
 	}
 
-	std::string ResolveLibCmdName(std::int16_t libraryIndex, std::int32_t commandId)
+	std::string ResolveLibCmdName(std::int16_t libraryIndex, std::int32_t commandId, bool qualifyGlobal)
 	{
 		if (!EnsureSupportLibraryCacheByLibraryId(libraryIndex)) {
 			std::ostringstream stream;
@@ -3448,6 +3441,12 @@ public:
 			return stream.str();
 		}
 		const std::string& name = symbols->commandNames[static_cast<size_t>(commandId)];
+		// 同名 DLL 或用户方法不能遮蔽原生支持库调用的身份。
+		if (qualifyGlobal && !name.empty() && (std::any_of(m_program.dlls.begin(), m_program.dlls.end(),
+			[&](const auto& item) { return item.name == name; }) ||
+			std::any_of(m_program.functions.begin(), m_program.functions.end(),
+				[&](const auto& item) { return item.name == name; })))
+			return symbols->fileName + "::" + name;
 		return name.empty() ? std::string("_Lib") + std::to_string(libraryIndex) + "Cmd" + std::to_string(commandId) : name;
 	}
 
@@ -3723,6 +3722,8 @@ private:
 					item.comment,
 					"匿名局部变量_",
 					anonymousLocalCount);
+				if (m_userNameCache[item.marker].empty())
+					m_userNameCache[item.marker] = "匿名局部变量_" + std::to_string(static_cast<std::uint32_t>(item.marker));
 			}
 		}
 		for (const auto& item : m_program.globals) {
@@ -3812,6 +3813,18 @@ private:
 				m_userNameCache[item.id] = name;
 			}
 		}
+		// 结构与类共用源码类型名空间，原生 ID 不同的同名类型必须可区分。
+		std::unordered_set<std::string> typeNames;
+		for (const auto& page : m_program.codePages) typeNames.insert(m_userNameCache[page.header.dwId]);
+		for (const auto& type : m_program.dataTypes) {
+			auto& name = m_userNameCache[type.header.dwId];
+			if (name.empty()) continue;
+			if (!typeNames.insert(name).second) {
+				name += "__结构_" + std::to_string(static_cast<std::uint32_t>(type.header.dwId));
+				while (!typeNames.insert(name).second) name += "_";
+			}
+		}
+
 	}
 
 	SupportLibrarySymbols* FindSupportLibrarySymbolsByLibraryId(std::int16_t libraryIndex)
@@ -3869,77 +3882,36 @@ private:
 			symbols.fileName,
 			m_supportLibrarySearchDirectories,
 			m_restrictSupportLibrarySearch);
-		HMODULE module = nullptr;
 		bool candidateExists = false;
 		bool moduleLoaded = false;
 		DWORD lastLoadError = ERROR_SUCCESS;
 		std::string lastCandidatePath;
 		for (const auto& path : candidates) {
 			std::error_code ec;
-			if (!std::filesystem::exists(path, ec)) {
-				continue;
-			}
+			if (!std::filesystem::is_regular_file(path, ec)) continue;
 			candidateExists = true;
 			lastCandidatePath = PathToUtf8(path);
-			module = LoadLibraryExA(path.string().c_str(), nullptr, 0);
-			if (module != nullptr) {
-				symbols.filePath = PathToUtf8(path);
-				moduleLoaded = true;
-				break;
+			support_library_public_info::LibraryMetadata metadata;
+			std::string error;
+			if (!support_library_public_info::LoadSupportLibraryMetadata(path, metadata, error)) {
+				lastLoadError = GetLastError();
+				continue;
 			}
-			lastLoadError = GetLastError();
-		}
-
-		if (module != nullptr) {
-			const auto* getInfoProc = reinterpret_cast<PFN_GET_LIB_INFO>(GetProcAddress(module, FUNCNAME_GET_LIB_INFO));
-			if (getInfoProc != nullptr) {
-				const LIB_INFO* libInfo = support_library_runtime::CallGetLibInfo(getInfoProc);
-				if (libInfo != nullptr && IsReadableMemoryRange(libInfo, sizeof(LIB_INFO))) {
-					SupportLibraryStringEncodingScope stringEncoding(
-						DetectUtf8SupportLibraryStrings(libInfo));
-					if (libInfo->m_nCmdCount > 0 &&
-						libInfo->m_nCmdCount <= kMaxSupportLibraryArrayCount &&
-						libInfo->m_pBeginCmdInfo != nullptr &&
-						IsReadableMemoryRange(
-							libInfo->m_pBeginCmdInfo,
-							sizeof(CMD_INFO) * static_cast<size_t>(libInfo->m_nCmdCount))) {
-						symbols.commandNames.reserve(static_cast<size_t>(libInfo->m_nCmdCount));
-						for (int i = 0; i < libInfo->m_nCmdCount; ++i) {
-							symbols.commandNames.emplace_back(ReadSupportLibraryName(libInfo->m_pBeginCmdInfo[i].m_szName));
-						}
-					}
-					if (libInfo->m_nLibConstCount > 0 &&
-						libInfo->m_nLibConstCount <= kMaxSupportLibraryArrayCount &&
-						libInfo->m_pLibConst != nullptr &&
-						IsReadableMemoryRange(
-							libInfo->m_pLibConst,
-							sizeof(LIB_CONST_INFO) * static_cast<size_t>(libInfo->m_nLibConstCount))) {
-						symbols.constantNames.reserve(static_cast<size_t>(libInfo->m_nLibConstCount));
-						for (int i = 0; i < libInfo->m_nLibConstCount; ++i) {
-							symbols.constantNames.emplace_back(ReadSupportLibraryName(libInfo->m_pLibConst[i].m_szName));
-						}
-					}
-					if (libInfo->m_nDataTypeCount > 0 &&
-						libInfo->m_nDataTypeCount <= kMaxSupportLibraryArrayCount &&
-						libInfo->m_pDataType != nullptr &&
-						IsReadableMemoryRange(
-							libInfo->m_pDataType,
-							sizeof(LIB_DATA_TYPE_INFO) * static_cast<size_t>(libInfo->m_nDataTypeCount))) {
-						symbols.dataTypes.reserve(static_cast<size_t>(libInfo->m_nDataTypeCount));
-						for (int i = 0; i < libInfo->m_nDataTypeCount; ++i) {
-							const LIB_DATA_TYPE_INFO& dataType = libInfo->m_pDataType[i];
-							SupportTypeSymbols typeSymbols;
-							typeSymbols.name = ReadSupportLibraryName(dataType.m_szName);
-							typeSymbols.isTabControl = (dataType.m_dwState & LDT_IS_TAB_UNIT) != 0;
-							typeSymbols.memberNames = BuildSupportTypeMemberNames(dataType);
-							typeSymbols.eventNames = BuildSupportTypeEventNames(dataType);
-							symbols.dataTypes.push_back(std::move(typeSymbols));
-						}
-					}
-				}
+			moduleLoaded = true;
+			symbols.filePath = lastCandidatePath;
+			for (const auto& command : metadata.commands) symbols.commandNames.push_back(command.name);
+			for (const auto& constant : metadata.constants) symbols.constantNames.push_back(constant.name);
+			for (const auto& type : metadata.dataTypes) {
+				SupportTypeSymbols info;
+				info.name = type.name;
+				info.isTabControl = (type.state & LDT_IS_TAB_UNIT) != 0;
+				info.memberNames = type.propertyNames;
+				if (info.memberNames.empty())
+					for (const auto& member : type.elements) info.memberNames.push_back(member.name);
+				info.eventNames = type.eventNames;
+				symbols.dataTypes.push_back(std::move(info));
 			}
-			// Intentionally keep the module loaded for the rest of the process lifetime.
-			// Some third-party .fne libraries corrupt the process heap during DLL detach.
+			break;
 		}
 
 		const bool loaded = !symbols.dataTypes.empty() || !symbols.commandNames.empty() || !symbols.constantNames.empty();
@@ -3995,6 +3967,12 @@ private:
 			return stream.str();
 		}
 		const std::string& name = symbols->dataTypes[static_cast<size_t>(typeIndex - 1)].name;
+		// 同名用户类与支持库类型必须在可编辑源码中消歧，防止回包变成自引用。
+		const bool collision = std::any_of(m_program.codePages.begin(), m_program.codePages.end(),
+			[&](const auto& page) { return page.name == name; }) ||
+			std::any_of(m_program.dataTypes.begin(), m_program.dataTypes.end(),
+				[&](const auto& type) { return type.name == name; });
+		if (collision && !name.empty()) return symbols->fileName + "::" + name;
 		return name.empty() ? std::string() : name;
 	}
 
@@ -4005,6 +3983,7 @@ private:
 	const std::vector<RemovedDefinedItemInfo>* m_removedDefinedItems = nullptr;
 	const std::vector<std::filesystem::path>* m_supportLibrarySearchDirectories = nullptr;
 	bool m_restrictSupportLibrarySearch = false;
+	const FunctionInfo* m_currentFunction = nullptr;
 	std::unordered_map<std::int32_t, std::string> m_userNameCache;
 	std::unordered_map<std::int32_t, std::int32_t> m_classTypePageById;
 	std::unordered_map<std::int32_t, std::string> m_methodOwnerNameCache;
@@ -4490,6 +4469,13 @@ std::string ResolveProgramPageLogicalName(
 	return prefix + "_" + std::to_string((std::max)(ordinal, size_t{ 1 }));
 }
 
+// 被其他类继承的匿名/隐藏类仍提供可调用成员，必须进入语义接口。
+bool IsRequiredBaseClass(const ModuleSections& sections, std::int32_t id)
+{
+	return std::any_of(sections.program.codePages.begin(), sections.program.codePages.end(),
+		[id](const CodePageInfo& page) { return page.baseClass == id; });
+}
+
 bool ShouldKeepPage(
 	const ModuleSections& sections,
 	const std::vector<EComDependencyRecord>& dependencyRecords,
@@ -4503,7 +4489,7 @@ bool ShouldKeepPage(
 	// 易模块已经把其上游模块的实现复制进原生程序段。独立编译时
 	// 必须保留这些隐藏页和导入函数，才能在不重新加载上游 .ec 的
 	// 前提下重建该模块的完整实现闭包。
-	if (options.includeImportedFunctions) {
+	if (options.includeImportedFunctions || IsRequiredBaseClass(sections, page.header.dwId)) {
 		return true;
 	}
 	if (IsClassHidden(sections, page.header.dwId) || IsDependencyDefinedId(dependencyRecords, page.header.dwId)) {
@@ -4687,6 +4673,7 @@ struct Expr {
 	std::int16_t shortValue1 = 0;
 	std::int16_t shortValue2 = 0;
 	bool flagValue = false;
+	bool unexamined = false;
 	std::string text;
 	std::unique_ptr<Expr> target;
 	std::unique_ptr<Expr> extra;
@@ -4806,7 +4793,7 @@ std::string RenderExpr(const Expr& expr, SymbolResolver& resolver, int expectedL
 	case ExprKind::Date:
 		return FormatDateLiteral(expr.numberValue);
 	case ExprKind::String:
-		return "“" + expr.text + "”";
+		return BuildDumpTextLiteral(expr.text, false);
 	case ExprKind::Constant:
 		return expr.shortValue1 == -2
 			? "#" + resolver.ResolveUserName(expr.intValue1)
@@ -4815,7 +4802,7 @@ std::string RenderExpr(const Expr& expr, SymbolResolver& resolver, int expectedL
 		return "#" + resolver.ResolveLibTypeName(expr.shortValue1, expr.shortValue2) + "." +
 			resolver.ResolveLibTypeMemberName(expr.shortValue1, expr.shortValue2, expr.intValue1);
 	case ExprKind::Variable:
-		return resolver.ResolveUserName(expr.intValue1);
+		return resolver.ResolveVariableReferenceName(expr.intValue1);
 	case ExprKind::MethodPtr:
 		return "&" + resolver.ResolveUserName(expr.intValue1);
 	case ExprKind::ArrayLiteral:
@@ -4845,6 +4832,8 @@ std::string RenderExpr(const Expr& expr, SymbolResolver& resolver, int expectedL
 		return prefix + resolver.ResolveLibTypeMemberName(expr.shortValue1, expr.intValue2, expr.intValue1);
 	}
 	case ExprKind::Call: {
+		// 旧格式允许参数以尚未解析的源码保存（如省略参数和数字常量）。
+		if (expr.shortValue1 == -1 && expr.intValue1 == 0) return NormalizeUnexaminedTextLiterals(expr.text);
 		if (expr.target == nullptr && expr.shortValue1 == 0) {
 			OperatorInfo operatorInfo = {};
 			if (TryGetOperatorInfo(expr.intValue1, operatorInfo)) {
@@ -4899,7 +4888,7 @@ std::string RenderExpr(const Expr& expr, SymbolResolver& resolver, int expectedL
 		}
 		text += (expr.shortValue1 == -2 || expr.shortValue1 == -3)
 			? resolver.ResolveUserName(expr.intValue1)
-			: resolver.ResolveLibCmdName(expr.shortValue1, expr.intValue1);
+			: resolver.ResolveLibCmdName(expr.shortValue1, expr.intValue1, expr.target == nullptr);
 		text += " (" + RenderExprList(expr.items, resolver) + ")";
 		return text;
 	}
@@ -4950,7 +4939,9 @@ bool ParseCallExpressionWithoutType(
 		return false;
 	}
 
+	outExpr->text = unexaminedIsNull ? std::string() : unexaminedCode;
 	outExpr->flagValue = (flag & 0x10) != 0;
+	outExpr->unexamined = (flag & 0x40) != 0;
 	if (outMask != nullptr) {
 		*outMask = (flag & 0x20) != 0;
 	}
@@ -5532,7 +5523,13 @@ bool ParseStatementBlock(
 			Statement statement;
 			statement.mask = mask;
 			statement.comment = std::move(comment);
-			if (!unexaminedCode.empty()) {
+			if (!unexaminedCode.empty() && callExpr != nullptr && callExpr->shortValue1 == -1 && !callExpr->unexamined &&
+				callExpr->intValue1 == 0 && !mask) {
+				// 原生纯注释保存在未分析文本槽位，不能当作可执行源码输出。
+				statement.kind = StatementKind::Expression;
+				statement.comment = std::move(unexaminedCode);
+			}
+			else if (!unexaminedCode.empty()) {
 				statement.kind = StatementKind::Unexamined;
 				statement.unexaminedCode = std::move(unexaminedCode);
 			}
@@ -5584,7 +5581,7 @@ void AppendStatementLines(const StatementBlock& block, SymbolResolver& resolver,
 			if (statement.mask) {
 				line += "' ";
 			}
-			line += statement.unexaminedCode;
+			line += statement.mask ? statement.unexaminedCode : NormalizeUnexaminedTextLiterals(statement.unexaminedCode);
 			AppendRenderedBodyLine(outLines, indent, line);
 			break;
 		}
@@ -5791,6 +5788,7 @@ void AppendStatementLines(const StatementBlock& block, SymbolResolver& resolver,
 
 bool TryRenderFunctionBody(const FunctionInfo& functionInfo, SymbolResolver& resolver, std::vector<std::string>& outLines, std::string* outError)
 {
+	resolver.SetCurrentFunction(&functionInfo);
 	outLines.clear();
 	if (outError != nullptr) {
 		outError->clear();
@@ -5902,7 +5900,7 @@ void BuildProgramPages(
 		AppendLine(page, "");
 
 		for (const auto* functionInfo : functions) {
-			if (functionInfo == nullptr || (!options.includeImportedFunctions && IsImportedFunction(*functionInfo))) {
+			if (functionInfo == nullptr || (!options.includeImportedFunctions && !IsRequiredBaseClass(sections, pageInfo.header.dwId) && IsImportedFunction(*functionInfo))) {
 				continue;
 			}
 			try {
@@ -6026,7 +6024,7 @@ void BuildStructPage(
 				(IsStructHidden(item) || IsDependencyDefinedId(dependencyRecords, item.header.dwId)))) {
 			continue;
 		}
-		std::string typeName = TrimAsciiCopy(item.name);
+		std::string typeName = TrimAsciiCopy(resolver.ResolveUserName(item.header.dwId));
 		if (typeName.empty()) {
 			if (const auto it = hints.localTypeAliases.find(item.header.dwId); it != hints.localTypeAliases.end()) {
 				typeName = it->second;
@@ -6178,6 +6176,9 @@ std::string EscapeXmlAttribute(const std::string& text)
 		case '>': out += "&gt;"; break;
 		case '"': out += "&quot;"; break;
 		case '\'': out += "&apos;"; break;
+		case '\r': out += "&#13;"; break;
+		case '\n': out += "&#10;"; break;
+		case '\t': out += "&#9;"; break;
 		default: out.push_back(static_cast<char>(ch)); break;
 		}
 	}
@@ -6557,12 +6558,14 @@ void BuildFormXmlEntries(
 		}
 		AppendXmlLine(formXml, 0, BuildXmlOpenTag("窗口", rootAttributes, false));
 		AppendFormControlPropertyXmlChildren(formXml, "窗口", 1, rootSemantic, false);
-		std::unordered_set<std::int32_t> listedEventTypes;
+		std::set<std::int32_t> listedEventTypes;
 		for (const auto& element : form.elements) {
-			if (element.isMenu || !listedEventTypes.insert(element.dataType).second) continue;
+			if (!element.isMenu) listedEventTypes.insert(element.dataType);
+		}
+		for (const auto dataType : listedEventTypes) {
 			std::vector<FormControlEventDefinition> events;
-			if (!propertyCodec.ReadEvents(element.dataType, events, nullptr) || events.empty()) continue;
-			AppendXmlLine(formXml, 1, BuildXmlOpenTag("窗口.事件定义", {{"控件类型", resolver.ResolveType(element.dataType)}}, false));
+			if (!propertyCodec.ReadEvents(dataType, events, nullptr) || events.empty()) continue;
+			AppendXmlLine(formXml, 1, BuildXmlOpenTag("窗口.事件定义", {{"控件类型", resolver.ResolveType(dataType)}}, false));
 			for (const auto& event : events) {
 				AppendXmlLine(formXml, 2, BuildXmlOpenTag("事件", {{"名称", event.name}, {"索引", std::to_string(event.index)},
 					{"返回类型", event.returnType == 0 ? "" : resolver.ResolveType(event.returnType)}}, false));
@@ -6867,10 +6870,22 @@ std::string BuildPublicHeaderText(
 	bool hasBodyContent = false;
 	GenerateOptions publicHeaderOptions;
 	publicHeaderOptions.includeImportedPages = true;
+	// 公开类的继承链也是模块接口的一部分，保留非公开基类及其公开成员。
+	std::unordered_set<std::int32_t> headerClasses;
+	for (const auto& page : sections.program.codePages) {
+		if (!IsHeaderClassPage(page) || !IsProgramPagePublic(sections, page.header.dwId)) continue;
+		const CodePageInfo* current = &page;
+		while (current != nullptr && headerClasses.insert(current->header.dwId).second) {
+			const auto found = std::find_if(sections.program.codePages.begin(), sections.program.codePages.end(),
+				[&](const CodePageInfo& candidate) { return candidate.header.dwId == current->baseClass; });
+			current = found == sections.program.codePages.end() ? nullptr : &*found;
+		}
+	}
 	const auto appendProgramPages = [&](const bool classPagesOnly) {
 		for (const auto& pageInfo : sections.program.codePages) {
 			const auto functions = CollectPageFunctions(sections.program, pageInfo);
-			if (!ShouldKeepPage(sections, dependencyRecords, pageInfo, functions, publicHeaderOptions)) {
+			if (!headerClasses.contains(pageInfo.header.dwId) &&
+				!ShouldKeepPage(sections, dependencyRecords, pageInfo, functions, publicHeaderOptions)) {
 				continue;
 			}
 
@@ -6878,13 +6893,13 @@ std::string BuildPublicHeaderText(
 			if (isClassPage != classPagesOnly) {
 				continue;
 			}
-			if (isClassPage && !IsProgramPagePublic(sections, pageInfo.header.dwId)) {
+			if (isClassPage && !headerClasses.contains(pageInfo.header.dwId)) {
 				continue;
 			}
 
 			std::vector<const FunctionInfo*> publicFunctions;
 			for (const auto* functionInfo : functions) {
-				if (functionInfo == nullptr || IsImportedFunction(*functionInfo) || (functionInfo->attr & 0x8) == 0) {
+				if (functionInfo == nullptr || (!isClassPage && IsImportedFunction(*functionInfo)) || (functionInfo->attr & 0x8) == 0) {
 					continue;
 				}
 				publicFunctions.push_back(functionInfo);
@@ -6901,7 +6916,7 @@ std::string BuildPublicHeaderText(
 					{
 						TrimAsciiCopy(resolver.ResolveUserName(pageInfo.header.dwId)),
 						BuildProgramPageBaseClassName(pageInfo, resolver),
-						"公开",
+						IsProgramPagePublic(sections, pageInfo.header.dwId) ? "公开" : std::string(),
 						TrimAsciiCopy(pageInfo.comment),
 					}));
 			}
@@ -7516,6 +7531,8 @@ bool BuildBundleFromSections(
 		bundle.projectSubsystem = GetProjectSubsystem(sections.systemInfo);
 	}
 	bundle.dependencies = document.dependencies;
+	for (const auto& method : sections.program.functions)
+		bundle.nativeMethodOrder.push_back(method.header.dwId);
 	bundle.nativeProgramHeader = BundleNativeProgramHeaderSnapshot{
 		sections.program.header.versionFlag1,
 		sections.program.header.unk1,

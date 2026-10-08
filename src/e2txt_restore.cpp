@@ -1935,6 +1935,7 @@ struct SupportLibraryTypeInfo {
 
 struct SupportLibraryTextTypeInfo {
 	std::string name;
+	bool isTabControl = false;
 	bool isEnumeration = false;
 	std::vector<std::string> methodNames;
 	std::unordered_map<std::string, std::int32_t> methodIndexes;
@@ -1996,10 +1997,10 @@ public:
 		if (typeName.empty()) {
 			return 0;
 		}
-		if (const auto it = m_builtinTypes.find(typeName); it != m_builtinTypes.end()) {
+		if (const auto it = m_userTypes.find(typeName); it != m_userTypes.end()) {
 			return it->second;
 		}
-		if (const auto it = m_userTypes.find(typeName); it != m_userTypes.end()) {
+		if (const auto it = m_builtinTypes.find(typeName); it != m_builtinTypes.end()) {
 			return it->second;
 		}
 		if (const auto it = m_supportTypes.find(typeName); it != m_supportTypes.end()) {
@@ -2173,6 +2174,7 @@ private:
 		struct TextCommandInfo {
 			std::string name;
 			bool memberOnly = false;
+			bool hidden = false;
 			std::string returnTypeName;
 		};
 		std::vector<TextCommandInfo> commands;
@@ -2215,6 +2217,7 @@ private:
 					commands.push_back(TextCommandInfo {
 						.name = std::move(name),
 						.memberOnly = line.find("分类=成员命令") != std::string::npos,
+						.hidden = line.find("隐藏") != std::string::npos,
 					});
 					for (const auto& field : SplitTopLevelCommaFields(line)) {
 						const std::string value = TrimAsciiCopy(field);
@@ -2228,9 +2231,9 @@ private:
 				if (std::string typeName = ExtractSupportLibraryTextName(line, ".数据类型 "); !typeName.empty()) {
 					typeInfos.push_back(SupportLibraryTextTypeInfo{ .name = std::move(typeName) });
 					currentType = &typeInfos.back();
+					currentType->isTabControl = line.find("Tab组件") != std::string::npos;
 					currentType->isEnumeration = line.find("类型=枚举") != std::string::npos;
-					currentType->sharesWindowMethods = line.find("类型=窗口组件") != std::string::npos &&
-						line.find("功能提供者") == std::string::npos;
+					currentType->sharesWindowMethods = line.find("类型=窗口组件") != std::string::npos;
 					continue;
 				}
 				if (currentType != nullptr) {
@@ -2286,9 +2289,12 @@ private:
 			const auto commandIndex = static_cast<std::int32_t>(index);
 			if (!commands[index].memberOnly) {
 				// 同名成员命令不能覆盖先加载支持库中的全局命令。
-				m_supportCommands.emplace(
-					normalizedName,
-					SupportLibraryCommandInfo{ libraryId, commandIndex, 0, commands[index].returnTypeName });
+				const SupportLibraryCommandInfo command{ libraryId, commandIndex, 0, commands[index].returnTypeName };
+				m_supportCommands.insert_or_assign(dependency.fileName + "::" + normalizedName, command);
+				if (!commands[index].hidden && m_hiddenSupportCommands.erase(normalizedName))
+					m_supportCommands.insert_or_assign(normalizedName, command);
+				else if (m_supportCommands.emplace(normalizedName, command).second && commands[index].hidden)
+					m_hiddenSupportCommands.insert(normalizedName);
 			}
 		}
 
@@ -2311,6 +2317,7 @@ private:
 			info.typeId = (supportIndex << 16) | static_cast<std::int32_t>(index + 1);
 			info.sharesWindowMethods = typeInfos[index].sharesWindowMethods;
 			info.isEnumeration = typeInfos[index].isEnumeration;
+			info.isTabControl = typeInfos[index].isTabControl;
 			for (size_t memberIndex = 0; memberIndex < typeInfos[index].members.size(); ++memberIndex) {
 				const auto& [name, typeName] = typeInfos[index].members[memberIndex];
 				info.membersByName.insert_or_assign(NormalizeTypeName(name),
@@ -2335,6 +2342,7 @@ private:
 						SupportLibraryCommandInfo{ libraryId, commandIndex, 0, commands[commandIndex].returnTypeName });
 				}
 			}
+			m_supportTypes.insert_or_assign(dependency.fileName + "::" + normalizedTypeName, info);
 			m_supportTypes.insert_or_assign(normalizedTypeName, std::move(info));
 		}
 
@@ -2455,8 +2463,7 @@ private:
 			info.typeId = (supportIndex << 16) | (i + 1);
 			info.isEnumeration = (dataType.m_dwState & LDT_ENUM) != 0;
 			info.isTabControl = (dataType.m_dwState & LDT_IS_TAB_UNIT) != 0;
-			info.sharesWindowMethods = (dataType.m_dwState & LDT_WIN_UNIT) != 0 &&
-				(dataType.m_dwState & LDT_IS_FUNCTION_PROVIDER) == 0;
+			info.sharesWindowMethods = (dataType.m_dwState & LDT_WIN_UNIT) != 0;
 			const auto memberNames = BuildSupportTypeMemberNames(dataType);
 			const auto properties = GetSupportTypeProperties(dataType);
 			for (size_t memberIndex = 0; memberIndex < memberNames.size(); ++memberIndex) {
@@ -2503,6 +2510,7 @@ private:
 			}
 			const std::string name = NormalizeTypeName(ReadSupportLibraryName(dataType.m_szName));
 			if (!name.empty()) {
+				m_supportTypes.insert_or_assign(dependency.fileName + "::" + name, info);
 				m_supportTypes.insert_or_assign(name, info);
 			}
 		}
@@ -2521,7 +2529,11 @@ private:
 				const std::string name = NormalizeTypeName(ReadSupportLibraryName(command.m_szName));
 				if (!name.empty()) {
 					// 成员命令只通过所属类型解析；同名全局命令沿用先加载支持库中的定义。
-					m_supportCommands.emplace(name, SupportLibraryCommandInfo{ libraryId, i, resolveReturnType(command.m_dtRetValType) });
+					const SupportLibraryCommandInfo symbol{ libraryId, i, resolveReturnType(command.m_dtRetValType) };
+					m_supportCommands.insert_or_assign(dependency.fileName + "::" + name, symbol);
+					const bool hidden = (command.m_wState & CT_IS_HIDED) != 0;
+					if (!hidden && m_hiddenSupportCommands.erase(name)) m_supportCommands.insert_or_assign(name, symbol);
+					else if (m_supportCommands.emplace(name, symbol).second && hidden) m_hiddenSupportCommands.insert(name);
 				}
 			}
 		}
@@ -2548,6 +2560,7 @@ private:
 	std::unordered_map<std::string, std::int32_t> m_builtinTypes;
 	std::unordered_map<std::string, std::int32_t> m_userTypes;
 	std::unordered_map<std::string, SupportLibraryTypeInfo> m_supportTypes;
+	std::unordered_set<std::string> m_hiddenSupportCommands;
 	std::unordered_map<std::string, SupportLibraryCommandInfo> m_supportCommands;
 	std::unordered_map<std::string, SupportLibraryConstantInfo> m_supportConstants;
 	std::unordered_set<std::string> m_placeholderTypeNames;
@@ -4733,6 +4746,10 @@ bool FindNativeAccessClosingBracket(const std::string& text, const size_t openPo
 			index += quoteLength - 1;
 			continue;
 		}
+		if (IsDBCSLeadByteEx(CP_ACP, static_cast<BYTE>(text[index])) && index + 1 < text.size()) {
+			++index;
+			continue;
+		}
 		if (!inChineseQuote && text[index] == '"') {
 			inAsciiQuote = !inAsciiQuote;
 			continue;
@@ -4930,6 +4947,10 @@ std::string StripOuterParentheses(std::string expression)
 				index += quoteLength - 1;
 				continue;
 			}
+			if (IsDBCSLeadByteEx(CP_ACP, static_cast<BYTE>(expression[index])) && index + 1 < expression.size()) {
+				++index;
+				continue;
+			}
 			if (!inChineseQuote && expression[index] == '"') {
 				inAsciiQuote = !inAsciiQuote;
 				continue;
@@ -4969,11 +4990,13 @@ bool TryResolveNativeFunction(
 				(symbol.maximumArguments < 0 || *argumentCount <= static_cast<size_t>(symbol.maximumArguments)));
 	};
 	// 非限定调用只在当前类及继承链中查找成员，其他类的方法不能遮蔽全局命令。
+	std::optional<NativeFunctionSymbol> declaredMethod;
 	std::unordered_set<std::int32_t> visited;
 	for (auto owner = context.currentOwnerTypeId; owner > 0 && visited.insert(owner).second;) {
 		const auto methods = context.methodsByOwnerType.find(owner);
 		if (methods != context.methodsByOwnerType.end()) {
 			const auto method = methods->second.find(functionKey);
+			if (method != methods->second.end() && !declaredMethod) declaredMethod = method->second;
 			if (method != methods->second.end() && acceptsArguments(method->second)) {
 				outSymbol = method->second;
 				return true;
@@ -5000,6 +5023,16 @@ bool TryResolveNativeFunction(
 			outSymbol = NativeFunctionSymbol{ commandInfo.libraryId, commandInfo.commandId, commandInfo.returnType };
 			return true;
 		}
+	}
+	// 参数数量用于选择同名支持库命令，不能改变已存在的用户函数身份。
+	// 旧工程可能保留未调用的历史函数体，实参数量由 IDE 编译器验证。
+	if (declaredMethod) {
+		outSymbol = *declaredMethod;
+		return true;
+	}
+	if (functionIt != context.functionsByName.end()) {
+		outSymbol = functionIt->second;
+		return true;
 	}
 	outSymbol = {};
 	return false;
@@ -5121,6 +5154,18 @@ bool TryResolveNativeExpressionType(
 	if (ParseNativeVariableAccessExpression(rawExpression, context, access)) {
 		outTypeId = access.typeId;
 		return outTypeId != 0;
+	}
+	const auto parsed = ParseSourceExpression(rawExpression);
+	if (parsed.IsValid() && parsed.root->kind == SourceExpressionKind::Member) {
+		std::vector<size_t> dots;
+		CollectTopLevelOperatorPositions(rawExpression, ".", dots);
+		std::int32_t ownerType = 0;
+		NativeObjectMemberSymbol member;
+		if (!dots.empty() && TryResolveNativeExpressionType(rawExpression.substr(0, dots.back()), context, ownerType) &&
+			TryResolveNativeMember(ownerType, parsed.root->text, context, member)) {
+			outTypeId = member.typeId;
+			return outTypeId != 0;
+		}
 	}
 	ParsedNativeFunctionCallExpression call;
 	if (ParseNativeFunctionCallExpression(rawExpression, call)) {
@@ -5279,7 +5324,29 @@ bool TryEncodeNativeIn38Expression(
 	ParsedNativeVariableAccessExpression access;
 	std::string parseError;
 	if (!ParseNativeVariableAccessExpression(rawExpression, context, access, &parseError)) {
-		if (!includeExpressionWrapper && ParseSourceExpression(rawExpression).IsValid()) {
+		const auto parsed = ParseSourceExpression(rawExpression);
+		if (parsed.IsValid() && parsed.root->kind == SourceExpressionKind::Member) {
+			std::vector<size_t> dots;
+			CollectTopLevelOperatorPositions(rawExpression, ".", dots);
+			std::int32_t ownerType = 0;
+			NativeObjectMemberSymbol member;
+			if (!dots.empty() && TryResolveNativeExpressionType(rawExpression.substr(0, dots.back()), context, ownerType) &&
+				TryResolveNativeMember(ownerType, parsed.root->text, context, member)) {
+				if (includeExpressionWrapper) {
+					variableReferences.push_back(static_cast<std::int32_t>(writer.position()));
+					writer.WriteU8(0x1D);
+					writer.WriteU8(0x38);
+				}
+				if (!TryEncodeNativeIn38Expression(rawExpression.substr(0, dots.back()), context, writer,
+					methodReferences, variableReferences, constantReferences, false, outError)) return false;
+				writer.WriteU8(0x39);
+				writer.WriteI32(member.id);
+				writer.WriteI32(member.ownerTypeId);
+				if (includeExpressionWrapper) writer.WriteU8(0x37);
+				return true;
+			}
+		}
+		if (!includeExpressionWrapper && parsed.IsValid() && parsed.root->kind != SourceExpressionKind::Member) {
 			writer.WriteI32(epl_system_id::kIdNaV);
 			writer.WriteU8(0x3A);
 			return TryEncodeNativeExpression(rawExpression, context, writer,
@@ -5467,7 +5534,9 @@ bool TryEncodeNativeExpression(
 	}
 
 	ParsedNativeVariableAccessExpression accessExpression;
-	if (ParseNativeVariableAccessExpression(expression, context, accessExpression)) {
+	std::string accessError;
+	if (ParseNativeVariableAccessExpression(expression, context, accessExpression, &accessError) ||
+		(parsedExpression.IsValid() && parsedExpression.root->kind == SourceExpressionKind::Member)) {
 		return TryEncodeNativeIn38Expression(
 			expression,
 			context,
@@ -5573,7 +5642,7 @@ bool TryEncodeNativeExpression(
 	}
 
 	if (outError != nullptr) {
-		*outError = "unsupported_expression: " + expression;
+		*outError = "unsupported_expression: " + expression + " (" + accessError + ")";
 	}
 	return false;
 }
@@ -5719,14 +5788,20 @@ bool TryEncodeNativeFunctionCallStatementLine(
 	}
 
 	ParsedNativeFunctionCallExpression call;
-	if (!ParseNativeFunctionCallExpression(statement.code, call) ||
-		call.name.find('.') != std::string::npos) {
+	if (!ParseNativeFunctionCallExpression(statement.code, call)) {
 		if (outError != nullptr) {
 			*outError = "function_call_parse_failed: " + statement.code;
 		}
 		return false;
 	}
 
+	// 类型限定的基类/程序集调用没有对象接收者；变量同名时仍走对象调用。
+	if (const auto dot = call.name.rfind('.'); dot != std::string::npos) {
+		std::int32_t receiverType = 0;
+		const auto qualified = context.functionsByName.find(TypeResolver::NormalizeTypeName(call.name));
+		if (TryResolveNativeExpressionType(call.name.substr(0, dot), context, receiverType) ||
+			qualified == context.functionsByName.end() || !qualified->second.qualified) return false;
+	}
 	NativeFunctionSymbol functionSymbol;
 	if (!TryResolveNativeFunction(call.name, context, functionSymbol, call.args.size())) {
 		if (outError != nullptr) {
@@ -9556,7 +9631,7 @@ bool BuildRestoreModel(
 		auto it = std::find_if(
 			parsedForms.begin(),
 			parsedForms.end(),
-			[&](const ParsedFormDef& item) { return TypeResolver::NormalizeTypeName(item.name) == normalized; });
+			[&](const ParsedFormDef& item) { return item.formXml == nullptr && TypeResolver::NormalizeTypeName(item.name) == normalized; });
 		if (it == parsedForms.end()) {
 			ParsedFormDef item;
 			item.name = formXml.name;
@@ -10441,7 +10516,10 @@ bool BuildRestoreModel(
 			rangeCount = 1;
 		}
 		for (const auto& parsedClass : dependencyClasses) {
-			if (!parsedClass.isPublic || parsedClass.isFormClass) {
+			if (parsedClass.isFormClass || (!parsedClass.isPublic &&
+				!std::any_of(dependencyClasses.begin(), dependencyClasses.end(), [&](const ParsedClassDef& derived) {
+					return TypeResolver::NormalizeTypeName(derived.baseClassName) == TypeResolver::NormalizeTypeName(parsedClass.name);
+				}))) {
 				continue;
 			}
 			DependencyNativeClassBinding* nativeClass = findNativeClassBinding(parsedClass);
@@ -11272,7 +11350,12 @@ bool BuildRestoreModel(
 			}
 			targetClass.vars.push_back(std::move(variable));
 		}
+	}
 
+	// 成员声明必须全部完成，方法才可引用排在后面的窗口或类。
+	for (size_t classIndex = 0; classIndex < parsedClasses.size(); ++classIndex) {
+		const auto& parsedClass = parsedClasses[classIndex];
+		auto& targetClass = model.classes[localClassModelIndices[classIndex]];
 		for (size_t methodIndex = 0; methodIndex < parsedClass.methods.size(); ++methodIndex) {
 			const auto& parsedMethod = parsedClass.methods[methodIndex];
 			const PreparedLocalMethod& preparedMethod = preparedLocalMethods[classIndex][methodIndex];
@@ -11452,7 +11535,7 @@ bool BuildRestoreModel(
 				// 窗口程序集继承窗口命令，允许省略当前窗口限定名称。
 				nativeObjectEncodeContext.baseTypes.insert_or_assign(form.classId, 65537);
 				// 每个窗口有独立的控件成员表，同时继承核心窗口的公共属性。
-				nativeObjectEncodeContext.baseTypes.insert_or_assign(form.id, 65537);
+				nativeObjectEncodeContext.baseTypes.insert_or_assign(form.id, form.classId);
 				addNativeObjectVariable(form.name, form.id, form.id);
 				for (const auto& element : form.elements) {
 					const auto elementKind = element.id & epl_system_id::kMaskType;
@@ -12000,45 +12083,6 @@ bool ParseLengthPrefixedTextArray(
 	return true;
 }
 
-std::vector<std::int32_t> CollectNativeSourceMethodIds(const ProjectBundle& bundle)
-{
-	std::vector<std::int32_t> methodIds;
-	for (const auto& snapshot : bundle.nativeSourceSnapshots) {
-		for (const auto& method : snapshot.methods) {
-			methodIds.push_back(method.id);
-		}
-	}
-	return methodIds;
-}
-
-bool TryCollectEPackageMethodIds(
-	const ProjectBundle& bundle,
-	const size_t expectedCount,
-	std::vector<std::int32_t>& outMethodIds)
-{
-	outMethodIds.clear();
-
-	const Document document = BuildDocumentFromBundle(bundle);
-	RestoreDocumentModel model;
-	std::string error;
-	if (BuildRestoreModel(document, &bundle, model, &error) &&
-		model.methods.size() == expectedCount) {
-		outMethodIds.reserve(model.methods.size());
-		for (const auto& method : model.methods) {
-			outMethodIds.push_back(method.id);
-		}
-		return true;
-	}
-
-	outMethodIds = CollectNativeSourceMethodIds(bundle);
-	if (outMethodIds.size() == expectedCount) {
-		return true;
-	}
-
-	outMethodIds.clear();
-	return false;
-}
-
 std::vector<std::uint8_t> BuildEPackageInfoSection(
 	const RestoreDocumentModel& model,
 	const ProjectBundle* originalBundle,
@@ -12047,20 +12091,31 @@ std::vector<std::uint8_t> BuildEPackageInfoSection(
 	std::vector<std::string> currentEntries(model.methods.size());
 	if (originalBundle != nullptr && originalSection != nullptr) {
 		std::vector<std::string> originalEntries;
-		std::vector<std::int32_t> originalMethodIds;
+		const auto& originalMethodIds = originalBundle->nativeMethodOrder;
 		if (ParseLengthPrefixedTextArray(originalSection->data, originalEntries) &&
-			TryCollectEPackageMethodIds(*originalBundle, originalEntries.size(), originalMethodIds) &&
 			originalMethodIds.size() == originalEntries.size()) {
 			std::unordered_map<std::int32_t, std::string> entryByMethodId;
 			entryByMethodId.reserve(originalEntries.size());
 			for (size_t index = 0; index < originalEntries.size(); ++index) {
 				entryByMethodId.insert_or_assign(originalMethodIds[index], originalEntries[index]);
 			}
-			for (size_t index = 0; index < model.methods.size(); ++index) {
-				if (const auto it = entryByMethodId.find(model.methods[index].id);
-					it != entryByMethodId.end()) {
-					currentEntries[index] = it->second;
+			// 易包导入关系属于链接元数据，语义重建后方法 ID 已改变，按所属程序集和名称重绑。
+			std::unordered_map<std::string, std::string> entriesByName;
+			for (size_t fileIndex = 0; fileIndex < originalBundle->nativeSourceSnapshots.size() &&
+				fileIndex < originalBundle->sourceFiles.size(); ++fileIndex) {
+				for (const auto& method : originalBundle->nativeSourceSnapshots[fileIndex].methods) {
+					const auto entry = entryByMethodId.find(method.id);
+					if (entry != entryByMethodId.end()) entriesByName.emplace(
+						originalBundle->sourceFiles[fileIndex].logicalName + "::" + method.name, entry->second);
 				}
+			}
+			for (size_t index = 0; index < model.methods.size(); ++index) {
+				const auto& method = model.methods[index];
+				const auto owner = std::find_if(model.classes.begin(), model.classes.end(),
+					[&](const auto& item) { return item.id == method.ownerClass; });
+				if (owner == model.classes.end()) continue;
+				const auto entry = entriesByName.find(owner->name + "::" + method.name);
+				if (entry != entriesByName.end()) currentEntries[index] = entry->second;
 			}
 		}
 	}
@@ -12613,7 +12668,8 @@ std::vector<std::uint8_t> BuildCodeSection(
 	}
 	writer.WriteTextArray(supportLibraryInfo);
 	writer.WriteI32(canReuseNativeProgramHeader ? nativeProgramHeader->flag1 : 0);
-	writer.WriteI32(canReuseNativeProgramHeader ? nativeProgramHeader->flag2 : startupMethodId);
+	// 启动入口引用必须指向本次语义重建分配的方法 ID。
+	writer.WriteI32(startupMethodId);
 	if (canReuseNativeProgramHeader && (nativeProgramHeader->flag1 & 0x1) != 0) {
 		writer.WriteBytes(nativeProgramHeader->unk3Op);
 	}
@@ -12884,6 +12940,16 @@ std::vector<std::uint8_t> BuildMinimalEditorInfoSection(
 	addPureTableTab(3, !model.globals.empty());
 	addPureTableTab(4, !model.dlls.empty());
 	addPureTableTab(6, !model.constants.empty());
+
+	// 只有窗口的模板也必须有可打开的编辑页，避免 IDE 将工程视为未就绪。
+	if (tabs.empty() && !model.forms.empty()) {
+		const auto& form = model.forms.front();
+		ByteWriter tabWriter;
+		tabWriter.WriteU8(5);
+		tabWriter.WriteI32(form.id);
+		tabWriter.WriteI32(form.elements.empty() ? 0 : form.elements.front().id);
+		tabs.push_back(tabWriter.TakeBytes());
+	}
 
 	ByteWriter writer;
 	if (tabs.empty()) {
@@ -13613,7 +13679,8 @@ bool RestoreBundleToBytesInternal(
 		restoreBundle.nativeSourceBytes.clear();
 		restoreBundle.nativeBundleDigest.clear();
 		restoreBundle.nativeSourceSnapshots.clear();
-		restoreBundle.nativeProgramHeader.reset();
+		// 程序头保存图标、调试参数及 DLL 等编译配置，不是方法字节码快照。
+		// 保留配置，入口 ID 由 BuildCodeSection 根据当前语义模型重新计算。
 		restoreBundle.nativeGlobalSnapshots.clear();
 		restoreBundle.nativeStructSnapshots.clear();
 		restoreBundle.nativeDllSnapshots.clear();
@@ -13641,9 +13708,16 @@ bool RestoreBundleToBytesInternal(
 
 	std::vector<NativeSectionSnapshot> originalSections;
 	std::vector<NativeSectionSnapshot>* originalSectionsPtr = nullptr;
-	if (!restoreBundle.nativeSourceBytes.empty()) {
+	if (!bundle.nativeSourceBytes.empty()) {
 		std::string ignoredError;
-		if (CaptureNativeSectionSnapshots(restoreBundle.nativeSourceBytes, originalSections, &ignoredError)) {
+		if (CaptureNativeSectionSnapshots(bundle.nativeSourceBytes, originalSections, &ignoredError)) {
+			if (!sourceTextMatchesNativeSnapshot) {
+				// 用户配置不含代码 ID；源码重建不能丢失 DLL 导出等项目选项。
+				std::erase_if(originalSections, [](const auto& section) {
+					return section.key != kSectionProjectConfig && section.key != kSectionConditionalCompilation &&
+						section.key != kSectionEPackageInfo;
+				});
+			}
 			originalSectionsPtr = &originalSections;
 		}
 	}
@@ -13654,7 +13728,7 @@ bool RestoreBundleToBytesInternal(
 			outBytes,
 			outError,
 			&restoreBundle,
-			sourceTextMatchesNativeSnapshot ? originalBundlePtr : nullptr,
+			originalBundlePtr,
 			originalSectionsPtr);
 	}
 	catch (const std::exception& ex) {

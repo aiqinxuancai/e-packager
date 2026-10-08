@@ -201,6 +201,7 @@
     <ClCompile Include="src\PathHelper.cpp" />
     <ClCompile Include="src\SupportLibraryPublicInfo.cpp" />
     <ClCompile Include="src\SupportLibraryRuntime.cpp" />
+    <ClCompile Include="src\FormControlPropertyBridge.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\compiler\ExecutableResourceBuilder.h" />
@@ -212,6 +213,9 @@
     <ClInclude Include="src\ProjectSystemInfo.h" />
     <ClInclude Include="src\ProjectSystemInfoCodec.h" />
     <ClInclude Include="src\FormControlPropertyCodec.h" />
+    <ClInclude Include="src\FormControlPropertyBridge.h" />
+    <ClInclude Include="src\BuiltinTypeNames.h" />
+    <ClInclude Include="src\ConditionalDeclarations.h" />
     <ClInclude Include="src\CommonWindowEvents.h" />
     <ClInclude Include="src\SelfUpdater.h" />
     <ClInclude Include="src\SimpleXmlDocument.h" />
@@ -253,5 +257,8 @@
     <ClInclude Include="thirdparty\json.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="CopyWin32PropertyWorker" AfterTargets="Build" Condition="'$(Platform)' == 'x64' and Exists('$(ProjectDir)bin\Win32\$(Configuration)\e-packager.exe')">
+    <Copy SourceFiles="$(ProjectDir)bin\Win32\$(Configuration)\e-packager.exe" DestinationFiles="$(OutDir)e-packager-x86.exe" SkipUnchangedFiles="true" />
+  </Target>
   <ImportGroup Label="ExtensionTargets" />
 </Project>
