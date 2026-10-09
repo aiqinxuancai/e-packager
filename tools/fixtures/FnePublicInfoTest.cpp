@@ -1,6 +1,14 @@
 ﻿// 用真实 FNE ABI 验证旧/新事件、长枚举、空文件配置及损坏元数据导出。
 #include <Windows.h>
 #include <lib2.h>
+#include <intrin.h>
+
+static bool initialized = false;
+BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
+{
+    if (reason == DLL_PROCESS_ATTACH) initialized = true;
+    return TRUE;
+}
 
 #define OPTIONS8 "Option\0Option\0Option\0Option\0Option\0Option\0Option\0Option\0"
 #define OPTIONS64 OPTIONS8 OPTIONS8 OPTIONS8 OPTIONS8 OPTIONS8 OPTIONS8 OPTIONS8 OPTIONS8
@@ -22,6 +30,8 @@ static LIB_DATA_TYPE_INFO types[3] = {};
 static LIB_INFO info = {};
 extern "C" __declspec(dllexport) PLIB_INFO WINAPI GetNewInf()
 {
+    // 未初始化的映像不能执行入口；快速失败确保测试不能靠 SEH 捕获后重试蒙混通过。
+    if (!initialized) __fastfail(FAST_FAIL_FATAL_APP_EXIT);
     types[0].m_szName = "LegacyControl";
     types[0].m_dwState = LDT_WIN_UNIT | _DT_OS(__OS_WIN);
     types[0].m_nPropertyCount = 4;

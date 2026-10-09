@@ -618,72 +618,6 @@ bool HasReadableCommands(const LIB_INFO* libInfo)
 			sizeof(CMD_INFO) * static_cast<size_t>(libInfo->m_nCmdCount));
 }
 
-int CountNamedDataTypes(const LIB_INFO* libInfo)
-{
-	if (!HasReadableDataTypes(libInfo)) {
-		return 0;
-	}
-
-	int namedCount = 0;
-	for (int i = 0; i < libInfo->m_nDataTypeCount; ++i) {
-		if (!ReadAnsiText(libInfo->m_pDataType[i].m_szName).empty()) {
-			++namedCount;
-		}
-	}
-	return namedCount;
-}
-
-bool ShouldRetrySupportLibraryWithDllInitialization(const LIB_INFO* libInfo)
-{
-	if (libInfo == nullptr) {
-		return false;
-	}
-	// A number of modern libraries publish pointers to their metadata arrays
-	// from static storage, but initialize the associated counts during DLL
-	// startup.  The lightweight loader sees non-null table addresses together
-	// with zero counts.  That combination is not a valid empty declaration and
-	// is a generic signal that the initialized load is required.
-	if ((libInfo->m_nCmdCount == 0 && libInfo->m_nDataTypeCount == 0 && libInfo->m_nLibConstCount == 0) ||
-		(libInfo->m_nCmdCount == 0 && libInfo->m_pBeginCmdInfo != nullptr) ||
-		(libInfo->m_nDataTypeCount == 0 && libInfo->m_pDataType != nullptr) ||
-		(libInfo->m_nLibConstCount == 0 && libInfo->m_pLibConst != nullptr)) {
-		return true;
-	}
-	// Modern FNEs can keep type metadata in directly mapped static data while
-	// their command table contains relocated function pointers.  A no-resolve
-	// load then looks partially valid, so inspecting only the type table loses
-	// every executable command.  Require a readable command table whenever the
-	// library declares commands before accepting the lightweight load.
-	if (libInfo->m_nCmdCount > 0 && !HasReadableCommands(libInfo)) {
-		return true;
-	}
-	if (HasReadableCommands(libInfo) && libInfo->m_nCmdCount > 0) {
-		int namedCommands = 0;
-		for (int index = 0; index < libInfo->m_nCmdCount; ++index)
-			if (!ReadAnsiText(libInfo->m_pBeginCmdInfo[index].m_szName).empty()) ++namedCommands;
-		if (namedCommands == 0) return true;
-	}
-	if (HasReadableDataTypes(libInfo)) {
-		for (int index = 0; index < libInfo->m_nDataTypeCount; ++index) {
-			const auto& type = libInfo->m_pDataType[index];
-			if (libInfo->m_nCmdCount == 0 && type.m_nCmdCount > 0) return true;
-			// 可视控件至少有公共窗口属性；空表通常由 DLL 初始化后补齐。
-			if ((type.m_dwState & LDT_WIN_UNIT) != 0 &&
-				type.m_nPropertyCount == 0) return true;
-		}
-	}
-	if (libInfo->m_nDataTypeCount <= 1) {
-		return false;
-	}
-	if (!HasReadableDataTypes(libInfo)) {
-		return true;
-	}
-
-	const int namedCount = CountNamedDataTypes(libInfo);
-	return namedCount <= 1 ||
-		namedCount * 4 < libInfo->m_nDataTypeCount;
-}
-
 std::optional<std::string> ResolveLocalLibraryTypeName(const DATA_TYPE baseType, const LIB_INFO* libInfo)
 {
 	if (HIWORD(baseType) == 1) {
@@ -1521,84 +1455,28 @@ bool TryLoadSupportLibraryDump(
 		~RestoreStringEncoding() { g_supportLibraryStringsAreUtf8 = previous; }
 	} restoreStringEncoding { previousStringEncoding };
 
-	HMODULE module = nullptr;
-	const LIB_INFO* libInfo = nullptr;
-	bool moduleCanBeFreed = true;
-
-	const auto closeModule = [&]() {
-		if (module != nullptr) {
-			if (moduleCanBeFreed) {
-				FreeLibrary(module);
-			}
-			module = nullptr;
-		}
-		moduleCanBeFreed = true;
-	};
-
-	auto tryLoad = [&](const DWORD flags, std::string& outAttemptError) -> bool {
-		module = LoadLibraryExW(filePath.c_str(), nullptr, flags);
-		if (module == nullptr) {
-			const DWORD errorCode = GetLastError();
-			outAttemptError =
-				"LoadLibraryEx failed (Win32 error=" + std::to_string(errorCode) + ")";
-			return false;
-		}
-		moduleCanBeFreed = flags != 0;
-
-		auto* getInfoProc = reinterpret_cast<PFN_GET_LIB_INFO>(GetProcAddress(module, FUNCNAME_GET_LIB_INFO));
-		if (getInfoProc == nullptr) {
-			outAttemptError = "GetNewInf not found";
-			closeModule();
-			return false;
-		}
-
-		DWORD exceptionCode = 0;
-		libInfo = support_library_runtime::CallGetLibInfo(getInfoProc, &exceptionCode);
-		if (libInfo == nullptr || !IsReadableMemoryRange(libInfo, sizeof(LIB_INFO))) {
-			outAttemptError = "GetNewInf returned invalid LIB_INFO";
-			if (exceptionCode != 0) {
-				std::ostringstream details;
-				details << "GetNewInf raised exception 0x" << std::hex << exceptionCode;
-				outAttemptError = details.str();
-			}
-			libInfo = nullptr;
-			closeModule();
-			return false;
-		}
-
-		return true;
-	};
-
-	std::string attemptError;
-#if defined(_M_X64)
-	// x64 support libraries may initialize their metadata tables from DllMain;
-	// loading them without dependency resolution leaves the command pointers
-	// null even though GetNewInf itself succeeds.
-	if (!tryLoad(0, attemptError)) {
-		outError = attemptError;
+	// GetNewInf 和通知回调都是可执行代码，必须先解析导入并完成 DLL 初始化。
+	// DONT_RESOLVE_DLL_REFERENCES 只适合检查映像，不能靠调用后的元数据猜测是否需要初始化。
+	const HMODULE module = LoadLibraryExW(filePath.c_str(), nullptr, 0);
+	if (module == nullptr) {
+		outError = "LoadLibraryEx failed (Win32 error=" + std::to_string(GetLastError()) + ")";
 		return false;
 	}
-#else
-	if (!tryLoad(DONT_RESOLVE_DLL_REFERENCES, attemptError)) {
-		if (!tryLoad(0, attemptError)) {
-			outError = attemptError;
-			return false;
-		}
+	// 保持已初始化支持库驻留：第三方库可能注册回调或启动线程，不能在读取元数据后卸载。
+	const auto getInfoProc = reinterpret_cast<PFN_GET_LIB_INFO>(GetProcAddress(module, FUNCNAME_GET_LIB_INFO));
+	if (getInfoProc == nullptr) {
+		outError = "GetNewInf not found";
+		return false;
 	}
-#endif
-	else if (ShouldRetrySupportLibraryWithDllInitialization(libInfo)) {
-		closeModule();
-		libInfo = nullptr;
-		std::string initializedAttemptError;
-		if (!tryLoad(0, initializedAttemptError) &&
-			!tryLoad(DONT_RESOLVE_DLL_REFERENCES, attemptError)) {
-			outError = initializedAttemptError.empty() ? attemptError : initializedAttemptError;
-			return false;
+	DWORD exceptionCode = 0;
+	const LIB_INFO* libInfo = support_library_runtime::CallGetLibInfo(getInfoProc, &exceptionCode);
+	if (libInfo == nullptr || !IsReadableMemoryRange(libInfo, sizeof(LIB_INFO))) {
+		outError = "GetNewInf returned invalid LIB_INFO";
+		if (exceptionCode != 0) {
+			std::ostringstream details;
+			details << "GetNewInf raised exception 0x" << std::hex << exceptionCode;
+			outError = details.str();
 		}
-	}
-
-	if (libInfo == nullptr) {
-		outError = attemptError;
 		return false;
 	}
 	g_supportLibraryStringsAreUtf8 = DetectUtf8MetadataStrings(libInfo);
@@ -1821,7 +1699,6 @@ bool TryLoadSupportLibraryDump(
 		}
 	}
 
-	closeModule();
 	return true;
 }
 
