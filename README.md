@@ -273,6 +273,8 @@ e-packager compile-check MyApp.e \
 
 ---
 
+回包时，普通常量按 `src/.常量.txt` 的行序排列；图片和音频按资源索引的 `order` 顺序排列。调整或重命名普通常量不会改变资源自身的顺序。原生常量资源表中的交错位置仅作为布局参考，发生冲突时优先保持常量页与资源索引各自的顺序。
+
 `project/_meta.json` 的 `systemInfo` 保存工程类型、编译器版本和系统保留数据。修改源码或执行 `update` 不会改变这些工程属性；旧目录会从 `.native_source.bin` 自动提取，原生文件缺失时无法恢复已丢失的信息。
 
 `systemInfo.compileType` 的已知值为 `0`（窗口 EXE）、`1`（控制台 EXE）、`2`（DLL）、`1000`（易模块），未知整数值也会保留。`projectSubsystem` 仅用于 EXE，显式设置 `windows` / `console` 时会更新 EXE 类型；DLL、易模块及未知类型应为 `unknown`，冲突配置会报错。主动转换工程种类时需同时设置这两个字段，并自行调整对应的启动代码和公开接口。

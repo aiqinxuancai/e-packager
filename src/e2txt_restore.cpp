@@ -30,6 +30,7 @@
 #include "..\thirdparty\json.hpp"
 
 #include "EFolderCodec.h"
+#include "ConstantResourceOrder.h"
 #include "FormControlPropertyCodec.h"
 #include "PathHelper.h"
 #include "ELanguageEnvironment.h"
@@ -9784,9 +9785,6 @@ bool BuildRestoreModel(
 	std::vector<size_t> localConstantModelIndices;
 	localConstantModelIndices.reserve(parsedConstants.size());
 	std::vector<std::int32_t> localConstantIds(parsedConstants.size(), 0);
-	std::vector<std::string> localConstantKeys;
-	localConstantKeys.reserve(parsedConstants.size());
-	std::unordered_map<std::string, int> localConstantKeyCounters;
 	const auto appendDefinedIdRange = [](RestoreDependencyInfo& dependency, const std::int32_t start, const std::int32_t count) {
 		if (count <= 0) {
 			return;
@@ -11006,7 +11004,6 @@ bool BuildRestoreModel(
 		constant.name = parsedConstant.name;
 		constant.comment = parsedConstant.comment;
 		constant.valueText = parsedConstant.valueText;
-		localConstantKeys.push_back(BuildBundleItemKey("constant", parsedConstant.name, localConstantKeyCounters));
 		localConstantModelIndices.push_back(model.constants.size());
 		model.constants.push_back(std::move(constant));
 	}
@@ -11648,36 +11645,12 @@ bool BuildRestoreModel(
 			}
 		}
 
-		std::unordered_map<std::string, size_t> constantIndexByKey;
-		for (size_t index = 0; index < localConstantKeys.size() && index < localConstantModelIndices.size(); ++index) {
-			constantIndexByKey.insert_or_assign(localConstantKeys[index], localConstantModelIndices[index]);
-		}
-		for (size_t index = 0; index < bundle->resources.size() && index < resourceModelIndices.size(); ++index) {
-			constantIndexByKey.insert_or_assign(bundle->resources[index].key, resourceModelIndices[index]);
-		}
-
-		std::vector<size_t> orderedConstantIndices;
-		orderedConstantIndices.reserve(model.constants.size());
-		std::unordered_set<size_t> assignedConstantIndices;
-		for (const auto& childKey : bundle->rootChildKeys) {
-			const auto it = constantIndexByKey.find(childKey);
-			if (it == constantIndexByKey.end()) {
-				continue;
-			}
-			if (assignedConstantIndices.insert(it->second).second) {
-				orderedConstantIndices.push_back(it->second);
-			}
-		}
-
+		const auto constantOrder = BuildConstantResourceOrder(
+			*bundle, localConstantModelIndices, resourceModelIndices, model.constants.size());
 		std::vector<RestoreConstant> reorderedConstants;
 		reorderedConstants.reserve(model.constants.size());
-		for (const auto index : orderedConstantIndices) {
+		for (const size_t index : constantOrder) {
 			reorderedConstants.push_back(std::move(model.constants[index]));
-		}
-		for (size_t index = 0; index < model.constants.size(); ++index) {
-			if (!assignedConstantIndices.contains(index)) {
-				reorderedConstants.push_back(std::move(model.constants[index]));
-			}
 		}
 		model.constants = std::move(reorderedConstants);
 	}
