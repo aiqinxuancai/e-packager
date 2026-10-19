@@ -187,6 +187,7 @@
     <ClCompile Include="src\WorkspaceUpdate.cpp" />
     <ClCompile Include="src\e2txt.cpp" />
     <ClCompile Include="src\e2txt_restore.cpp" />
+    <ClCompile Include="src\ConstantResourceOrder.cpp" />
 	<ClCompile Include="src\compiler\BlackMoonEcodeBridge.cpp" />
 	<ClCompile Include="src\compiler\BlackMoonCompiler.cpp" />
     <ClCompile Include="src\compiler\CompilerModel.cpp" />
@@ -215,6 +216,7 @@
     <ClInclude Include="src\DependencyDownloader.h" />
     <ClInclude Include="src\VcToolchainSetup.h" />
     <ClInclude Include="src\EFolderCodec.h" />
+    <ClInclude Include="src\ConstantResourceOrder.h" />
     <ClInclude Include="src\ProjectSystemInfo.h" />
     <ClInclude Include="src\ProjectSystemInfoCodec.h" />
     <ClInclude Include="src\FormControlPropertyCodec.h" />

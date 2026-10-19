@@ -30,6 +30,7 @@
 #include "..\thirdparty\json.hpp"
 
 #include "EFolderCodec.h"
+#include "ConstantResourceOrder.h"
 #include "FormControlPropertyCodec.h"
 #include "PathHelper.h"
 #include "ELanguageEnvironment.h"
@@ -9784,9 +9785,6 @@ bool BuildRestoreModel(
 	std::vector<size_t> localConstantModelIndices;
 	localConstantModelIndices.reserve(parsedConstants.size());
 	std::vector<std::int32_t> localConstantIds(parsedConstants.size(), 0);
-	std::vector<std::string> localConstantKeys;
-	localConstantKeys.reserve(parsedConstants.size());
-	std::unordered_map<std::string, int> localConstantKeyCounters;
 	const auto appendDefinedIdRange = [](RestoreDependencyInfo& dependency, const std::int32_t start, const std::int32_t count) {
 		if (count <= 0) {
 			return;
@@ -11006,7 +11004,6 @@ bool BuildRestoreModel(
 		constant.name = parsedConstant.name;
 		constant.comment = parsedConstant.comment;
 		constant.valueText = parsedConstant.valueText;
-		localConstantKeys.push_back(BuildBundleItemKey("constant", parsedConstant.name, localConstantKeyCounters));
 		localConstantModelIndices.push_back(model.constants.size());
 		model.constants.push_back(std::move(constant));
 	}
@@ -11648,84 +11645,12 @@ bool BuildRestoreModel(
 			}
 		}
 
-		// 常量页的行序由 src/.常量.txt 决定，不再按原生工程树快照整体重排。
-		// 否则调整顺序、新增或重命名常量都会丢失位置信息，且 pack 不会报错。
-		//
-		// 图片/音频资源仍要落回原生常量表中的相对位置。这里不用「快照序号」定位，
-		// 因为常量被增删或改名后序号会漂移；改为找资源在快照中相邻的常量作为锚点：
-		// 优先挂在它前面的那个常量之后，前一个常量已不存在时退化为插到后一个常量之前，
-		// 两侧都找不到（例如 update 新追加的资源）则排在所有常量之后。
-		std::unordered_map<std::string, size_t> resourceOrdinalByKey;
-		for (size_t index = 0; index < bundle->resources.size() && index < resourceModelIndices.size(); ++index) {
-			resourceOrdinalByKey.insert_or_assign(bundle->resources[index].key, index);
-		}
-
-		std::unordered_map<std::string, size_t> localConstantSlotByKey;
-		for (size_t slot = 0; slot < localConstantKeys.size() && slot < localConstantModelIndices.size(); ++slot) {
-			localConstantSlotByKey.insert_or_assign(localConstantKeys[slot], slot);
-		}
-
-		std::vector<size_t> resourceInsertSlots(bundle->resources.size(), 0);
-		std::vector<bool> resourceSlotAssigned(bundle->resources.size(), false);
-		for (size_t childIndex = 0; childIndex < bundle->rootChildKeys.size(); ++childIndex) {
-			const auto it = resourceOrdinalByKey.find(bundle->rootChildKeys[childIndex]);
-			if (it == resourceOrdinalByKey.end() || resourceSlotAssigned[it->second]) {
-				continue;
-			}
-
-			bool anchored = false;
-			for (size_t cursor = childIndex; cursor > 0;) {
-				--cursor;
-				const auto anchor = localConstantSlotByKey.find(bundle->rootChildKeys[cursor]);
-				if (anchor != localConstantSlotByKey.end()) {
-					resourceInsertSlots[it->second] = anchor->second + 1;
-					anchored = true;
-					break;
-				}
-			}
-			if (!anchored) {
-				for (size_t cursor = childIndex + 1; cursor < bundle->rootChildKeys.size(); ++cursor) {
-					const auto anchor = localConstantSlotByKey.find(bundle->rootChildKeys[cursor]);
-					if (anchor != localConstantSlotByKey.end()) {
-						resourceInsertSlots[it->second] = anchor->second;
-						anchored = true;
-						break;
-					}
-				}
-			}
-			if (anchored) {
-				resourceSlotAssigned[it->second] = true;
-			}
-		}
-
-		// 资源按插入下标分组；快照里没有位置（例如 update 新增的资源）排在所有常量之后。
-		std::vector<std::vector<size_t>> resourcesBySlot(localConstantModelIndices.size() + 1);
-		for (size_t ordinal = 0; ordinal < resourceModelIndices.size(); ++ordinal) {
-			const size_t slot = resourceSlotAssigned[ordinal]
-				? (std::min)(resourceInsertSlots[ordinal], localConstantModelIndices.size())
-				: localConstantModelIndices.size();
-			resourcesBySlot[slot].push_back(ordinal);
-		}
-
+		const auto constantOrder = BuildConstantResourceOrder(
+			*bundle, localConstantModelIndices, resourceModelIndices, model.constants.size());
 		std::vector<RestoreConstant> reorderedConstants;
 		reorderedConstants.reserve(model.constants.size());
-		for (size_t slot = 0; slot <= localConstantModelIndices.size(); ++slot) {
-			for (const size_t ordinal : resourcesBySlot[slot]) {
-				reorderedConstants.push_back(std::move(model.constants[resourceModelIndices[ordinal]]));
-			}
-			if (slot < localConstantModelIndices.size()) {
-				reorderedConstants.push_back(std::move(model.constants[localConstantModelIndices[slot]]));
-			}
-		}
-
-		// 依赖模块带入的常量不属于本地常量页，保持原有相对顺序，仍排在本地常量之后。
-		std::unordered_set<size_t> localConstantIndices(
-			localConstantModelIndices.begin(), localConstantModelIndices.end());
-		localConstantIndices.insert(resourceModelIndices.begin(), resourceModelIndices.end());
-		for (size_t index = 0; index < model.constants.size(); ++index) {
-			if (!localConstantIndices.contains(index)) {
-				reorderedConstants.push_back(std::move(model.constants[index]));
-			}
+		for (const size_t index : constantOrder) {
+			reorderedConstants.push_back(std::move(model.constants[index]));
 		}
 		model.constants = std::move(reorderedConstants);
 	}
