@@ -2632,10 +2632,6 @@ public:
 				break;
 			case BodyStatementKind::IfTrue:
 				WriteIfTrue(statement);
-				// 若 IfTrue 是块中最后一条语句，注入空行，避免 IDE 将流程线延伸到父块尾标记
-				if (!statements.empty() && &statement == &statements.back()) {
-					WriteBlankLine();
-				}
 				break;
 			case BodyStatementKind::IfElse:
 				WriteIfElse(statement);
@@ -2669,9 +2665,6 @@ public:
 				break;
 			case BodyStatementKind::IfTrue:
 				WriteIfTrueWithRawHandler(statement, writeRaw);
-				if (!statements.empty() && &statement == &statements.back()) {
-					WriteBlankLine();
-				}
 				break;
 			case BodyStatementKind::IfElse:
 				WriteIfElseWithRawHandler(statement, writeRaw);
@@ -2721,8 +2714,6 @@ public:
 	{
 		WriteUnexaminedCall(type, libraryId, methodId, mask, code);
 	}
-	// 在 .如果真结束 后注入空行，使 IDE 能正确定位流程线终点
-	void WriteBlankLinePublic() { WriteBlankLine(); }
 
 private:
 	void WriteBlankLine()
@@ -3027,18 +3018,9 @@ bool ParseBodyBlock(
 	while (index < lines.size()) {
 		const std::string& rawLine = lines[index];
 		if (IsBlankLine(rawLine)) {
-			size_t lookahead = index;
-			while (lookahead < lines.size() && IsBlankLine(lines[lookahead])) {
-				++lookahead;
-			}
-			if (outStatements.empty()) {
-				index = lookahead;
-				continue;
-			}
-			while (index < lookahead) {
-				outStatements.push_back(BodyStatement{ BodyStatementKind::Raw, false, false, std::string() });
-				++index;
-			}
+			// 空行也是原生语句，块首和空分支中的空行同样参与 IDE 行号及流程线定位。
+			outStatements.push_back(BodyStatement{ BodyStatementKind::Raw, false, false, std::string() });
+			++index;
 			continue;
 		}
 		const int currentIndent = CountIndentLevel(rawLine);
@@ -3373,10 +3355,10 @@ EffectiveMethodBodyLines BuildEffectiveMethodBodyLinesForEncoding(const std::vec
 		result.leadingTrimmed = 1;
 	}
 
-	size_t trailingTrimmed = 0;
-	while (end > begin && trailingTrimmed < 2 && IsBlankLine(result.lines[end - 1])) {
+	// BuildProgramPages 仅在正文前后各输出一个格式分隔行，其余空行必须编码。
+	// JoinPageLines 不额外追加换行，最后一个子程序也遵循相同规则。
+	if (end > begin && IsBlankLine(result.lines[end - 1])) {
 		--end;
-		++trailingTrimmed;
 	}
 
 	if (begin != 0 || end != result.lines.size()) {
@@ -3385,6 +3367,10 @@ EffectiveMethodBodyLines BuildEffectiveMethodBodyLinesForEncoding(const std::vec
 			result.lines.begin() + static_cast<std::ptrdiff_t>(end));
 	}
 
+	// 手写的空子程序可能没有正文空行，仍需一个原生空白语句供 IDE 定位光标。
+	if (result.lines.empty()) {
+		result.lines.emplace_back();
+	}
 	return result;
 }
 
@@ -5894,9 +5880,6 @@ bool WriteBlockWithStructuredControlEncoding(
 			writer.WriteMarker(0x52);
 			writer.EndBlock();
 			writer.WriteMarker(0x73);
-			if (!statements.empty() && &statement == &statements.back()) {
-				writer.WriteBlankLinePublic();
-			}
 			break;
 		}
 		case BodyStatementKind::IfElse: {
@@ -6496,9 +6479,6 @@ bool TryBuildMethodCodeDataWithNativeObjectCallReuse(
 					writer.WriteMarker(0x52);
 					writer.EndBlock();
 					writer.WriteMarker(0x73);
-					if (!blockStatements.empty() && &statement == &blockStatements.back()) {
-						writer.WriteBlankLinePublic();
-					}
 					break;
 				case BodyStatementKind::IfElse:
 					writer.BeginBlock(1);
@@ -6872,9 +6852,6 @@ bool TryBuildMethodCodeDataWithReusableNativeLineSegments(
 					writer.WriteMarker(0x52);
 					writer.EndBlock();
 					writer.WriteMarker(0x73);
-					if (!statements.empty() && &statement == &statements.back()) {
-						writer.WriteBlankLinePublic();
-					}
 					break;
 				case BodyStatementKind::IfElse:
 					writer.BeginBlock(1);

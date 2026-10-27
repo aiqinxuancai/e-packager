@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import random
 import re
 import shutil
 import subprocess
@@ -71,7 +72,7 @@ def normalize(text):
     return '\n'.join(line.strip() for line in text.splitlines() if line.strip())
 
 
-def inventory(workspace):
+def inventory(workspace, preserve_blank_lines=False):
     result = {}
     for folder in ('src', 'image', 'audio'):
         for path in sorted((workspace / folder).rglob('*')):
@@ -80,7 +81,9 @@ def inventory(workspace):
             key = path.relative_to(workspace).as_posix()
             data = path.read_bytes()
             if folder == 'src':
-                result[key] = {'kind': 'text', 'value': normalize(data.decode('utf-8-sig'))}
+                text = data.decode('utf-8-sig')
+                value = text.replace('\r\n', '\n').replace('\r', '\n') if preserve_blank_lines else normalize(text)
+                result[key] = {'kind': 'text', 'value': value}
             elif path.name == 'list.json':
                 result[key] = {'kind': 'index', 'value': json.loads(data.decode('utf-8-sig'))}
             else:
@@ -195,7 +198,7 @@ def audit(args, item, arch):
         if not row['modified_pages']:
             row['issues'].append('no_assembly_or_class_to_edit')
             return row
-        expected = inventory(workspace)
+        expected = inventory(workspace, getattr(args, 'preserve_blank_lines', False))
         edited = root / 'edited.e'
         if not stage('semantic_pack', ['pack', workspace, edited]):
             return row
@@ -214,7 +217,7 @@ def audit(args, item, arch):
         if decoded_stage['status'] != 'ok':
             row['issues'].append('reunpack_' + decoded_stage['status'])
             return row
-        actual = inventory(decoded)
+        actual = inventory(decoded, getattr(args, 'preserve_blank_lines', False))
         row['reunpack_unresolved_tokens'] = unresolved_tokens(decoded)
         if row['reunpack_unresolved_tokens']:
             row['issues'].append('reunpack_unresolved_tokens')
@@ -245,7 +248,8 @@ def report(args, manifest, rows, unchanged):
              f'- 文件数：{len(manifest)}；每条命令超时：{args.timeout} 秒。',
              '- 每个类／程序集页底部追加一行唯一注释；保留原生元数据。',
              '- 未修改回包逐字节、MD5、SHA256 比较；修改回包再次拆包，比较源码、窗口、资源及注释。',
-             '- 源码比较仅忽略空行和行首尾空白；资源二进制 SHA256 比较，索引 JSON 结构比较。',
+             ('- 源码仅统一换行符，逐字比较并保留空行和缩进。' if args.preserve_blank_lines else
+              '- 源码比较仅忽略空行和行首尾空白。') + '资源二进制 SHA256 比较，索引 JSON 结构比较。',
              '- 再拆包临时文件位于输入副本旁，以保留工程目录的支持库查找上下文。',
              '- 不手动删除快照；页尾注释改变源码摘要，回包器保留声明身份并禁止复用旧执行代码。',
              '- 首次和再次拆包均扫描源码/XML 的 `_Lib*`，记录原始行号；控件属性工作进程失败单列为问题。',
@@ -281,6 +285,7 @@ def recheck_context(args):
     """对早期把产物移出工程目录的审计补验，保留首次结果及日志。"""
     metadata = json.loads((args.output / 'run.json').read_text(encoding='utf-8-sig'))
     args.source = Path(metadata['source'])
+    args.preserve_blank_lines = metadata.get('preserve_blank_lines', False)
     manifest = json.loads((args.output / 'manifest.json').read_text(encoding='utf-8-sig'))
     rows = json.loads((args.output / 'results.json').read_text(encoding='utf-8-sig'))
     for arch in args.architectures:
@@ -303,8 +308,8 @@ def recheck_context(args):
         if stage['status'] != 'ok':
             row['issues'].append('reunpack_' + stage['status'])
         else:
-            actual = inventory(decoded)
-            row['differences'] = compare(inventory(root / 'workspace'), actual, decoded)
+            actual = inventory(decoded, args.preserve_blank_lines)
+            row['differences'] = compare(inventory(root / 'workspace', args.preserve_blank_lines), actual, decoded)
             row['missing_markers'] = [p['path'] for p in row['modified_pages']
                 if p['marker'] not in actual.get(p['path'], {}).get('value', '')]
             if row['missing_markers']:
@@ -334,6 +339,9 @@ def main():
     parser.add_argument('--bin-root', type=Path, default=Path(__file__).resolve().parent.parent / 'bin')
     parser.add_argument('--architectures', nargs='+', choices=['Win32', 'x64'], default=['Win32', 'x64'])
     parser.add_argument('--ids', help='完整排序列表中的编号，逗号分隔；用于复现')
+    parser.add_argument('--sample-per-extension', type=int, help='每种扩展名随机抽取指定数量的非空文件')
+    parser.add_argument('--seed', type=int, default=20261027, help='随机抽样种子，写入审计记录')
+    parser.add_argument('--preserve-blank-lines', action='store_true', help='源码逐字比较，仅统一换行符')
     parser.add_argument('--extensions', nargs='+', choices=['.e', '.ec'], default=['.e'],
                         help='选择待测扩展名；默认仅 .e，以保持既有审计编号')
     parser.add_argument('--workers', type=int, default=4)
@@ -348,6 +356,8 @@ def main():
         parser.error('输出目录不能位于原始输入目录中')
     if args.workers < 1 or args.timeout < 1:
         parser.error('workers 和 timeout 必须为正数')
+    if args.sample_per_extension is not None and (args.sample_per_extension < 1 or args.ids):
+        parser.error('sample-per-extension 必须为正数，且不能与 ids 同用')
     binaries = {arch: args.bin_root / arch / 'Release/e-packager.exe' for arch in args.architectures}
     for exe in binaries.values():
         if not exe.is_file():
@@ -360,6 +370,16 @@ def main():
     originals = sorted((p for p in args.source.rglob('*') if p.is_file() and p.suffix.lower() in args.extensions),
                        key=lambda p: p.relative_to(args.source).as_posix().casefold())
     ids = {int(i) for i in args.ids.split(',')} if args.ids else None
+    if args.sample_per_extension:
+        rng = random.Random(args.seed)
+        ids = set()
+        for extension in dict.fromkeys(args.extensions):
+            candidates = [i for i, p in enumerate(originals, 1)
+                          if p.suffix.lower() == extension and p.stat().st_size > 0
+                          and 'kanec' not in p.name.casefold()]
+            if len(candidates) < args.sample_per_extension:
+                parser.error(f'{extension} 非空文件不足 {args.sample_per_extension} 个')
+            ids.update(rng.sample(candidates, args.sample_per_extension))
     manifest = [dict(id=i, relative=p.relative_to(args.source).as_posix(), **hashes(p))
                 for i, p in enumerate(originals, 1) if ids is None or i in ids]
     if not manifest:
@@ -367,6 +387,9 @@ def main():
     save(args.output / 'manifest.json', manifest)
     metadata = {'started': datetime.now().isoformat(), 'source': str(args.source),
                 'timeout': args.timeout, 'workers': args.workers, 'extensions': args.extensions,
+                'sample_per_extension': args.sample_per_extension, 'seed': args.seed,
+                'sample_excluded_name_contains': ['KanEc'] if args.sample_per_extension else [],
+                'preserve_blank_lines': args.preserve_blank_lines,
                 'binaries': {arch: dict(path=str(exe), **hashes(exe)) for arch, exe in binaries.items()},
                 'script_sha256': hashes(Path(__file__))['sha256']}
     revision = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=Path(__file__).resolve().parent.parent,
