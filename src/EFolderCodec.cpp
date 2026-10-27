@@ -871,6 +871,91 @@ std::string NormalizeRelativePathKey(const std::string& pathText)
 	return NormalizeRelativePathKey(std::filesystem::path(pathText));
 }
 
+// 只认领旧清单中的源码和窗口文件，不扫描删除用户自行新增的文件。
+bool ReadPreviousSourcePaths(
+	const std::filesystem::path& root,
+	std::vector<std::filesystem::path>& paths,
+	std::string* outError)
+{
+	for (const auto& metaPath : { GetMetaJsonPath(root), GetLegacyMetaJsonPath(root) }) {
+		std::error_code ec;
+		const bool exists = std::filesystem::exists(metaPath, ec);
+		if (!ec && !exists) continue;
+		json meta;
+		if (ec || !ReadJsonFile(metaPath, meta) || !meta.is_object()) {
+			if (outError) *outError = "read_previous_meta_json_failed";
+			return false;
+		}
+		for (const auto* field : { "sourceFiles", "formFiles" }) {
+			const auto entries = meta.find(field);
+			if (entries == meta.end()) continue;
+			if (!entries->is_array()) {
+				if (outError) *outError = "invalid_previous_source_files";
+				return false;
+			}
+			for (const auto& item : *entries) {
+				const auto value = item.find("relativePath");
+				if (!item.is_object() || value == item.end() || !value->is_string()) {
+					if (outError) *outError = "invalid_previous_source_path";
+					return false;
+				}
+				const std::filesystem::path relative = Utf8PathToPath(value->get<std::string>());
+				bool safe = !relative.empty() && !relative.has_root_path();
+				for (const auto& part : relative) {
+					if (part == ".." || part.native().find(L':') != std::wstring::npos) safe = false;
+				}
+				const auto normalized = relative.lexically_normal();
+				const auto key = NormalizeRelativePathKey(normalized);
+				const auto extension = ToLowerAscii(normalized.extension().string());
+				if (!safe || !key.starts_with("src/") || (extension != ".txt" && extension != ".xml")) {
+					if (outError) *outError = "invalid_previous_source_path";
+					return false;
+				}
+				paths.push_back(normalized);
+			}
+		}
+		return true;
+	}
+	return true;
+}
+
+bool RemoveObsoleteSourceFiles(
+	const std::filesystem::path& root,
+	const std::vector<std::filesystem::path>& previousPaths,
+	const std::unordered_set<std::string>& writtenPaths,
+	std::string* outError)
+{
+	for (const auto& relative : previousPaths) {
+		if (writtenPaths.contains(NormalizeRelativePathKey(relative))) continue;
+		// 不沿符号链接或目录联接删除工作区外的文件，也不递归删除目录。
+		auto target = root;
+		bool missing = false;
+		for (const auto& part : relative) {
+			target /= part;
+			const DWORD attributes = GetFileAttributesW(target.c_str());
+			if (attributes == INVALID_FILE_ATTRIBUTES) {
+				const DWORD error = GetLastError();
+				if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+					missing = true;
+					break;
+				}
+			}
+			if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+				if (outError) *outError = "inspect_obsolete_source_file_failed: " + PathToUtf8(target);
+				return false;
+			}
+		}
+		if (missing) continue;
+		std::error_code ec;
+		if (!std::filesystem::is_regular_file(target, ec) || ec ||
+			!std::filesystem::remove(target, ec) || ec) {
+			if (outError) *outError = "remove_obsolete_source_file_failed: " + PathToUtf8(target);
+			return false;
+		}
+	}
+	return true;
+}
+
 bool AppendUniqueKey(std::vector<std::string>& keys, const std::string& key)
 {
 	if (key.empty()) {
@@ -1315,6 +1400,9 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 		return false;
 	}
 
+	std::vector<std::filesystem::path> previousSourcePaths;
+	if (!ReadPreviousSourcePaths(root, previousSourcePaths, outError)) return false;
+
 	std::unordered_set<std::string> usedRelativePaths;
 	ReserveBundleRelativePaths(usedRelativePaths);
 
@@ -1527,13 +1615,6 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 		? LocalToUtf8Text(ComputeBundleDigest(persistedBundle))
 		: std::string();
 
-	if (!WriteUtf8TextFileBom(GetMetaJsonPath(root), NormalizeCrLf(DumpJson(metaJson)))) {
-		if (outError != nullptr) {
-			*outError = "write_meta_json_failed";
-		}
-		return false;
-	}
-
 	if (!WriteUtf8TextFileBom(root / "image" / "list.json", NormalizeCrLf(DumpJson(imageList))) ||
 		!WriteUtf8TextFileBom(root / "audio" / "list.json", NormalizeCrLf(DumpJson(audioList)))) {
 		if (outError != nullptr) {
@@ -1554,6 +1635,16 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 		std::error_code removeEc;
 		std::filesystem::remove(root / "header" / "header.txt", removeEc);
 		std::filesystem::remove(root / "header", removeEc);
+	}
+
+	// 清理成功后再发布新清单，失败时保留旧文件归属以便重试。
+	if (!RemoveObsoleteSourceFiles(root, previousSourcePaths, usedRelativePaths, outError)) return false;
+
+	if (!WriteUtf8TextFileBom(GetMetaJsonPath(root), NormalizeCrLf(DumpJson(metaJson)))) {
+		if (outError != nullptr) {
+			*outError = "write_meta_json_failed";
+		}
+		return false;
 	}
 
 	return true;
