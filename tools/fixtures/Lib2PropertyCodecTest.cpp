@@ -3,6 +3,8 @@
 #include <iostream>
 #include <stdexcept>
 using namespace e2txt;
+// 支持库公开信息模块会登记运行期警告；该独立测试不链接解包器，提供空实现。
+namespace e2txt { void AddRuntimeWarning(const std::string&) {} }
 static void Require(bool ok, const std::string& message) { if (!ok) throw std::runtime_error(message); }
 int main(int argc, char** argv)
 {

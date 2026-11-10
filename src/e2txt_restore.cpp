@@ -32,6 +32,7 @@
 #include "EFolderCodec.h"
 #include "ConstantResourceOrder.h"
 #include "FormControlPropertyCodec.h"
+#include "FormControlPropertyXml.h"
 #include "PathHelper.h"
 #include "ELanguageEnvironment.h"
 #include "SimpleXmlDocument.h"
@@ -8440,21 +8441,6 @@ std::string GetXmlAttribute(const SimpleXmlNode& node, const std::string& key)
 	return std::string();
 }
 
-FormControlPropertyXmlNode ConvertFormControlPropertyXmlNode(const SimpleXmlNode& node)
-{
-	FormControlPropertyXmlNode converted;
-	converted.name = node.name;
-	converted.attributes.reserve(node.attributes.size());
-	for (const auto& attribute : node.attributes) {
-		converted.attributes.push_back(attribute);
-	}
-	converted.children.reserve(node.children.size());
-	for (const auto& child : node.children) {
-		converted.children.push_back(ConvertFormControlPropertyXmlNode(child));
-	}
-	return converted;
-}
-
 std::size_t CountFormControlTabHeaders(const SimpleXmlNode& node)
 {
 	for (const auto& child : node.children) {
@@ -8731,19 +8717,10 @@ bool BuildFormControlTree(
 	element.tabStop = GetXmlBoolAttribute(node, "可停留焦点", true);
 	element.tabIndex = GetXmlIntAttribute(node, "停留顺序", 0);
 	element.locked = GetXmlBoolAttribute(node, "锁定", false);
+	// 省略“扩展属性数据”时为空，由 Apply 以支持库默认实例为基底按 XML 属性重建。
 	element.extensionData = DecodeBase64(GetXmlAttribute(node, "扩展属性数据"));
-	std::vector<std::pair<std::string, std::string>> xmlAttributes;
-	xmlAttributes.reserve(node.attributes.size());
-	for (const auto& attribute : node.attributes) {
-		xmlAttributes.push_back(attribute);
-	}
-	std::vector<FormControlPropertyXmlNode> xmlChildren;
-	xmlChildren.reserve(node.children.size());
-	for (const auto& child : node.children) {
-		if (StartsWith(child.name, node.name + ".") &&
-			child.name != node.name + ".事件" && child.name != node.name + ".事件定义")
-			xmlChildren.push_back(ConvertFormControlPropertyXmlNode(child));
-	}
+	const auto xmlAttributes = CopyFormControlXmlAttributes(node);
+	const auto xmlChildren = CollectFormControlPropertyXmlNodes(node, node.name);
 	std::vector<std::uint8_t> updatedPropertyData;
 	if (!propertyCodec.Apply(
 				element.dataType,
@@ -8946,17 +8923,8 @@ bool BuildFormsFromXml(
 			selfElement.tabIndex = GetXmlIntAttribute(root, "停留顺序", 0);
 			selfElement.locked = GetXmlBoolAttribute(root, "锁定", false);
 			selfElement.extensionData = DecodeBase64(GetXmlAttribute(root, "扩展属性数据"));
-			std::vector<std::pair<std::string, std::string>> rootAttributes;
-			rootAttributes.reserve(root.attributes.size());
-			for (const auto& attribute : root.attributes) {
-				rootAttributes.push_back(attribute);
-			}
-			std::vector<FormControlPropertyXmlNode> rootPropertyChildren;
-			rootPropertyChildren.reserve(root.children.size());
-			for (const auto& child : root.children) {
-				if (StartsWith(child.name, "窗口.") && child.name != "窗口.事件" && child.name != "窗口.事件定义")
-					rootPropertyChildren.push_back(ConvertFormControlPropertyXmlNode(child));
-			}
+			const auto rootAttributes = CopyFormControlXmlAttributes(root);
+			const auto rootPropertyChildren = CollectFormControlPropertyXmlNodes(root, "窗口");
 			std::vector<std::uint8_t> updatedRootPropertyData;
 			if (!propertyCodec.Apply(
 						selfElement.dataType,

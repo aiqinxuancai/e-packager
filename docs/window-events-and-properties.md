@@ -45,6 +45,22 @@ _启动窗口.标题 ＝ “点击成功”
 
 `ITF_DLG_INIT_CUSTOMIZE_DATA` 是支持库自带的交互编辑对话框接口，`lib2.h` 没有定义通用的自定义属性字节 setter；部分库另外允许通过 `ITF_NOTIFY_PROPERTY_CHANGED` 写入自定义数据，这种情况可直接验证。仅允许对话框编辑的库不能保证无头写入，工具会明确报赋值未持久化，原始全量属性数据仍保留。`ITF_PROPERTY_UPDATE_UI` 是设计器界面的可操作性判断，不作为能否保存字节数据的额外限制。
 
+### 扩展属性数据
+
+`扩展属性数据` 是支持库通过 `ITF_GET_ALL_PROPERTY_DATA` 保存的控件原始字节，XML 中的普通属性和结构化节点都由它解码而来。拆包时对每个控件试做一次不带原始数据的重建：以支持库默认实例为基底，按 XML 属性设置后保存，再与原始字节逐字节比较。比较只忽略 LOGFONT 字体名终止符之后的填充（IDE 保存时常残留未初始化内存），该结构按已解码的字体属性值定位。结果等价时省略该属性，XML 只保留可读属性；以下情况继续保留：
+
+- 支持库或 Win32 属性工作进程不可用，属性未能解码；
+- 原始数据是旧版本格式，支持库保存时会升级为当前格式，例如部分树型框和窗口；
+- 原始数据含公开属性无法表达的私有状态，例如高级表格的颜色标志位、没有列表项时组合框保存的选中项。
+
+保留时，属性修改仍以该字节为基底，未修改的控件原样写回。删除 `扩展属性数据` 后改由 XML 属性完整重建，旧格式和私有状态随之按支持库当前行为规范化。新增控件无需填写该属性。原始数据为空与省略等价，封包都会由默认实例生成完整数据。
+
+应用属性时按支持库公开定义顺序，在同一控件实例上回读，只设置不一致的属性，最多重复 4 轮直到收敛。这样可以处理属性间的依赖（同时新增列表项目并设置现行选中项）和副作用（设置数据源会清空标题）。部分支持库以空数据创建控件时不初始化某些字段，不同实例读到的默认值不同，因此不能拿其他实例的读数判断是否需要设置。setter 要求重新创建控件时，每轮结束后统一重建一次，下一轮在新实例上回读。最后保存、重新创建控件并回读全部 XML 属性，未持久化的值会明确报错。
+
+独立编译器读取窗口时同样以 `扩展属性数据`（或空数据）为基底合并 XML 属性后再解码，与封包结果一致。
+
+属性数据与控件 ID 无关（IDE 复制控件时沿用同一份数据），桥接缓存键不含窗口和控件 ID，请求也只携带属性，同一命令内类型、原始数据和属性都相同的控件复用结果。在 2204 个控件的用户工程上，Win32 解包平均由 6.0 秒变为 6.5 秒，语义回包为 27.3 秒与 26.8 秒，2204 个 `扩展属性数据` 中省略 2131 个。
+
 ## 验证
 
 ```powershell
@@ -111,6 +127,6 @@ python tools/TestFnePublicInfoExport.py --fixture temp/fne-export-check/fixture.
 ```bat
 mkdir temp\lib2-property-check
 cl /nologo /LD /utf-8 /std:c++20 /EHsc /Ielib tools\fixtures\Lib2PropertyTest.cpp /Fotemp\lib2-property-check\fixture.obj /Fetemp\lib2-property-check\fixture.fne /link user32.lib /EXPORT:GetNewInf=_GetNewInf@0
-cl /nologo /utf-8 /std:c++20 /EHsc /Ielib /Isrc tools\fixtures\Lib2PropertyCodecTest.cpp src\FormControlPropertyCodec.cpp src\FormControlPropertyBridge.cpp src\SupportLibraryRuntime.cpp src\PathHelper.cpp /Fotemp\lib2-property-check\ /Fetemp\lib2-property-check\test.exe /link user32.lib advapi32.lib
+cl /nologo /utf-8 /std:c++20 /EHsc /Ielib /Isrc tools\fixtures\Lib2PropertyCodecTest.cpp src\FormControlPropertyCodec.cpp src\FormControlPropertyBridge.cpp src\SupportLibraryRuntime.cpp src\PathHelper.cpp src\RuntimeLogger.cpp src\ELanguageEnvironment.cpp src\SupportLibraryPublicInfo.cpp src\WorkerMessagePipe.cpp /Fotemp\lib2-property-check\ /Fetemp\lib2-property-check\test.exe /link user32.lib advapi32.lib ole32.lib shell32.lib
 temp\lib2-property-check\test.exe %CD%\temp\lib2-property-check\fixture.fne
 ```

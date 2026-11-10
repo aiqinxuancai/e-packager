@@ -114,6 +114,14 @@ json ProcessRequest(const json& request, WorkerContext& context)
                 request.at("unit"), request.at("attributes"), data, &error,
                 request.at("children").get<std::vector<FormControlPropertyXmlNode>>());
             response["data"] = data;
+        } else if (operation == "rebuildable") {
+            // 重建与比较在同一请求内完成，避免为每个控件额外往返传输属性数据。
+            std::string reason;
+            response["rebuildable"] = codec.CanRebuildFromXml(type, request.at("data"), request.at("form"),
+                request.at("unit"), request.at("attributes"),
+                request.at("children").get<std::vector<FormControlPropertyXmlNode>>(), &reason);
+            response["reason"] = reason;
+            response["ok"] = true;
         } else {
             throw std::runtime_error("property_worker_operation_invalid");
         }
@@ -291,7 +299,12 @@ bool InvokeFormControlWorker(const json& request, json& response, std::string* e
     auto& state = State();
     auto effectiveRequest = request;
     effectiveRequest["e_directory"] = PathToUtf8(e_language_environment::GetExplicitDirectory());
-    const auto encoded = json::to_cbor(effectiveRequest);
+    // 属性数据与控件 ID 无关（IDE 复制控件时沿用同一份数据），缓存键不含窗口/控件 ID，
+    // 使同一工程中的相同控件复用结果；工作进程仍收到真实 ID。
+    auto cacheIdentity = effectiveRequest;
+    cacheIdentity.erase("form");
+    cacheIdentity.erase("unit");
+    const auto encoded = json::to_cbor(cacheIdentity);
     const std::string key(encoded.begin(), encoded.end());
     std::lock_guard lock(state.mutex);
     if (const auto found = state.cache.find(key); found != state.cache.end()) {

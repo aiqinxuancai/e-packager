@@ -6424,44 +6424,84 @@ void AppendFormControlPropertyXmlAttributes(
 	}
 }
 
-bool AppendFormControlPropertyXmlChildren(
-	FormXml& formXml,
+// 把解码出的结构化属性和集合整理成窗口 XML 子节点；写出 XML 与重建检查共用这一份节点。
+std::vector<FormControlPropertyXmlNode> BuildFormControlPropertyXmlNodes(
 	const std::string& tagName,
-	const int indent,
 	const FormControlPropertySemanticData& semantic,
 	const bool tabControl)
 {
-	bool appended = false;
+	std::vector<FormControlPropertyXmlNode> nodes;
 	for (const auto& node : semantic.structured) {
-		AppendXmlLine(formXml, indent, BuildXmlOpenTag(tagName + "." + node.name, node.attributes, true));
-		appended = true;
+		FormControlPropertyXmlNode property = node;
+		property.name = tagName + "." + node.name;
+		nodes.push_back(std::move(property));
 	}
 	for (const auto& collection : semantic.collections) {
 		const std::string propertyName = !collection.definition.xmlName.empty()
 			? collection.definition.xmlName : collection.definition.name;
 		if (propertyName.empty()) continue;
-		const std::string containerName = tagName + "." + propertyName;
-		AppendXmlLine(formXml, indent, BuildXmlOpenTag(containerName, {}, false));
+		FormControlPropertyXmlNode container;
+		container.name = tagName + "." + propertyName;
 		if (collection.kind == FormControlPropertyCollectionKind::Integer) {
 			for (std::size_t index = 0; index < collection.integerValues.size(); ++index) {
-				AppendXmlLine(formXml, indent + 1, BuildXmlOpenTag(
-					"项目", {{ "索引", std::to_string(index) },
-					{ "数值", std::to_string(collection.integerValues[index]) }}, true));
+				container.children.push_back({ "项目", {{ "索引", std::to_string(index) },
+					{ "数值", std::to_string(collection.integerValues[index]) }}, {} });
 			}
 		}
 		else {
 			const char* itemName = tabControl ? "子夹" : "项目";
 			const char* valueName = tabControl ? "标题" : "文本";
 			for (std::size_t index = 0; index < collection.textValues.size(); ++index) {
-				AppendXmlLine(formXml, indent + 1, BuildXmlOpenTag(
-					itemName, {{ "索引", std::to_string(index) },
-					{ valueName, collection.textValues[index] }}, true));
+				container.children.push_back({ itemName, {{ "索引", std::to_string(index) },
+					{ valueName, collection.textValues[index] }}, {} });
 			}
 		}
-		AppendXmlLine(formXml, indent, "</" + containerName + ">");
-		appended = true;
+		nodes.push_back(std::move(container));
 	}
-	return appended;
+	return nodes;
+}
+
+void AppendFormControlPropertyXmlNode(
+	FormXml& formXml,
+	const int indent,
+	const FormControlPropertyXmlNode& node)
+{
+	// 带属性的叶子节点自闭合；集合容器即使为空也保留成对标签，便于直接添加项目。
+	if (node.children.empty() && !node.attributes.empty()) {
+		AppendXmlLine(formXml, indent, BuildXmlOpenTag(node.name, node.attributes, true));
+		return;
+	}
+	AppendXmlLine(formXml, indent, BuildXmlOpenTag(node.name, node.attributes, false));
+	for (const auto& child : node.children) {
+		AppendFormControlPropertyXmlNode(formXml, indent + 1, child);
+	}
+	AppendXmlLine(formXml, indent, "</" + node.name + ">");
+}
+
+// 仅凭 XML 属性即可重建等价的原始属性数据时省略“扩展属性数据”，目录中不再保留冗余 Base64；
+// 解码失败、旧版本格式或含私有状态的数据继续原样保留。
+void OmitRebuildableFormControlPropertyData(
+	std::vector<std::pair<std::string, std::string>>& attributes,
+	FormControlPropertyCodec& codec,
+	const FormInfo::ElementInfo& item,
+	const std::uint32_t formId,
+	const std::vector<FormControlPropertyXmlNode>& propertyNodes)
+{
+	std::string reason;
+	if (!codec.CanRebuildFromXml(
+			item.dataType,
+			item.extensionData,
+			formId,
+			static_cast<std::uint32_t>(item.id),
+			attributes,
+			propertyNodes,
+			&reason)) {
+		runtime_logger::Write(runtime_logger::Level::Info,
+			"control_property_data_retained: form=" + std::to_string(formId) +
+			", unit=" + std::to_string(item.id) + ", type=" + std::to_string(item.dataType) + ", reason=" + reason);
+		return;
+	}
+	std::erase_if(attributes, [](const auto& attribute) { return attribute.first == "扩展属性数据"; });
 }
 
 std::vector<FormControlSupportLibrary> BuildFormControlSupportLibraries(const ProgramSection& program)
@@ -6554,6 +6594,7 @@ void BuildFormXmlEntries(
 		auto rootAttributes = formSelf != nullptr
 			? BuildFormControlXmlAttributes(*formSelf, false)
 			: std::vector<std::pair<std::string, std::string>>();
+		std::vector<FormControlPropertyXmlNode> rootPropertyNodes;
 		if (formSelf != nullptr) {
 			AppendFormControlPropertyXmlAttributes(
 				rootAttributes,
@@ -6561,13 +6602,22 @@ void BuildFormXmlEntries(
 				*formSelf,
 				static_cast<std::uint32_t>(form.header.dwId),
 				&rootSemantic);
+			rootPropertyNodes = BuildFormControlPropertyXmlNodes("窗口", rootSemantic, false);
+			OmitRebuildableFormControlPropertyData(
+				rootAttributes,
+				propertyCodec,
+				*formSelf,
+				static_cast<std::uint32_t>(form.header.dwId),
+				rootPropertyNodes);
 		}
 		rootAttributes.insert(rootAttributes.begin(), std::make_pair("名称", formXml.name));
 		if (!TrimAsciiCopy(form.comment).empty()) {
 			rootAttributes.insert(rootAttributes.begin() + 1, std::make_pair("备注", TrimAsciiCopy(form.comment)));
 		}
 		AppendXmlLine(formXml, 0, BuildXmlOpenTag("窗口", rootAttributes, false));
-		AppendFormControlPropertyXmlChildren(formXml, "窗口", 1, rootSemantic, false);
+		for (const auto& node : rootPropertyNodes) {
+			AppendFormControlPropertyXmlNode(formXml, 1, node);
+		}
 		std::set<std::int32_t> listedEventTypes;
 		for (const auto& element : form.elements) {
 			if (!element.isMenu) listedEventTypes.insert(element.dataType);
@@ -6694,17 +6744,24 @@ void BuildFormXmlEntries(
 				static_cast<std::uint32_t>(form.header.dwId),
 				&semantic);
 			const bool isTabControl = resolver.IsTabControlDataType(item.dataType);
+			const auto propertyNodes = BuildFormControlPropertyXmlNodes(tagName, semantic, isTabControl);
+			OmitRebuildableFormControlPropertyData(
+				attributes,
+				propertyCodec,
+				item,
+				static_cast<std::uint32_t>(form.header.dwId),
+				propertyNodes);
 			const bool hasChildren = !item.children.empty();
 			const bool hasEventBindings = !item.events.empty();
-			const bool hasSemanticProperties = !semantic.collections.empty() || !semantic.structured.empty();
-			if (!hasChildren && !hasEventBindings && !hasSemanticProperties) {
+			if (!hasChildren && !hasEventBindings && propertyNodes.empty()) {
 				AppendXmlLine(formXml, indent, BuildXmlOpenTag(tagName, attributes, true));
 				return;
 			}
 
 			AppendXmlLine(formXml, indent, BuildXmlOpenTag(tagName, attributes, false));
-			AppendFormControlPropertyXmlChildren(
-				formXml, tagName, indent + 1, semantic, isTabControl);
+			for (const auto& node : propertyNodes) {
+				AppendFormControlPropertyXmlNode(formXml, indent + 1, node);
+			}
 			AppendFormControlEventXmlLines(formXml, item, tagName, indent + 1, resolver);
 			if (isTabControl) {
 				std::vector<const FormInfo::ElementInfo*> currentGroup;

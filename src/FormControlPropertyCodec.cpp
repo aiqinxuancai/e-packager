@@ -2082,6 +2082,79 @@ bool FillNativePropertyValue(
 	}
 }
 
+// setter 之间可能存在依赖（先有列表项目才能设置现行选中项）或副作用（设置数据源会清空标题），
+// 每轮在同一控件实例上回读修正；轮数用尽仍不一致时由保存后的回读校验报告未持久化。
+constexpr std::size_t kMaxPropertyConvergencePasses = 4;
+
+// 读取控件实例的当前属性值，并按 lib2.h 约定释放 getter 返回的文本或字节集。
+bool ReadLiveUnitProperty(
+	const PFN_GET_PROPERTY_DATA getProperty,
+	const PFN_NOTIFY_LIB notifyLibrary,
+	const HUNIT unit,
+	const FormControlPropertyDefinition& definition,
+	const bool utf8,
+	FormControlPropertyValue& outValue)
+{
+	UNIT_PROPERTY_VALUE rawValue = {};
+	if (!CallGetPropertyDataSafely(getProperty, unit, static_cast<int>(definition.callbackIndex), rawValue)) {
+		return false;
+	}
+	const bool valueRead = ReadUnitPropertyValue(definition, rawValue, utf8, outValue);
+	if (valueRead &&
+		(outValue.kind == FormControlPropertyValueKind::Text ||
+			outValue.kind == FormControlPropertyValueKind::Binary)) {
+		const void* returnedData = outValue.kind == FormControlPropertyValueKind::Text
+			? static_cast<const void*>(rawValue.m_szText)
+			: static_cast<const void*>(rawValue.m_data.m_pData);
+		// lib2.h 明确规定 getter 返回的文本/字节集由调用方释放。
+		FreePropertyValueDataSafely(notifyLibrary, returnedData);
+	}
+	if (!valueRead) {
+		return false;
+	}
+	if (definition.dataType == UD_FONT && outValue.binaryValue.size() == sizeof(LOGFONTA)) {
+		// LOGFONT 字体名结束后的未初始化尾部不是属性值，禁止泄露到 XML。
+		const auto begin = outValue.binaryValue.begin() + offsetof(LOGFONTA, lfFaceName);
+		const auto end = std::find(begin, outValue.binaryValue.end(), std::uint8_t{0});
+		if (end != outValue.binaryValue.end()) std::fill(end, outValue.binaryValue.end(), 0);
+	}
+	return true;
+}
+
+// 比较两份原始属性数据。LOGFONT 字体名终止符之后的填充不是属性值（IDE 保存时常残留
+// 未初始化内存），按两份数据共有的字体属性值定位该结构，只忽略其填充区域。
+bool ArePropertyDataEquivalent(
+	const std::vector<std::uint8_t>& original,
+	const std::vector<std::uint8_t>& rebuilt,
+	const std::vector<FormControlPropertyValue>& values)
+{
+	if (original.size() != rebuilt.size()) {
+		return false;
+	}
+	std::vector<std::uint8_t> left = original;
+	std::vector<std::uint8_t> right = rebuilt;
+	for (const auto& value : values) {
+		if (value.definition.dataType != UD_FONT || value.binaryValue.size() != sizeof(LOGFONTA)) {
+			continue;
+		}
+		const auto font = value.binaryValue.begin();
+		const auto terminator = std::find(font + offsetof(LOGFONTA, lfFaceName), value.binaryValue.end(), std::uint8_t{0});
+		if (terminator == value.binaryValue.end()) {
+			continue;
+		}
+		const auto significant = terminator - font + 1;
+		constexpr auto fontSize = static_cast<std::ptrdiff_t>(sizeof(LOGFONTA));
+		for (std::ptrdiff_t offset = 0; offset + fontSize <= static_cast<std::ptrdiff_t>(left.size()); ++offset) {
+			if (!std::equal(font, font + significant, left.begin() + offset)) {
+				continue;
+			}
+			std::fill(left.begin() + offset + significant, left.begin() + offset + fontSize, std::uint8_t{0});
+			std::fill(right.begin() + offset + significant, right.begin() + offset + fontSize, std::uint8_t{0});
+		}
+	}
+	return left == right;
+}
+
 }  // namespace
 
 }  // namespace e2txt
@@ -2151,33 +2224,15 @@ bool FormControlPropertyCodec::Decode(
 		return false;
 	}
 	for (std::size_t index = context.fixedPropertyCount; index < context.properties.size(); ++index) {
-		UNIT_PROPERTY_VALUE rawValue = {};
-		if (!CallGetPropertyDataSafely(
-				context.getProperty,
-				unit,
-				static_cast<int>(context.properties[index].callbackIndex),
-				rawValue)) {
-			continue;
-		}
 		FormControlPropertyValue value;
-		const bool valueRead = ReadUnitPropertyValue(context.properties[index], rawValue, context.utf8, value);
-		if (valueRead &&
-			(value.kind == FormControlPropertyValueKind::Text ||
-				value.kind == FormControlPropertyValueKind::Binary)) {
-			const void* returnedData = value.kind == FormControlPropertyValueKind::Text
-				? static_cast<const void*>(rawValue.m_szText)
-				: static_cast<const void*>(rawValue.m_data.m_pData);
-			// lib2.h 明确规定 getter 返回的文本/字节集由调用方释放。
-			FreePropertyValueDataSafely(context.notifyLibrary, returnedData);
-		}
-		if (!valueRead) {
+		if (!ReadLiveUnitProperty(
+				context.getProperty,
+				context.notifyLibrary,
+				unit,
+				context.properties[index],
+				context.utf8,
+				value)) {
 			continue;
-		}
-		if (value.definition.dataType == UD_FONT && value.binaryValue.size() == sizeof(LOGFONTA)) {
-			// LOGFONT 字体名结束后的未初始化尾部不是属性值，禁止泄露到 XML。
-			const auto begin = value.binaryValue.begin() + offsetof(LOGFONTA, lfFaceName);
-			const auto end = std::find(begin, value.binaryValue.end(), std::uint8_t{0});
-			if (end != value.binaryValue.end()) std::fill(end, value.binaryValue.end(), 0);
 		}
 		if (outSemantic != nullptr && value.definition.dataType == UD_FONT) {
 			FormControlPropertyXmlNode node;
@@ -2233,27 +2288,59 @@ bool FormControlPropertyCodec::Apply(
 
 	if (m_executionMode == FormControlExecutionMode::Isolated) {
 		auto request = nlohmann::json::from_cbor(BridgeContext());
+		// 只发送属性，名称、位置等保留字段不影响结果，相同控件可复用桥接缓存。
 		request.update({{"operation", "apply"}, {"type", dataType}, {"data", originalData}, {"form", formId},
-			{"unit", unitId}, {"attributes", xmlAttributes}, {"children", xmlChildren}});
+			{"unit", unitId}, {"attributes", propertyAttributes}, {"children", xmlChildren}});
 		nlohmann::json response;
 		if (!InvokeFormControlWorker(request, response, outError)) return false;
 		outData = response.at("data").get<std::vector<std::uint8_t>>();
 		return true;
+	}
+	return ApplyInProcess(dataType, originalData, formId, unitId, propertyAttributes, xmlChildren,
+		outData, outError, nullptr, true);
+}
+
+bool FormControlPropertyCodec::ApplyInProcess(
+	const std::int32_t dataType,
+	const std::vector<std::uint8_t>& originalData,
+	const std::uint32_t formId,
+	const std::uint32_t unitId,
+	const std::vector<std::pair<std::string, std::string>>& propertyAttributes,
+	const std::vector<FormControlPropertyXmlNode>& xmlChildren,
+	std::vector<std::uint8_t>& outData,
+	std::string* outError,
+	std::vector<FormControlPropertyValue>* outTargets,
+	const bool verifyPersisted)
+{
+	outData = originalData;
+	if (outTargets != nullptr) {
+		outTargets->clear();
 	}
 	TypeContext context;
 	if (!BuildTypeContext(dataType, context, outError)) {
 		return false;
 	}
 	std::vector<FormControlPropertyValue> originalValues;
-	const bool canReadOriginal = Decode(
-		dataType,
-		originalData,
-		formId,
-		unitId,
-		originalValues,
-		nullptr);
+	bool canReadOriginal = false;
+	if (const auto cached = m_defaultValues.find(dataType); originalData.empty() && cached != m_defaultValues.end()) {
+		originalValues = cached->second;
+		canReadOriginal = true;
+	}
+	else {
+		canReadOriginal = Decode(dataType, originalData, formId, unitId, originalValues, nullptr);
+		if (originalData.empty() && canReadOriginal) m_defaultValues.emplace(dataType, originalValues);
+	}
+	const auto findOriginal = [&originalValues](const FormControlPropertyDefinition& definition) {
+		return std::find_if(
+			originalValues.begin(),
+			originalValues.end(),
+			[&definition](const FormControlPropertyValue& value) {
+				return value.definition.metadataIndex == definition.metadataIndex;
+			});
+	};
 
-	std::vector<FormControlPropertyValue> updates;
+	// XML 中出现的每个属性都是目标值；是否需要调用 setter 由控件实例回读决定。
+	std::vector<FormControlPropertyValue> targets;
 	for (const auto& attribute : propertyAttributes) {
 		const auto definitionIt = std::find_if(
 			context.properties.begin() + static_cast<std::ptrdiff_t>(context.fixedPropertyCount),
@@ -2285,11 +2372,8 @@ bool FormControlPropertyCodec::Apply(
 			// preserve it as bytes without needing to know the private payload ABI.
 			unknownKind = FormControlPropertyValueKind::Binary;
 		}
-		for (const auto& original : originalValues) {
-			if (original.definition.metadataIndex == definitionIt->metadataIndex) {
-				unknownKind = original.kind;
-				break;
-			}
+		if (const auto original = findOriginal(*definitionIt); original != originalValues.end()) {
+			unknownKind = original->kind;
 		}
 		if (!ParseXmlPropertyValue(*definitionIt, attribute.second, parsed, unknownKind)) {
 			if (outError != nullptr) {
@@ -2297,20 +2381,7 @@ bool FormControlPropertyCodec::Apply(
 			}
 			return false;
 		}
-		const auto originalIt = std::find_if(
-			originalValues.begin(),
-			originalValues.end(),
-			[&definitionIt](const FormControlPropertyValue& value) {
-				return value.definition.metadataIndex == definitionIt->metadataIndex;
-			});
-		if (canReadOriginal && originalIt != originalValues.end() && AreValuesEquivalent(*originalIt, parsed)) {
-			continue;
-		}
-		if ((parsed.definition.state & (UW_ONLY_READ | UW_CANNOT_INIT)) != 0) {
-			if (outError) *outError = "window_control_property_not_design_writable: " + parsed.definition.xmlName;
-			return false;
-		}
-		updates.push_back(std::move(parsed));
+		targets.push_back(std::move(parsed));
 	}
 
 	for (const auto& definition : context.properties) {
@@ -2327,11 +2398,11 @@ bool FormControlPropertyCodec::Apply(
 			}
 			return false;
 		}
+		const auto original = findOriginal(definition);
 		std::vector<std::uint8_t> structuredData;
 		bool encoded = false;
 		if (definition.dataType == UD_FONT) {
-			for (const auto& original : originalValues)
-				if (original.definition.metadataIndex == definition.metadataIndex) structuredData = original.binaryValue;
+			if (original != originalValues.end()) structuredData = original->binaryValue;
 			encoded = EncodeFontNode(*structuredNode, structuredData);
 		} else {
 			FormControlPropertyCollectionKind collectionKind;
@@ -2348,10 +2419,6 @@ bool FormControlPropertyCodec::Apply(
 					}
 					break;
 				}
-				const auto original = std::find_if(originalValues.begin(), originalValues.end(),
-					[&definition](const auto& value) {
-						return value.definition.metadataIndex == definition.metadataIndex;
-					});
 				if (!hasKind) hasKind = original != originalValues.end() && TryInferCollectionKind(*original, collectionKind);
 			}
 			encoded = hasKind && EncodeStructuredProperty(*structuredNode, collectionKind, context.utf8, structuredData);
@@ -2364,26 +2431,29 @@ bool FormControlPropertyCodec::Apply(
 		parsed.definition = definition;
 		parsed.kind = FormControlPropertyValueKind::Binary;
 		parsed.binaryValue = std::move(structuredData);
-		const auto originalIt = std::find_if(
-			originalValues.begin(),
-			originalValues.end(),
-			[&definition](const FormControlPropertyValue& value) {
-				return value.definition.metadataIndex == definition.metadataIndex;
-			});
-		if (canReadOriginal && originalIt != originalValues.end() && AreValuesEquivalent(*originalIt, parsed)) {
-			continue;
-		}
-		if ((parsed.definition.state & (UW_ONLY_READ | UW_CANNOT_INIT)) != 0) {
-			if (outError) *outError = "window_control_property_not_design_writable: " + parsed.definition.xmlName;
-			return false;
-		}
-		updates.push_back(std::move(parsed));
+		targets.push_back(std::move(parsed));
 	}
-
-	if (updates.empty()) {
+	if (targets.empty()) {
 		return true;
 	}
-	if (context.notify == nullptr || context.getAll == nullptr) {
+	// 窗口 XML 解析后的属性没有稳定顺序；统一按支持库公开定义顺序应用，
+	// 使解包时的重建检查与实际封包得到相同结果。
+	std::stable_sort(targets.begin(), targets.end(), [](const auto& left, const auto& right) {
+		return left.definition.metadataIndex < right.definition.metadataIndex;
+	});
+	if (outTargets != nullptr) {
+		*outTargets = targets;
+	}
+
+	// 原始数据已满足全部目标值时保留原字节，不让字体填充等私有字节随封包改变。
+	if (!originalData.empty() && canReadOriginal &&
+		std::all_of(targets.begin(), targets.end(), [&](const FormControlPropertyValue& target) {
+			const auto original = findOriginal(target.definition);
+			return original != originalValues.end() && AreValuesEquivalent(*original, target);
+		})) {
+		return true;
+	}
+	if (context.create == nullptr || context.getProperty == nullptr) {
 		if (outError != nullptr) *outError = "window_control_property_update_interface_unavailable";
 		return false;
 	}
@@ -2392,30 +2462,66 @@ bool FormControlPropertyCodec::Apply(
 		if (outError != nullptr) *outError = "window_control_create_failed";
 		return false;
 	}
-	for (const auto& update : updates) {
-		UNIT_PROPERTY_VALUE nativeValue = {};
-		std::string nativeText;
-		bool needsRecreate = false;
-		if (!FillNativePropertyValue(update, context.utf8, nativeText, nativeValue) ||
-			!CallNotifyPropertyChangedSafely(
-				context.notify,
-				unit,
-				static_cast<int>(update.definition.callbackIndex),
-				nativeValue,
-				needsRecreate)) {
-			if (outError != nullptr) *outError = "window_control_property_update_failed: " + update.definition.xmlName;
-			return false;
+	// 以同一控件实例的回读值为基准，只对不一致的属性调用 setter。不能拿其他实例的读数比较：
+	// 部分支持库以空数据创建时不初始化字段，每个实例读到的默认值都不同。
+	bool modified = false;
+	for (std::size_t pass = 0; pass < kMaxPropertyConvergencePasses; ++pass) {
+		bool changed = false;
+		std::string recreateProperty;
+		for (const auto& target : targets) {
+			FormControlPropertyValue current;
+			const bool readable = ReadLiveUnitProperty(
+				context.getProperty, context.notifyLibrary, unit, target.definition, context.utf8, current);
+			// 无法回读的值只设置一次，是否保存成功由最终校验给出结论。
+			if (readable ? AreValuesEquivalent(target, current) : pass != 0) {
+				continue;
+			}
+			if ((target.definition.state & (UW_ONLY_READ | UW_CANNOT_INIT)) != 0) {
+				if (outError) *outError = "window_control_property_not_design_writable: " + target.definition.xmlName;
+				return false;
+			}
+			if (context.notify == nullptr || context.getAll == nullptr) {
+				if (outError != nullptr) *outError = "window_control_property_update_interface_unavailable";
+				return false;
+			}
+			UNIT_PROPERTY_VALUE nativeValue = {};
+			std::string nativeText;
+			bool needsRecreate = false;
+			if (!FillNativePropertyValue(target, context.utf8, nativeText, nativeValue) ||
+				!CallNotifyPropertyChangedSafely(
+					context.notify,
+					unit,
+					static_cast<int>(target.definition.callbackIndex),
+					nativeValue,
+					needsRecreate)) {
+				if (outError != nullptr) *outError = "window_control_property_update_failed: " + target.definition.xmlName;
+				return false;
+			}
+			if (needsRecreate) {
+				recreateProperty = target.definition.xmlName;
+			}
+			changed = true;
+			modified = true;
 		}
-		if (needsRecreate) {
+		// lib2.h：setter 已更新内部数据，返回真只表示外形需重新创建才能刷新。每轮结束后
+		// 统一重建一次，下一轮在新实例上回读全部目标值，避免逐个属性重复创建控件。
+		if (!recreateProperty.empty()) {
 			const HGLOBAL saved = CallGetAllPropertyDataSafely(context.getAll, unit);
 			std::vector<std::uint8_t> data;
 			const bool copied = saved != nullptr && CopyGlobalBytes(saved, data);
 			if (saved) GlobalFree(saved);
 			if (!copied || (unit = static_cast<HUNIT>(CreateUnit(context, data, formId, unitId))) == 0) {
-				if (outError) *outError = "window_control_property_recreate_failed: " + update.definition.xmlName;
+				if (outError) *outError = "window_control_property_recreate_failed: " + recreateProperty;
 				return false;
 			}
 		}
+		if (!changed) {
+			break;
+		}
+	}
+	// 实例未作修改说明原始数据已满足目标值；没有保存接口时空数据也只能保持原样。
+	if (!modified && (!originalData.empty() || context.getAll == nullptr)) {
+		return true;
 	}
 
 	const HGLOBAL globalData = CallGetAllPropertyDataSafely(context.getAll, unit);
@@ -2429,17 +2535,79 @@ bool FormControlPropertyCodec::Apply(
 		if (outError != nullptr) *outError = "window_control_property_save_data_invalid";
 		return false;
 	}
-	// setter 可能拒绝值却正常返回；以序列化后重新创建的读数判断是否真正保存。
+	if (!verifyPersisted) {
+		return true;
+	}
+	// setter 可能拒绝值却正常返回，也可能影响其他属性；以序列化后重新创建的读数核对全部目标值。
 	std::vector<FormControlPropertyValue> persisted;
 	if (!Decode(dataType, outData, formId, unitId, persisted, outError)) return false;
-	for (const auto& update : updates) {
+	for (const auto& target : targets) {
 		const auto found = std::find_if(persisted.begin(), persisted.end(), [&](const auto& value) {
-			return value.definition.metadataIndex == update.definition.metadataIndex;
+			return value.definition.metadataIndex == target.definition.metadataIndex;
 		});
-		if (found == persisted.end() || !AreValuesEquivalent(update, *found)) {
-			if (outError) *outError = "window_control_property_not_persisted: " + update.definition.xmlName;
+		if (found == persisted.end() || !AreValuesEquivalent(target, *found)) {
+			if (outError) *outError = "window_control_property_not_persisted: " + target.definition.xmlName;
 			return false;
 		}
+	}
+	return true;
+}
+
+bool FormControlPropertyCodec::CanRebuildFromXml(
+	const std::int32_t dataType,
+	const std::vector<std::uint8_t>& originalData,
+	const std::uint32_t formId,
+	const std::uint32_t unitId,
+	const std::vector<std::pair<std::string, std::string>>& xmlAttributes,
+	const std::vector<FormControlPropertyXmlNode>& xmlChildren,
+	std::string* outReason)
+{
+	if (outReason != nullptr) {
+		outReason->clear();
+	}
+	// 空数据与省略等价：封包都会从支持库默认实例重建。
+	if (originalData.empty()) {
+		return true;
+	}
+	std::vector<std::pair<std::string, std::string>> propertyAttributes;
+	for (const auto& attribute : xmlAttributes) {
+		if (!IsReservedXmlAttribute(attribute.first)) {
+			propertyAttributes.push_back(attribute);
+		}
+	}
+	if (propertyAttributes.empty() && xmlChildren.empty()) {
+		if (outReason != nullptr) *outReason = "no_decoded_property";
+		return false;
+	}
+	if (m_executionMode == FormControlExecutionMode::Isolated) {
+		auto request = nlohmann::json::from_cbor(BridgeContext());
+		request.update({{"operation", "rebuildable"}, {"type", dataType}, {"data", originalData}, {"form", formId},
+			{"unit", unitId}, {"attributes", propertyAttributes}, {"children", xmlChildren}});
+		nlohmann::json response;
+		std::string error;
+		if (!InvokeFormControlWorker(request, response, &error)) {
+			if (outReason != nullptr) *outReason = "worker_failed: " + error;
+			return false;
+		}
+		if (outReason != nullptr) *outReason = response.value("reason", std::string());
+		return response.value("rebuildable", false);
+	}
+	// 重建结果随后与原始数据逐字节比较：等价时回读值必然与原始数据一致，无需再创建控件核对；
+	// 不等价时无论回读结果如何都保留原始数据。XML 目标值即原始数据解码值，用于定位字体结构。
+	std::vector<std::uint8_t> rebuilt;
+	std::vector<FormControlPropertyValue> targets;
+	std::string error;
+	if (!ApplyInProcess(dataType, {}, formId, unitId, propertyAttributes, xmlChildren, rebuilt, &error, &targets, false)) {
+		if (outReason != nullptr) *outReason = "rebuild_failed: " + error;
+		return false;
+	}
+	if (!ArePropertyDataEquivalent(originalData, rebuilt, targets)) {
+		// 常见原因：旧版本格式会被支持库升级，或原始数据含公开属性无法表达的私有状态。
+		if (outReason != nullptr) {
+			*outReason = "rebuilt_data_differs: original_size=" + std::to_string(originalData.size()) +
+				", rebuilt_size=" + std::to_string(rebuilt.size());
+		}
+		return false;
 	}
 	return true;
 }

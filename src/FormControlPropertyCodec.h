@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -115,7 +116,8 @@ public:
 		std::string* outError = nullptr,
 		FormControlPropertySemanticData* outSemantic = nullptr);
 
-	// 根据 XML 中出现的专属属性更新原始属性数据。未出现的字段保持原值。
+	// 根据 XML 中出现的专属属性更新原始属性数据。未出现的字段保持原值；
+	// 原始数据为空时以支持库默认实例为基底，由 XML 属性完整重建。
 	bool Apply(
 		std::int32_t dataType,
 		const std::vector<std::uint8_t>& originalData,
@@ -125,6 +127,17 @@ public:
 		std::vector<std::uint8_t>& outData,
 		std::string* outError = nullptr,
 		const std::vector<FormControlPropertyXmlNode>& xmlChildren = {});
+
+	// 判断不带原始数据、仅凭 XML 属性重建的结果是否与原始属性数据等价，
+	// 等价时窗口 XML 可省略“扩展属性数据”。outReason 返回不等价的原因。
+	bool CanRebuildFromXml(
+		std::int32_t dataType,
+		const std::vector<std::uint8_t>& originalData,
+		std::uint32_t formId,
+		std::uint32_t unitId,
+		const std::vector<std::pair<std::string, std::string>>& xmlAttributes,
+		const std::vector<FormControlPropertyXmlNode>& xmlChildren,
+		std::string* outReason = nullptr);
 
 	// 从支持库公开事件表读取名称和原生索引，包含 IDE 通用事件。
 	bool ReadEvents(std::int32_t dataType, std::vector<FormControlEventDefinition>& events, std::string* outError);
@@ -138,6 +151,19 @@ private:
 	struct LibraryState;
 	struct TypeContext;
 
+	// 进程内执行 Apply（属性已去除保留字段）；outTargets 返回按定义顺序排列的 XML 目标值。
+	// verifyPersisted 为假时跳过保存后的回读核对，仅供随后逐字节比较结果的重建检查使用。
+	bool ApplyInProcess(
+		std::int32_t dataType,
+		const std::vector<std::uint8_t>& originalData,
+		std::uint32_t formId,
+		std::uint32_t unitId,
+		const std::vector<std::pair<std::string, std::string>>& propertyAttributes,
+		const std::vector<FormControlPropertyXmlNode>& xmlChildren,
+		std::vector<std::uint8_t>& outData,
+		std::string* outError,
+		std::vector<FormControlPropertyValue>* outTargets,
+		bool verifyPersisted);
 	LibraryState* EnsureLibrary(std::uint16_t supportIndex);
 	bool BuildTypeContext(
 		std::int32_t dataType,
@@ -156,6 +182,8 @@ private:
 	const bool m_restrictSearch = false;
 	const FormControlExecutionMode m_executionMode;
 	std::vector<LibraryState> m_libraryStates;
+	// 空数据创建的默认属性值，只用于推断值类型和补全结构化属性，按控件类型缓存。
+	std::unordered_map<std::int32_t, std::vector<FormControlPropertyValue>> m_defaultValues;
 	void* m_parentWindow = nullptr;
 	// 复用隐藏的顶层宿主；每条请求使用独立子容器，销毁时连同临时控件一起释放。
 	void* m_probeHostWindow = nullptr;

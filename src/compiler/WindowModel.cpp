@@ -1,6 +1,7 @@
 ﻿#include "WindowModel.h"
 
 #include "../FormControlPropertyCodec.h"
+#include "../FormControlPropertyXml.h"
 #include "../PathHelper.h"
 #include "../SimpleXmlDocument.h"
 
@@ -406,10 +407,13 @@ void ReadEvents(
 	}
 }
 
+// 与封包相同：以“扩展属性数据”为基底合并 XML 属性（省略时由属性重建），再解码实际生效的属性。
 bool ReadPropertyData(
 	const Program& program,
 	const std::int32_t dataType,
 	const std::vector<std::uint8_t>& extensionData,
+	const e2txt::SimpleXmlNode& node,
+	const std::string& tagName,
 	const std::uint32_t formId,
 	const std::uint32_t unitId,
 	std::vector<WindowProperty>& output,
@@ -435,8 +439,11 @@ bool ReadPropertyData(
 		// a persisted e5.6 absolute path before the adapter FNE, producing a
 		// different property ABI and spurious CREATE_UNIT failures.
 		!program.supportLibrarySearchDirectories.empty());
+	std::vector<std::uint8_t> effectiveData;
+	if (!codec.Apply(dataType, extensionData, formId, unitId, e2txt::CopyFormControlXmlAttributes(node),
+			effectiveData, outError, e2txt::CollectFormControlPropertyXmlNodes(node, tagName))) return false;
 	std::vector<e2txt::FormControlPropertyValue> values;
-	if (!codec.Decode(dataType, extensionData, formId, unitId, values, outError, outSemantic)) return false;
+	if (!codec.Decode(dataType, effectiveData, formId, unitId, values, outError, outSemantic)) return false;
 	for (const auto& value : values) {
 		WindowProperty property;
 		CopyDecodedProperty(value, property);
@@ -496,7 +503,7 @@ bool ReadControl(
 	if (typeCode != 0) {
 		std::string propertyError;
 		const bool propertyDecoded = ReadPropertyData(program, static_cast<std::int32_t>(typeCode), control.extensionData,
-			formId, control.id, control.properties, &propertyError, &semantic);
+			node, control.typeName, formId, control.id, control.properties, &propertyError, &semantic);
 		if (!propertyDecoded) {
 			// Keep diagnostics ASCII-safe: the CLI may be running under CP936,
 			// while control names are UTF-8 and would otherwise appear garbled.
@@ -743,7 +750,7 @@ bool BuildWindowModel(Program& program, std::string& outError)
 		const std::uint32_t formTypeCode = ResolveTypeCode(program, "窗口");
 		if (formTypeCode != 0) {
 			(void)ReadPropertyData(program, static_cast<std::int32_t>(formTypeCode), form.extensionData,
-				form.id, form.id, form.properties, nullptr, nullptr);
+				root, "窗口", form.id, form.id, form.properties, nullptr, nullptr);
 		}
 		ReadEvents(root, "窗口.事件", program, binding.className, form.events);
 		for (const auto& child : root.children) {
