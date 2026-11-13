@@ -1046,7 +1046,9 @@ bool NeedsEscapedTextLiteral(const std::string& text)
 		return true;
 	}
 	for (const unsigned char ch : text) {
-		if (ch == '"' || ch == '\\' || ch == '\r' || ch == '\n' || ch == '\t' || ch < 0x20) {
+		// 易语言中文引号内的反斜杠是普通字符，路径无需进入转义传输格式。
+		// 真正需要转义时仍编码整个载荷，保留控制字符及历史前缀的无损回包。
+		if (ch == '"' || ch == '\r' || ch == '\n' || ch == '\t' || ch < 0x20) {
 			return true;
 		}
 	}
@@ -3313,9 +3315,20 @@ public:
 	{
 		m_currentFunction = function;
 		m_localNames.clear();
+		m_visibleMemberCallableNames.clear();
 		if (function == nullptr) return;
 		for (const auto& item : function->locals) m_localNames.insert(ResolveUserName(item.marker));
 		for (const auto& item : function->params) m_localNames.insert(ResolveUserName(item.marker));
+		// 与回包解析器一致：只有当前类及继承链的成员能遮蔽非限定调用。
+		std::unordered_set<std::int32_t> visited;
+		for (auto owner = ResolveCallableOwnerId(function->ownerClass);
+			owner > 0 && visited.insert(owner).second;) {
+			if (const auto members = m_memberCallableNames.find(owner); members != m_memberCallableNames.end())
+				m_visibleMemberCallableNames.insert(members->second.begin(), members->second.end());
+			const auto base = m_callableBaseTypes.find(owner);
+			if (base == m_callableBaseTypes.end()) break;
+			owner = ResolveCallableOwnerId(base->second);
+		}
 	}
 
 	std::string ResolveVariableReferenceName(std::int32_t id) const
@@ -3358,7 +3371,7 @@ public:
 		const std::string& name = symbols->commandNames[static_cast<size_t>(commandId)];
 		if (name.empty()) return UnresolvedCommandName(libraryIndex, commandId, "command_name_empty_or_unreadable");
 		// 同名 DLL 或用户方法不能遮蔽原生支持库调用的身份。
-		if (qualifyGlobal && m_callableNames.contains(name))
+		if (qualifyGlobal && (m_globalCallableNames.contains(name) || m_visibleMemberCallableNames.contains(name)))
 			return symbols->fileName + "::" + name;
 		return name;
 	}
@@ -3481,6 +3494,18 @@ public:
 	}
 
 private:
+	// 模块内联可能保留上游类型 ID；名称作用域统一使用实际承载方法的代码页 ID。
+	std::int32_t ResolveCallableOwnerId(std::int32_t owner) const
+	{
+		// 0/-1 表示无基类/根对象，不能把空内存地址索引当成实际类作用域。
+		if (owner <= 0) return owner;
+		if (const auto page = m_classTypePageById.find(owner); page != m_classTypePageById.end())
+			return page->second;
+		if (const auto type = m_typeNameId.find(owner); type != m_typeNameId.end())
+			return type->second;
+		return owner;
+	}
+
 	std::string ResolveTypeUncached(std::int32_t typeValue)
 	{
 		if (typeValue == 0) {
@@ -3645,9 +3670,8 @@ private:
 	void BuildReferenceIndexes()
 	{
 		// 此处保留原始名称比较规则，不能与消歧后的显示名称集合合并。
-		m_callableNames.reserve(m_program.functions.size() + m_program.dlls.size());
-		for (const auto& function : m_program.functions) m_callableNames.insert(function.name);
-		for (const auto& dll : m_program.dlls) m_callableNames.insert(dll.name);
+		m_globalCallableNames.reserve(m_program.functions.size() + m_program.dlls.size());
+		for (const auto& dll : m_program.dlls) m_globalCallableNames.insert(dll.name);
 		for (const auto& page : m_program.codePages) m_rawTypeNames.insert(page.name);
 		for (const auto& type : m_program.dataTypes) m_rawTypeNames.insert(type.name);
 		for (const auto& type : m_program.dataTypes) {
@@ -3657,6 +3681,14 @@ private:
 		for (const auto& page : m_program.codePages) {
 			m_typeNameId.emplace(page.header.dwId, page.header.dwId);
 			m_typeNameId.emplace(page.header.dwUnk, page.header.dwId);
+			m_callableBaseTypes.emplace(page.header.dwId, page.baseClass);
+		}
+		for (const auto& function : m_program.functions) {
+			const auto owner = ResolveCallableOwnerId(function.ownerClass);
+			m_memberCallableNames[owner].insert(function.name);
+			// 普通/窗口程序集方法属于全局；其他对象类的方法不参与全局重名判定。
+			if (epl_system_id::GetType(owner) != epl_system_id::kTypeClass)
+				m_globalCallableNames.insert(function.name);
 		}
 		for (const auto& [id, name] : m_userNameCache) {
 			const auto kind = epl_system_id::GetType(id);
@@ -4022,7 +4054,9 @@ private:
 	const FunctionInfo* m_currentFunction = nullptr;
 	std::unordered_map<std::int32_t, std::string> m_userNameCache;
 	std::unordered_map<std::int32_t, std::string> m_resolvedTypeNames;
-	std::unordered_set<std::string> m_callableNames, m_rawTypeNames;
+	std::unordered_set<std::string> m_globalCallableNames, m_visibleMemberCallableNames, m_rawTypeNames;
+	std::unordered_map<std::int32_t, std::unordered_set<std::string>> m_memberCallableNames;
+	std::unordered_map<std::int32_t, std::int32_t> m_callableBaseTypes;
 	std::unordered_map<std::int32_t, const FunctionInfo*> m_functionById;
 	std::unordered_map<std::int32_t, std::int32_t> m_typeNameId, m_memberFormById, m_controlFormById;
 	std::unordered_set<std::string> m_userTypeNames, m_globalMemberNames, m_localNames;

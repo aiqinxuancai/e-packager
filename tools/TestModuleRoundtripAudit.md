@@ -20,7 +20,7 @@ py -3 -X utf8 tools/TestModuleRoundtripAudit.py `
 5. 检查每条注释仍在对应文件，比较全部源码／窗口内容、图片／音频索引和二进制数据。文本比较仅忽略空行及行首尾空白，不忽略注释或语句。
 6. 将再次拆出的目录回包为 `second.e`，记录能否继续回包。最后重新读取全部受测原文件，检查大小和两个哈希均未变化，并复核工具二进制没有中途变化。
 
-首次和再次拆包都扫描主工程 `src/` 下文本及 XML 中的 `_Lib*`，记录文件、原始行号、符号和整行内容。即使命令返回 0，发现占位符或 `control_property_decode_failed` 也列为问题。
+首次和再次拆包都扫描主工程 `src/` 下文本及 XML 中的原生符号占位符，包括 `_Lib*`、`_Cls_0x*`、`_Sub_0x*`、`_User_0x*` 等，记录文件、原始行号、符号和整行内容。即使命令返回 0，发现占位符或 `control_property_decode_failed` 也列为问题。
 
 页尾修改使工程摘要失效，当前回包器保留声明身份并禁止复用旧执行代码，进行语义重建；脚本本身不手动删除快照。空程序集中的页尾注释是否能保留也纳入检查。无类／程序集可修改的样本单独标记，不冒充语义回包通过。
 
@@ -38,7 +38,7 @@ py -3 -X utf8 tools/TestModuleRoundtripAudit.py `
 - `results.json` / `summary.json` / `report.md`：详细结果、汇总和 Markdown 问题清单。
 - `content.diff.txt`：每个差异文本文件最多保留 160 行 unified diff；全部差异文件名记录在 `result.json`。
 
-脚本完成发现问题返回 1；这不意味着脚本没有完成测试。`unpack_unresolved_tokens` / `reunpack_unresolved_tokens` 表示发现 `_Lib*`，需要结合依赖日志判断是否缺库，并排除用户自定义的同前缀名称。`*_property_decode_failed` 表示控件属性未能完整读取。源码不一致也需查看差异，区分语义丢失、注释丢失、路径变化和资源索引变化。
+脚本完成发现问题返回 1；这不意味着脚本没有完成测试。`unpack_unresolved_tokens` / `reunpack_unresolved_tokens` 表示发现原生符号占位符，需要结合依赖日志判断是否缺库或缺失类型名称，并排除用户自定义的同前缀名称。`*_property_decode_failed` 表示控件属性未能完整读取。源码不一致也需查看差异，区分语义丢失、注释丢失、路径变化和资源索引变化。
 
 定向复现（编号取决于完整目录排序，应先核对 `manifest.json`）：
 

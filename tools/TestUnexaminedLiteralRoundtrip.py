@@ -36,6 +36,12 @@ def main():
         '    不存在的命令 (“普通内容”)',
         '.如果真结束',
     ]
+    # 普通路径使用 IDE 原文；控制字符和历史前缀仍须无损传输。
+    expected_lines = [
+        line.replace(r'“#e2txt_text#C:\\data\\index.html”', r'“C:\data\index.html”')
+            .replace(r'“#e2txt_text#C:\\path”', r'“C:\path”')
+        for line in lines
+    ]
     for arch in ['Win32', 'x64']:
         exe = binaries / f'{arch}/Release/e-packager.exe'
         root = args.output / arch
@@ -52,7 +58,7 @@ def main():
             workspace = root / f'decoded-{iteration}'
             run(decoder, 'unpack', packed, workspace, '--main-only')
             actual = (workspace / page).read_text(encoding='utf-8-sig')
-            for expected in lines:
+            for expected in expected_lines:
                 assert expected in actual, (arch, iteration, expected, actual)
             assert f'semantic-literal-{iteration}' in actual
         print(arch, 'PASS', flush=True)

@@ -92,12 +92,16 @@ def inventory(workspace, preserve_blank_lines=False):
 
 
 def unresolved_tokens(workspace):
-    """记录原始行号，同时检查声明和窗口 XML 中的支持库占位符。"""
+    """记录声明和窗口 XML 中未解析的支持库、类、方法及变量身份。"""
+    # 与导出器 ResolveUserName 的占位命名对应，不能只检查支持库而漏掉类型丢名。
+    placeholder = re.compile(
+        r'_(?:Lib[\w-]*|(?:Sub|User|Mod|Mem|Control|Menu|Const|FormCls|Local|Img|Sound|'
+        r'StructMem|Struct|DllParam|Cls|Form|Dll)_0x[0-9A-Fa-f]+)\b')
     found = []
     for path in sorted((workspace / 'src').rglob('*')):
         if path.is_file() and path.suffix.lower() in ('.txt', '.xml'):
             for number, line in enumerate(path.read_text(encoding='utf-8-sig').splitlines(), 1):
-                tokens = re.findall(r'_Lib[\w-]*', line)
+                tokens = placeholder.findall(line)
                 if tokens:
                     found.append({'path': path.relative_to(workspace).as_posix(),
                                   'line': number, 'tokens': tokens, 'text': line})
@@ -252,7 +256,7 @@ def report(args, manifest, rows, unchanged):
               '- 源码比较仅忽略空行和行首尾空白。') + '资源二进制 SHA256 比较，索引 JSON 结构比较。',
              '- 再拆包临时文件位于输入副本旁，以保留工程目录的支持库查找上下文。',
              '- 不手动删除快照；页尾注释改变源码摘要，回包器保留声明身份并禁止复用旧执行代码。',
-             '- 首次和再次拆包均扫描源码/XML 的 `_Lib*`，记录原始行号；控件属性工作进程失败单列为问题。',
+             '- 首次和再次拆包均扫描源码/XML 的 `_Lib*`、`_Cls_0x*` 等原生符号占位，记录原始行号；控件属性工作进程失败单列为问题。',
              '- .ec 原样回包输出 .ec；修改后输出可编辑 .e，重新编译成 .ec 不属于本轮自动审计。',
              '- 本次不执行 IDE 编译；拆包与内容比较通过不代表 IDE 编译或运行正确。',
              f'- 原文件内容复核：{unchanged}。', '',
