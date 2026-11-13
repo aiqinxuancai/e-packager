@@ -10,6 +10,8 @@ struct WorkspaceWriteOptions {
 	std::string defaultPackOutputFileName;
 	// 同时生成 AGENTS.md 与 README.md；依赖模块副本可关闭说明文档。
 	bool writeAgentsMarkdown = true;
+	// 默认复制当前工具到 tool/e-packager.exe，可在解包时关闭。
+	bool copyToolExecutable = true;
 };
 
 bool WriteWorkspaceFiles(

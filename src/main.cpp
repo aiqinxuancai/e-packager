@@ -150,6 +150,7 @@ void ConfigureConsoleForUtf8()
 
 struct UnpackOptions {
 	bool writeAgentsMarkdown = true;
+	bool copyToolExecutable = true;
 	bool writeDependencyArtifacts = true;
 	bool unpackDependencyModules = true;
 	bool compilerInput = false;
@@ -480,7 +481,8 @@ DependencyModuleExportResult ExportDependencyModules(
 	const e2txt::ProjectBundle& bundle,
 	const e2txt::ReadOptions& readOptions,
 	const size_t workerCount,
-	const bool compilerInput)
+	const bool compilerInput,
+	const bool copyToolExecutable)
 {
 	DependencyModuleExportResult result;
 	std::filesystem::path ecomRoot = outputDir / "ecom";
@@ -563,6 +565,7 @@ DependencyModuleExportResult ExportDependencyModules(
 		std::string childError;
 		const UnpackOptions childOptions {
 			.writeAgentsMarkdown = false,
+			.copyToolExecutable = copyToolExecutable,
 			.writeDependencyArtifacts = true,
 			.unpackDependencyModules = false,
 			.compilerInput = compilerInput,
@@ -647,7 +650,8 @@ bool RefreshDependencyArtifacts(
 	const size_t workerCount,
 	DependencyRefreshResult& outResult,
 	std::string& outError,
-	const bool compilerInput = false)
+	const bool compilerInput = false,
+	const bool copyToolExecutable = true)
 {
 	outResult = {};
 	outError.clear();
@@ -663,7 +667,8 @@ bool RefreshDependencyArtifacts(
 			bundle,
 			readOptions,
 			workerCount,
-			compilerInput);
+			compilerInput,
+			copyToolExecutable);
 		outResult.exportedEComModules = ecomResult.exportedCount;
 		outResult.annotations.insert(
 			outResult.annotations.end(),
@@ -719,6 +724,7 @@ bool DoUnpackInternal(
 	}
 	timer.Record("write_bundle");
 	workspaceOptions.writeAgentsMarkdown = options.writeAgentsMarkdown;
+	workspaceOptions.copyToolExecutable = options.copyToolExecutable;
 	if (!workspace_support::WriteWorkspaceFiles(effectiveInputPath, effectiveOutputDir, outError, workspaceOptions)) {
 		return false;
 	}
@@ -735,7 +741,8 @@ bool DoUnpackInternal(
 				options.dependencyExportThreadCount,
 				dependencyRefreshResult,
 				outError,
-				options.compilerInput)) {
+				options.compilerInput,
+				options.copyToolExecutable)) {
 			return false;
 		}
 	}
@@ -1201,6 +1208,10 @@ bool ParseUnpackOptions(
 		if (option == "--main-only") {
 			outOptions.writeDependencyArtifacts = false;
 			outOptions.unpackDependencyModules = false;
+			continue;
+		}
+		if (option == "--no-tool-output") {
+			outOptions.copyToolExecutable = false;
 			continue;
 		}
 		return false;
@@ -2417,9 +2428,10 @@ void PrintUsage()
 	std::cout << Utf8Literal(u8"e-packager 用法:") << std::endl;
 	std::cout << Utf8Literal(u8"  通用选项：--e-dir <易语言目录> 或 --e-dir=<目录>，目录须包含 lib、static_lib、ecom；普通解包/回包仅从指定目录的 lib 加载支持库。") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager                           # 封包当前项目到 .\\pack\\<info.json sourceFileName>") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager <input.e|input.ec> [--password <text>] [--main-only]       # 拆包 .e/.ec 文件到同目录下同名文件夹（拖放直接打开）") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager <input.e|input.ec> [--password <text>] [--main-only] [--no-tool-output]       # 拆包 .e/.ec 文件到同目录下同名文件夹（拖放直接打开）") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager <input.fne>               # 导出支持库公开接口到同目录 .txt（仅 Win32 版可用）") << std::endl;
-	std::cout << Utf8Literal(u8"  e-packager unpack <input.e|input.ec> <output-dir> [--password <text>] [--main-only]    # 拆包到指定目录") << std::endl;
+	std::cout << Utf8Literal(u8"  e-packager unpack <input.e|input.ec> <output-dir> [--password <text>] [--main-only] [--no-tool-output]    # 拆包到指定目录") << std::endl;
+	std::cout << Utf8Literal(u8"       --no-tool-output 不复制封包工具到解包目录及依赖模块目录；默认写出 tool/e-packager.exe。") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager decrypt-fne <input.fne> [output.txt]      # 导出支持库公开接口单文件（仅 Win32 版可用）") << std::endl;
 	std::cout << Utf8Literal(u8"  e-packager pack <input-dir> <output.e|output.ec> [--password <text>] [--compile-check ...]  # 封包，可选 AutoLinker 无头编译确认") << std::endl;
 	std::cout << Utf8Literal(u8"       --compile-check [--eide <e.exe>] [--compile-target auto|win_exe|win_console_exe|win_dll|ecom] [--compile-static] [--compile-timeout <seconds>]") << std::endl;
@@ -2880,7 +2892,7 @@ int RunCommand(int argc, char* argv[])
 	}
 
 	// Drag-and-drop: a single .e/.ec/.fne file path passed directly
-	if (argc == 2 || argc >= 4) {
+	if (argc >= 2) {
 		std::filesystem::path inputPath(command);
 		std::string ext = inputPath.extension().string();
 		std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);

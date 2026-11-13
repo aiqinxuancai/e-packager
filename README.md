@@ -88,6 +88,10 @@ EC 拆包保留内嵌的匿名类、隐藏函数及其依赖声明，统一按�
 # 快速解包（不刷新依赖模块和支持库接口）
 e-packager unpack MyApp.e MyApp\ --main-only
 
+# 不复制封包工具（默认会写出 tool/e-packager.exe）
+e-packager unpack MyApp.e MyApp\ --no-tool-output
+e-packager MyApp.e --no-tool-output
+
 # 带密码的文件
 e-packager unpack MyApp.e MyApp\ --password 123456
 e-packager pack MyApp\ MyApp.e --password 123456
@@ -268,7 +272,7 @@ e-packager compile-check MyApp.e \
 | `header/` | 公开接口头文件（`.ec` 项目） |
 | `image/` | 图片资源，元数据在 `image/list.json` |
 | `audio/` | 音频资源，元数据在 `audio/list.json` |
-| `tool/e-packager.exe` | 随目录自带的封包工具 |
+| `tool/e-packager.exe` | 默认随目录自带的封包工具；`--no-tool-output` 可跳过 |
 | `info.json` | 来源文件的类型、路径、修改时间、MD5 |
 | `README.md` | 自动生成的项目结构、工具来源与回包方法说明 |
 | `AGENTS.md` | 供 AI Agent 阅读的项目结构说明 |
@@ -328,7 +332,7 @@ e-packager update MyApp\ --remove-image 启动画面 --remove-audio notify
 
 所有 `--add-*` / `--remove-*` 均支持这两种写法。省略目录时，优先选择当前工作区（或当前 `tool/` 的父目录），否则选择工具自身所在的工作区；找不到工作区会报错。相对资源文件路径仍相对于当前工作目录解析。显式指定目录的写法继续有效。
 
-每次解包都会将当前工具复制为 `tool/e-packager.exe` 并覆盖已有副本；源和目标为同一个文件时直接保留，不执行自复制。
+默认每次解包都会将当前工具复制为 `tool/e-packager.exe` 并覆盖已有副本；源和目标为同一个文件时直接保留，不执行自复制。添加 `--no-tool-output` 可跳过主工程和依赖模块目录中的工具复制，也不会创建 `tool/` 目录；已有工具副本会保留，不会覆盖或删除。该选项可与 `--main-only`、`--password` 组合使用，后续使用外部工具执行 `e-packager pack <目录> <输出.e|输出.ec>` 回包。
 
 增删参数均可重复，也可组合使用；同一次 `update` 先删除再新增，可用来替换同名资源。删除选择器必须唯一匹配对应类型，找不到或存在歧义会报错，参数验证失败不会写回工作区；同一次命令重复指定同一删除目标只计一次。
 

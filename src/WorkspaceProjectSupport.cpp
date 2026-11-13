@@ -331,7 +331,7 @@ json BuildInfoJson(const SourceFileInfo& info, const WorkspaceWriteOptions& opti
 	return infoJson;
 }
 
-std::wstring BuildWorkspaceStructureMarkdown(const SourceFileInfo& info)
+std::wstring BuildWorkspaceStructureMarkdown(const SourceFileInfo& info, const WorkspaceWriteOptions& options)
 {
 	const bool isEcProject = IsEcSourceFileKind(info.sourceFileKind);
 	const std::wstring headerDirectoryLine = isEcProject
@@ -358,7 +358,7 @@ std::wstring BuildWorkspaceStructureMarkdown(const SourceFileInfo& info)
 		<< dependencyDirectoryLines
 		<< L"| `image/` | 图片资源 / 二进制资源及 `list.json`。 |\r\n"
 		<< L"| `audio/` | 音频资源 / 二进制资源及 `list.json`。 |\r\n"
-		<< L"| `tool/` | 当前目录自带的 `e-packager.exe`。 |\r\n"
+		<< (options.copyToolExecutable ? L"| `tool/` | 当前目录自带的 `e-packager.exe`。 |\r\n" : L"")
 		<< L"| `pack/` | 默认回包输出目录，首次回包时生成。 |\r\n"
 		<< L"| `README.md` | 项目结构与回包入门说明。 |\r\n"
 		<< L"| `AGENTS.md` | 供 AI Agent 使用的源码编辑规则与操作说明。 |\r\n"
@@ -389,6 +389,8 @@ std::string BuildAgentsMarkdown(
 	const std::filesystem::path& outputDir,
 	const WorkspaceWriteOptions& options)
 {
+	const std::wstring toolCommand = options.copyToolExecutable ? L"tool\\e-packager.exe" : L"e-packager";
+	const std::wstring powerShellToolCommand = options.copyToolExecutable ? L".\\tool\\e-packager.exe" : L"e-packager";
 	std::vector<std::filesystem::path> eLanguageBaseDirs;
 	const auto installation = e_language_environment::GetInstallationDirectory();
 	if (!installation.empty()) eLanguageBaseDirs.push_back(installation);
@@ -403,6 +405,7 @@ std::string BuildAgentsMarkdown(
 		eLanguagePathLines += L"- 当前未找到包含 lib、static_lib、ecom 的有效易语言安装目录；可使用 `--e-dir` 指定目录，或检查 `HKEY_CLASSES_ROOT\\E.Document\\Shell\\Open\\Command` 或 `HKEY_LOCAL_MACHINE\\SOFTWARE\\Classes\\E.Document\\Shell\\Open\\Command` 的默认值。\r\n";
 	}
 	const std::wstring directCompileSection =
+		std::wstring() +
 		L"## 无 IDE 编译（实验性，仅在用户明确要求时使用）\r\n"
 		L"\r\n"
 		L"**使用限制：只有用户明确要求使用无 IDE 编译 / `compile` 时，才可以执行以下命令。该功能是实验性项目，不保证稳定性、兼容性或产物行为与易语言 IDE 一致。不能因用户要求编辑源码、回包、验证或修复错误，就自动调用 `compile`；也不能在 `validate`、`pack` 或 IDE 编译检查失败后自动改用它。**\r\n"
@@ -424,19 +427,19 @@ std::string BuildAgentsMarkdown(
 		L"\r\n"
 		L"```powershell\r\n"
 		L"# 预检只检查当前覆盖的语义规则，不代表编译或运行成功\r\n"
-		L".\\tool\\e-packager.exe validate . --diagnostics json\r\n"
+		+ powerShellToolCommand + L" validate . --diagnostics json\r\n"
 		L"\r\n"
 		L"# x86 EXE\r\n"
-		L".\\tool\\e-packager.exe compile . .\\build\\app-x86.exe --arch x86 --blackmoon-core-dir \"D:\\deps\\BlackMoonModernCore\"\r\n"
+		+ powerShellToolCommand + L" compile . .\\build\\app-x86.exe --arch x86 --blackmoon-core-dir \"D:\\deps\\BlackMoonModernCore\"\r\n"
 		L"\r\n"
 		L"# x64 EXE，需要对应的 x64 依赖\r\n"
-		L".\\tool\\e-packager.exe compile . .\\build\\app-x64.exe --arch x64 --blackmoon-core-dir \"D:\\deps\\BlackMoonModernCore\"\r\n"
+		+ powerShellToolCommand + L" compile . .\\build\\app-x64.exe --arch x64 --blackmoon-core-dir \"D:\\deps\\BlackMoonModernCore\"\r\n"
 		L"\r\n"
 		L"# DLL（根据输出扩展名识别，也可使用 --dll）\r\n"
-		L".\\tool\\e-packager.exe compile . .\\build\\app.dll --arch x86 --blackmoon-core-dir \"D:\\deps\\BlackMoonModernCore\"\r\n"
+		+ powerShellToolCommand + L" compile . .\\build\\app.dll --arch x86 --blackmoon-core-dir \"D:\\deps\\BlackMoonModernCore\"\r\n"
 		L"\r\n"
 		L"# 显式工具链与易语言依赖路径\r\n"
-		L".\\tool\\e-packager.exe compile . .\\build\\app.exe --arch x86 `\r\n"
+		+ powerShellToolCommand + L" compile . .\\build\\app.exe --arch x86 `\r\n"
 		L"  --blackmoon-core-dir \"D:\\deps\\BlackMoonModernCore\" `\r\n"
 		L"  --vc-tools-dir \"C:\\path\\to\\VC\\Tools\\MSVC\\<版本>\" `\r\n"
 		L"  --windows-sdk-dir \"C:\\Program Files (x86)\\Windows Kits\\10\" `\r\n"
@@ -481,7 +484,7 @@ std::string BuildAgentsMarkdown(
 		L"需要独立做 IDE 权威编译检查时，直接启动易语言 IDE：\r\n"
 		L"\r\n"
 		L"```powershell\r\n"
-		L"tool\\e-packager.exe pack . .\\pack\\checked.e `\r\n"
+		+ toolCommand + L" pack . .\\pack\\checked.e `\r\n"
 		L"  --compile-check `\r\n"
 		L"  --eide \"<易语言主程序路径>\" `\r\n"
 		L"  --compile-static --compile-timeout 120\r\n"
@@ -495,13 +498,15 @@ std::string BuildAgentsMarkdown(
 		<< L"# AGENTS.md\r\n"
 		<< L"\r\n"
 		<< L"项目简介与快速回包方法见 [README.md](README.md)。\r\n"
+		<< (options.copyToolExecutable ? L""
+			: L"\r\n本次解包使用了 `--no-tool-output`，未复制封包工具。下文 `e-packager` 需通过 PATH 或外部工具的实际路径运行。\r\n")
 		<< L"\r\n"
 		<< L"## 项目说明\r\n"
 		<< L"\r\n"
 		<< L"当前目录是由 `" << Utf8ToWide(info.fileName) << L"` 解包得到的易语言目录工程。\r\n"
-		<< L"外部编辑器应直接修改本目录内容，再通过 `tool\\e-packager.exe` 回包生成 `" << packOutputFileName << L"` 文件。\r\n"
+		<< L"外部编辑器应直接修改本目录内容，再通过 `" << toolCommand << L"` 回包生成 `" << packOutputFileName << L"` 文件。\r\n"
 		<< L"\r\n"
-		<< BuildWorkspaceStructureMarkdown(info)
+		<< BuildWorkspaceStructureMarkdown(info, options)
 		<< L"## 易语言路径\r\n"
 		<< L"\r\n"
 		<< L"- 当前易语言主程序路径通常从注册表读取：`HKEY_CLASSES_ROOT\\E.Document\\Shell\\Open\\Command`，以及兼容视图下的 `HKEY_LOCAL_MACHINE\\SOFTWARE\\Classes\\E.Document\\Shell\\Open\\Command`。\r\n"
@@ -583,9 +588,9 @@ std::string BuildAgentsMarkdown(
 		<< L"- `image/list.json` 和 `audio/list.json` 是资源索引，实际资源文件通常位于同目录下的 `.bin` 文件中；封包时按索引读取，不要只新增文件而不更新 `list.json`。\r\n"
 		<< L"- 资源的使用方法和常量一致，在易语言代码中以 `#资源名` 引用；`list.json` 中的 `logicalName` 就是 `#` 后面的资源名。\r\n"
 		<< L"- `image/` 与 `audio/` 只是资源类型分组，除图片和音频外，也可以存放程序需要携带的任意二进制数据。\r\n"
-		<< L"- 新增图片资源：`tool\\e-packager.exe update --add-image 图片文件路径`，默认使用文件名 stem 作为资源名，例如 `logo.png` 对应 `#logo`。\r\n"
-		<< L"- 新增音频资源：`tool\\e-packager.exe update --add-audio 音频文件路径`，默认使用文件名 stem 作为资源名。\r\n"
-		<< L"- 显式指定资源名：`tool\\e-packager.exe update --add-image 资源名=文件路径` 或 `tool\\e-packager.exe update --add-audio 资源名=文件路径`；资源名不要包含路径分隔符或 Windows 文件名非法字符。\r\n"
+		<< L"- 新增图片资源：`" << toolCommand << L" update --add-image 图片文件路径`，默认使用文件名 stem 作为资源名，例如 `logo.png` 对应 `#logo`。\r\n"
+		<< L"- 新增音频资源：`" << toolCommand << L" update --add-audio 音频文件路径`，默认使用文件名 stem 作为资源名。\r\n"
+		<< L"- 显式指定资源名：`" << toolCommand << L" update --add-image 资源名=文件路径` 或 `" << toolCommand << L" update --add-audio 资源名=文件路径`；资源名不要包含路径分隔符或 Windows 文件名非法字符。\r\n"
 		<< L"\r\n"
 		<< L"## 新增程序集 / 类 / 窗口操作\r\n"
 		<< L"\r\n"
@@ -628,7 +633,7 @@ std::string BuildAgentsMarkdown(
 		<< L"\r\n"
 		<< L"- 封包器会优先按这些规则匹配窗口和窗口程序集：同名、`窗口程序集_<窗口名>`，以及少量兼容写法。为了减少名称链接错误，新增窗口时优先使用 `窗口程序集_<窗口名>.txt` 这种命名。\r\n"
 		<< L"- 新增源码页后，不需要手动编辑窗口列表页或其它目录索引；`pack` 时会自动扫描 `src/**/*.txt`（排除 `src/.数据类型.txt`、`src/.DLL声明.txt`、`src/.常量.txt`、`src/.全局变量.txt` 这些固定文件）以及 `src/**/*.xml`。\r\n"
-		<< L"- 新增完成后，立即运行 `tool\\e-packager.exe` 或 `tool\\e-packager.exe pack . .\\pack\\" << Utf8ToWide(info.fileName) << L"` 做一次封包验证，尽早发现语法错误、窗口绑定错误或名称链接错误。\r\n"
+		<< L"- 新增完成后，立即运行 `" << toolCommand << L"` 或 `" << toolCommand << L" pack . .\\pack\\" << Utf8ToWide(info.fileName) << L"` 做一次封包验证，尽早发现语法错误、窗口绑定错误或名称链接错误。\r\n"
 		<< L"\r\n"
 		<< L"## 类的限制与注意事项\r\n"
 		<< L"\r\n"
@@ -639,7 +644,7 @@ std::string BuildAgentsMarkdown(
 		<< L"\r\n"
 		<< L"## 回包前预检\r\n"
 		<< L"\r\n"
-		<< L"- 修改源码后先运行 `tool\\e-packager.exe validate .`。`pack` 和无参默认回包也会自动执行同一套预检，存在确定性错误时不会写出目标文件。\r\n"
+		<< L"- 修改源码后先运行 `" << toolCommand << L" validate .`。`pack` 和无参默认回包也会自动执行同一套预检，存在确定性错误时不会写出目标文件。\r\n"
 		<< L"- 预检会阻止声明槽位或属性错位、非法数组维数、自定义类型数组成员零维、声明顺序错误、重复名称、未知点指令、流程结束标记不匹配、智能引号或括号未闭合、`a ＝` 缺少值、半角 `a = value`、只读目标赋值、窗体 XML 或窗口程序集绑定错误、控件成员或事件处理器缺失，以及可静态确定的符号、成员、调用签名、返回值和表达式类型错误。\r\n"
 		<< L"- 只有行尾未使用的声明槽位可以省略；为了填写后面的属性、数组维数或说明而保留的中间空槽仍必须写逗号。`validate` 不会要求声明补齐全部尾槽。\r\n"
 		<< L"- 预检采用保守语义：类继承和访问权限、类实例方法调用边界、支持库或易模块重载及特殊命令、变体型及泛型类型流、窗口事件参数签名、全部隐式转换和特殊表达式尚未完整覆盖；依赖元数据缺失或语义无法确定时不会臆测报错。DLL 入口和运行期错误也不在检查范围内。因此 `errors=0` 只表示没有发现当前覆盖范围内的确定性错误，不等于 IDE 编译成功。\r\n"
@@ -694,11 +699,11 @@ std::string BuildAgentsMarkdown(
 		<< L"\r\n"
 		<< L"在项目根目录执行以下任一方式：\r\n"
 		<< L"\r\n"
-		<< L"- 默认方式：`tool\\e-packager.exe`\r\n"
+		<< L"- 默认方式：`" << toolCommand << L"`\r\n"
 		<< L"  默认输出到 `pack/` 目录，文件名优先使用 `info.json` 中记录的默认封包文件名。\r\n"
-		<< L"- 只做快速预检：`tool\\e-packager.exe validate .`\r\n"
-		<< L"- 显式方式：`tool\\e-packager.exe pack . .\\pack\\" << packOutputFileName << L"`\r\n"
-		<< L"- 设置打开密码：`tool\\e-packager.exe pack . .\\pack\\" << packOutputFileName << L" --password 密码文本`\r\n"
+		<< L"- 只做快速预检：`" << toolCommand << L" validate .`\r\n"
+		<< L"- 显式方式：`" << toolCommand << L" pack . .\\pack\\" << packOutputFileName << L"`\r\n"
+		<< L"- 设置打开密码：`" << toolCommand << L" pack . .\\pack\\" << packOutputFileName << L" --password 密码文本`\r\n"
 		<< L"\r\n"
 		<< L"回包后的 `" << packOutputFileName << L"` 可直接在易语言 IDE 中打开；能否成功编译仍以 IDE 或 AutoLinker 的实际编译结果为准。\r\n"
 		<< L"\r\n"
@@ -706,17 +711,17 @@ std::string BuildAgentsMarkdown(
 		<< L"\r\n"
 		<< L"当你增删模块、支持库、图片、音频或其它二进制资源，或希望刷新当前目录下的派生依赖文件时，可在项目根目录执行：\r\n"
 		<< L"\r\n"
-		<< L"- 目录可省略：优先使用当前工作区（或当前 `tool/` 的父目录），否则使用工具自身所在的工作区。也可直接执行 `tool\\e-packager.exe --add-image logo.png` 或 `--remove-image logo`；所有新增和删除选项均支持。相对文件路径以当前工作目录为准。\r\n"
-		<< L"- 刷新当前 `project/.module.json`、`ecom/` 以及可用时的 `elib/`：`tool\\e-packager.exe update`\r\n"
-		<< L"- 新增模块后顺带写入依赖并刷新：`tool\\e-packager.exe update --add-ecom 某模块.ec`\r\n"
-		<< L"- 新增支持库后顺带写入依赖并刷新：`tool\\e-packager.exe update --add-elib 某支持库.fne`\r\n"
-		<< L"- `--add-elib` 也可直接填写支持库名称，例如：`tool\\e-packager.exe update --add-elib spec`\r\n"
-		<< L"- 新增图片资源并写入 `image/list.json`：`tool\\e-packager.exe update --add-image logo.png`\r\n"
-		<< L"- 新增音频资源并写入 `audio/list.json`：`tool\\e-packager.exe update --add-audio notify.wav`\r\n"
-		<< L"- 删除依赖：`tool\\e-packager.exe update --remove-ecom 模块名或文件名`、`--remove-elib 支持库名或文件名`；支持库也可按 GUID 删除。\r\n"
-		<< L"- 删除资源：`tool\\e-packager.exe update --remove-image 资源名`、`--remove-audio 资源名`；也支持索引 key 或 relativePath，会同步清理索引、工程树及不再引用的资源文件。\r\n"
+		<< L"- 目录可省略：优先使用当前工作区（或当前 `tool/` 的父目录），否则使用工具自身所在的工作区。也可直接执行 `" << toolCommand << L" --add-image logo.png` 或 `--remove-image logo`；所有新增和删除选项均支持。相对文件路径以当前工作目录为准。\r\n"
+		<< L"- 刷新当前 `project/.module.json`、`ecom/` 以及可用时的 `elib/`：`" << toolCommand << L" update`\r\n"
+		<< L"- 新增模块后顺带写入依赖并刷新：`" << toolCommand << L" update --add-ecom 某模块.ec`\r\n"
+		<< L"- 新增支持库后顺带写入依赖并刷新：`" << toolCommand << L" update --add-elib 某支持库.fne`\r\n"
+		<< L"- `--add-elib` 也可直接填写支持库名称，例如：`" << toolCommand << L" update --add-elib spec`\r\n"
+		<< L"- 新增图片资源并写入 `image/list.json`：`" << toolCommand << L" update --add-image logo.png`\r\n"
+		<< L"- 新增音频资源并写入 `audio/list.json`：`" << toolCommand << L" update --add-audio notify.wav`\r\n"
+		<< L"- 删除依赖：`" << toolCommand << L" update --remove-ecom 模块名或文件名`、`--remove-elib 支持库名或文件名`；支持库也可按 GUID 删除。\r\n"
+		<< L"- 删除资源：`" << toolCommand << L" update --remove-image 资源名`、`--remove-audio 资源名`；也支持索引 key 或 relativePath，会同步清理索引、工程树及不再引用的资源文件。\r\n"
 		<< L"- 增删参数可重复或组合，先删后增；找不到或匹配不唯一会报错。删除后请同步修改源码引用，封包按语义重建。\r\n"
-		<< L"- 自定义资源常量名：`tool\\e-packager.exe update --add-image 启动画面=splash.bin`，代码中用 `#启动画面` 引用。\r\n"
+		<< L"- 自定义资源常量名：`" << toolCommand << L" update --add-image 启动画面=splash.bin`，代码中用 `#启动画面` 引用。\r\n"
 		<< L"\r\n"
 		<< L"`update` 不会直接回包；它用于在继续编辑源码前，同步项目中模块 / 支持库的依赖描述、导出的辅助资料以及资源索引。\r\n"
 		<< L"\r\n"
@@ -738,6 +743,8 @@ std::string BuildAgentsMarkdown(
 
 std::string BuildReadmeMarkdown(const SourceFileInfo& info, const WorkspaceWriteOptions& options)
 {
+	const std::wstring toolCommand = options.copyToolExecutable ? L"tool\\e-packager.exe" : L"e-packager";
+	const std::wstring powerShellToolCommand = options.copyToolExecutable ? L".\\tool\\e-packager.exe" : L"e-packager";
 	const std::wstring packOutputFileName = GetDocumentationPackOutputFileName(info, options);
 	std::wostringstream stream;
 	stream
@@ -746,7 +753,7 @@ std::string BuildReadmeMarkdown(const SourceFileInfo& info, const WorkspaceWrite
 		<< L"本目录由 [e-packager](https://github.com/aiqinxuancai/e-packager) 从 `"
 		<< Utf8ToWide(info.fileName) << L"` 解包生成，可使用 Git 管理版本、查看代码 Diff，并通过外部编辑器或 AI 辅助编辑后回包。\r\n"
 		<< L"\r\n"
-		<< BuildWorkspaceStructureMarkdown(info)
+		<< BuildWorkspaceStructureMarkdown(info, options)
 		<< L"依赖辅助目录按工程类型和解包选项生成，部分目录可能不存在。\r\n"
 		<< L"\r\n"
 		<< L"## 编辑项目\r\n"
@@ -757,20 +764,22 @@ std::string BuildReadmeMarkdown(const SourceFileInfo& info, const WorkspaceWrite
 		<< L"\r\n"
 		<< L"## 回包方法\r\n"
 		<< L"\r\n"
-		<< L"在本目录打开 PowerShell，使用随目录附带的工具：\r\n"
+		<< (options.copyToolExecutable
+			? L"在本目录打开 PowerShell，使用随目录附带的工具：\r\n"
+			: L"本次解包使用了 `--no-tool-output`，未复制封包工具。请将外部 e-packager 加入 PATH，或将以下命令中的 `e-packager` 替换为实际工具路径，在本目录执行：\r\n")
 		<< L"\r\n"
 		<< L"```powershell\r\n"
 		<< L"# 检查编辑后的源码\r\n"
-		<< L".\\tool\\e-packager.exe validate .\r\n"
+		<< powerShellToolCommand << L" validate .\r\n"
 		<< L"\r\n"
 		<< L"# 默认回包到 pack/，文件名由 info.json 决定\r\n"
-		<< L".\\tool\\e-packager.exe\r\n"
+		<< powerShellToolCommand << L"\r\n"
 		<< L"\r\n"
 		<< L"# 显式指定输出文件\r\n"
-		<< L".\\tool\\e-packager.exe pack . \".\\pack\\" << packOutputFileName << L"\"\r\n"
+		<< powerShellToolCommand << L" pack . \".\\pack\\" << packOutputFileName << L"\"\r\n"
 		<< L"```\r\n"
 		<< L"\r\n"
-		<< L"也可以直接运行 `tool/e-packager.exe` 无参回包。`pack` 会自动执行源码预检；回包得到的是易语言工程或模块文件，不是可执行程序。预检通过不等于 IDE 编译成功，生成的 `.e` 仍需在易语言 IDE 中打开并编译。\r\n";
+		<< L"也可以直接运行 `" << toolCommand << L"` 无参回包。`pack` 会自动执行源码预检；回包得到的是易语言工程或模块文件，不是可执行程序。预检通过不等于 IDE 编译成功，生成的 `.e` 仍需在易语言 IDE 中打开并编译。\r\n";
 	if (IsEcSourceFileKind(info.sourceFileKind)) {
 		stream
 			<< L"\r\n"
@@ -779,7 +788,7 @@ std::string BuildReadmeMarkdown(const SourceFileInfo& info, const WorkspaceWrite
 			<< L"未修改的模块目录可以回包为原始 `.ec`。修改源码或资源后，必须显式输出为 `.e`，再通过易语言编译为模块：\r\n"
 			<< L"\r\n"
 			<< L"```powershell\r\n"
-			<< L".\\tool\\e-packager.exe pack . \".\\pack\\project.e\"\r\n"
+			<< powerShellToolCommand << L" pack . \".\\pack\\project.e\"\r\n"
 			<< L"```\r\n";
 	}
 	stream
@@ -789,9 +798,9 @@ std::string BuildReadmeMarkdown(const SourceFileInfo& info, const WorkspaceWrite
 		<< L"以下命令在本目录执行，路径请替换为实际文件：\r\n"
 		<< L"\r\n"
 		<< L"```powershell\r\n"
-		<< L".\\tool\\e-packager.exe --add-ecom \"D:\\modules\\示例.ec\"\r\n"
-		<< L".\\tool\\e-packager.exe --add-image \"启动画面=D:\\res\\logo.png\"\r\n"
-		<< L".\\tool\\e-packager.exe --add-audio \"提示音=D:\\res\\notify.wav\"\r\n"
+		<< powerShellToolCommand << L" --add-ecom \"D:\\modules\\示例.ec\"\r\n"
+		<< powerShellToolCommand << L" --add-image \"启动画面=D:\\res\\logo.png\"\r\n"
+		<< powerShellToolCommand << L" --add-audio \"提示音=D:\\res\\notify.wav\"\r\n"
 		<< L"```\r\n"
 		<< L"\r\n"
 		<< L"图片、音频及其它二进制资源都是常量资源，代码中以 `#资源名` 引用。`image/list.json` 与 `audio/list.json` 记录资源名称及文件路径；不要只把文件放进目录而不更新索引。`update` 完成后仍需执行回包。\r\n";
@@ -929,7 +938,7 @@ bool WriteWorkspaceFiles(
 		return false;
 	}
 
-	if (!CopyExecutableToToolDirectory(outputDir, outError)) {
+	if (options.copyToolExecutable && !CopyExecutableToToolDirectory(outputDir, outError)) {
 		return false;
 	}
 
