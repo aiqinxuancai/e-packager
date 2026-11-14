@@ -1106,8 +1106,7 @@ void AppendRenderedBodyLine(std::vector<std::string>& outLines, const int indent
 
 std::string QuoteIfNotEmpty(const std::string& text)
 {
-	const std::string trimmed = TrimAsciiCopy(text);
-	return trimmed.empty() ? std::string() : Quote(trimmed);
+	return text.empty() ? std::string() : Quote(text);
 }
 
 std::string BuildDefinitionLine(
@@ -1185,7 +1184,6 @@ std::string BuildCommentedDefinitionLine(
 			continuation = fields.back().substr(newline);
 			fields.back().resize(newline);
 		}
-		fields.back() = TrimAsciiCopy(fields.back());
 	}
 	return (minimumFieldCount == 0
 		? BuildDefinitionLine(type, fields)
@@ -2783,6 +2781,7 @@ struct SupportLibrarySymbols {
 	std::string commandTableError;
 	int declaredCommandCount = 0;
 	std::vector<std::string> commandNames;
+	std::vector<bool> commandMemberOnly;
 	std::vector<std::string> constantNames;
 	std::vector<SupportTypeSymbols> dataTypes;
 };
@@ -3437,6 +3436,13 @@ public:
 		}
 		const std::string& name = symbols->commandNames[static_cast<size_t>(commandId)];
 		if (name.empty()) return unresolved("command_name_empty_or_unreadable");
+		// 原生文件允许无接收者的成员命令；裸名称不能在全局命令表中重绑。
+		// 显示仍遵从 IDE，内部视图单独记录原库/命令身份。
+		if (qualifyGlobal && !m_ideDisplay && m_currentFunction &&
+			static_cast<size_t>(commandId) < symbols->commandMemberOnly.size() &&
+			symbols->commandMemberOnly[static_cast<size_t>(commandId)]) {
+			return ResolveNativeLibraryReference(libraryIndex, commandId, argumentCount);
+		}
 		// 用回包器的同一绑定规则检验裸名称，避免两套作用域判定逐渐分叉。
 		const auto owner = m_currentFunction ? ResolveCallableOwnerId(m_currentFunction->ownerClass) : 0;
 		const auto bound = BindCallable(m_callableBindings, TrimAsciiCopy(name), owner, argumentCount,
@@ -4042,7 +4048,10 @@ private:
 			symbols.declaredCommandCount = metadata.declaredCommandCount;
 			symbols.commandTableError = metadata.commandTableError;
 			symbols.filePath = lastCandidatePath;
-			for (const auto& command : metadata.commands) symbols.commandNames.push_back(command.name);
+			for (const auto& command : metadata.commands) {
+				symbols.commandNames.push_back(command.name);
+				symbols.commandMemberOnly.push_back(command.category == -1);
+			}
 			for (const auto& constant : metadata.constants) symbols.constantNames.push_back(constant.name);
 			for (const auto& type : metadata.dataTypes) {
 				SupportTypeSymbols info;
@@ -4443,7 +4452,7 @@ std::string BuildMethodParameterLine(const VariableInfo& info, SymbolResolver& r
 			TrimAsciiCopy(resolver.ResolveDeclarationName(info.name, info.comment, info.marker)),
 			BuildTypeField(info, resolver, hints),
 			JoinStrings(flags, " "),
-			TrimAsciiCopy(info.comment),
+			info.comment,
 		});
 }
 
@@ -4456,7 +4465,7 @@ std::string BuildLocalVariableLine(const VariableInfo& info, SymbolResolver& res
 			BuildTypeField(info, resolver, hints),
 			(info.attr & 0x0001) != 0 ? "静态" : std::string(),
 			BuildArraySuffix(info.arrayBounds),
-			TrimAsciiCopy(info.comment),
+			info.comment,
 		});
 }
 
@@ -4482,7 +4491,7 @@ std::string BuildGlobalVariableLine(const VariableInfo& info, SymbolResolver& re
 			BuildTypeField(info, resolver, hints),
 			(info.attr & 0x0100) != 0 ? "公开" : std::string(),
 			BuildArraySuffix(info.arrayBounds),
-			TrimAsciiCopy(info.comment),
+			info.comment,
 		});
 }
 
@@ -4495,7 +4504,7 @@ std::string BuildStructMemberLine(const VariableInfo& info, const std::string& r
 			resolvedType,
 			(info.attr & kVarAttrByRef) != 0 ? "传址" : std::string(),
 			BuildArraySuffix(info.arrayBounds),
-			TrimAsciiCopy(info.comment),
+			info.comment,
 		},
 		1);
 }
@@ -4515,7 +4524,7 @@ std::string BuildDllParameterLine(const VariableInfo& info, const std::string& r
 			TrimAsciiCopy(resolver.ResolveDeclarationName(info.name, info.comment, info.marker)),
 			resolvedType,
 			JoinStrings(flags, " "),
-			TrimAsciiCopy(info.comment),
+			info.comment,
 		},
 		1);
 }
@@ -4654,7 +4663,11 @@ bool ShouldKeepPage(
 		return true;
 	}
 	if (IsClassHidden(sections, page.header.dwId) || IsDependencyDefinedId(dependencyRecords, page.header.dwId)) {
-		return false;
+		// 隐藏导入类上的本地扩展仍是用户源码，不能连同导入实现一并过滤。
+		return std::any_of(functions.begin(), functions.end(), [&](const FunctionInfo* method) {
+			return method != nullptr && !IsImportedFunction(*method) &&
+				!IsDependencyDefinedId(dependencyRecords, method->header.dwId);
+		});
 	}
 	if (IsAnonymousProgramPage(page)) {
 		if (!IsRootProgramPage(page)) {
@@ -6083,7 +6096,7 @@ void BuildProgramPages(
 					TrimAsciiCopy(resolver.ResolveUserName(functionInfo->header.dwId)),
 					ResolveTypeWithHints(functionInfo->returnType, resolver, hints),
 					(functionInfo->attr & 0x8) != 0 ? "公开" : std::string(),
-					TrimAsciiCopy(functionInfo->comment),
+					functionInfo->comment,
 				}));
 
 				for (const auto& param : functionInfo->params) {
@@ -6199,7 +6212,7 @@ void BuildStructPage(
 			{
 				typeName,
 				IsStructPublic(item) ? "公开" : std::string(),
-				TrimAsciiCopy(item.comment),
+				item.comment,
 			}));
 		for (const auto& member : item.members) {
 			const std::string resolvedType = ResolveMemberTypeWithHints(member, typeName, resolver, hints);
@@ -6244,7 +6257,7 @@ void BuildDllPage(
 				QuoteIfNotEmpty(item.fileName),
 				QuoteIfNotEmpty(item.commandName),
 				(item.attr & 0x2) != 0 ? "公开" : std::string(),
-				TrimAsciiCopy(item.comment),
+				item.comment,
 			}));
 		for (const auto& param : item.params) {
 			std::string typeText = ResolveDllParamTypeWithHints(param, dllName, resolver, hints);
@@ -6308,7 +6321,7 @@ void BuildConstantPage(const ModuleSections& sections, const GenerateOptions& op
 				TrimAsciiCopy(resolver.ResolveUserName(item.marker)),
 				Quote(valueText),
 				(item.attr & 0x2) != 0 ? "公开" : std::string(),
-				TrimAsciiCopy(item.comment),
+				item.comment,
 			}));
 	}
 	outDocument.pages.push_back(std::move(page));
@@ -7186,7 +7199,7 @@ std::string BuildPublicHeaderText(
 			{
 				typeName,
 				"公开",
-				TrimAsciiCopy(item.comment),
+				item.comment,
 			}));
 		for (const auto& member : item.members) {
 			lines.push_back(BuildStructMemberLine(
@@ -7213,7 +7226,7 @@ std::string BuildPublicHeaderText(
 				QuoteIfNotEmpty(item.fileName),
 				QuoteIfNotEmpty(item.commandName),
 				"公开",
-				TrimAsciiCopy(item.comment),
+				item.comment,
 			}));
 		for (const auto& param : item.params) {
 			lines.push_back(BuildDllParameterLine(
@@ -7257,7 +7270,7 @@ std::string BuildPublicHeaderText(
 				TrimAsciiCopy(resolver.ResolveUserName(item.marker)),
 				Quote(valueText),
 				"公开",
-				TrimAsciiCopy(item.comment),
+				item.comment,
 			}));
 	}
 
@@ -7417,7 +7430,8 @@ std::string ComputeStructSnapshotDigest(
 	const AnonymousTypeHints& hints)
 {
 	std::ostringstream stream;
-	std::string typeName = TrimAsciiCopy(item.name);
+	// 身份摘要必须使用导出声明名，与同名类消歧后的文本保持一致。
+	std::string typeName = TrimAsciiCopy(resolver.ResolveUserName(item.header.dwId));
 	if (typeName.empty()) {
 		if (const auto it = hints.localTypeAliases.find(item.header.dwId); it != hints.localTypeAliases.end()) {
 			typeName = it->second;
@@ -7772,8 +7786,49 @@ bool BuildBundleFromSections(
 		bundle.projectSubsystem = GetProjectSubsystem(sections.systemInfo);
 	}
 	bundle.dependencies = document.dependencies;
+	for (const auto& page : sections.program.codePages)
+		bundle.nativeClassOrder.push_back(page.header.dwId);
 	for (const auto& method : sections.program.functions)
 		bundle.nativeMethodOrder.push_back(method.header.dwId);
+	for (const auto& item : sections.program.dataTypes)
+		bundle.nativeStructOrder.push_back(item.header.dwId);
+	for (const auto& item : sections.program.dlls)
+		bundle.nativeDllOrder.push_back(item.header.dwId);
+	const auto hiddenVariable = [](const VariableInfo& source) {
+		NativeDependencyVariableSymbol item;
+		item.id = source.marker;
+		item.dataType = source.dataType;
+		item.attr = source.attr;
+		item.arrayBounds = source.arrayBounds;
+		item.name = source.name;
+		item.comment = source.comment;
+		return item;
+	};
+	for (const auto& source : sections.program.dataTypes) {
+		if (!IsStructHidden(source)) continue;
+		NativeDependencyStructSymbol item;
+		item.id = source.header.dwId;
+		item.memoryAddress = source.header.dwUnk;
+		item.name = source.name;
+		item.attr = source.attr;
+		item.comment = source.comment;
+		for (const auto& member : source.members) item.members.push_back(hiddenVariable(member));
+		bundle.nativeHiddenStructs.push_back(std::move(item));
+	}
+	for (const auto& source : sections.program.dlls) {
+		if (!IsDllHidden(source)) continue;
+		NativeDependencyDllSymbol item;
+		item.id = source.header.dwId;
+		item.memoryAddress = source.header.dwUnk;
+		item.name = source.name;
+		item.attr = source.attr;
+		item.returnType = source.returnType;
+		item.comment = source.comment;
+		item.fileName = source.fileName;
+		item.commandName = source.commandName;
+		for (const auto& param : source.params) item.params.push_back(hiddenVariable(param));
+		bundle.nativeHiddenDlls.push_back(std::move(item));
+	}
 	bundle.nativeProgramHeader = BundleNativeProgramHeaderSnapshot{
 		sections.program.header.versionFlag1,
 		sections.program.header.unk1,

@@ -7354,6 +7354,7 @@ std::string FormatFormXmlSyntaxError(
 	return stream.str();
 }
 
+// 身份摘要沿用原生快照的备注空白规范；仅用于匹配 ID，不修改实际备注内容。
 std::string ComputeParsedVariableDigest(const ParsedVariableDef& variable)
 {
 	std::ostringstream stream;
@@ -7361,7 +7362,7 @@ std::string ComputeParsedVariableDigest(const ParsedVariableDef& variable)
 	stream << "type=" << variable.typeName << "\n";
 	stream << "flags=" << variable.flagsText << "\n";
 	stream << "array=" << variable.arrayText << "\n";
-	stream << "comment=" << variable.comment;
+	stream << "comment=" << TrimAsciiCopy(variable.comment);
 	return ComputeTextDigest(stream.str());
 }
 
@@ -7919,7 +7920,7 @@ std::string ComputeParsedDllDigest(const ParsedDllDef& dll)
 	stream << "file=" << dll.fileName << "\n";
 	stream << "command=" << dll.commandName << "\n";
 	stream << "public=" << (dll.isPublic ? 1 : 0) << "\n";
-	stream << "comment=" << dll.comment << "\n";
+	stream << "comment=" << TrimAsciiCopy(dll.comment) << "\n";
 	stream << "params=" << dll.params.size() << "\n";
 	for (const auto& item : dll.params) {
 		stream << ComputeParsedVariableDigest(item) << "\n";
@@ -7932,7 +7933,7 @@ std::string ComputeParsedStructDigest(const ParsedStructDef& item)
 	std::ostringstream stream;
 	stream << "name=" << item.name << "\n";
 	stream << "public=" << (item.isPublic ? 1 : 0) << "\n";
-	stream << "comment=" << item.comment << "\n";
+	stream << "comment=" << TrimAsciiCopy(item.comment) << "\n";
 	stream << "members=" << item.members.size() << "\n";
 	for (const auto& member : item.members) {
 		stream << ComputeParsedVariableDigest(member) << "\n";
@@ -7947,7 +7948,7 @@ std::string ComputeParsedConstantDigest(const ParsedConstantDef& item)
 	stream << "value=" << item.valueText << "\n";
 	stream << "longText=" << (item.isLongText ? 1 : 0) << "\n";
 	stream << "public=" << (item.isPublic ? 1 : 0) << "\n";
-	stream << "comment=" << item.comment;
+	stream << "comment=" << TrimAsciiCopy(item.comment);
 	return ComputeTextDigest(stream.str());
 }
 
@@ -7960,7 +7961,7 @@ std::string ComputeBundleResourceDigest(const BundleBinaryResource& resource)
 	stream << "pageType=" << (resource.kind == BundleResourceKind::Image ? kConstPageImage : kConstPageSound) << "\n";
 	stream << "name=" << resource.logicalName << "\n";
 	stream << "public=" << (resource.isPublic ? 1 : 0) << "\n";
-	stream << "comment=" << resource.comment << "\n";
+	stream << "comment=" << TrimAsciiCopy(resource.comment) << "\n";
 	stream << "data=" << dataDigest;
 	return ComputeTextDigest(stream.str());
 }
@@ -8012,12 +8013,14 @@ std::string ExtractRemainingDefinitionFieldText(
 	const std::string& keyword,
 	const size_t startFieldIndex)
 {
+	const size_t first = line.find_first_not_of(" \t");
+	const std::string definition = first == std::string::npos ? std::string() : line.substr(first);
 	const std::string prefix = "." + keyword;
-	if (!StartsWith(line, prefix)) {
+	if (!StartsWith(definition, prefix)) {
 		return std::string();
 	}
 
-	const std::string rest = TrimAsciiCopy(line.substr(prefix.size()));
+	const std::string rest = definition.substr(prefix.size());
 	if (rest.empty()) {
 		return std::string();
 	}
@@ -8036,7 +8039,10 @@ std::string ExtractRemainingDefinitionFieldText(
 		if (ch == ',' && !inQuote) {
 			++currentFieldIndex;
 			if (currentFieldIndex == startFieldIndex) {
-				return TrimAsciiCopy(rest.substr(index + 1));
+				// 逗号后的一个空格是导出格式分隔符，其余空白属于备注正文。
+				size_t begin = index + 1;
+				if (begin < rest.size() && rest[begin] == ' ') ++begin;
+				return rest.substr(begin);
 			}
 		}
 	}
@@ -8119,7 +8125,7 @@ bool ParseProgramPage(const Page& page, const std::unordered_set<std::string>& f
 	// 普通程序集的公开/备注字段也会补齐空基类列；仅旧式双字段标题保留根类含义。
 	outClass.hasBaseClassField = fields.size() == 2 || !outClass.baseClassName.empty();
 	outClass.isPublic = GetFieldOrEmpty(fields, 2) == "公开";
-	outClass.comment = ExtractRemainingDefinitionFieldText(TrimAsciiCopy(page.lines[index]), "程序集", 3);
+	outClass.comment = ExtractRemainingDefinitionFieldText(page.lines[index], "程序集", 3);
 	const std::string normalizedBaseClassName = TypeResolver::NormalizeTypeName(outClass.baseClassName);
 	outClass.isFormClass =
 		formNames.contains(outClass.name) ||
@@ -8143,7 +8149,7 @@ bool ParseProgramPage(const Page& page, const std::unordered_set<std::string>& f
 			variable.name = GetFieldOrEmpty(fields, 0);
 			variable.typeName = GetFieldOrEmpty(fields, 1);
 			variable.arrayText = GetFieldOrEmpty(fields, 3);
-			variable.comment = ExtractRemainingDefinitionFieldText(trimmed, "程序集变量", 4);
+			variable.comment = ExtractRemainingDefinitionFieldText(page.lines[index], "程序集变量", 4);
 			outClass.vars.push_back(std::move(variable));
 			++index;
 			continue;
@@ -8154,7 +8160,7 @@ bool ParseProgramPage(const Page& page, const std::unordered_set<std::string>& f
 			method.name = GetFieldOrEmpty(fields, 0);
 			method.returnTypeName = GetFieldOrEmpty(fields, 1);
 			method.isPublic = GetFieldOrEmpty(fields, 2) == "公开";
-			method.comment = ExtractRemainingDefinitionFieldText(trimmed, "子程序", 3);
+			method.comment = ExtractRemainingDefinitionFieldText(page.lines[index], "子程序", 3);
 			++index;
 
 			while (index < page.lines.size()) {
@@ -8165,7 +8171,7 @@ bool ParseProgramPage(const Page& page, const std::unordered_set<std::string>& f
 					variable.name = GetFieldOrEmpty(fields, 0);
 					variable.typeName = GetFieldOrEmpty(fields, 1);
 					variable.flagsText = GetFieldOrEmpty(fields, 2);
-					variable.comment = ExtractRemainingDefinitionFieldText(line, "参数", 3);
+					variable.comment = ExtractRemainingDefinitionFieldText(page.lines[index], "参数", 3);
 					method.params.push_back(std::move(variable));
 					++index;
 					continue;
@@ -8177,7 +8183,7 @@ bool ParseProgramPage(const Page& page, const std::unordered_set<std::string>& f
 					variable.typeName = GetFieldOrEmpty(fields, 1);
 					variable.flagsText = GetFieldOrEmpty(fields, 2);
 					variable.arrayText = GetFieldOrEmpty(fields, 3);
-					variable.comment = ExtractRemainingDefinitionFieldText(line, "局部变量", 4);
+					variable.comment = ExtractRemainingDefinitionFieldText(page.lines[index], "局部变量", 4);
 					method.locals.push_back(std::move(variable));
 					++index;
 					continue;
@@ -8238,7 +8244,7 @@ void ParseGlobalPage(const Page& page, std::vector<ParsedVariableDef>& outGlobal
 		variable.typeName = GetFieldOrEmpty(fields, 1);
 		variable.flagsText = GetFieldOrEmpty(fields, 2);
 		variable.arrayText = GetFieldOrEmpty(fields, 3);
-		variable.comment = ExtractRemainingDefinitionFieldText(trimmed, "全局变量", 4);
+		variable.comment = ExtractRemainingDefinitionFieldText(line, "全局变量", 4);
 		outGlobals.push_back(std::move(variable));
 	}
 }
@@ -8255,7 +8261,7 @@ void ParseStructPage(const Page& page, std::vector<ParsedStructDef>& outStructs)
 			ParsedStructDef item;
 			item.name = GetFieldOrEmpty(fields, 0);
 			item.isPublic = GetFieldOrEmpty(fields, 1) == "公开";
-			item.comment = ExtractRemainingDefinitionFieldText(trimmed, "数据类型", 2);
+			item.comment = ExtractRemainingDefinitionFieldText(line, "数据类型", 2);
 			outStructs.push_back(std::move(item));
 			current = &outStructs.back();
 			currentMember = nullptr;
@@ -8268,15 +8274,15 @@ void ParseStructPage(const Page& page, std::vector<ParsedStructDef>& outStructs)
 			member.typeName = GetFieldOrEmpty(fields, 1);
 			member.flagsText = GetFieldOrEmpty(fields, 2);
 			member.arrayText = GetFieldOrEmpty(fields, 3);
-			member.comment = ExtractRemainingDefinitionFieldText(trimmed, "成员", 4);
+			member.comment = ExtractRemainingDefinitionFieldText(line, "成员", 4);
 			current->members.push_back(std::move(member));
 			currentMember = &current->members.back();
 			continue;
 		}
-		if (!trimmed.empty() && current != nullptr && trimmed.front() != '.') {
+		if (!line.empty() && current != nullptr && (trimmed.empty() || trimmed.front() != '.')) {
 			std::string& comment = currentMember != nullptr ? currentMember->comment : current->comment;
 			if (!comment.empty()) comment += "\r\n";
-			comment += trimmed;
+			comment += line;
 		}
 	}
 }
@@ -8296,7 +8302,7 @@ void ParseDllPage(const Page& page, std::vector<ParsedDllDef>& outDlls)
 			dll.fileName = Unquote(GetFieldOrEmpty(fields, 2));
 			dll.commandName = Unquote(GetFieldOrEmpty(fields, 3));
 			dll.isPublic = GetFieldOrEmpty(fields, 4) == "公开";
-			dll.comment = ExtractRemainingDefinitionFieldText(trimmed, "DLL命令", 5);
+			dll.comment = ExtractRemainingDefinitionFieldText(line, "DLL命令", 5);
 			outDlls.push_back(std::move(dll));
 			current = &outDlls.back();
 			currentParam = nullptr;
@@ -8308,15 +8314,15 @@ void ParseDllPage(const Page& page, std::vector<ParsedDllDef>& outDlls)
 			param.name = GetFieldOrEmpty(fields, 0);
 			param.typeName = GetFieldOrEmpty(fields, 1);
 			param.flagsText = GetFieldOrEmpty(fields, 2);
-			param.comment = ExtractRemainingDefinitionFieldText(trimmed, "参数", 3);
+			param.comment = ExtractRemainingDefinitionFieldText(line, "参数", 3);
 			current->params.push_back(std::move(param));
 			currentParam = &current->params.back();
 			continue;
 		}
-		if (!trimmed.empty() && current != nullptr && trimmed.front() != '.') {
+		if (!line.empty() && current != nullptr && (trimmed.empty() || trimmed.front() != '.')) {
 			std::string& comment = currentParam != nullptr ? currentParam->comment : current->comment;
 			if (!comment.empty()) comment += "\r\n";
-			comment += trimmed;
+			comment += line;
 		}
 	}
 }
@@ -8368,7 +8374,7 @@ bool ParseConstantPage(
 				commentFieldIndex = 4;
 			}
 		}
-		item.comment = ExtractRemainingDefinitionFieldText(trimmed, "常量", commentFieldIndex);
+		item.comment = ExtractRemainingDefinitionFieldText(line, "常量", commentFieldIndex);
 		outConstants.push_back(std::move(item));
 	}
 	return true;
@@ -8385,7 +8391,7 @@ void ParseWindowPage(const Page& page, std::vector<ParsedFormDef>& outForms)
 		ParseDefinitionFields(trimmed, "窗口", fields);
 		ParsedFormDef item;
 		item.name = GetFieldOrEmpty(fields, 0);
-		item.comment = ExtractRemainingDefinitionFieldText(trimmed, "窗口", 1);
+		item.comment = ExtractRemainingDefinitionFieldText(line, "窗口", 1);
 		outForms.push_back(std::move(item));
 	}
 }
@@ -9197,6 +9203,22 @@ bool ResolveDependencyModulePath(
 	return false;
 }
 
+bool HaveSameEComDependencyIdentities(const ProjectBundle& left, const ProjectBundle& right)
+{
+	std::vector<const Dependency*> lhs, rhs;
+	for (const auto& item : left.dependencies)
+		if (item.kind == DependencyKind::ECom) lhs.push_back(&item);
+	for (const auto& item : right.dependencies)
+		if (item.kind == DependencyKind::ECom) rhs.push_back(&item);
+	if (lhs.size() != rhs.size()) return false;
+	for (size_t index = 0; index < lhs.size(); ++index) {
+		// resolvedPath 是环境搜索结果，不代表用户更改了工程的模块引用。
+		if (lhs[index]->name != rhs[index]->name || lhs[index]->path != rhs[index]->path ||
+			lhs[index]->reExport != rhs[index]->reExport) return false;
+	}
+	return true;
+}
+
 bool BuildRestoreModel(
 	const Document& document,
 	const ProjectBundle* bundle,
@@ -9577,7 +9599,13 @@ bool BuildRestoreModel(
 				continue;
 			}
 			if (candidate.textDigest != digest) {
-				continue;
+				// 兼容旧工作区按原生名生成的摘要；成员及其余声明字段仍须完全匹配。
+				ParsedStructDef nativeNamedDefinition = definition;
+				nativeNamedDefinition.name = candidate.symbolName;
+				if (candidate.symbolName.empty() ||
+					candidate.textDigest != ComputeParsedStructDigest(nativeNamedDefinition)) {
+					continue;
+				}
 			}
 			reusedStructSnapshots.insert(&candidate);
 			return &candidate;
@@ -10285,6 +10313,37 @@ bool BuildRestoreModel(
 			appendDefinedIdRange(dependency, rangeStart, rangeCount);
 		}
 
+		// 外部模块可能已改名或删去旧接口；工程中的既有导入身份不能随之消失。
+		// 仅补齐声明，不取回旧的可执行方法体。
+		for (const auto& nativeClass : dependency.nativeClasses) {
+			if (std::any_of(model.classes.begin(), model.classes.end(), [&](const RestoreClass& item) {
+				return item.id == nativeClass.id;
+			})) continue;
+			RestoreClass item;
+			item.id = nativeClass.id;
+			allocator.Observe(item.id);
+			item.memoryAddress = nativeClass.memoryAddress;
+			item.name = nativeClass.name;
+			item.baseClass = nativeClass.baseClass;
+			item.isHidden = true;
+			for (const auto& source : nativeClass.variables) {
+				RestoreVariable variable;
+				variable.id = source.id;
+				allocator.Observe(variable.id);
+				variable.dataType = source.dataType;
+				variable.attr = source.attr;
+				variable.arrayBounds = source.arrayBounds;
+				variable.name = source.name;
+				variable.comment = source.comment;
+				item.vars.push_back(std::move(variable));
+			}
+			const auto name = TypeResolver::NormalizeTypeName(item.name);
+			importedClassModelIndices.insert_or_assign(name, model.classes.size());
+			importedClassModelOrder.emplace_back(name, model.classes.size());
+			resolver.RegisterUserType(item.name, item.id);
+			model.classes.push_back(std::move(item));
+		}
+
 		for (const auto& binding : importedDependencyStructBindings) {
 			const auto& parsedStruct = dependencyStructs[binding.parsedStructIndex];
 			auto& targetStruct = model.structs[binding.modelStructIndex];
@@ -10732,12 +10791,67 @@ bool BuildRestoreModel(
 		}
 	}
 
+	// 依赖未变时，隐藏声明仍属于原工程；外部模块的新接口不能使历史身份消失。
+	// 可编辑声明不从这里恢复，因此删除源码声明仍会正常生效。
+	if (originalBundle != nullptr && bundle != nullptr &&
+		HaveSameEComDependencyIdentities(*bundle, *originalBundle)) {
+		const auto restoreHiddenVariable = [&](const NativeDependencyVariableSymbol& source) {
+			RestoreVariable item;
+			item.id = source.id;
+			allocator.Observe(item.id);
+			item.dataType = source.dataType;
+			item.attr = source.attr;
+			item.arrayBounds = source.arrayBounds;
+			item.name = source.name;
+			item.comment = source.comment;
+			return item;
+		};
+		for (const auto& source : originalBundle->nativeHiddenStructs) {
+			const auto existing = std::find_if(model.structs.begin(), model.structs.end(),
+				[&](const auto& item) { return item.id == source.id; });
+			RestoreStruct item;
+			item.id = source.id;
+			allocator.Observe(item.id);
+			item.memoryAddress = source.memoryAddress;
+			item.attr = source.attr;
+			item.name = source.name;
+			item.comment = source.comment;
+			for (const auto& member : source.members) item.members.push_back(restoreHiddenVariable(member));
+			// 同名类型的可见绑定由接口及源码负责，隐藏历史声明只补齐身份。
+			if (existing == model.structs.end()) model.structs.push_back(std::move(item));
+			else *existing = std::move(item);
+		}
+		for (const auto& source : originalBundle->nativeHiddenDlls) {
+			const auto existing = std::find_if(model.dlls.begin(), model.dlls.end(),
+				[&](const auto& item) { return item.id == source.id; });
+			RestoreDll item;
+			item.id = source.id;
+			allocator.Observe(item.id);
+			item.memoryAddress = source.memoryAddress;
+			item.attr = source.attr;
+			item.returnType = source.returnType;
+			item.name = source.name;
+			item.comment = source.comment;
+			item.fileName = source.fileName;
+			item.commandName = source.commandName;
+			for (const auto& param : source.params) item.params.push_back(restoreHiddenVariable(param));
+			if (existing == model.dlls.end()) model.dlls.push_back(std::move(item));
+			else *existing = std::move(item);
+		}
+	}
+
 	// 必需基类可同时出现在模块接口和可编辑源码页中，每个原生身份只构造一次。
 	std::unordered_set<std::int32_t> localIdentityClasses, localIdentityMethods;
 	for (const auto* identity : nativeSourceSnapshotsByIndex) {
 		if (identity == nullptr) continue;
 		localIdentityClasses.insert(identity->classId);
 		for (const auto& method : identity->methods) localIdentityMethods.insert(method.id);
+	}
+	std::unordered_map<std::int32_t, RestoreClass> localImportedClasses;
+	for (auto& item : model.classes) {
+		if (localIdentityClasses.contains(item.id)) {
+			localImportedClasses.emplace(item.id, item);
+		}
 	}
 	std::erase_if(model.classes, [&](const auto& item) { return localIdentityClasses.contains(item.id); });
 	std::erase_if(model.methods, [&](const auto& item) { return localIdentityMethods.contains(item.id); });
@@ -10748,6 +10862,13 @@ bool BuildRestoreModel(
 			classIndex < nativeSourceSnapshotsByIndex.size() ? nativeSourceSnapshotsByIndex[classIndex] : nullptr;
 		RestoreClass item;
 		if (nativeSourceSnapshot != nullptr && nativeSourceSnapshot->classId != 0) {
+			// 导入类可以附有本地扩展方法：重建可编辑部分，保留其余导入成员的归属。
+			if (const auto it = localImportedClasses.find(nativeSourceSnapshot->classId);
+				it != localImportedClasses.end()) {
+				item = it->second;
+				item.vars.clear();
+				std::erase_if(item.functionIds, [&](const auto id) { return localIdentityMethods.contains(id); });
+			}
 			item.id = nativeSourceSnapshot->classId;
 			item.memoryAddress = nativeSourceSnapshot->classMemoryAddress;
 			item.formId = nativeSourceSnapshot->formId;
@@ -10782,7 +10903,8 @@ bool BuildRestoreModel(
 					continue;
 				}
 				existing.memoryAddress = reusableStructSnapshot != nullptr ? reusableStructSnapshot->memoryAddress : 0;
-				existing.name = parsedStruct.name;
+				existing.name = reusableStructSnapshot != nullptr && !reusableStructSnapshot->symbolName.empty()
+				? reusableStructSnapshot->symbolName : parsedStruct.name;
 				existing.comment = parsedStruct.comment;
 				existing.attr = parsedStruct.isPublic ? 0x1 : 0;
 				existing.isPlaceholder = false;
@@ -10797,7 +10919,8 @@ bool BuildRestoreModel(
 					? reusableStructSnapshot->id
 					: allocator.Alloc(epl_system_id::kTypeStruct);
 			item.memoryAddress = reusableStructSnapshot != nullptr ? reusableStructSnapshot->memoryAddress : 0;
-			item.name = parsedStruct.name;
+			item.name = reusableStructSnapshot != nullptr && !reusableStructSnapshot->symbolName.empty()
+				? reusableStructSnapshot->symbolName : parsedStruct.name;
 			item.comment = parsedStruct.comment;
 			item.attr = parsedStruct.isPublic ? 0x1 : 0;
 			modelStructIndex = model.structs.size();
@@ -12928,6 +13051,22 @@ std::vector<TItem> ReorderTopLevelItemsLocalFirst(
 	return ordered;
 }
 
+// 模块导入按原生声明表的位置绑定，不能将仍存在的声明按本地/外部重新分组。
+// 这里只保留身份顺序，声明内容及方法体仍来自本次语义重建；新增项稳定追加。
+template <typename TItem>
+void PreserveNativeDeclarationOrder(std::vector<TItem>& items, const std::vector<std::int32_t>& ids)
+{
+	std::unordered_map<std::int32_t, size_t> ranks;
+	for (size_t index = 0; index < ids.size(); ++index) ranks.emplace(ids[index], index);
+	const auto rank = [&](const TItem& item) {
+		const auto it = ranks.find(item.id);
+		return it == ranks.end() ? ids.size() : it->second;
+	};
+	std::stable_sort(items.begin(), items.end(), [&](const TItem& lhs, const TItem& rhs) {
+		return rank(lhs) < rank(rhs);
+	});
+}
+
 bool SerializeToModuleBytes(
 	const RestoreDocumentModel& model,
 	std::vector<std::uint8_t>& outBytes,
@@ -12941,10 +13080,18 @@ bool SerializeToModuleBytes(
 	}
 
 	RestoreDocumentModel emitModel = model;
-	emitModel.classes = ReorderClassesForEmit(std::move(emitModel.classes), emitModel.dependencies, currentBundle);
+	if (originalBundle != nullptr) {
+		PreserveNativeDeclarationOrder(emitModel.classes, originalBundle->nativeClassOrder);
+		PreserveNativeDeclarationOrder(emitModel.methods, originalBundle->nativeMethodOrder);
+		PreserveNativeDeclarationOrder(emitModel.structs, originalBundle->nativeStructOrder);
+		PreserveNativeDeclarationOrder(emitModel.dlls, originalBundle->nativeDllOrder);
+	}
+	else {
+		emitModel.classes = ReorderClassesForEmit(std::move(emitModel.classes), emitModel.dependencies, currentBundle);
+		emitModel.structs = ReorderTopLevelItemsLocalFirst(std::move(emitModel.structs), emitModel.dependencies);
+		emitModel.dlls = ReorderTopLevelItemsLocalFirst(std::move(emitModel.dlls), emitModel.dependencies);
+	}
 	emitModel.globals = ReorderTopLevelItemsLocalFirst(std::move(emitModel.globals), emitModel.dependencies);
-	emitModel.structs = ReorderTopLevelItemsLocalFirst(std::move(emitModel.structs), emitModel.dependencies);
-	emitModel.dlls = ReorderTopLevelItemsLocalFirst(std::move(emitModel.dlls), emitModel.dependencies);
 
 	std::string resourceError;
 	const std::vector<std::uint8_t> resourceBytes = BuildResourceSection(emitModel, &resourceError);

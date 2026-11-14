@@ -146,6 +146,8 @@ struct NativeDependencyConstantSymbol {
 
 // 原生工程里易模块导入的公开数据类型符号。
 struct NativeDependencyStructSymbol {
+	std::int32_t attr = 0x2;
+	std::string comment;
 	std::vector<NativeDependencyVariableSymbol> members;
 	std::int32_t id = 0;
 	std::int32_t memoryAddress = 0;
@@ -399,12 +401,20 @@ struct ProjectBundle {
 	std::vector<std::string> rootChildKeys;
 	std::vector<WindowBinding> windowBindings;
 	std::vector<BundleNativeSourceFileSnapshot> nativeSourceSnapshots;
+	// 原生程序集顺序参与模块导入绑定；语义回包保留已有声明的相对位置。
+	std::vector<std::int32_t> nativeClassOrder;
 	// 原生程序段的方法顺序，用于按位置关联易包链接条目。
 	std::vector<std::int32_t> nativeMethodOrder;
+	// 声明顺序决定同名结构的消歧名称，并影响导入声明定位。
+	std::vector<std::int32_t> nativeStructOrder;
+	std::vector<std::int32_t> nativeDllOrder;
 	std::optional<BundleNativeProgramHeaderSnapshot> nativeProgramHeader;
 	std::vector<BundleNativeGlobalSnapshot> nativeGlobalSnapshots;
 	std::vector<BundleNativeStructSnapshot> nativeStructSnapshots;
 	std::vector<BundleNativeDllSnapshot> nativeDllSnapshots;
+	// 仅从原件重读的隐藏声明，不含方法体；避免接口重建遗漏历史身份。
+	std::vector<NativeDependencyStructSymbol> nativeHiddenStructs;
+	std::vector<NativeDependencyDllSymbol> nativeHiddenDlls;
 	std::vector<BundleNativeConstantSnapshot> nativeConstantSnapshots;
 	std::string nativeBundleDigest;
 	std::vector<std::uint8_t> nativeSourceBytes;
