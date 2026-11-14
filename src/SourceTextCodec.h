@@ -2,9 +2,20 @@
 
 #include <cstddef>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace e2txt::source_text {
+
+// 显式停用行的流程关键字；其余内容属于停用表达式，不是普通注释。
+inline bool IsMaskedFlowBody(std::string_view body)
+{
+    for (const std::string_view name : {"如果", "如果真", "如果结束", "如果真结束", "否则",
+        "判断开始", "判断", "默认", "判断结束", "判断循环首", "判断循环尾",
+        "循环判断首", "循环判断尾", "计次循环首", "计次循环尾", "变量循环首", "变量循环尾"})
+        if (body == name || (body.starts_with(name) && body.size() > name.size() && body[name.size()] == ' ')) return true;
+    return false;
+}
 
 // 内部文本字面量编码集中维护；目录原生文本不把此前缀当成用户转义指令。
 std::string EncodeLiteral(const std::string& text, bool longText = false);

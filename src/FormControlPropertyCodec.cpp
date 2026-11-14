@@ -2445,8 +2445,9 @@ bool FormControlPropertyCodec::ApplyInProcess(
 		*outTargets = targets;
 	}
 
-	// 原始数据已满足全部目标值时保留原字节，不让字体填充等私有字节随封包改变。
-	if (!originalData.empty() && canReadOriginal &&
+	// 空载荷同样是合法的默认控件状态；全部目标值一致时不触发无意义的序列化。
+	// 保留原字节，也避免第三方支持库的保存接口改变本来未编辑的属性。
+	if (canReadOriginal &&
 		std::all_of(targets.begin(), targets.end(), [&](const FormControlPropertyValue& target) {
 			const auto original = findOriginal(target.definition);
 			return original != originalValues.end() && AreValuesEquivalent(*original, target);
@@ -2519,8 +2520,8 @@ bool FormControlPropertyCodec::ApplyInProcess(
 			break;
 		}
 	}
-	// 实例未作修改说明原始数据已满足目标值；没有保存接口时空数据也只能保持原样。
-	if (!modified && (!originalData.empty() || context.getAll == nullptr)) {
+	// 实例未作修改说明原始数据（包括空载荷默认态）已满足目标值。
+	if (!modified) {
 		return true;
 	}
 

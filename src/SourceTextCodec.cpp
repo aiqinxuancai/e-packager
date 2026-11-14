@@ -192,6 +192,7 @@ bool Transform(const std::string& input, bool render, ParsedProgramText& output)
     output = {};
     output.sourceLines.push_back(1);
     size_t sourceLine = 1;
+    size_t maskQuote = std::string::npos;
     bool lineStart = true, declaration = false, comment = false, asciiQuote = false;
     for (size_t i = 0; i < input.size();) {
         if (lineStart) {
@@ -201,6 +202,7 @@ bool Transform(const std::string& input, bool render, ParsedProgramText& output)
             lineStart = false;
             auto prefix = i;
             while (prefix < input.size() && (input[prefix] == ' ' || input[prefix] == '\t')) ++prefix;
+            maskQuote = At(input, prefix, ".' ") ? prefix + 1 : std::string::npos;
             // 整行载荷仍有自己的语法；不能把它误当作普通表达式的字符串。
             if (At(input, prefix, "#e2txt_body_line#") || At(input, prefix, "' #e2txt_body_line#")) {
                 if (render) return false;
@@ -246,7 +248,7 @@ bool Transform(const std::string& input, bool render, ParsedProgramText& output)
         }
         if (!declaration && !comment) {
             if (ch == '"') asciiQuote = !asciiQuote;
-            else if (ch == '\'' && !asciiQuote) comment = true;
+            else if (ch == '\'' && !asciiQuote && i != maskQuote) comment = true;
         }
         const auto next = NextCharacter(input, i);
         output.canonical.append(input, i, next - i);

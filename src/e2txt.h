@@ -153,6 +153,16 @@ struct NativeDependencyStructSymbol {
 	std::vector<std::int32_t> memberIds;
 };
 
+// 原生工程已导入的 DLL 声明，不包含可执行方法体。
+struct NativeDependencyDllSymbol {
+	std::int32_t id = 0;
+	std::int32_t memoryAddress = 0;
+	std::int32_t attr = 0;
+	std::int32_t returnType = 0;
+	std::string name, comment, fileName, commandName;
+	std::vector<NativeDependencyVariableSymbol> params;
+};
+
 // 原生工程里单个易模块依赖的导入符号表。
 struct NativeDependencySymbolRecord {
 	std::string name;
@@ -163,6 +173,7 @@ struct NativeDependencySymbolRecord {
 	std::vector<NativeDependencyStructSymbol> structs;
 	std::vector<NativeDependencyMethodSymbol> methods;
 	std::vector<NativeDependencyConstantSymbol> constants;
+	std::vector<NativeDependencyDllSymbol> dlls;
 };
 
 // 目录化资源类型。
@@ -255,6 +266,16 @@ struct BundleUnresolvedVariable {
 	std::string name;
 };
 
+// 已删除或改变类型的声明仍有原生引用；按方法保存符号种类与所有者，不猜测名称。
+struct BundleNativeReference {
+	std::int32_t id = 0;
+	std::string name;
+	std::string kind;
+	std::int32_t ownerType = 0;
+	std::int32_t type = 0;
+	std::int16_t library = -2;
+};
+
 // 原生方法快照。
 struct BundleNativeMethodSnapshot {
 	// 声明身份独立于方法体字节码，支持语义重建时保留未知类型。
@@ -269,6 +290,7 @@ struct BundleNativeMethodSnapshot {
 	std::vector<std::int32_t> localIds;
 	std::vector<std::int32_t> localTypes;
 	std::vector<BundleUnresolvedVariable> unresolvedVariables;
+	std::vector<BundleNativeReference> identityReferences;
 	std::vector<std::uint8_t> lineOffset;
 	std::vector<std::uint8_t> blockOffset;
 	std::vector<std::uint8_t> methodReference;
@@ -312,6 +334,8 @@ struct BundleNativeDllSnapshot {
 // 原生自定义数据类型快照。
 struct BundleNativeStructSnapshot {
 	std::string name;
+	// 未经显示消歧的原生名称，用于跨模块匹配；不能从别名字符串反推。
+	std::string symbolName;
 	std::string textDigest;
 	std::int32_t id = 0;
 	std::int32_t memoryAddress = 0;

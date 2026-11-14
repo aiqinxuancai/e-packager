@@ -24,7 +24,7 @@ namespace e2txt {
 
 namespace {
 
-constexpr std::int32_t kBundleDirectoryFormatVersion = 7;
+constexpr std::int32_t kBundleDirectoryFormatVersion = 8;
 
 using json = nlohmann::json;
 
@@ -386,11 +386,16 @@ json ResourceMetaToJson(const BundleBinaryResource& resource)
 
 json NativeMethodSnapshotToJson(const BundleNativeMethodSnapshot& snapshot)
 {
+	json retired = json::array();
+	for (const auto& item : snapshot.identityReferences)
+		retired.push_back({ { "id", item.id }, { "name", LocalToUtf8Text(item.name) },
+			{ "kind", item.kind }, { "ownerType", item.ownerType }, { "type", item.type }, { "library", item.library } });
 	json unresolved = json::array();
 	for (const auto& item : snapshot.unresolvedVariables)
 		unresolved.push_back({ { "id", item.id }, { "name", LocalToUtf8Text(item.name) } });
 	return json{
 		{ "unresolvedVariables", std::move(unresolved) },
+		{ "identityReferences", std::move(retired) },
 		{ "returnType", snapshot.returnType },
 		{ "name", LocalToUtf8Text(snapshot.name) },
 		{ "textDigest", snapshot.textDigest },
@@ -457,6 +462,7 @@ json NativeDllSnapshotToJson(const BundleNativeDllSnapshot& snapshot)
 json NativeStructSnapshotToJson(const BundleNativeStructSnapshot& snapshot)
 {
 	return json{
+		{ "symbolName", LocalToUtf8Text(snapshot.symbolName) },
 		{ "name", LocalToUtf8Text(snapshot.name) },
 		{ "textDigest", snapshot.textDigest },
 		{ "id", snapshot.id },
@@ -561,6 +567,10 @@ BundleNativeMethodSnapshot NativeMethodSnapshotFromJson(const json& item)
 {
 	BundleNativeMethodSnapshot snapshot;
 	snapshot.returnType = item.value("returnType", 0);
+	for (const auto& value : item.value("identityReferences", json::array()))
+		snapshot.identityReferences.push_back({ value.at("id").get<std::int32_t>(),
+			Utf8ToLocalText(value.at("name").get<std::string>()), value.at("kind").get<std::string>(),
+			value.value("ownerType", 0), value.value("type", 0), value.value<std::int16_t>("library", -2) });
 	for (const auto& value : item.value("unresolvedVariables", json::array()))
 		snapshot.unresolvedVariables.push_back({ value.at("id").get<std::int32_t>(), Utf8ToLocalText(value.at("name").get<std::string>()) });
 	snapshot.name = Utf8ToLocalText(item.value("name", ""));
@@ -666,6 +676,7 @@ BundleNativeDllSnapshot NativeDllSnapshotFromJson(const json& item)
 BundleNativeStructSnapshot NativeStructSnapshotFromJson(const json& item)
 {
 	BundleNativeStructSnapshot snapshot;
+	snapshot.symbolName = Utf8ToLocalText(item.value("symbolName", ""));
 	snapshot.name = Utf8ToLocalText(item.value("name", ""));
 	snapshot.textDigest = item.value("textDigest", "");
 	snapshot.id = item.value("id", 0);

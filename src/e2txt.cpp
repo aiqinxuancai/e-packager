@@ -701,6 +701,8 @@ struct FunctionInfo {
 };
 
 struct DataTypeInfo {
+	// 在显示名称消歧之前保存模块声明名。
+	std::string originalName;
 	BlockHeader header;
 	std::int32_t attr = 0;
 	std::string name;
@@ -3202,6 +3204,22 @@ public:
 		BuildClassTypePageMap();
 		BuildUserNameCache();
 		BuildReferenceIndexes();
+		for (const auto& type : program.dataTypes)
+			for (const auto& member : type.members) {
+				m_declaredMembers[type.header.dwId].insert(member.marker);
+				m_variableTypes[member.marker] = member.dataType;
+			}
+		for (const auto& page : program.codePages)
+			for (const auto& member : page.pageVars) {
+				m_declaredMembers[page.header.dwId].insert(member.marker);
+				m_variableTypes[member.marker] = member.dataType;
+			}
+		for (const auto& function : program.functions) {
+			m_variableTypes[function.header.dwId] = function.returnType;
+			for (const auto& variable : function.params) m_variableTypes[variable.marker] = variable.dataType;
+			for (const auto& variable : function.locals) m_variableTypes[variable.marker] = variable.dataType;
+		}
+		for (const auto& variable : program.globals) m_variableTypes[variable.marker] = variable.dataType;
 	}
 
 	std::vector<const FunctionInfo*> CollectPageFunctions(const CodePageInfo& page) const
@@ -3235,6 +3253,13 @@ public:
 			[&](const auto& item) { return item.second == name; })) name += "_";
 		m_unresolvedNames.emplace(id, name);
 		return name;
+	}
+
+	std::string ResolveDeclarationName(const std::string& rawName, const std::string& comment, std::int32_t id) const
+	{
+		auto name = TrimAsciiCopy(rawName);
+		if (name.empty()) name = ParseDebugSymbolName(comment);
+		return name.empty() ? ResolveUserName(id) : name;
 	}
 
 	void SetIdeDisplay(bool enabled) { m_ideDisplay = enabled; m_resolvedTypeNames.clear(); }
@@ -3275,6 +3300,86 @@ public:
 		return found == m_unresolvedVariables.end() ? std::vector<BundleUnresolvedVariable>{} : found->second;
 	}
 
+	std::vector<BundleNativeReference> IdentityReferences(std::int32_t methodId) const
+	{
+		const auto it = m_identityReferences.find(methodId);
+		return it == m_identityReferences.end() ? std::vector<BundleNativeReference>{} : it->second;
+	}
+
+	void HintReferenceType(std::int32_t id, std::int32_t type) const
+	{
+		if (!m_ideDisplay && m_currentFunction)
+			m_referenceTypes[m_currentFunction->header.dwId][id] = type;
+	}
+
+	bool HasReferenceType(std::int32_t id) const
+	{
+		if (m_currentFunction) {
+			const auto method = m_referenceTypes.find(m_currentFunction->header.dwId);
+			if (method != m_referenceTypes.end()) {
+				const auto value = method->second.find(id);
+				if (value != method->second.end() && value->second != 0) return true;
+			}
+		}
+		const auto declared = m_variableTypes.find(id);
+		return declared != m_variableTypes.end() && declared->second != 0;
+	}
+
+	bool NeedsNativeMethodBinding(std::int32_t id)
+	{
+		if (!HasReferenceType(id)) return true;
+		const auto found = m_variableTypes.find(id);
+		if (found == m_variableTypes.end() || !epl_system_id::IsLibDataType(found->second)) return false;
+		std::int16_t library = 0, type = 0;
+		epl_system_id::DecomposeLibDataTypeId(found->second, library, type);
+		return !EnsureSupportLibraryCacheByLibraryId(library);
+	}
+
+	// 接收对象类型或支持库元数据缺失时，调用本身仍记录了支持库和命令 ID。
+	std::string ResolveNativeLibraryReference(std::int16_t library, std::int32_t command, size_t argumentCount)
+	{
+		if (m_ideDisplay || !m_currentFunction) return ResolveLibCmdName(library, command, false, argumentCount);
+		std::string alias = "_NativeLib" + std::to_string(library) + "Cmd" + std::to_string(command);
+		while (std::any_of(m_userNameCache.begin(), m_userNameCache.end(),
+			[&](const auto& entry) { return entry.second == alias; })) alias += "_";
+		auto& refs = m_identityReferences[m_currentFunction->header.dwId];
+		if (std::none_of(refs.begin(), refs.end(), [&](const auto& ref) { return ref.name == alias; }))
+			refs.push_back({command, alias, "function", 0, 0, library});
+		return alias;
+	}
+
+	bool HasChangedVariableType(std::int32_t id, std::int32_t nativeType) const
+	{
+		const auto it = m_variableTypes.find(id);
+		return it != m_variableTypes.end() && it->second != nativeType;
+	}
+
+	std::string ResolveReferenceName(std::int32_t id, const std::string& kind,
+		std::int32_t ownerType = 0, std::int16_t library = -2, bool detached = false) const
+	{
+		if (kind == "member") {
+			const auto owner = m_declaredMembers.find(ownerType);
+			detached = detached || owner == m_declaredMembers.end() || !owner->second.contains(id);
+		}
+		if (m_ideDisplay || !m_currentFunction || (!detached && !m_retiredIds.contains(id))) return ResolveUserName(id);
+		auto& alias = m_retiredAliases[id];
+		if (alias.empty()) {
+			alias = MakeUnresolvedName(id);
+			while (std::any_of(m_userNameCache.begin(), m_userNameCache.end(),
+				[&](const auto& entry) { return entry.second == alias; })) alias += "_";
+		}
+		auto& references = m_identityReferences[m_currentFunction->header.dwId];
+		auto it = std::find_if(references.begin(), references.end(), [&](const auto& ref) {
+			return ref.id == id && ref.kind == kind && ref.ownerType == ownerType;
+		});
+		auto type = m_referenceTypes[m_currentFunction->header.dwId][id];
+		if (type == 0)
+			if (const auto known = m_variableTypes.find(id); known != m_variableTypes.end()) type = known->second;
+		if (it == references.end()) references.push_back({id, alias, kind, ownerType, type, library});
+		else if (type != 0) it->type = type;
+		return alias;
+	}
+
 	void SetCurrentFunction(const FunctionInfo* function)
 	{
 		m_currentFunction = function;
@@ -3286,7 +3391,7 @@ public:
 
 	std::string ResolveVariableReferenceName(std::int32_t id) const
 	{
-		const auto name = ResolveUserName(id);
+		const auto name = ResolveReferenceName(id, "variable");
 		if (!name.empty() && m_currentFunction != nullptr && !m_userNameCache.contains(id)) {
 			auto& references = m_unresolvedVariables[m_currentFunction->header.dwId];
 			if (std::none_of(references.begin(), references.end(), [id](const auto& item) { return item.id == id; }))
@@ -3318,16 +3423,20 @@ public:
 
 	std::string ResolveLibCmdName(std::int16_t libraryIndex, std::int32_t commandId, bool qualifyGlobal, size_t argumentCount)
 	{
+		const auto unresolved = [&](const char* reason) {
+			const auto display = UnresolvedCommandName(libraryIndex, commandId, reason);
+			return m_ideDisplay || !m_currentFunction ? display : ResolveNativeLibraryReference(libraryIndex, commandId, argumentCount);
+		};
 		if (!EnsureSupportLibraryCacheByLibraryId(libraryIndex)) {
-			return UnresolvedCommandName(libraryIndex, commandId, "library_metadata_unavailable");
+			return unresolved("library_metadata_unavailable");
 		}
 
 		const auto* symbols = FindSupportLibrarySymbolsByLibraryId(libraryIndex);
 		if (symbols == nullptr || commandId < 0 || static_cast<size_t>(commandId) >= symbols->commandNames.size()) {
-			return UnresolvedCommandName(libraryIndex, commandId, "command_id_out_of_range");
+			return unresolved("command_id_out_of_range");
 		}
 		const std::string& name = symbols->commandNames[static_cast<size_t>(commandId)];
-		if (name.empty()) return UnresolvedCommandName(libraryIndex, commandId, "command_name_empty_or_unreadable");
+		if (name.empty()) return unresolved("command_name_empty_or_unreadable");
 		// 用回包器的同一绑定规则检验裸名称，避免两套作用域判定逐渐分叉。
 		const auto owner = m_currentFunction ? ResolveCallableOwnerId(m_currentFunction->ownerClass) : 0;
 		const auto bound = BindCallable(m_callableBindings, TrimAsciiCopy(name), owner, argumentCount,
@@ -3374,30 +3483,28 @@ public:
 		return name.empty() ? std::string("_Lib") + std::to_string(libraryIndex) + "Type" + std::to_string(typeId) : name;
 	}
 
-	std::string ResolveLibTypeMemberName(std::int16_t libraryIndex, std::int32_t typeId, std::int32_t memberId)
+	std::string ResolveLibTypeMemberName(std::int16_t libraryIndex, std::int32_t typeId, std::int32_t memberId,
+		bool preserveReference = false)
 	{
-		if (!EnsureSupportLibraryCacheByLibraryId(libraryIndex)) {
-			std::ostringstream stream;
-			stream << "_Lib" << libraryIndex << "Type" << typeId << "Mem" << memberId;
-			return stream.str();
+		if (EnsureSupportLibraryCacheByLibraryId(libraryIndex)) {
+			const auto* symbols = FindSupportLibrarySymbolsByLibraryId(libraryIndex);
+			if (symbols && typeId >= 0 && static_cast<size_t>(typeId) < symbols->dataTypes.size()) {
+				const auto& members = symbols->dataTypes[static_cast<size_t>(typeId)].memberNames;
+				if (memberId >= 0 && static_cast<size_t>(memberId) < members.size() && !members[memberId].empty())
+					return members[memberId];
+			}
 		}
-
-		const auto* symbols = FindSupportLibrarySymbolsByLibraryId(libraryIndex);
-		if (symbols == nullptr || typeId < 0 || static_cast<size_t>(typeId) >= symbols->dataTypes.size()) {
-			std::ostringstream stream;
-			stream << "_Lib" << libraryIndex << "Type" << typeId << "Mem" << memberId;
-			return stream.str();
-		}
-
-		const auto& members = symbols->dataTypes[static_cast<size_t>(typeId)].memberNames;
-		if (memberId < 0 || static_cast<size_t>(memberId) >= members.size()) {
-			std::ostringstream stream;
-			stream << "_Lib" << libraryIndex << "Type" << typeId << "Mem" << memberId;
-			return stream.str();
-		}
-
-		const std::string& name = members[static_cast<size_t>(memberId)];
-		return name.empty() ? std::string("_Lib") + std::to_string(libraryIndex) + "Type" + std::to_string(typeId) + "Mem" + std::to_string(memberId) : name;
+		std::string name = "_Lib" + std::to_string(libraryIndex) + "Type" + std::to_string(typeId) + "Mem" + std::to_string(memberId);
+		if (!preserveReference || m_ideDisplay || !m_currentFunction) return name;
+		// 外部类型成员的原生编号和所属类型由表达式给出，不依赖名称或本机支持库版本。
+		name = "_Native" + name.substr(1);
+		while (std::any_of(m_userNameCache.begin(), m_userNameCache.end(),
+			[&](const auto& entry) { return entry.second == name; })) name += "_";
+		auto& refs = m_identityReferences[m_currentFunction->header.dwId];
+		const auto owner = ((static_cast<std::int32_t>(libraryIndex) + 1) << 16) | (typeId + 1);
+		if (std::none_of(refs.begin(), refs.end(), [&](const auto& ref) { return ref.name == name; }))
+			refs.push_back({memberId + 1, name, "member", owner, 0, libraryIndex});
+		return name;
 	}
 
 	std::string ResolveLibTypeEventName(std::int32_t typeValue, std::int32_t eventId)
@@ -3810,6 +3917,8 @@ private:
 				if (epl_system_id::GetType(elementId) == 0) {
 					elementId |= element.isMenu ? epl_system_id::kTypeFormMenu : epl_system_id::kTypeFormControl;
 				}
+				m_variableTypes[elementId] = element.dataType;
+				m_declaredMembers[item.header.dwId].insert(elementId);
 				m_userNameCache[elementId] = ResolveVisibleName(
 					element.name,
 					element.comment,
@@ -3831,6 +3940,7 @@ private:
 					}
 				}
 				m_userNameCache[item.id] = name;
+				m_retiredIds.insert(item.id);
 			}
 		}
 		// 结构与类共用源码类型名空间，原生 ID 不同的同名类型必须可区分。
@@ -4020,6 +4130,12 @@ private:
 	const std::vector<std::filesystem::path>* m_supportLibrarySearchDirectories = nullptr;
 	bool m_restrictSupportLibrarySearch = false;
 	bool m_ideDisplay = false;
+	std::unordered_map<std::int32_t, std::unordered_set<std::int32_t>> m_declaredMembers;
+	std::unordered_map<std::int32_t, std::int32_t> m_variableTypes;
+	std::unordered_set<std::int32_t> m_retiredIds;
+	mutable std::unordered_map<std::int32_t, std::string> m_retiredAliases;
+	mutable std::unordered_map<std::int32_t, std::vector<BundleNativeReference>> m_identityReferences;
+	mutable std::unordered_map<std::int32_t, std::unordered_map<std::int32_t, std::int32_t>> m_referenceTypes;
 	const FunctionInfo* m_currentFunction = nullptr;
 	mutable std::unordered_map<std::int32_t, std::vector<BundleUnresolvedVariable>> m_unresolvedVariables;
 	mutable std::unordered_map<std::int32_t, std::string> m_unresolvedNames;
@@ -4324,7 +4440,7 @@ std::string BuildMethodParameterLine(const VariableInfo& info, SymbolResolver& r
 	return BuildDefinitionLine(
 		"参数",
 		{
-			TrimAsciiCopy(resolver.ResolveUserName(info.marker)),
+			TrimAsciiCopy(resolver.ResolveDeclarationName(info.name, info.comment, info.marker)),
 			BuildTypeField(info, resolver, hints),
 			JoinStrings(flags, " "),
 			TrimAsciiCopy(info.comment),
@@ -4336,7 +4452,7 @@ std::string BuildLocalVariableLine(const VariableInfo& info, SymbolResolver& res
 	return BuildDefinitionLine(
 		"局部变量",
 		{
-			TrimAsciiCopy(resolver.ResolveUserName(info.marker)),
+			TrimAsciiCopy(resolver.ResolveDeclarationName(info.name, info.comment, info.marker)),
 			BuildTypeField(info, resolver, hints),
 			(info.attr & 0x0001) != 0 ? "静态" : std::string(),
 			BuildArraySuffix(info.arrayBounds),
@@ -4349,7 +4465,7 @@ std::string BuildClassVariableLine(const VariableInfo& info, SymbolResolver& res
 	return BuildCommentedDefinitionLine(
 		"程序集变量",
 		{
-			TrimAsciiCopy(resolver.ResolveUserName(info.marker)),
+			TrimAsciiCopy(resolver.ResolveDeclarationName(info.name, info.comment, info.marker)),
 			BuildTypeField(info, resolver, hints),
 			std::string(),
 			BuildArraySuffix(info.arrayBounds),
@@ -4362,7 +4478,7 @@ std::string BuildGlobalVariableLine(const VariableInfo& info, SymbolResolver& re
 	return BuildDefinitionLine(
 		"全局变量",
 		{
-			TrimAsciiCopy(resolver.ResolveUserName(info.marker)),
+			TrimAsciiCopy(resolver.ResolveDeclarationName(info.name, info.comment, info.marker)),
 			BuildTypeField(info, resolver, hints),
 			(info.attr & 0x0100) != 0 ? "公开" : std::string(),
 			BuildArraySuffix(info.arrayBounds),
@@ -4375,7 +4491,7 @@ std::string BuildStructMemberLine(const VariableInfo& info, const std::string& r
 	return BuildDefinitionLine(
 		"成员",
 		{
-			TrimAsciiCopy(resolver.ResolveUserName(info.marker)),
+			TrimAsciiCopy(resolver.ResolveDeclarationName(info.name, info.comment, info.marker)),
 			resolvedType,
 			(info.attr & kVarAttrByRef) != 0 ? "传址" : std::string(),
 			BuildArraySuffix(info.arrayBounds),
@@ -4396,7 +4512,7 @@ std::string BuildDllParameterLine(const VariableInfo& info, const std::string& r
 	return BuildDefinitionLine(
 		"参数",
 		{
-			TrimAsciiCopy(resolver.ResolveUserName(info.marker)),
+			TrimAsciiCopy(resolver.ResolveDeclarationName(info.name, info.comment, info.marker)),
 			resolvedType,
 			JoinStrings(flags, " "),
 			TrimAsciiCopy(info.comment),
@@ -4831,7 +4947,7 @@ std::string RenderExpr(const Expr& expr, SymbolResolver& resolver, int expectedL
 		return BuildDumpTextLiteral(expr.text, false);
 	case ExprKind::Constant:
 		return expr.shortValue1 == -2
-			? "#" + resolver.ResolveUserName(expr.intValue1)
+			? "#" + resolver.ResolveReferenceName(expr.intValue1, "constant")
 			: "#" + resolver.ResolveLibConstantName(expr.shortValue1, expr.intValue1);
 	case ExprKind::EnumConstant:
 		return "#" + resolver.ResolveLibTypeName(expr.shortValue1, expr.shortValue2) + "." +
@@ -4839,7 +4955,7 @@ std::string RenderExpr(const Expr& expr, SymbolResolver& resolver, int expectedL
 	case ExprKind::Variable:
 		return resolver.ResolveVariableReferenceName(expr.intValue1);
 	case ExprKind::MethodPtr:
-		return "&" + resolver.ResolveUserName(expr.intValue1);
+		return "&" + resolver.ResolveReferenceName(expr.intValue1, "function");
 	case ExprKind::ArrayLiteral:
 		return "{ " + RenderExprList(expr.items, resolver) + " }";
 	case ExprKind::AccessArray:
@@ -4848,6 +4964,12 @@ std::string RenderExpr(const Expr& expr, SymbolResolver& resolver, int expectedL
 			(expr.extra == nullptr ? std::string() : RenderExpr(*expr.extra, resolver)) +
 			"]";
 	case ExprKind::AccessMember: {
+		const Expr* ownerExpression = expr.target.get();
+		while (ownerExpression && ownerExpression->kind == ExprKind::AccessArray)
+			ownerExpression = ownerExpression->target.get();
+		if (expr.shortValue1 == -2 && ownerExpression &&
+			(ownerExpression->kind == ExprKind::Variable || ownerExpression->kind == ExprKind::AccessMember))
+			resolver.HintReferenceType(ownerExpression->intValue1, expr.intValue2);
 		std::string prefix;
 		if (expr.target != nullptr) {
 			const bool omitTarget =
@@ -4862,9 +4984,11 @@ std::string RenderExpr(const Expr& expr, SymbolResolver& resolver, int expectedL
 				(static_cast<std::uint32_t>(expr.intValue1) & 0xFF000000u) == 0) {
 				return prefix + resolver.ResolveLibTypeMemberName(0, 0, expr.intValue1 - 1);
 			}
-			return prefix + resolver.ResolveUserName(expr.intValue1);
+			return prefix + resolver.ResolveReferenceName(expr.intValue1, "member", expr.intValue2, -2,
+				expr.target && expr.target->kind == ExprKind::Variable &&
+				resolver.HasChangedVariableType(expr.target->intValue1, expr.intValue2));
 		}
-		return prefix + resolver.ResolveLibTypeMemberName(expr.shortValue1, expr.intValue2, expr.intValue1);
+		return prefix + resolver.ResolveLibTypeMemberName(expr.shortValue1, expr.intValue2, expr.intValue1, true);
 	}
 	case ExprKind::Call: {
 		// 旧格式允许参数以尚未解析的源码保存（如省略参数和数字常量）。
@@ -4923,8 +5047,13 @@ std::string RenderExpr(const Expr& expr, SymbolResolver& resolver, int expectedL
 			}
 		}
 		text += (expr.shortValue1 == -2 || expr.shortValue1 == -3)
-			? resolver.ResolveUserName(expr.intValue1)
-			: resolver.ResolveLibCmdName(expr.shortValue1, expr.intValue1, expr.target == nullptr, expr.items.size());
+			? resolver.ResolveReferenceName(expr.intValue1, "function", 0, expr.shortValue1,
+				expr.target && (expr.target->kind == ExprKind::Variable || expr.target->kind == ExprKind::AccessMember) &&
+				resolver.NeedsNativeMethodBinding(expr.target->intValue1))
+			: expr.target && (expr.target->kind == ExprKind::Variable || expr.target->kind == ExprKind::AccessMember) &&
+				resolver.NeedsNativeMethodBinding(expr.target->intValue1)
+				? resolver.ResolveNativeLibraryReference(expr.shortValue1, expr.intValue1, expr.items.size())
+				: resolver.ResolveLibCmdName(expr.shortValue1, expr.intValue1, expr.target == nullptr, expr.items.size());
 		text += " (" + RenderExprList(expr.items, resolver) + ")";
 		return text;
 	}
@@ -5602,7 +5731,7 @@ void AppendStatementLines(const StatementBlock& block, SymbolResolver& resolver,
 {
 	const auto appendControlLine = [&](int depth, std::string line) {
 		// 只转换语法树中的流程节点，普通注释中相同文字不参与转换。
-		if (resolver.IsIdeDisplay() && line.starts_with("' .")) {
+		if (line.starts_with("' .")) {
 			if (line.starts_with("' .判断开始 ("))
 				line = ".判断开始断 (" + line.substr(std::string_view("' .判断开始 (").size());
 			else line = ".' " + line.substr(3);
@@ -5616,7 +5745,7 @@ void AppendStatementLines(const StatementBlock& block, SymbolResolver& resolver,
 		case StatementKind::Expression: {
 			std::string line;
 			if (statement.mask) {
-				line += "' ";
+				line += statement.expression && !resolver.IsIdeDisplay() ? ".' " : "' ";
 			}
 			if (statement.expression != nullptr) {
 				line += RenderExpr(*statement.expression, resolver);
@@ -6373,6 +6502,8 @@ std::vector<std::pair<std::string, std::string>> BuildFormControlXmlAttributes(
 	if (item.locked) {
 		attributes.emplace_back("锁定", BoolToEText(true));
 	}
+	// 第三方控件从空数据创建可能含未初始化状态，单次逆向重建相等不能证明稳定。
+	// 保留原始持久化基底；回包仍按 XML 修改属性并校验，不复用任何可执行代码。
 	attributes.emplace_back("扩展属性数据", EncodeBase64(item.extensionData));
 	return attributes;
 }
@@ -6500,32 +6631,6 @@ void AppendFormControlPropertyXmlNode(
 	AppendXmlLine(formXml, indent, "</" + node.name + ">");
 }
 
-// 仅凭 XML 属性即可重建等价的原始属性数据时省略“扩展属性数据”，目录中不再保留冗余 Base64；
-// 解码失败、旧版本格式或含私有状态的数据继续原样保留。
-void OmitRebuildableFormControlPropertyData(
-	std::vector<std::pair<std::string, std::string>>& attributes,
-	FormControlPropertyCodec& codec,
-	const FormInfo::ElementInfo& item,
-	const std::uint32_t formId,
-	const std::vector<FormControlPropertyXmlNode>& propertyNodes)
-{
-	std::string reason;
-	if (!codec.CanRebuildFromXml(
-			item.dataType,
-			item.extensionData,
-			formId,
-			static_cast<std::uint32_t>(item.id),
-			attributes,
-			propertyNodes,
-			&reason)) {
-		runtime_logger::Write(runtime_logger::Level::Info,
-			"control_property_data_retained: form=" + std::to_string(formId) +
-			", unit=" + std::to_string(item.id) + ", type=" + std::to_string(item.dataType) + ", reason=" + reason);
-		return;
-	}
-	std::erase_if(attributes, [](const auto& attribute) { return attribute.first == "扩展属性数据"; });
-}
-
 std::vector<FormControlSupportLibrary> BuildFormControlSupportLibraries(const ProgramSection& program)
 {
 	std::vector<FormControlSupportLibrary> libraries;
@@ -6625,12 +6730,6 @@ void BuildFormXmlEntries(
 				static_cast<std::uint32_t>(form.header.dwId),
 				&rootSemantic);
 			rootPropertyNodes = BuildFormControlPropertyXmlNodes("窗口", rootSemantic, false);
-			OmitRebuildableFormControlPropertyData(
-				rootAttributes,
-				propertyCodec,
-				*formSelf,
-				static_cast<std::uint32_t>(form.header.dwId),
-				rootPropertyNodes);
 		}
 		rootAttributes.insert(rootAttributes.begin(), std::make_pair("名称", formXml.name));
 		if (!TrimAsciiCopy(form.comment).empty()) {
@@ -6767,12 +6866,6 @@ void BuildFormXmlEntries(
 				&semantic);
 			const bool isTabControl = resolver.IsTabControlDataType(item.dataType);
 			const auto propertyNodes = BuildFormControlPropertyXmlNodes(tagName, semantic, isTabControl);
-			OmitRebuildableFormControlPropertyData(
-				attributes,
-				propertyCodec,
-				item,
-				static_cast<std::uint32_t>(form.header.dwId),
-				propertyNodes);
 			const bool hasChildren = !item.children.empty();
 			const bool hasEventBindings = !item.events.empty();
 			if (!hasChildren && !hasEventBindings && propertyNodes.empty()) {
@@ -7276,7 +7369,7 @@ std::string ComputeSnapshotVariableDigest(const SnapshotVariableDef& variable)
 std::string ComputeGlobalSnapshotDigest(const VariableInfo& info, SymbolResolver& resolver)
 {
 	SnapshotVariableDef snapshot;
-	snapshot.name = TrimAsciiCopy(resolver.ResolveUserName(info.marker));
+	snapshot.name = TrimAsciiCopy(resolver.ResolveDeclarationName(info.name, info.comment, info.marker));
 	snapshot.typeName = BuildTypeField(info, resolver);
 	snapshot.flagsText = (info.attr & 0x0100) != 0 ? "公开" : std::string();
 	snapshot.arrayText = BuildArraySuffix(info.arrayBounds);
@@ -7290,7 +7383,7 @@ std::string ComputeDllParamSnapshotDigest(
 	SymbolResolver& resolver)
 {
 	SnapshotVariableDef snapshot;
-	snapshot.name = TrimAsciiCopy(resolver.ResolveUserName(info.marker));
+	snapshot.name = TrimAsciiCopy(resolver.ResolveDeclarationName(info.name, info.comment, info.marker));
 	snapshot.typeName = resolvedType;
 	std::vector<std::string> flags;
 	if ((info.attr & kVarAttrByRef) != 0) {
@@ -7310,7 +7403,7 @@ std::string ComputeStructMemberSnapshotDigest(
 	SymbolResolver& resolver)
 {
 	SnapshotVariableDef snapshot;
-	snapshot.name = TrimAsciiCopy(resolver.ResolveUserName(info.marker));
+	snapshot.name = TrimAsciiCopy(resolver.ResolveDeclarationName(info.name, info.comment, info.marker));
 	snapshot.typeName = resolvedType;
 	snapshot.flagsText = (info.attr & kVarAttrByRef) != 0 ? "传址" : std::string();
 	snapshot.arrayText = BuildArraySuffix(info.arrayBounds);
@@ -7836,6 +7929,7 @@ bool BuildBundleFromSections(
 				methodSnapshot.attr = functionInfo->attr;
 				methodSnapshot.returnType = functionInfo->returnType;
 				methodSnapshot.unresolvedVariables = resolver.UnresolvedVariables(functionInfo->header.dwId);
+				methodSnapshot.identityReferences = resolver.IdentityReferences(functionInfo->header.dwId);
 				for (const auto& param : functionInfo->params) {
 					methodSnapshot.paramIds.push_back(param.marker);
 					methodSnapshot.paramTypes.push_back(param.dataType);
@@ -7877,6 +7971,8 @@ bool BuildBundleFromSections(
 					continue;
 				}
 				BundleNativeStructSnapshot snapshot;
+				snapshot.symbolName = item.originalName.empty()
+					? resolver.ResolveDeclarationName(item.name, item.comment, item.header.dwId) : item.originalName;
 				snapshot.name = TrimAsciiCopy(resolver.ResolveUserName(item.header.dwId));
 				snapshot.textDigest = ComputeStructSnapshotDigest(item, resolver, anonymousTypeHints);
 				snapshot.id = item.header.dwId;
@@ -8384,6 +8480,22 @@ bool ExtractNativeDependencySymbols(
 		outRecords[recordIndex].structs.push_back(std::move(structSymbol));
 	}
 
+	for (const auto& dll : sections.program.dlls) {
+		const auto index = findRecordIndexById(dll.header.dwId);
+		if (index >= outRecords.size()) continue;
+		NativeDependencyDllSymbol symbol;
+		symbol.id = dll.header.dwId;
+		symbol.memoryAddress = dll.header.dwUnk;
+		symbol.attr = dll.attr;
+		symbol.returnType = dll.returnType;
+		symbol.name = dll.name;
+		symbol.comment = dll.comment;
+		symbol.fileName = dll.fileName;
+		symbol.commandName = dll.commandName;
+		for (const auto& param : dll.params) symbol.params.push_back(variableIdentity(param));
+		outRecords[index].dlls.push_back(std::move(symbol));
+	}
+
 	for (const auto& function : sections.program.functions) {
 		const size_t recordIndex = findRecordIndexById(function.header.dwId);
 		if (recordIndex >= outRecords.size()) {
@@ -8644,6 +8756,12 @@ bool Generator::GenerateBundleInternal(
 		return false;
 	}
 	timer.Record("parse_sections");
+	{
+		SymbolResolver originalNames(sections.program, sections.resources, inputPath,
+			&sections.losable.removedDefinedItems);
+		for (auto& type : sections.program.dataTypes)
+			type.originalName = originalNames.ResolveDeclarationName(type.name, type.comment, type.header.dwId);
+	}
 	if (options.includeImportedFunctions) {
 		// 同一 EC 可嵌入多个同名上游类型。先按原生 ID 消歧，再统一解码声明与引用，
 		// 不能在文本层合并名称，否则不同对象会绑定到同一份实现。

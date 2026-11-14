@@ -28,14 +28,17 @@ int main() {
     Check(RestoreIdentityProgram(origin, display, edit, result, error) && result.find("_Cls_") == std::string::npos, "explicit type wins");
     const auto ambiguous = head + "' .如果真 (_Local_0x12 ≠ 0)\r\n' .如果真 (_Local_0x34 ≠ 0)\r\n";
     const auto ambiguousDisplay = head + ".' 如果真 ( ≠ 0)\r\n.' 如果真 ( ≠ 0)\r\n";
-    Check(!RestoreIdentityProgram(ambiguous, ambiguousDisplay, ambiguousDisplay + "' edit\r\n", result, error), "ambiguous native references fail closed");
+    Check(RestoreIdentityProgram(ambiguous, ambiguousDisplay, ambiguousDisplay + "' edit\r\n", result, error) &&
+        result == ambiguous + "' edit\r\n", "unchanged repeated references retain occurrence identity");
+    Check(!RestoreIdentityProgram(ambiguous, ambiguousDisplay, head + ".' 如果真 ( ≠ 0)\r\n", result, error),
+        "deleting an indistinguishable occurrence fails closed");
     const auto user = head + "_Local_0x12 ＝ 7\r\n' .如果真 (真)\r\n' 这是普通注释\r\n' .如果真结束\r\n";
     Check(RestoreIdentityProgram(user, user, user, result, error) && result == user, "ordinary names and comments unchanged");
     Check(!RestoreIdentityProgram(origin, "", display, result, error), "broken provenance rejected");
     Check(RestoreIdentityProgram("", "", "a ＝ 读入文件 (取运行目录 () ＋ “\\xx\\”)\r\n", result, error), "new source accepted");
     Check(result == "a ＝ 读入文件 (取运行目录 () ＋ “\\xx\\”)\r\n", "path untouched");
     Check(RestoreIdentityProgram("", "", head + ".' 如果真 (_Local_0x1E217 ≠ 0)\r\n    标准输出 (1, “OK”)\r\n.如果真结束\r\n", result, error), "new disabled block");
-    Check(result == head + "' .如果真 (_Local_0x1E217 ≠ 0)\r\n    标准输出 (1, “OK”)\r\n' .如果真结束\r\n", "new disabled block structure");
+    Check(result == head + ".' 如果真 (_Local_0x1E217 ≠ 0)\r\n    标准输出 (1, “OK”)\r\n.' 如果真结束\r\n", "new disabled block structure");
     edit = display;
     edit.replace(edit.find(".子程序 方法"), std::string(".子程序 方法").size(), ".子程序 改名");
     Check(!RestoreIdentityProgram(origin, display, edit, result, error) && error.starts_with("unmatched_native_identity:"), "renamed method cannot lose identity");
@@ -46,5 +49,13 @@ int main() {
     Check(!RestoreIdentityProgram(origin, display, edit, result, error), "moving a hidden local across methods fails closed");
     edit = display + "' .如果真 (真)\r\n' 普通注释\r\n' .如果真结束\r\n";
     Check(RestoreIdentityProgram(origin, display, edit, result, error) && result.ends_with("' .如果真 (真)\r\n' 普通注释\r\n' .如果真结束\r\n"), "comments survive an edited identity page");
+    const auto explicitOrigin = head + "' preceding comment\r\n.' 如果真 (_Local_0x12 ≠ 0)\r\n\r\n.' 如果真结束\r\n";
+    const auto explicitDisplay = head + "' preceding comment\r\n.' 如果真 ( ≠ 0)\r\n\r\n.如果真结束\r\n";
+    Check(RestoreIdentityProgram(explicitOrigin, explicitDisplay, explicitDisplay + "' edit\r\n", result, error) &&
+        result == explicitOrigin + "' edit\r\n", "explicit empty disabled control stays structural");
+    const auto commentOrigin = head + ".' _Dll_0x108EC ()\r\n.子程序 其他\r\n";
+    const auto commentDisplay = head + "' 注册IE右键 ()\r\n.子程序 其他\r\n";
+    Check(RestoreIdentityProgram(commentOrigin, commentDisplay, commentDisplay + "' added comment\r\n", result, error) &&
+        result == commentOrigin + "' added comment\r\n", "unrelated whole comments cannot imply moved identity");
     std::cout << "PASS source identity provenance\n";
 }

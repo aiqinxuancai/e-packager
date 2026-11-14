@@ -18,6 +18,11 @@ int main(int argc, char** argv)
         for (size_t i = 0; i < expected.size(); ++i) attributes.emplace_back("Value" + std::to_string(i), expected[i]);
         std::vector<std::uint8_t> data;
         std::string error;
+        std::vector<FormControlPropertyValue> defaults;
+        Require(codec.Decode(65537, {}, 1, 1, defaults, &error), error);
+        std::vector<std::pair<std::string, std::string>> unchanged;
+        for (const auto& value : defaults) unchanged.emplace_back(value.definition.xmlName, FormControlPropertyCodec::ValueToXmlText(value));
+        Require(codec.Apply(65537, {}, 1, 1, unchanged, data, &error) && data.empty(), "unchanged empty property payload must stay empty");
         Require(codec.Apply(65537, {}, 1, 1, attributes, data, &error), error);
         std::vector<FormControlPropertyValue> values;
         Require(codec.Decode(65537, data, 1, 1, values, &error), error);

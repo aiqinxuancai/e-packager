@@ -110,6 +110,7 @@ struct RestoreDependencyInfo {
 	std::vector<DefinedIdRange> definedIds;
 	std::vector<NativeDependencyClassSymbol> nativeClasses;
 	std::vector<NativeDependencyStructSymbol> nativeStructs;
+	std::vector<NativeDependencyDllSymbol> nativeDlls;
 	std::vector<NativeDependencyMethodSymbol> nativeMethods;
 	std::vector<NativeDependencyConstantSymbol> nativeConstants;
 	std::int32_t childIdStart = 0;
@@ -1194,15 +1195,21 @@ class IdAllocator {
 public:
 	std::int32_t Alloc(const std::int32_t typeMask)
 	{
-		return typeMask | (++m_next);
+		const auto id = typeMask | (++m_next);
+		m_observed.insert(id);
+		return id;
 	}
 
 	void Observe(const std::int32_t id)
 	{
 		m_next = (std::max)(m_next, id & epl_system_id::kMaskNum);
+		m_observed.insert(id);
 	}
 
+bool IsObserved(const std::int32_t id) const { return m_observed.contains(id); }
+
 private:
+	std::unordered_set<std::int32_t> m_observed;
 	std::int32_t m_next = 0xFFFF;
 };
 
@@ -1391,6 +1398,7 @@ void ApplyNativeDependencyDefinedIds(
 			}
 			dependency.nativeClasses = nativeRecords[matchedIndex].classes;
 			dependency.nativeStructs = nativeRecords[matchedIndex].structs;
+			dependency.nativeDlls = nativeRecords[matchedIndex].dlls;
 			dependency.nativeMethods = nativeRecords[matchedIndex].methods;
 			dependency.nativeConstants = nativeRecords[matchedIndex].constants;
 		}
@@ -1606,7 +1614,7 @@ public:
 		while (m_hasOriginalRanges && m_childNext > 0 && m_childNext <= m_childEnd) {
 			const std::int32_t id = typeMask | m_childNext;
 			++m_childNext;
-			if (m_reservedChildIds.contains(id)) continue;
+			if (m_reservedChildIds.contains(id) || allocator.IsObserved(id)) continue;
 			allocator.Observe(id);
 			return id;
 		}
@@ -2321,6 +2329,7 @@ struct BodyStatement {
 	std::vector<BodyStatement> elseBlock;
 	std::vector<BodySwitchCase> cases;
 	std::vector<BodyStatement> defaultBlock;
+	bool explicitMaskedExpression = false;
 };
 
 int CountIndentLevel(const std::string& line)
@@ -2364,7 +2373,15 @@ bool ExtractMaskPrefix(const std::string& line, bool& outMask, std::string& outC
 {
 	outMask = false;
 	outCode = StripIndent(line);
-	if (StartsWith(outCode, "' ")) {
+	if (StartsWith(outCode, ".' ")) {
+		outMask = true;
+		outCode = (source_text::IsMaskedFlowBody(outCode.substr(3)) ? "." : "") + outCode.substr(3);
+	}
+	else if (StartsWith(outCode, ".判断开始断 (")) {
+		outMask = true;
+		outCode = ".判断开始 (" + outCode.substr(std::string(".判断开始断 (").size());
+	}
+	else if (StartsWith(outCode, "' ")) {
 		outMask = true;
 		outCode.erase(0, 2);
 	}
@@ -2987,6 +3004,9 @@ bool ParseBodyBlock(
 		// 若后续存在缩进子体，仍按原生屏蔽流程处理，避免激活其中的语句。
 		size_t commentEnd = index;
 		while (commentEnd < lines.size() && CountIndentLevel(lines[commentEnd]) == currentIndent) {
+			// 显式停用流程不是普通注释，空流程体也不能被注释段吞掉。
+			const auto control = StripIndent(lines[commentEnd]);
+			if (StartsWith(control, ".' ") || StartsWith(control, ".判断开始断 (")) break;
 			bool commentMask = false;
 			std::string commentCode;
 			ExtractMaskPrefix(lines[commentEnd], commentMask, commentCode);
@@ -3013,6 +3033,13 @@ bool ParseBodyBlock(
 		if (!mask) code = NormalizeSourceParentheses(code);
 		const std::string trimmedCode = TrimAsciiCopy(code);
 		if (!StartsWith(trimmedCode, ".")) {
+			if (StartsWith(StripIndent(effectiveLine), ".' ")) {
+				BodyStatement statement{BodyStatementKind::Raw, true, false, code};
+				statement.explicitMaskedExpression = true;
+				outStatements.push_back(std::move(statement));
+				++index;
+				continue;
+			}
 			bool rawMask = false;
 			std::string rawCode;
 			ExtractMaskPrefixPreserveIndent(StripExpectedIndent(effectiveLine, expectedIndent), rawMask, rawCode);
@@ -3968,6 +3995,9 @@ struct NativeObjectMethodEncodeContext : CallableBindingTables {
 	std::unordered_map<std::string, NativeObjectVariableSymbol> variablesByName;
 	std::unordered_map<std::int32_t, std::unordered_map<std::string, NativeObjectMemberSymbol>> membersByOwnerType;
 	std::unordered_map<std::string, NativeConstantSymbol> constantsByName;
+	std::unordered_map<std::string, NativeFunctionSymbol> referenceFunctions;
+	std::unordered_map<std::string, NativeConstantSymbol> referenceConstants;
+	std::unordered_map<std::string, NativeObjectMemberSymbol> referenceMembers;
 	const TypeResolver* typeResolver = nullptr;
 	std::int32_t currentOwnerTypeId = 0;
 	NativeObjectVariableSymbol currentWindowSelf;
@@ -4487,6 +4517,10 @@ bool TryResolveNativeMember(
 	NativeObjectMemberSymbol& outMember)
 {
 	const auto name = TypeResolver::NormalizeTypeName(rawMemberName);
+	if (const auto it = context.referenceMembers.find(name); it != context.referenceMembers.end()) {
+		outMember = it->second;
+		return true;
+	}
 	std::unordered_set<std::int32_t> visited;
 	for (auto owner = ownerTypeId; owner > 0 && visited.insert(owner).second;) {
 		if (const auto members = context.membersByOwnerType.find(owner);
@@ -4683,6 +4717,10 @@ bool TryResolveNativeFunction(
 	NativeFunctionSymbol& outSymbol,
 	const std::optional<size_t> argumentCount = std::nullopt)
 {
+	if (const auto it = context.referenceFunctions.find(TypeResolver::NormalizeTypeName(rawName)); it != context.referenceFunctions.end()) {
+		outSymbol = it->second;
+		return true;
+	}
 	const auto resolved = BindCallable(context, TypeResolver::NormalizeTypeName(rawName),
 		context.currentOwnerTypeId, argumentCount, [&]() -> std::optional<CallableSymbol> {
 			if (context.typeResolver == nullptr) return std::nullopt;
@@ -4778,6 +4816,10 @@ bool TryResolveNativeOwnerMethod(
 	NativeFunctionSymbol& outSymbol)
 {
 	const std::string methodKey = TypeResolver::NormalizeTypeName(rawName);
+	if (const auto it = context.referenceFunctions.find(methodKey); it != context.referenceFunctions.end()) {
+		outSymbol = it->second;
+		return true;
+	}
 	std::unordered_set<std::int32_t> visited;
 	std::int32_t currentType = ownerType;
 	while (currentType > 0 && visited.insert(currentType).second) {
@@ -4820,7 +4862,8 @@ bool TryResolveNativeExpressionType(
 		CollectTopLevelOperatorPositions(rawExpression, ".", dots);
 		std::int32_t ownerType = 0;
 		NativeObjectMemberSymbol member;
-		if (!dots.empty() && TryResolveNativeExpressionType(rawExpression.substr(0, dots.back()), context, ownerType) &&
+		if (!dots.empty() && (TryResolveNativeExpressionType(rawExpression.substr(0, dots.back()), context, ownerType) ||
+				context.referenceMembers.contains(TypeResolver::NormalizeTypeName(parsed.root->text))) &&
 			TryResolveNativeMember(ownerType, parsed.root->text, context, member)) {
 			outTypeId = member.typeId;
 			return outTypeId != 0;
@@ -4989,7 +5032,8 @@ bool TryEncodeNativeIn38Expression(
 			CollectTopLevelOperatorPositions(rawExpression, ".", dots);
 			std::int32_t ownerType = 0;
 			NativeObjectMemberSymbol member;
-			if (!dots.empty() && TryResolveNativeExpressionType(rawExpression.substr(0, dots.back()), context, ownerType) &&
+			if (!dots.empty() && (TryResolveNativeExpressionType(rawExpression.substr(0, dots.back()), context, ownerType) ||
+				context.referenceMembers.contains(TypeResolver::NormalizeTypeName(parsed.root->text))) &&
 				TryResolveNativeMember(ownerType, parsed.root->text, context, member)) {
 				if (includeExpressionWrapper) {
 					variableReferences.push_back(static_cast<std::int32_t>(writer.position()));
@@ -5135,6 +5179,13 @@ bool TryEncodeNativeExpression(
 	if (expression.front() == '#' && parsedExpression.IsValid() &&
 		parsedExpression.root->kind == SourceExpressionKind::Name) {
 		const std::string constantName = TrimAsciiCopy(expression.substr(1));
+		if (const auto retired = context.referenceConstants.find(TypeResolver::NormalizeTypeName(constantName));
+			retired != context.referenceConstants.end()) {
+			constantReferences.push_back(static_cast<std::int32_t>(writer.position()));
+			writer.WriteU8(0x1B);
+			writer.WriteI32(retired->second.id);
+			return true;
+		}
 		const auto constantIt = context.constantsByName.find(TypeResolver::NormalizeTypeName(constantName));
 		if (constantIt != context.constantsByName.end() && constantIt->second.id != 0) {
 			if (constantIt->second.libraryId == -2) {
@@ -5255,7 +5306,7 @@ bool TryEncodeNativeExpression(
 		const bool hasObjectTarget = isMemberCall &&
 			TryResolveNativeExpressionType(memberCall.objectName, context, targetTypeId);
 		if (isMemberCall && (hasObjectTarget || qualified == context.functionsByName.end() || !qualified->second.qualified)) {
-			if (!hasObjectTarget) {
+			if (!hasObjectTarget && !context.referenceFunctions.contains(TypeResolver::NormalizeTypeName(memberCall.methodName))) {
 				if (outError != nullptr) {
 					*outError = "member_call_target_type_not_found: " + memberCall.objectName;
 				}
@@ -5380,7 +5431,8 @@ bool TryEncodeNativeObjectMethodCallLine(
 	}
 
 	std::int32_t targetTypeId = 0;
-	if (!TryResolveNativeExpressionType(call.objectName, context, targetTypeId)) {
+	if (!TryResolveNativeExpressionType(call.objectName, context, targetTypeId) &&
+		!context.referenceFunctions.contains(TypeResolver::NormalizeTypeName(call.methodName))) {
 		if (outError != nullptr) {
 			*outError = "object_target_type_not_found: " + call.objectName;
 		}
@@ -5622,7 +5674,7 @@ bool RequiresSemanticRawStatementEncoding(
 bool CanWriteUnexaminedRawStatement(const BodyStatement& statement)
 {
 	const std::string code = TrimAsciiCopy(statement.code);
-	return statement.mask || code.empty() || code.front() == '\'';
+	return (statement.mask && !statement.explicitMaskedExpression) || code.empty() || code.front() == '\'';
 }
 
 bool TryEncodeNativeStructuredCall(
@@ -8272,7 +8324,8 @@ void ParseDllPage(const Page& page, std::vector<ParsedDllDef>& outDlls)
 bool ParseConstantPage(
 	const Page& page,
 	std::vector<ParsedConstantDef>& outConstants,
-	std::string* outError)
+	std::string* outError,
+	const bool allowLegacyFiveFields = false)
 {
 	std::vector<std::string> fields;
 	for (size_t lineIndex = 0; lineIndex < page.lines.size(); ++lineIndex) {
@@ -8309,7 +8362,7 @@ bool ParseConstantPage(
 		}
 		else {
 			const std::string legacyPublicField = GetFieldOrEmpty(fields, 3);
-			const bool usesLegacyFiveFields = legacyPublicField == "公开";
+			const bool usesLegacyFiveFields = allowLegacyFiveFields && legacyPublicField == "公开";
 			if (usesLegacyFiveFields) {
 				item.isPublic = legacyPublicField == "公开";
 				commentFieldIndex = 4;
@@ -9264,7 +9317,8 @@ bool BuildRestoreModel(
 			ParseDllPage(page, parsedDlls);
 		}
 		else if (page.typeName == "常量资源") {
-			if (!ParseConstantPage(page, parsedConstants, outError)) {
+			if (!ParseConstantPage(page, parsedConstants, outError,
+				bundle && bundle->bundleFormatVersion > 0 && bundle->bundleFormatVersion < 5)) {
 				return false;
 			}
 		}
@@ -9664,7 +9718,7 @@ bool BuildRestoreModel(
 		}
 		if (!dependencyLoaded) {
 			if (!dependency.nativeClasses.empty() || !dependency.nativeStructs.empty() ||
-				!dependency.nativeMethods.empty() || !dependency.nativeConstants.empty()) {
+				!dependency.nativeMethods.empty() || !dependency.nativeConstants.empty() || !dependency.nativeDlls.empty()) {
 				DependencyImportIdCursor dependencyIds(dependency);
 				if (dependencyIds.HasOriginalRanges()) {
 					dependencyIds.ObserveAll(allocator);
@@ -9728,6 +9782,21 @@ bool BuildRestoreModel(
 					variable.comment = source.comment;
 					return variable;
 				};
+				// 缺少外部模块时，导入表中的 DLL 声明仍完整可用；必须与类、结构一并恢复。
+				for (const auto& source : dependency.nativeDlls) {
+					RestoreDll dll;
+					dll.id = source.id;
+					allocator.Observe(dll.id);
+					dll.memoryAddress = source.memoryAddress;
+					dll.attr = source.attr;
+					dll.returnType = source.returnType;
+					dll.name = source.name;
+					dll.comment = source.comment;
+					dll.fileName = source.fileName;
+					dll.commandName = source.commandName;
+					for (const auto& param : source.params) dll.params.push_back(restoreVariableIdentity(param));
+					model.dlls.push_back(std::move(dll));
+				}
 				for (const auto& classSymbol : dependency.nativeClasses) {
 					const auto index = addNativeOnlyClass(classSymbol.id, classSymbol.name, classSymbol.memoryAddress, classSymbol.baseClass);
 					for (const auto& variable : classSymbol.variables)
@@ -9949,6 +10018,11 @@ bool BuildRestoreModel(
 		for (size_t structIndex = 0; structIndex < dependencyStructs.size(); ++structIndex) {
 			const auto* importedStructSymbol = findDependencyImportedStructSymbol(dependencyStructs[structIndex]);
 			const auto* nativeSnapshot = findDependencyNativeStructSnapshot(dependencyStructs[structIndex]);
+			if (!importedStructSymbol && nativeSnapshot && !nativeSnapshot->symbolName.empty()) {
+				const auto original = dependencyImportedStructSymbolsByName.find(
+					TypeResolver::NormalizeTypeName(nativeSnapshot->symbolName));
+				if (original != dependencyImportedStructSymbolsByName.end()) importedStructSymbol = original->second;
+			}
 			dependencyImportedStructSymbolsByIndex[structIndex] = importedStructSymbol;
 			dependencyNativeStructSnapshotsByIndex[structIndex] = nativeSnapshot;
 			const std::int32_t preferredTypeId =
@@ -10131,7 +10205,7 @@ bool BuildRestoreModel(
 					importedStructSymbol != nullptr && importedStructSymbol->memoryAddress != 0
 						? importedStructSymbol->memoryAddress
 						: (nativeSnapshot != nullptr ? nativeSnapshot->memoryAddress : 0);
-				item.name = parsedStruct.name;
+				item.name = importedStructSymbol ? importedStructSymbol->name : parsedStruct.name;
 				item.comment = parsedStruct.comment;
 				item.attr = 0x2;
 				modelStructIndex = model.structs.size();
@@ -11346,6 +11420,9 @@ bool BuildRestoreModel(
 				}
 				method.locals.push_back(std::move(local));
 			}
+			nativeObjectEncodeContext.referenceFunctions.clear();
+			nativeObjectEncodeContext.referenceConstants.clear();
+			nativeObjectEncodeContext.referenceMembers.clear();
 			nativeObjectEncodeContext.variablesByName = classVariables;
 			for (size_t paramIndex = 0; paramIndex < parsedMethod.params.size() && paramIndex < method.params.size(); ++paramIndex) {
 				addNativeObjectVariable(parsedMethod.params[paramIndex].name, method.params[paramIndex].id, method.params[paramIndex].dataType);
@@ -11356,6 +11433,20 @@ bool BuildRestoreModel(
 			// 缺失声明的引用来自原生符号身份，而非按占位名称猜测 ID。
 			// 仅补充当前方法已存在的引用，不覆盖用户声明，不复用任何方法体字节。
 			if (identityNativeMethodSnapshot != nullptr) {
+				for (const auto& ref : identityNativeMethodSnapshot->identityReferences) {
+					const auto name = TypeResolver::NormalizeTypeName(ref.name);
+					if (nativeObjectEncodeContext.variablesByName.contains(name) ||
+						nativeObjectEncodeContext.functionsByName.contains(name) ||
+						nativeObjectEncodeContext.constantsByName.contains(name)) {
+						if (outError) *outError = "native_identity_name_conflict: " + parsedMethod.name + ":" + ref.name;
+						return false;
+					}
+					if (ref.kind == "variable") nativeObjectEncodeContext.variablesByName.emplace(name, NativeObjectVariableSymbol{ref.id, ref.type});
+					else if (ref.kind == "function") nativeObjectEncodeContext.referenceFunctions.emplace(name, NativeFunctionSymbol{ref.library, ref.id, ref.type});
+					else if (ref.kind == "member") nativeObjectEncodeContext.referenceMembers.emplace(name, NativeObjectMemberSymbol{ref.id, ref.ownerType, ref.type});
+					else if (ref.kind == "constant") nativeObjectEncodeContext.referenceConstants.emplace(name, NativeConstantSymbol{ref.library, ref.id});
+					else { if (outError) *outError = "native_reference_kind_invalid:" + ref.kind; return false; }
+				}
 				for (const auto& reference : identityNativeMethodSnapshot->unresolvedVariables) {
 					const auto [entry, inserted] = nativeObjectEncodeContext.variablesByName.try_emplace(
 						TypeResolver::NormalizeTypeName(reference.name), NativeObjectVariableSymbol{ reference.id, 0 });

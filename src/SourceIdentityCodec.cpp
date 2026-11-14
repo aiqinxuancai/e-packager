@@ -1,8 +1,10 @@
 ﻿#include "SourceIdentityCodec.h"
+#include "SourceTextCodec.h"
 #include <Windows.h>
 #include <algorithm>
 #include <cctype>
 #include <set>
+#include <unordered_map>
 #include <string_view>
 #include <vector>
 
@@ -67,14 +69,14 @@ std::string ControlDisplay(std::string line)
 std::string ControlCanonical(std::string line)
 {
     if (line.starts_with(".判断开始断 (")) return "' .判断开始 (" + line.substr(std::string_view(".判断开始断 (").size());
-    if (line.starts_with(".' ")) return "' ." + line.substr(3);
+    if (line.starts_with(".' ") && IsMaskedFlowBody(line.substr(3))) return "' ." + line.substr(3);
     return line;
 }
 std::string Fingerprint(const std::vector<Token>& tokens, bool shape)
 {
     std::string out;
     for (const auto& token : tokens) {
-        const auto value = shape && token.kind != 0 ? "#" : token.text;
+        const auto value = shape && token.kind != 0 && !(tokens.size() == 1 && token.kind == 2) ? "#" : token.text;
         out += std::to_string(token.kind) + ":" + std::to_string(value.size()) + ":" + value + ";";
     }
     return out;
@@ -100,6 +102,31 @@ std::vector<Method> Parse(const std::vector<std::string>& source, const std::vec
         }
         result.back().lines.push_back({source[i], display[i], Tokens(display[i]), source[i] != display[i]});
     }
+    return result;
+}
+// 完整旧方法仍作为子序列存在时，用前后两次对齐证明每个出现位置唯一。
+// 仅凭相同行号或“第一个同名语句”不能证明身份；删除重复语句仍须拒绝歧义。
+std::vector<const Line*> AlignUnchanged(const Method& old, const Method& edited)
+{
+    std::vector<const Line*> result(edited.lines.size(), nullptr);
+    std::vector<size_t> source, earliest, latest;
+    for (size_t i = 0; i < old.lines.size(); ++i)
+        if (!old.lines[i].displayed.empty()) source.push_back(i);
+    size_t cursor = 0;
+    for (const auto index : source) {
+        while (cursor < edited.lines.size() && edited.lines[cursor].displayed != old.lines[index].displayed) ++cursor;
+        if (cursor == edited.lines.size()) return result;
+        earliest.push_back(cursor++);
+    }
+    latest.resize(source.size());
+    cursor = edited.lines.size();
+    for (size_t i = source.size(); i-- > 0;) {
+        while (cursor > 0 && edited.lines[cursor - 1].displayed != old.lines[source[i]].displayed) --cursor;
+        if (cursor == 0) return result;
+        latest[i] = --cursor;
+    }
+    for (size_t i = 0; i < source.size(); ++i)
+        if (earliest[i] == latest[i]) result[earliest[i]] = &old.lines[source[i]];
     return result;
 }
 bool Reconstruct(const Line& old, const std::string& edited, std::string& result)
@@ -175,7 +202,19 @@ bool RestoreIdentityProgram(const std::string& origin, const std::string& displa
     const auto source = Lines(origin), display = Lines(displayedOrigin);
     if (source.size() != display.size()) { error = "native_identity_line_count_mismatch"; return false; }
     if (edited == displayedOrigin) { canonical = origin; return true; }
+    const auto flowSource = source.empty() ? Lines(edited) : source;
+    const bool explicitFlow = std::any_of(flowSource.begin(), flowSource.end(), [](const auto& line) {
+        return line.starts_with(".' ") || line.starts_with(".判断开始断 (");
+    });
     const auto methods = Parse(source, display);
+    const auto currentLines = Lines(edited);
+    const auto currentMethods = Parse(currentLines, currentLines);
+    std::unordered_map<std::string, std::vector<const Line*>> aligned;
+    for (const auto& old : methods) {
+        for (const auto& current : currentMethods) if (old.name == current.name)
+            aligned.emplace(old.name, AlignUnchanged(old, current));
+    }
+    size_t methodLine = 0;
     const Method* method = &methods.front();
     std::vector<Flow> flow;
     canonical.clear();
@@ -189,6 +228,7 @@ bool RestoreIdentityProgram(const std::string& origin, const std::string& displa
         if (indent != std::string::npos) {
             const auto body = line.substr(indent);
             if (body.starts_with(".子程序 ")) {
+                methodLine = 0;
                 auto name = Trim(body.substr(std::string_view(".子程序 ").size()));
                 name = Trim(name.substr(0, name.find(',')));
                 method = nullptr;
@@ -199,7 +239,14 @@ bool RestoreIdentityProgram(const std::string& origin, const std::string& displa
             }
             std::set<std::string> candidates;
             const auto tokens = Tokens(body);
-            if (method) for (const bool shape : {false, true}) {
+            if (method) {
+                const auto match = aligned.find(method->name);
+                if (match != aligned.end() && methodLine < match->second.size()) {
+                    const auto* old = match->second[methodLine];
+                    if (old && !Boundary(old->displayed)) candidates.insert(old->changed ? old->canonical : body);
+                }
+            }
+            if (method && candidates.empty()) for (const bool shape : {false, true}) {
                 for (const auto& old : method->lines) {
                     if (!old.changed || Boundary(old.displayed) || Fingerprint(old.tokens, shape) != Fingerprint(tokens, shape)) continue;
                     std::string rebuilt;
@@ -223,9 +270,14 @@ bool RestoreIdentityProgram(const std::string& origin, const std::string& displa
                     }
                 }
             }
-            const auto restored = candidates.empty() ? ControlCanonical(body) : *candidates.begin();
-            line = line.substr(0, indent) + RestoreFlowMask(body, restored, flow);
+            auto restored = candidates.empty() ? (explicitFlow ? body : ControlCanonical(body)) : *candidates.begin();
+            restored = RestoreFlowMask(body, restored, flow);
+            if (explicitFlow && restored.starts_with("' .") &&
+                (body.starts_with(".' ") || body.starts_with(".判断开始断 (") || Boundary(body)))
+                restored = ".' " + restored.substr(3);
+            line = line.substr(0, indent) + restored;
         }
+        ++methodLine;
         canonical += line;
         if (cr) canonical += '\r';
         if (end < edited.size()) canonical += '\n';

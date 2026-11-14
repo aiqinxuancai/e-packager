@@ -1,5 +1,6 @@
 ﻿#include "ConditionalDeclarations.h"
 #include "SourcePreflightValidator.h"
+#include "SourceTextCodec.h"
 
 #include <Windows.h>
 #include "SourceExpressionParser.h"
@@ -945,6 +946,13 @@ void ValidateProgramPage(
 	for (size_t index = 0; index < lines.size(); ++index) {
 		const size_t lineNumber = index + 1;
 		std::string line = NormalizeSourceParentheses(TrimAsciiCopy(lines[index]));
+		// 停用流程仍须验证块结构，但其引号不是普通行注释。
+		if (StartsWith(line, ".' ")) {
+			if (!source_text::IsMaskedFlowBody(line.substr(3))) continue;
+			line = "." + line.substr(3);
+		}
+		else if (StartsWith(line, ".判断开始断 ("))
+			line = ".判断开始 (" + line.substr(std::string(".判断开始断 (").size());
 		if (line.empty()) {
 			continue;
 		}

@@ -375,6 +375,9 @@ void AddSemanticError(
 
 std::string StripComment(const std::string& line)
 {
+	const auto trimmed = Trim(line);
+	// 原生停用流程的表达式允许引用已删除声明，不参与活动代码的类型校验。
+	if (trimmed.starts_with(".' ") || trimmed.starts_with(".判断开始断 (")) return {};
 	bool text = false;
 	for (std::size_t i = 0; i < line.size();) {
 		if (!text && line.compare(i, std::string("“").size(), "“") == 0) { text = true; i += std::string("“").size(); continue; }
