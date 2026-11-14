@@ -179,6 +179,9 @@
     <ClCompile Include="src\SelfUpdater.cpp" />
     <ClCompile Include="src\SimpleXmlDocument.cpp" />
     <ClCompile Include="src\SourceExpressionParser.cpp" />
+    <ClCompile Include="src\SourceTextCodec.cpp" />
+    <ClCompile Include="src\LongTextConstantCodec.cpp" />
+    <ClCompile Include="src\SourceCallBindingCodec.cpp" />
     <ClCompile Include="src\SourcePreflightValidator.cpp" />
     <ClCompile Include="src\SourceValidationCommand.cpp" />
     <ClCompile Include="src\SourceSemanticValidator.cpp" />
@@ -224,11 +227,15 @@
     <ClInclude Include="src\FormControlPropertyXml.h" />
     <ClInclude Include="src\WorkerMessagePipe.h" />
     <ClInclude Include="src\BuiltinTypeNames.h" />
+    <ClInclude Include="src\CallableBinding.h" />
     <ClInclude Include="src\ConditionalDeclarations.h" />
     <ClInclude Include="src\CommonWindowEvents.h" />
     <ClInclude Include="src\SelfUpdater.h" />
     <ClInclude Include="src\SimpleXmlDocument.h" />
     <ClInclude Include="src\SourceExpressionParser.h" />
+    <ClInclude Include="src\SourceTextCodec.h" />
+    <ClInclude Include="src\LongTextConstantCodec.h" />
+    <ClInclude Include="src\SourceCallBindingCodec.h" />
     <ClInclude Include="src\SourcePreflightValidator.h" />
     <ClInclude Include="src\SourceValidationCommand.h" />
     <ClInclude Include="src\SourceSemanticValidator.h" />

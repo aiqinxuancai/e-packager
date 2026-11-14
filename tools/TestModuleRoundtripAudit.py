@@ -136,9 +136,9 @@ def append_comments(workspace, index):
         if not re.search(r'^\s*\.(?:程序集|类)(?:\s|$)', text, re.M):
             continue
         marker = f"' module-roundtrip-audit-{index:04}-{len(modified):04}"
-        text = text.replace('\r\n', '\n').replace('\r', '\n')
-        text += ('' if text.endswith('\n') else '\n') + marker + '\n'
-        path.write_bytes(text.replace('\n', '\r\n').encode('utf-8-sig'))
+        # 原生多行字面量内的 LF/CR 是数据，追加注释不可规范化既有文件。
+        text += ('' if text.endswith(('\r', '\n')) else '\r\n') + marker + '\r\n'
+        path.write_bytes(text.encode('utf-8-sig'))
         modified.append({'path': path.relative_to(workspace).as_posix(), 'marker': marker,
                          'methods': len(re.findall(r'^\s*\.子程序(?:\s|$)', text, re.M)),
                          'before_sha256': hashlib.sha256(data).hexdigest(),

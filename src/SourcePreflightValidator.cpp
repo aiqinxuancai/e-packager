@@ -1128,6 +1128,20 @@ SourcePreflightReport ValidateProjectBundleSource(const ProjectBundle& bundle, c
 			return true;
 		});
 	}
+	// 验证器消费内部单行字面量；对外诊断必须回到用户实际看到的物理行。
+	for (const auto& file : bundle.sourceFiles) {
+		if (file.sourceLines.empty()) continue;
+		const auto path = DiagnosticPathToUtf8(file.relativePath.empty() ? file.logicalName : file.relativePath);
+		const auto remap = [&](auto& diagnostics) {
+			for (auto& item : diagnostics)
+				if (item.filePath == path && item.line > 0 && item.line <= file.sourceLines.size())
+					item.line = file.sourceLines[item.line - 1];
+		};
+		remap(report.errors);
+		remap(report.warnings);
+		if (file.sourceLines.back() > file.sourceLines.size())
+			report.checkedLines += file.sourceLines.back() - file.sourceLines.size();
+	}
 	return report;
 }
 
@@ -1196,7 +1210,7 @@ std::string FormatSourcePreflightReportJson(
 			for (const auto& file : bundle->sourceFiles) {
 				const std::string relative = normalize(DiagnosticPathToUtf8(file.relativePath.empty() ? file.logicalName : file.relativePath));
 				if (normalize("src/" + relative) == path || relative == path) {
-					content = file.content;
+					content = file.sourceLines.empty() ? file.content : file.displayedContent;
 					break;
 				}
 			}

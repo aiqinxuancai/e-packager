@@ -1,5 +1,7 @@
 ﻿#include "SupportLibraryPublicInfo.h"
 #include "BuiltinTypeNames.h"
+#include "CallableBinding.h"
+#include "SourceTextCodec.h"
 #include "SupportLibraryRuntime.h"
 #include "RuntimeLogger.h"
 #include "OperationStageTimer.h"
@@ -1035,70 +1037,11 @@ std::string StripWrappedText(const std::string& text, const std::string& left, c
 	return text.substr(left.size(), text.size() - left.size() - right.size());
 }
 
-char ToHexDigit(const std::uint8_t value)
-{
-	return static_cast<char>(value < 10 ? ('0' + value) : ('A' + (value - 10)));
-}
+using source_text::EncodeLiteral;
 
-bool NeedsEscapedTextLiteral(const std::string& text)
+std::string BuildDumpTextLiteral(const std::string& text, bool longText)
 {
-	if (StartsWithText(text, kEscapedTextLiteralPrefix) || StartsWithText(text, kEscapedLongTextLiteralPrefix)) {
-		return true;
-	}
-	for (const unsigned char ch : text) {
-		// 易语言中文引号内的反斜杠是普通字符，路径无需进入转义传输格式。
-		// 真正需要转义时仍编码整个载荷，保留控制字符及历史前缀的无损回包。
-		if (ch == '"' || ch == '\r' || ch == '\n' || ch == '\t' || ch < 0x20) {
-			return true;
-		}
-	}
-	return false;
-}
-
-std::string EscapeTextLiteralPayload(const std::string& text)
-{
-	std::string out;
-	out.reserve(text.size());
-	for (const unsigned char ch : text) {
-		switch (ch) {
-		case '\\':
-			out += "\\\\";
-			break;
-		case '\r':
-			out += "\\r";
-			break;
-		case '\n':
-			out += "\\n";
-			break;
-		case '\t':
-			out += "\\t";
-			break;
-		case '"':
-			out += "\\x22";
-			break;
-		default:
-			if (ch < 0x20) {
-				out += "\\x";
-				out.push_back(ToHexDigit(static_cast<std::uint8_t>((ch >> 4) & 0x0F)));
-				out.push_back(ToHexDigit(static_cast<std::uint8_t>(ch & 0x0F)));
-			}
-			else {
-				out.push_back(static_cast<char>(ch));
-			}
-			break;
-		}
-	}
-	return out;
-}
-
-std::string BuildDumpTextLiteral(const std::string& rawText, const bool isLongText)
-{
-	if (!isLongText && !NeedsEscapedTextLiteral(rawText)) {
-		return std::string(kTextLiteralLeftQuote) + rawText + kTextLiteralRightQuote;
-	}
-
-	const char* prefix = isLongText ? kEscapedLongTextLiteralPrefix : kEscapedTextLiteralPrefix;
-	return std::string(kTextLiteralLeftQuote) + prefix + EscapeTextLiteralPayload(rawText) + kTextLiteralRightQuote;
+	return EncodeLiteral(text, longText);
 }
 
 // 旧版 IDE 会把含真实换行的文本表达式保存在未解析语句中。
@@ -3315,20 +3258,9 @@ public:
 	{
 		m_currentFunction = function;
 		m_localNames.clear();
-		m_visibleMemberCallableNames.clear();
 		if (function == nullptr) return;
 		for (const auto& item : function->locals) m_localNames.insert(ResolveUserName(item.marker));
 		for (const auto& item : function->params) m_localNames.insert(ResolveUserName(item.marker));
-		// 与回包解析器一致：只有当前类及继承链的成员能遮蔽非限定调用。
-		std::unordered_set<std::int32_t> visited;
-		for (auto owner = ResolveCallableOwnerId(function->ownerClass);
-			owner > 0 && visited.insert(owner).second;) {
-			if (const auto members = m_memberCallableNames.find(owner); members != m_memberCallableNames.end())
-				m_visibleMemberCallableNames.insert(members->second.begin(), members->second.end());
-			const auto base = m_callableBaseTypes.find(owner);
-			if (base == m_callableBaseTypes.end()) break;
-			owner = ResolveCallableOwnerId(base->second);
-		}
 	}
 
 	std::string ResolveVariableReferenceName(std::int32_t id) const
@@ -3358,7 +3290,7 @@ public:
 		return false;
 	}
 
-	std::string ResolveLibCmdName(std::int16_t libraryIndex, std::int32_t commandId, bool qualifyGlobal)
+	std::string ResolveLibCmdName(std::int16_t libraryIndex, std::int32_t commandId, bool qualifyGlobal, size_t argumentCount)
 	{
 		if (!EnsureSupportLibraryCacheByLibraryId(libraryIndex)) {
 			return UnresolvedCommandName(libraryIndex, commandId, "library_metadata_unavailable");
@@ -3370,8 +3302,11 @@ public:
 		}
 		const std::string& name = symbols->commandNames[static_cast<size_t>(commandId)];
 		if (name.empty()) return UnresolvedCommandName(libraryIndex, commandId, "command_name_empty_or_unreadable");
-		// 同名 DLL 或用户方法不能遮蔽原生支持库调用的身份。
-		if (qualifyGlobal && (m_globalCallableNames.contains(name) || m_visibleMemberCallableNames.contains(name)))
+		// 用回包器的同一绑定规则检验裸名称，避免两套作用域判定逐渐分叉。
+		const auto owner = m_currentFunction ? ResolveCallableOwnerId(m_currentFunction->ownerClass) : 0;
+		const auto bound = BindCallable(m_callableBindings, TrimAsciiCopy(name), owner, argumentCount,
+			[&]() -> std::optional<CallableSymbol> { return CallableSymbol{ libraryIndex, commandId }; });
+		if (qualifyGlobal && bound && (bound->libraryId != libraryIndex || bound->methodId != commandId))
 			return symbols->fileName + "::" + name;
 		return name;
 	}
@@ -3670,8 +3605,9 @@ private:
 	void BuildReferenceIndexes()
 	{
 		// 此处保留原始名称比较规则，不能与消歧后的显示名称集合合并。
-		m_globalCallableNames.reserve(m_program.functions.size() + m_program.dlls.size());
-		for (const auto& dll : m_program.dlls) m_globalCallableNames.insert(dll.name);
+		m_callableBindings.functionsByName.reserve(m_program.functions.size() + m_program.dlls.size());
+		for (const auto& dll : m_program.dlls)
+			m_callableBindings.functionsByName.insert_or_assign(TrimAsciiCopy(dll.name), CallableSymbol{ -3, dll.header.dwId, dll.returnType });
 		for (const auto& page : m_program.codePages) m_rawTypeNames.insert(page.name);
 		for (const auto& type : m_program.dataTypes) m_rawTypeNames.insert(type.name);
 		for (const auto& type : m_program.dataTypes) {
@@ -3681,14 +3617,20 @@ private:
 		for (const auto& page : m_program.codePages) {
 			m_typeNameId.emplace(page.header.dwId, page.header.dwId);
 			m_typeNameId.emplace(page.header.dwUnk, page.header.dwId);
-			m_callableBaseTypes.emplace(page.header.dwId, page.baseClass);
+			m_callableBindings.baseTypes.emplace(page.header.dwId, page.baseClass);
 		}
+		for (auto& [owner, base] : m_callableBindings.baseTypes) base = ResolveCallableOwnerId(base);
 		for (const auto& function : m_program.functions) {
 			const auto owner = ResolveCallableOwnerId(function.ownerClass);
-			m_memberCallableNames[owner].insert(function.name);
-			// 普通/窗口程序集方法属于全局；其他对象类的方法不参与全局重名判定。
+			CallableSymbol symbol{ -2, function.header.dwId, function.returnType };
+			symbol.maximumArguments = static_cast<std::int32_t>(function.params.size());
+			for (size_t index = 0; index < function.params.size(); ++index)
+				if ((function.params[index].attr & kVarAttrNullable) == 0)
+					symbol.minimumArguments = static_cast<std::int32_t>(index + 1);
+			const auto key = TrimAsciiCopy(function.name);
+			m_callableBindings.methodsByOwnerType[owner].insert_or_assign(key, symbol);
 			if (epl_system_id::GetType(owner) != epl_system_id::kTypeClass)
-				m_globalCallableNames.insert(function.name);
+				m_callableBindings.functionsByName.insert_or_assign(key, symbol);
 		}
 		for (const auto& [id, name] : m_userNameCache) {
 			const auto kind = epl_system_id::GetType(id);
@@ -4054,9 +3996,8 @@ private:
 	const FunctionInfo* m_currentFunction = nullptr;
 	std::unordered_map<std::int32_t, std::string> m_userNameCache;
 	std::unordered_map<std::int32_t, std::string> m_resolvedTypeNames;
-	std::unordered_set<std::string> m_globalCallableNames, m_visibleMemberCallableNames, m_rawTypeNames;
-	std::unordered_map<std::int32_t, std::unordered_set<std::string>> m_memberCallableNames;
-	std::unordered_map<std::int32_t, std::int32_t> m_callableBaseTypes;
+	std::unordered_set<std::string> m_rawTypeNames;
+	CallableBindingTables m_callableBindings;
 	std::unordered_map<std::int32_t, const FunctionInfo*> m_functionById;
 	std::unordered_map<std::int32_t, std::int32_t> m_typeNameId, m_memberFormById, m_controlFormById;
 	std::unordered_set<std::string> m_userTypeNames, m_globalMemberNames, m_localNames;
@@ -4810,7 +4751,7 @@ bool TryGetOperatorInfo(std::int32_t methodId, OperatorInfo& outInfo)
 	case 15: outInfo = { "×", 2, OperatorInfo::Type::Multi }; return true;
 	case 16: outInfo = { "÷", 2, OperatorInfo::Type::Multi }; return true;
 	case 17: outInfo = { "\\", 3, OperatorInfo::Type::Multi }; return true;
-	case 18: outInfo = { "%", 4, OperatorInfo::Type::Multi }; return true;
+	case 18: outInfo = { "％", 4, OperatorInfo::Type::Multi }; return true;
 	case 19: outInfo = { "＋", 5, OperatorInfo::Type::Multi }; return true;
 	case 20: outInfo = { "－", 5, OperatorInfo::Type::Multi }; return true;
 	case 21: outInfo = { "－", 1, OperatorInfo::Type::Unary }; return true;
@@ -4867,10 +4808,10 @@ std::string RenderExpr(const Expr& expr, SymbolResolver& resolver, int expectedL
 	case ExprKind::MethodPtr:
 		return "&" + resolver.ResolveUserName(expr.intValue1);
 	case ExprKind::ArrayLiteral:
-		return "{" + RenderExprList(expr.items, resolver) + "}";
+		return "{ " + RenderExprList(expr.items, resolver) + " }";
 	case ExprKind::AccessArray:
 		return (expr.target == nullptr ? std::string() : RenderExpr(*expr.target, resolver)) +
-			"[" +
+			" [" +
 			(expr.extra == nullptr ? std::string() : RenderExpr(*expr.extra, resolver)) +
 			"]";
 	case ExprKind::AccessMember: {
@@ -4950,7 +4891,7 @@ std::string RenderExpr(const Expr& expr, SymbolResolver& resolver, int expectedL
 		}
 		text += (expr.shortValue1 == -2 || expr.shortValue1 == -3)
 			? resolver.ResolveUserName(expr.intValue1)
-			: resolver.ResolveLibCmdName(expr.shortValue1, expr.intValue1, expr.target == nullptr);
+			: resolver.ResolveLibCmdName(expr.shortValue1, expr.intValue1, expr.target == nullptr, expr.items.size());
 		text += " (" + RenderExprList(expr.items, resolver) + ")";
 		return text;
 	}

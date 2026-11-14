@@ -31,6 +31,9 @@ struct SourceExpressionNode {
 	SourceExpressionKind kind = SourceExpressionKind::Missing;
 	std::string text;
 	std::vector<std::unique_ptr<SourceExpressionNode>> children;
+	// 名称节点在传入表达式中的字节范围，用于绑定重写，避免搜索同名文本误改字符串。
+	std::size_t sourceOffset = std::string::npos;
+	std::size_t sourceLength = 0;
 };
 
 // 单行表达式解析结果。

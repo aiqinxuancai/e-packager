@@ -45,6 +45,14 @@ def main():
         work.mkdir()
         workspace = work / 'workspace'
         run(decoder, 'unpack', repo / 'eproj/e-console-exe-new-proj.e', workspace, '--main-only')
+        # 此夹具明确验证旧版目录输入，后续新拆包目录则采用原生字面量。
+        metadata_path = workspace / 'project/_meta.json'
+        metadata = json.loads(metadata_path.read_text(encoding='utf-8-sig'))
+        metadata['formatVersion'] = 3
+        metadata.pop('programTextFormat', None)
+        for item in metadata['sourceFiles']:
+            item.pop('literalFormat', None)
+        write(metadata_path, json.dumps(metadata, ensure_ascii=False, indent=2))
         source = '''.版本 2
 .程序集 程序集1
 .子程序 _启动子程序, 整数型
@@ -68,6 +76,14 @@ def main():
 .子程序 派生核心目录, 文本型, 公开
 返回 (krnln::取运行目录 () ＋ “\\xx\\”)
 ''')
+        write(workspace / 'src/不同参数类.txt', '''.版本 2
+.程序集 不同参数类, <对象>, 公开
+.子程序 取运行目录, 文本型, 公开
+.参数 必需参数, 整数型
+返回 (“带参数成员”)
+.子程序 无参数核心目录, 文本型, 公开
+返回 (取运行目录 () ＋ “\\xx\\”)
+''')
         packed = work / 'first.e'
         run(tool, 'pack', workspace, packed)
         decoded = work / 'decoded'
@@ -75,15 +91,16 @@ def main():
         expected = source.replace('“#e2txt_text#C:\\\\legacy\\\\”', '“C:\\legacy\\”')
         actual = (decoded / 'src/程序集1.txt').read_text(encoding='utf-8-sig')
         assert [s.strip() for s in actual.splitlines() if s.strip()] == [s.strip() for s in expected.splitlines() if s.strip()], actual
-        # 其他类不能污染全局；当前类和继承链的真实冲突仍须保住原生调用。
+        # 其他类不能污染全局；当前类和继承链显示裸名称，通过独立绑定记录保住原生调用。
         for page in ('同名类', '派生类'):
             text = (decoded / f'src/{page}.txt').read_text(encoding='utf-8-sig')
-            assert '返回 (krnln::取运行目录 () ＋ “\\xx\\”)' in text, text
+            assert '返回 (取运行目录 () ＋ “\\xx\\”)' in text, text
+        assert '返回 (取运行目录 () ＋ “\\xx\\”)' in (decoded / 'src/不同参数类.txt').read_text(encoding='utf-8-sig')
         before = methods(decoded)
         assert b'\\xx\\' in before['_启动子程序']
         for iteration in range(2):
             old_path, new_path = (('xx', 'yy'), ('yy', 'zz'))[iteration]
-            for page in ('程序集1', '同名类', '派生类'):
+            for page in ('程序集1', '同名类', '派生类', '不同参数类'):
                 path = decoded / f'src/{page}.txt'
                 text = path.read_text(encoding='utf-8-sig')
                 # 修改真实字符串值，避免只改空白而复用原方法字节码。
@@ -95,7 +112,7 @@ def main():
             run(tool, 'unpack', rebuilt, decoded, '--main-only')
             after = methods(decoded)
             assert before['_启动子程序'].replace(f'\\{old_path}\\'.encode(), f'\\{new_path}\\'.encode()) == after['_启动子程序'], (arch, iteration, 'path_or_call_identity_changed')
-            for method in ('本类核心目录', '派生核心目录'):
+            for method in ('本类核心目录', '派生核心目录', '无参数核心目录'):
                 assert before[method].replace(f'\\{old_path}\\'.encode(), f'\\{new_path}\\'.encode()) == after[method], (arch, iteration, method)
             before = after
 

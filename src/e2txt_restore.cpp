@@ -4,6 +4,8 @@
 
 #include <Windows.h>
 #include "SourceExpressionParser.h"
+#include "CallableBinding.h"
+#include "SourceTextCodec.h"
 
 #include <algorithm>
 #include <array>
@@ -697,66 +699,9 @@ constexpr const char* kEscapedBodyLinePrefix = "#e2txt_body_line#";
 
 std::string StripExpectedIndent(const std::string& line, const int expectedIndent);
 
-int ParseHexNibble(const char ch)
-{
-	if (ch >= '0' && ch <= '9') {
-		return ch - '0';
-	}
-	if (ch >= 'a' && ch <= 'f') {
-		return ch - 'a' + 10;
-	}
-	if (ch >= 'A' && ch <= 'F') {
-		return ch - 'A' + 10;
-	}
-	return -1;
-}
-
 std::string UnescapeTextLiteralPayload(const std::string& text)
 {
-	std::string out;
-	out.reserve(text.size());
-	for (size_t i = 0; i < text.size(); ++i) {
-		if (text[i] != '\\') {
-			out.push_back(text[i]);
-			continue;
-		}
-		if (i + 1 >= text.size()) {
-			out.push_back('\\');
-			break;
-		}
-
-		const char next = text[++i];
-		switch (next) {
-		case '\\':
-			out.push_back('\\');
-			break;
-		case 'r':
-			out.push_back('\r');
-			break;
-		case 'n':
-			out.push_back('\n');
-			break;
-		case 't':
-			out.push_back('\t');
-			break;
-		case 'x':
-			if (i + 2 < text.size()) {
-				const int high = ParseHexNibble(text[i + 1]);
-				const int low = ParseHexNibble(text[i + 2]);
-				if (high >= 0 && low >= 0) {
-					out.push_back(static_cast<char>((high << 4) | low));
-					i += 2;
-					break;
-				}
-			}
-			out += "\\x";
-			break;
-		default:
-			out.push_back(next);
-			break;
-		}
-	}
-	return out;
+	return source_text::DecodePayload(text);
 }
 
 bool TryParseInt32(const std::string& text, std::int32_t& outValue)
@@ -4003,27 +3948,17 @@ struct NativeObjectMemberSymbol {
 	std::int32_t typeId = 0;
 };
 
-struct NativeFunctionSymbol {
-	std::int16_t libraryId = 0;
-	std::int32_t methodId = 0;
-	std::int32_t returnType = 0;
-	bool qualified = false;
-	std::int32_t minimumArguments = 0;
-	std::int32_t maximumArguments = -1;
-};
+using NativeFunctionSymbol = CallableSymbol;
 
 struct NativeConstantSymbol {
 	std::int16_t libraryId = -2;
 	std::int32_t id = 0;
 };
 
-struct NativeObjectMethodEncodeContext {
+struct NativeObjectMethodEncodeContext : CallableBindingTables {
 	std::unordered_map<std::string, NativeObjectVariableSymbol> variablesByName;
 	std::unordered_map<std::int32_t, std::unordered_map<std::string, NativeObjectMemberSymbol>> membersByOwnerType;
 	std::unordered_map<std::string, NativeConstantSymbol> constantsByName;
-	std::unordered_map<std::string, NativeFunctionSymbol> functionsByName;
-	std::unordered_map<std::int32_t, std::unordered_map<std::string, NativeFunctionSymbol>> methodsByOwnerType;
-	std::unordered_map<std::int32_t, std::int32_t> baseTypes;
 	const TypeResolver* typeResolver = nullptr;
 	std::int32_t currentOwnerTypeId = 0;
 	NativeObjectVariableSymbol currentWindowSelf;
@@ -4739,59 +4674,18 @@ bool TryResolveNativeFunction(
 	NativeFunctionSymbol& outSymbol,
 	const std::optional<size_t> argumentCount = std::nullopt)
 {
-	const std::string functionKey = TypeResolver::NormalizeTypeName(rawName);
-	const auto acceptsArguments = [&](const NativeFunctionSymbol& symbol) {
-		return !argumentCount.has_value() ||
-			(*argumentCount >= static_cast<size_t>(symbol.minimumArguments) &&
-				(symbol.maximumArguments < 0 || *argumentCount <= static_cast<size_t>(symbol.maximumArguments)));
-	};
-	// 非限定调用只在当前类及继承链中查找成员，其他类的方法不能遮蔽全局命令。
-	std::optional<NativeFunctionSymbol> declaredMethod;
-	std::unordered_set<std::int32_t> visited;
-	for (auto owner = context.currentOwnerTypeId; owner > 0 && visited.insert(owner).second;) {
-		const auto methods = context.methodsByOwnerType.find(owner);
-		if (methods != context.methodsByOwnerType.end()) {
-			const auto method = methods->second.find(functionKey);
-			if (method != methods->second.end() && !declaredMethod) declaredMethod = method->second;
-			if (method != methods->second.end() && acceptsArguments(method->second)) {
-				outSymbol = method->second;
-				return true;
-			}
-		}
-		const auto base = context.baseTypes.find(owner);
-		if (base == context.baseTypes.end()) break;
-		owner = base->second;
-	}
-	const auto functionIt = context.functionsByName.find(functionKey);
-	if (functionIt != context.functionsByName.end() && acceptsArguments(functionIt->second)) {
-		outSymbol = functionIt->second;
-		return true;
-	}
-	if (context.typeResolver != nullptr) {
-		SupportLibraryCommandInfo commandInfo;
-		if (context.typeResolver->TryResolveSupportCommand(rawName, commandInfo)) {
-			outSymbol = NativeFunctionSymbol{ commandInfo.libraryId, commandInfo.commandId, commandInfo.returnType };
-			return true;
-		}
-		// 省略窗口限定名的命令不得遮蔽用户子程序、DLL 或全局支持库命令。
-		if (context.currentWindowSelf.id != 0 &&
-			context.typeResolver->TryResolveSupportTypeMethod(context.currentWindowSelf.typeId, rawName, commandInfo)) {
-			outSymbol = NativeFunctionSymbol{ commandInfo.libraryId, commandInfo.commandId, commandInfo.returnType };
-			return true;
-		}
-	}
-	// 参数数量用于选择同名支持库命令，不能改变已存在的用户函数身份。
-	// 旧工程可能保留未调用的历史函数体，实参数量由 IDE 编译器验证。
-	if (declaredMethod) {
-		outSymbol = *declaredMethod;
-		return true;
-	}
-	if (functionIt != context.functionsByName.end()) {
-		outSymbol = functionIt->second;
-		return true;
-	}
-	outSymbol = {};
-	return false;
+	const auto resolved = BindCallable(context, TypeResolver::NormalizeTypeName(rawName),
+		context.currentOwnerTypeId, argumentCount, [&]() -> std::optional<CallableSymbol> {
+			if (context.typeResolver == nullptr) return std::nullopt;
+			SupportLibraryCommandInfo command;
+			if (context.typeResolver->TryResolveSupportCommand(rawName, command) ||
+				(context.currentWindowSelf.id != 0 && context.typeResolver->TryResolveSupportTypeMethod(
+					context.currentWindowSelf.typeId, rawName, command)))
+				return CallableSymbol{ command.libraryId, command.commandId, command.returnType };
+			return std::nullopt;
+		});
+	outSymbol = resolved.value_or(CallableSymbol{});
+	return resolved.has_value();
 }
 
 bool IsSemanticOnlyCoreSupportCommandName(const std::string& rawName)
@@ -8388,6 +8282,7 @@ bool ParseConstantPage(
 			item.isLongText = decodedLongText;
 		}
 		else if (StartsWith(item.valueText, "<文本长度:") && EndsWith(item.valueText, ">")) {
+			// 依赖公开表也可能只有 IDE 的占位显示；真正写出前再要求完整内容。
 			item.isLongText = true;
 		}
 		(void)decodedText;
@@ -12176,14 +12071,7 @@ void WriteConstants(ByteWriter& writer, const std::vector<RestoreConstant>& cons
 		}
 
 		if (StartsWith(valueText, "<文本长度:") && EndsWith(valueText, ">")) {
-			const size_t colonPos = valueText.find(':');
-			const size_t endPos = valueText.rfind('>');
-			std::int32_t length = 0;
-			if (colonPos != std::string::npos && endPos != std::string::npos && colonPos + 1 < endPos) {
-				TryParseInt32(valueText.substr(colonPos + 1, endPos - colonPos - 1), length);
-			}
-			out.WriteU8(kConstTypeText);
-			out.WriteBStr(std::make_optional(std::string((std::max)(length, 0), ' ')));
+			if (outError) *outError = "long_text_content_missing";
 			return;
 		}
 

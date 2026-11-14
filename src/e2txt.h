@@ -208,6 +208,9 @@ struct BundleSourceFile {
 	std::string logicalName;
 	std::string relativePath;
 	std::string content;
+	// 读取原生字符串目录时保留实际文本与行号映射，仅供诊断，不参与快照摘要。
+	std::string displayedContent;
+	std::vector<std::size_t> sourceLines;
 };
 
 // 目录化窗口 XML 文件。

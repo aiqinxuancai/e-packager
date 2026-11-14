@@ -481,11 +481,15 @@ private:
 	std::unique_ptr<SourceExpressionNode> ParsePrimary(SourceExpressionParseResult& result)
 	{
 		if (Current().kind == TokenKind::Name) {
-			const std::string name = Consume().text;
+			const Token token = Consume();
+			const std::string name = token.text;
 			if (name == "真" || name == "假") {
 				return MakeNode(SourceExpressionKind::LogicalLiteral, name);
 			}
-			return MakeNode(SourceExpressionKind::Name, name);
+			auto node = MakeNode(SourceExpressionKind::Name, name);
+			node->sourceOffset = token.position;
+			node->sourceLength = token.text.size();
+			return node;
 		}
 		if (Current().kind == TokenKind::Number) {
 			return MakeNode(SourceExpressionKind::NumberLiteral, Consume().text);

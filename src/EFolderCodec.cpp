@@ -1,4 +1,7 @@
 ﻿#include "EFolderCodec.h"
+#include "SourceTextCodec.h"
+#include "LongTextConstantCodec.h"
+#include "SourceCallBindingCodec.h"
 
 #include <Windows.h>
 
@@ -20,7 +23,7 @@ namespace e2txt {
 
 namespace {
 
-constexpr std::int32_t kBundleDirectoryFormatVersion = 3;
+constexpr std::int32_t kBundleDirectoryFormatVersion = 6;
 
 using json = nlohmann::json;
 
@@ -1423,9 +1426,31 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 	std::error_code legacyRemoveEc;
 	std::filesystem::remove(GetLegacyProjectModuleJsonPath(root), legacyRemoveEc);
 
+	std::string displayedConstants;
+	std::vector<source_text::LongTextConstant> longTexts;
+	source_text::RenderLongTextConstants(bundle.constantText, displayedConstants, longTexts);
+	json textIndex = {{"formatVersion", 1}, {"constants", json::array()}};
+	for (size_t index = 0; index < longTexts.size(); ++index) {
+		const auto& item = longTexts[index];
+		std::string identity = "new-" + std::to_string(index);
+		for (const auto& snapshot : bundle.nativeConstantSnapshots)
+			if (snapshot.name == item.name && snapshot.id != 0) { identity = std::to_string(snapshot.id); break; }
+		const auto relative = "text/constant-" + identity + ".txt";
+		if (!WriteUtf8TextFileBom(root / relative, LocalToUtf8Text(item.value))) {
+			if (outError) *outError = "write_long_text_constant_failed: " + LocalToUtf8Text(item.name);
+			return false;
+		}
+		textIndex["constants"].push_back({{"name", LocalToUtf8Text(item.name)}, {"relativePath", relative},
+			{"displayLength", item.value.size()}});
+	}
+	if (!WriteUtf8TextFileBom(root / "text" / "list.json", NormalizeCrLf(DumpJson(textIndex)))) {
+		if (outError) *outError = "write_long_text_index_failed";
+		return false;
+	}
+
 	if (!WriteLocalTextFileUtf8Bom(root / "src" / ".数据类型.txt", bundle.dataTypeText) ||
 		!WriteLocalTextFileUtf8Bom(root / "src" / ".DLL声明.txt", bundle.dllDeclareText) ||
-		!WriteLocalTextFileUtf8Bom(root / "src" / ".常量.txt", bundle.constantText) ||
+		!WriteLocalTextFileUtf8Bom(root / "src" / ".常量.txt", displayedConstants) ||
 		!WriteLocalTextFileUtf8Bom(root / "src" / ".全局变量.txt", bundle.globalText)) {
 		if (outError != nullptr) {
 			*outError = "write_fixed_text_failed";
@@ -1435,6 +1460,10 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 
 	json metaJson;
 	metaJson["formatVersion"] = kBundleDirectoryFormatVersion;
+	metaJson["programTextFormat"] = "ide-literals-v1";
+	metaJson["constantTextFormat"] = "ide-long-text-v1";
+	metaJson["programCallFormat"] = "provenance-v1";
+	json callBindings = {{"formatVersion", 1}, {"pages", json::object()}};
 	metaJson["sourceFileKind"] = SourceFileKindToText(bundle.sourceFileKind);
 	metaJson["projectSubsystem"] = ProjectSubsystemToText(bundle.projectSubsystem);
 	if (bundle.systemInfo) metaJson["systemInfo"] = ProjectSystemInfoToJson(*bundle.systemInfo);
@@ -1477,15 +1506,28 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 	for (auto file : bundle.sourceFiles) {
 		const std::string desiredRelativePath = NormalizeSourceRelativePathForWrite(file);
 		file.relativePath = MakeUniqueRelativePath(desiredRelativePath, usedRelativePaths);
-		if (!WriteLocalTextFileUtf8Bom(root / file.relativePath, file.content)) {
-			if (outError != nullptr) {
-				*outError = "write_source_file_failed";
-			}
+		std::string displayed;
+		std::string bareCalls;
+		const bool hasBindings = source_text::RenderCallBindings(file.content, bareCalls);
+		const bool nativeLiterals = source_text::RenderIdeProgram(bareCalls, displayed);
+		const auto outputText = nativeLiterals ? displayed : NormalizeCrLf(bareCalls);
+		if (hasBindings) callBindings["pages"][LocalToUtf8Text(file.key)] = LocalToUtf8Text(file.content);
+		// 源码换行使用 CRLF；字面量中的 LF/CR 字节不可被整文件规范化改变。
+		if (!WriteUtf8TextFileBom(root / file.relativePath, LocalToUtf8Text(outputText))) {
+			if (outError != nullptr) *outError = "write_source_file_failed";
 			return false;
 		}
 		file.content = NormalizeCrLf(file.content);
-		metaJson["sourceFiles"].push_back(FileMetaToJson(file));
+		auto metadata = FileMetaToJson(file);
+		metadata["literalFormat"] = nativeLiterals ? "ide" : "legacy";
+		metadata["callBindings"] = hasBindings;
+		metaJson["sourceFiles"].push_back(std::move(metadata));
 		persistedBundle.sourceFiles.push_back(file);
+	}
+
+	if (!WriteUtf8TextFileBom(root / "project" / ".call_bindings.json", NormalizeCrLf(DumpJson(callBindings)))) {
+		if (outError) *outError = "write_call_bindings_failed";
+		return false;
 	}
 
 	for (auto file : bundle.formFiles) {
@@ -1690,6 +1732,12 @@ bool BundleDirectoryCodec::ReadBundle(const std::string& inputDir, ProjectBundle
 	bundle.sourcePath = moduleJson.value("sourcePath", std::string());
 	bundle.sourceFileKind = ResolveBundleSourceFileKind(metaJson, moduleJson.value("sourcePath", std::string()));
 	bundle.bundleFormatVersion = metaJson.value("formatVersion", 0);
+	const std::string programTextFormat = metaJson.value("programTextFormat", "legacy");
+	if (bundle.bundleFormatVersion > kBundleDirectoryFormatVersion ||
+		(programTextFormat != "legacy" && programTextFormat != "ide-literals-v1")) {
+		if (outError != nullptr) *outError = "unsupported_program_text_format";
+		return false;
+	}
 	bundle.projectNameStored = metaJson.value("projectNameStored", true);
 	if (const auto it = metaJson.find("projectSubsystem"); it != metaJson.end() && it->is_string()) {
 		bundle.projectSubsystem = ProjectSubsystemFromText(it->get<std::string>());
@@ -1875,6 +1923,120 @@ bool BundleDirectoryCodec::ReadBundle(const std::string& inputDir, ProjectBundle
 	}
 	if (!ReadAutoDiscoveredFormFiles(root, bundle, outError)) {
 		return false;
+	}
+
+	if (programTextFormat == "ide-literals-v1") {
+		std::unordered_set<std::string> legacyPages;
+		for (const auto& item : metaJson.value("sourceFiles", json::array())) {
+			const auto format = item.value("literalFormat", "ide");
+			if (format != "ide" && format != "legacy") {
+				if (outError != nullptr) *outError = "unsupported_page_literal_format";
+				return false;
+			}
+			if (format == "legacy") legacyPages.insert(Utf8ToLocalText(item.value("relativePath", "")));
+		}
+		for (auto& file : bundle.sourceFiles) {
+			if (legacyPages.contains(file.relativePath)) continue;
+			file.displayedContent = file.content;
+			auto parsed = source_text::ParseIdeProgram(file.content);
+			file.content = std::move(parsed.canonical);
+			file.sourceLines = std::move(parsed.sourceLines);
+		}
+	}
+
+
+	const auto programCallFormat = metaJson.value("programCallFormat", "legacy");
+	if ((bundle.bundleFormatVersion >= 6 && programCallFormat != "provenance-v1") ||
+		(programCallFormat != "legacy" && programCallFormat != "provenance-v1")) {
+		if (outError) *outError = "unsupported_program_call_format";
+		return false;
+	}
+	if (programCallFormat == "provenance-v1") {
+		json bindings;
+		if (!ReadJsonFile(root / "project" / ".call_bindings.json", bindings) ||
+			!bindings.is_object() || bindings.value("formatVersion", 0) != 1 ||
+			!bindings.contains("pages") || !bindings["pages"].is_object()) {
+			if (outError) *outError = "read_call_bindings_failed";
+			return false;
+		}
+		std::unordered_set<std::string> boundPages;
+		for (const auto& item : metaJson.value("sourceFiles", json::array())) {
+			if (!item.contains("callBindings") || !item["callBindings"].is_boolean()) {
+				if (outError) *outError = "missing_page_call_binding_marker";
+				return false;
+			}
+			const auto key = item.value("key", "");
+			if (item.value("callBindings", false) != bindings["pages"].contains(key)) {
+				if (outError) *outError = "inconsistent_page_call_bindings";
+				return false;
+			}
+			if (item.value("callBindings", false)) boundPages.insert(Utf8ToLocalText(key));
+		}
+		for (auto& file : bundle.sourceFiles) {
+			if (!boundPages.contains(file.key)) continue;
+			const auto& value = bindings["pages"][LocalToUtf8Text(file.key)];
+			std::string canonical, error;
+			if (!value.is_string() || !source_text::RestoreCallBindings(
+				Utf8ToLocalText(value.get<std::string>()), file.content, canonical, error)) {
+				if (outError) *outError = file.relativePath + ":" + error;
+				return false;
+			}
+			file.content = std::move(canonical);
+		}
+	}
+
+	std::string displayedConstants = bundle.constantText;
+	const auto constantTextFormat = metaJson.value("constantTextFormat", "legacy");
+	if (constantTextFormat != "legacy" && constantTextFormat != "ide-long-text-v1") {
+		if (outError) *outError = "unsupported_constant_text_format";
+		return false;
+	}
+	if (constantTextFormat == "ide-long-text-v1") {
+		if (!ReadTextFileUtf8ToLocal(root / "src" / ".常量.txt", displayedConstants)) {
+			if (outError) *outError = "read_constant_text_failed";
+			return false;
+		}
+		json textIndex;
+		if (!ReadJsonFile(root / "text" / "list.json", textIndex) ||
+			!textIndex.is_object() || textIndex.value("formatVersion", 0) != 1 ||
+			!textIndex.contains("constants") || !textIndex["constants"].is_array()) {
+			if (outError) *outError = "invalid_long_text_index";
+			return false;
+		}
+		std::unordered_map<std::string, json> entries;
+		for (const auto& item : textIndex["constants"]) {
+			if (!item.is_object() || !item.contains("name") || !item["name"].is_string() ||
+				!item.contains("relativePath") || !item["relativePath"].is_string() ||
+				!item.contains("displayLength") || !item["displayLength"].is_number_unsigned() ||
+				!entries.emplace(Utf8ToLocalText(item["name"].get<std::string>()), item).second) {
+				if (outError) *outError = "invalid_long_text_entry";
+				return false;
+			}
+		}
+		std::string canonical, error;
+		const auto read = [&](const std::string& name, const std::string& placeholder,
+			std::string& value, std::string& detail) {
+			const auto entry = entries.find(name);
+			if (entry == entries.end()) { detail = "long_text_content_missing: " + LocalToUtf8Text(name); return false; }
+			const auto& item = entry->second;
+			if (placeholder != "<文本长度: " + std::to_string(item["displayLength"].get<size_t>()) + ">") {
+				detail = "long_text_length_is_display_only: " + LocalToUtf8Text(name); return false;
+			}
+			const auto path = Utf8PathToPath(item["relativePath"].get<std::string>());
+			if (path.has_root_path() || path.parent_path() != std::filesystem::path("text") ||
+				path.filename() == "." || path.filename() == ".." || path.extension() != ".txt") {
+				detail = "invalid_long_text_path"; return false;
+			}
+			if (!ReadTextFileUtf8ToLocal(root / path, value)) {
+				detail = "read_long_text_constant_failed: " + LocalToUtf8Text(name); return false;
+			}
+			return true;
+		};
+		if (!source_text::RestoreLongTextConstants(bundle.constantText, read, canonical, error)) {
+			if (outError) *outError = error;
+			return false;
+		}
+		bundle.constantText = std::move(canonical);
 	}
 
 	// 旧摘要只有在原有可见内容和系统信息都未改变时，才允许迁移。

@@ -38,9 +38,13 @@ def main():
     ]
     # 普通路径使用 IDE 原文；控制字符和历史前缀仍须无损传输。
     expected_lines = [
-        line.replace(r'“#e2txt_text#C:\\data\\index.html”', r'“C:\data\index.html”')
-            .replace(r'“#e2txt_text#C:\\path”', r'“C:\path”')
-        for line in lines
+        r'不存在的命令 (“C:\data\index.html”)',
+        '不存在的命令 (“第一行\n第二行\t末尾”)',
+        '不存在的命令 (“#e2txt_text#literal”)',
+        '不存在的命令 (“"引号"”)',
+        r'.如果真 (不存在的条件 (“C:\path”))',
+        '    不存在的命令 (“普通内容”)',
+        '.如果真结束',
     ]
     for arch in ['Win32', 'x64']:
         exe = binaries / f'{arch}/Release/e-packager.exe'
@@ -48,6 +52,14 @@ def main():
         root.mkdir()
         workspace = root / 'workspace'
         run(decoder, 'unpack', repo / 'eproj/e-console-exe-new-proj.e', workspace, '--main-only')
+        # 此夹具明确验证旧版目录输入，后续新拆包目录则采用原生字面量。
+        metadata_path = workspace / 'project/_meta.json'
+        metadata = json.loads(metadata_path.read_text(encoding='utf-8-sig'))
+        metadata['formatVersion'] = 3
+        metadata.pop('programTextFormat', None)
+        for item in metadata['sourceFiles']:
+            item.pop('literalFormat', None)
+        write(metadata_path, json.dumps(metadata, ensure_ascii=False, indent=2))
         page = 'src/程序集1.txt'
         write(workspace / page, '.版本 2\n.程序集 程序集1\n.子程序 _启动子程序, 整数型\n' + '\n'.join(lines) + '\n返回 (0)\n')
         for iteration in range(2):
