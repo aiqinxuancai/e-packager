@@ -210,6 +210,8 @@ struct BundleSourceFile {
 	std::string content;
 	// 读取原生字符串目录时保留实际文本与行号映射，仅供诊断，不参与快照摘要。
 	std::string displayedContent;
+	// 同一原生语法树的 IDE 显示视图，用于生成缺失身份与停用流程的对应元数据。
+	std::string identityDisplay;
 	std::vector<std::size_t> sourceLines;
 };
 
@@ -247,6 +249,12 @@ struct WindowBinding {
 	std::string className;
 };
 
+// 原生引用仍存在、但声明已缺失的变量身份；名称仅供内部语义编码使用。
+struct BundleUnresolvedVariable {
+	std::int32_t id = 0;
+	std::string name;
+};
+
 // 原生方法快照。
 struct BundleNativeMethodSnapshot {
 	// 声明身份独立于方法体字节码，支持语义重建时保留未知类型。
@@ -260,6 +268,7 @@ struct BundleNativeMethodSnapshot {
 	std::vector<std::int32_t> paramTypes;
 	std::vector<std::int32_t> localIds;
 	std::vector<std::int32_t> localTypes;
+	std::vector<BundleUnresolvedVariable> unresolvedVariables;
 	std::vector<std::uint8_t> lineOffset;
 	std::vector<std::uint8_t> blockOffset;
 	std::vector<std::uint8_t> methodReference;

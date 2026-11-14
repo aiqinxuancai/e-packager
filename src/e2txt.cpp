@@ -3227,6 +3227,21 @@ public:
 			return it->second;
 		}
 
+		if (m_ideDisplay) return {};
+		if (const auto found = m_unresolvedNames.find(id); found != m_unresolvedNames.end()) return found->second;
+		auto name = MakeUnresolvedName(id);
+		// 占位别名不能与真实声明同名；身份来自缺失 ID，而不是名称形状。
+		while (std::any_of(m_userNameCache.begin(), m_userNameCache.end(),
+			[&](const auto& item) { return item.second == name; })) name += "_";
+		m_unresolvedNames.emplace(id, name);
+		return name;
+	}
+
+	void SetIdeDisplay(bool enabled) { m_ideDisplay = enabled; m_resolvedTypeNames.clear(); }
+	bool IsIdeDisplay() const { return m_ideDisplay; }
+
+	std::string MakeUnresolvedName(std::int32_t id) const
+	{
 		switch (epl_system_id::GetType(id)) {
 		case epl_system_id::kTypeMethod: return "_Sub_0x" + ToHexSuffix(id);
 		case epl_system_id::kTypeGlobal: return "_Global_0x" + ToHexSuffix(id);
@@ -3254,6 +3269,12 @@ public:
 		return stream.str();
 	}
 
+	std::vector<BundleUnresolvedVariable> UnresolvedVariables(std::int32_t methodId) const
+	{
+		const auto found = m_unresolvedVariables.find(methodId);
+		return found == m_unresolvedVariables.end() ? std::vector<BundleUnresolvedVariable>{} : found->second;
+	}
+
 	void SetCurrentFunction(const FunctionInfo* function)
 	{
 		m_currentFunction = function;
@@ -3266,6 +3287,11 @@ public:
 	std::string ResolveVariableReferenceName(std::int32_t id) const
 	{
 		const auto name = ResolveUserName(id);
+		if (!name.empty() && m_currentFunction != nullptr && !m_userNameCache.contains(id)) {
+			auto& references = m_unresolvedVariables[m_currentFunction->header.dwId];
+			if (std::none_of(references.begin(), references.end(), [id](const auto& item) { return item.id == id; }))
+				references.push_back({ id, name });
+		}
 		const auto kind = epl_system_id::GetType(id);
 		const bool localCollision = m_localNames.contains(name);
 		if (kind == epl_system_id::kTypeClassMember) {
@@ -3993,7 +4019,10 @@ private:
 	const std::vector<RemovedDefinedItemInfo>* m_removedDefinedItems = nullptr;
 	const std::vector<std::filesystem::path>* m_supportLibrarySearchDirectories = nullptr;
 	bool m_restrictSupportLibrarySearch = false;
+	bool m_ideDisplay = false;
 	const FunctionInfo* m_currentFunction = nullptr;
+	mutable std::unordered_map<std::int32_t, std::vector<BundleUnresolvedVariable>> m_unresolvedVariables;
+	mutable std::unordered_map<std::int32_t, std::string> m_unresolvedNames;
 	std::unordered_map<std::int32_t, std::string> m_userNameCache;
 	std::unordered_map<std::int32_t, std::string> m_resolvedTypeNames;
 	std::unordered_set<std::string> m_rawTypeNames;
@@ -4676,6 +4705,7 @@ struct Expr {
 	std::int16_t shortValue2 = 0;
 	bool flagValue = false;
 	bool unexamined = false;
+	bool commentPresent = false;
 	std::string text;
 	std::unique_ptr<Expr> target;
 	std::unique_ptr<Expr> extra;
@@ -4700,6 +4730,7 @@ struct SwitchCase {
 	std::unique_ptr<Expr> condition;
 	std::string unexaminedCode;
 	std::string comment;
+	bool commentPresent = false;
 	bool mask = false;
 	std::unique_ptr<StatementBlock> block;
 };
@@ -4708,6 +4739,8 @@ struct Statement {
 	StatementKind kind = StatementKind::Expression;
 	bool mask = false;
 	bool maskOnEnd = false;
+	bool commentPresent = false;
+	bool endCommentPresent = false;
 	std::string comment;
 	std::string commentOnEnd;
 	std::string unexaminedCode;
@@ -4942,6 +4975,7 @@ bool ParseCallExpressionWithoutType(
 		return false;
 	}
 
+	outExpr->commentPresent = !commentIsNull;
 	outExpr->text = unexaminedIsNull ? std::string() : unexaminedCode;
 	outExpr->flagValue = (flag & 0x10) != 0;
 	outExpr->unexamined = (flag & 0x40) != 0;
@@ -5368,6 +5402,7 @@ bool ParseStatementBlock(
 				if (!ParseCallExpressionWithoutType(reader, callExpr, &caseInfo.unexaminedCode, &caseInfo.comment, &caseInfo.mask, outError)) {
 					return false;
 				}
+				caseInfo.commentPresent = callExpr != nullptr && callExpr->commentPresent;
 				if (callExpr != nullptr && !callExpr->items.empty()) {
 					caseInfo.condition = std::move(callExpr->items.front());
 				}
@@ -5429,6 +5464,8 @@ bool ParseStatementBlock(
 			Statement statement;
 			statement.mask = mask;
 			statement.maskOnEnd = endMask;
+			statement.commentPresent = callExpr != nullptr && callExpr->commentPresent;
+			statement.endCommentPresent = endCallExpr != nullptr && endCallExpr->commentPresent;
 			statement.comment = std::move(comment);
 			statement.commentOnEnd = std::move(endComment);
 			statement.unexaminedCode = std::move(unexaminedCode);
@@ -5444,8 +5481,6 @@ bool ParseStatementBlock(
 			case 5:
 				statement.kind = StatementKind::DoWhileLoop;
 				statement.unexaminedCode = std::move(endUnexaminedCode);
-				statement.commentOnEnd.clear();
-				statement.maskOnEnd = false;
 				if (endCallExpr != nullptr && !endCallExpr->items.empty()) {
 					statement.condition = std::move(endCallExpr->items.front());
 				}
@@ -5487,6 +5522,7 @@ bool ParseStatementBlock(
 		if (type == 0x6C) {
 			Statement statement;
 			statement.kind = StatementKind::IfTrue;
+			statement.commentPresent = callExpr != nullptr && callExpr->commentPresent;
 			statement.mask = mask;
 			statement.comment = std::move(comment);
 			statement.unexaminedCode = std::move(unexaminedCode);
@@ -5505,6 +5541,7 @@ bool ParseStatementBlock(
 		if (type == 0x6B) {
 			Statement statement;
 			statement.kind = StatementKind::IfElse;
+			statement.commentPresent = callExpr != nullptr && callExpr->commentPresent;
 			statement.mask = mask;
 			statement.comment = std::move(comment);
 			statement.unexaminedCode = std::move(unexaminedCode);
@@ -5524,6 +5561,7 @@ bool ParseStatementBlock(
 
 		if (type == 0x6A) {
 			Statement statement;
+			statement.commentPresent = callExpr != nullptr && callExpr->commentPresent;
 			statement.mask = mask;
 			statement.comment = std::move(comment);
 			if (!unexaminedCode.empty() && callExpr != nullptr && callExpr->shortValue1 == -1 && !callExpr->unexamined &&
@@ -5562,6 +5600,15 @@ bool ParseStatementBlock(
 
 void AppendStatementLines(const StatementBlock& block, SymbolResolver& resolver, int indent, std::vector<std::string>& outLines)
 {
+	const auto appendControlLine = [&](int depth, std::string line) {
+		// 只转换语法树中的流程节点，普通注释中相同文字不参与转换。
+		if (resolver.IsIdeDisplay() && line.starts_with("' .")) {
+			if (line.starts_with("' .判断开始 ("))
+				line = ".判断开始断 (" + line.substr(std::string_view("' .判断开始 (").size());
+			else line = ".' " + line.substr(3);
+		}
+		AppendRenderedBodyLine(outLines, depth, line);
+	};
 	for (const auto& statement : block.items) {
 		const std::string renderedCode = statement.mask ? statement.unexaminedCode
 			: NormalizeUnexaminedTextLiterals(statement.unexaminedCode);
@@ -5574,7 +5621,7 @@ void AppendStatementLines(const StatementBlock& block, SymbolResolver& resolver,
 			if (statement.expression != nullptr) {
 				line += RenderExpr(*statement.expression, resolver);
 			}
-			if (!statement.comment.empty()) {
+			if (statement.commentPresent || !statement.comment.empty()) {
 				line += statement.expression == nullptr ? "' " : "  ' ";
 				line += statement.comment;
 			}
@@ -5598,14 +5645,14 @@ void AppendStatementLines(const StatementBlock& block, SymbolResolver& resolver,
 			line += statement.unexaminedCode.empty()
 				? ".如果真 (" + (statement.condition == nullptr ? std::string() : RenderExpr(*statement.condition, resolver)) + ")"
 				: "." + renderedCode;
-			if (!statement.comment.empty()) {
+			if (statement.commentPresent || !statement.comment.empty()) {
 				line += "  ' " + statement.comment;
 			}
-			AppendRenderedBodyLine(outLines, indent, line);
+			appendControlLine(indent, line);
 			if (statement.block != nullptr) {
 				AppendStatementLines(*statement.block, resolver, indent + 1, outLines);
 			}
-			AppendRenderedBodyLine(outLines, indent, (statement.mask ? "' " : "") + std::string(".如果真结束"));
+			appendControlLine(indent, (statement.mask && !resolver.IsIdeDisplay() ? "' " : "") + std::string(".如果真结束"));
 			break;
 		}
 		case StatementKind::IfElse: {
@@ -5616,18 +5663,18 @@ void AppendStatementLines(const StatementBlock& block, SymbolResolver& resolver,
 			line += statement.unexaminedCode.empty()
 				? ".如果 (" + (statement.condition == nullptr ? std::string() : RenderExpr(*statement.condition, resolver)) + ")"
 				: "." + renderedCode;
-			if (!statement.comment.empty()) {
+			if (statement.commentPresent || !statement.comment.empty()) {
 				line += "  ' " + statement.comment;
 			}
-			AppendRenderedBodyLine(outLines, indent, line);
+			appendControlLine(indent, line);
 			if (statement.block != nullptr) {
 				AppendStatementLines(*statement.block, resolver, indent + 1, outLines);
 			}
-			AppendRenderedBodyLine(outLines, indent, (statement.mask ? "' " : "") + std::string(".否则"));
+			appendControlLine(indent, (statement.mask && !resolver.IsIdeDisplay() ? "' " : "") + std::string(".否则"));
 			if (statement.elseBlock != nullptr) {
 				AppendStatementLines(*statement.elseBlock, resolver, indent + 1, outLines);
 			}
-			AppendRenderedBodyLine(outLines, indent, (statement.mask ? "' " : "") + std::string(".如果结束"));
+			appendControlLine(indent, (statement.mask && !resolver.IsIdeDisplay() ? "' " : "") + std::string(".如果结束"));
 			break;
 		}
 		case StatementKind::WhileLoop: {
@@ -5638,10 +5685,10 @@ void AppendStatementLines(const StatementBlock& block, SymbolResolver& resolver,
 			line += statement.unexaminedCode.empty()
 				? ".判断循环首 (" + (statement.condition == nullptr ? std::string() : RenderExpr(*statement.condition, resolver)) + ")"
 				: "." + renderedCode;
-			if (!statement.comment.empty()) {
+			if (statement.commentPresent || !statement.comment.empty()) {
 				line += "  ' " + statement.comment;
 			}
-			AppendRenderedBodyLine(outLines, indent, line);
+			appendControlLine(indent, line);
 			if (statement.block != nullptr) {
 				AppendStatementLines(*statement.block, resolver, indent + 1, outLines);
 			}
@@ -5650,10 +5697,10 @@ void AppendStatementLines(const StatementBlock& block, SymbolResolver& resolver,
 				endLine += "' ";
 			}
 			endLine += ".判断循环尾 ()";
-			if (!statement.commentOnEnd.empty()) {
+			if (statement.endCommentPresent || !statement.commentOnEnd.empty()) {
 				endLine += "  ' " + statement.commentOnEnd;
 			}
-			AppendRenderedBodyLine(outLines, indent, endLine);
+			appendControlLine(indent, endLine);
 			break;
 		}
 		case StatementKind::DoWhileLoop: {
@@ -5662,24 +5709,24 @@ void AppendStatementLines(const StatementBlock& block, SymbolResolver& resolver,
 				line += "' ";
 			}
 			line += ".循环判断首 ()";
-			if (!statement.comment.empty()) {
+			if (statement.commentPresent || !statement.comment.empty()) {
 				line += "  ' " + statement.comment;
 			}
-			AppendRenderedBodyLine(outLines, indent, line);
+			appendControlLine(indent, line);
 			if (statement.block != nullptr) {
 				AppendStatementLines(*statement.block, resolver, indent + 1, outLines);
 			}
 			std::string endLine;
-			if (statement.mask) {
+			if (statement.maskOnEnd) {
 				endLine += "' ";
 			}
 			endLine += statement.unexaminedCode.empty()
 				? ".循环判断尾 (" + (statement.condition == nullptr ? std::string() : RenderExpr(*statement.condition, resolver)) + ")"
 				: "." + renderedCode;
-			if (!statement.comment.empty()) {
-				endLine += "  ' " + statement.comment;
+			if (statement.endCommentPresent || !statement.commentOnEnd.empty()) {
+				endLine += "  ' " + statement.commentOnEnd;
 			}
-			AppendRenderedBodyLine(outLines, indent, endLine);
+			appendControlLine(indent, endLine);
 			break;
 		}
 		case StatementKind::CounterLoop: {
@@ -5694,10 +5741,10 @@ void AppendStatementLines(const StatementBlock& block, SymbolResolver& resolver,
 					(statement.expr2 == nullptr ? std::string() : RenderExpr(*statement.expr2, resolver)) +
 					")"
 				: "." + renderedCode;
-			if (!statement.comment.empty()) {
+			if (statement.commentPresent || !statement.comment.empty()) {
 				line += "  ' " + statement.comment;
 			}
-			AppendRenderedBodyLine(outLines, indent, line);
+			appendControlLine(indent, line);
 			if (statement.block != nullptr) {
 				AppendStatementLines(*statement.block, resolver, indent + 1, outLines);
 			}
@@ -5706,10 +5753,10 @@ void AppendStatementLines(const StatementBlock& block, SymbolResolver& resolver,
 				endLine += "' ";
 			}
 			endLine += ".计次循环尾 ()";
-			if (!statement.commentOnEnd.empty()) {
+			if (statement.endCommentPresent || !statement.commentOnEnd.empty()) {
 				endLine += "  ' " + statement.commentOnEnd;
 			}
-			AppendRenderedBodyLine(outLines, indent, endLine);
+			appendControlLine(indent, endLine);
 			break;
 		}
 		case StatementKind::ForLoop: {
@@ -5728,10 +5775,10 @@ void AppendStatementLines(const StatementBlock& block, SymbolResolver& resolver,
 					(statement.expr4 == nullptr ? std::string() : RenderExpr(*statement.expr4, resolver)) +
 					")"
 				: "." + renderedCode;
-			if (!statement.comment.empty()) {
+			if (statement.commentPresent || !statement.comment.empty()) {
 				line += "  ' " + statement.comment;
 			}
-			AppendRenderedBodyLine(outLines, indent, line);
+			appendControlLine(indent, line);
 			if (statement.block != nullptr) {
 				AppendStatementLines(*statement.block, resolver, indent + 1, outLines);
 			}
@@ -5740,10 +5787,10 @@ void AppendStatementLines(const StatementBlock& block, SymbolResolver& resolver,
 				endLine += "' ";
 			}
 			endLine += ".变量循环尾 ()";
-			if (!statement.commentOnEnd.empty()) {
+			if (statement.endCommentPresent || !statement.commentOnEnd.empty()) {
 				endLine += "  ' " + statement.commentOnEnd;
 			}
-			AppendRenderedBodyLine(outLines, indent, endLine);
+			appendControlLine(indent, endLine);
 			break;
 		}
 		case StatementKind::SwitchBlock: {
@@ -5774,19 +5821,19 @@ void AppendStatementLines(const StatementBlock& block, SymbolResolver& resolver,
 				else {
 					line += "." + renderedCaseCode;
 				}
-				if (!caseItem.comment.empty()) {
+				if (caseItem.commentPresent || !caseItem.comment.empty()) {
 					line += "  ' " + caseItem.comment;
 				}
-				AppendRenderedBodyLine(outLines, indent, line);
+				appendControlLine(indent, line);
 				if (caseItem.block != nullptr) {
 					AppendStatementLines(*caseItem.block, resolver, indent + 1, outLines);
 				}
 			}
-			AppendRenderedBodyLine(outLines, indent, (statement.switchCases[0].mask ? "' " : "") + std::string(".默认"));
+			appendControlLine(indent, (statement.switchCases[0].mask && !resolver.IsIdeDisplay() ? "' " : "") + std::string(".默认"));
 			if (statement.defaultBlock != nullptr) {
 				AppendStatementLines(*statement.defaultBlock, resolver, indent + 1, outLines);
 			}
-			AppendRenderedBodyLine(outLines, indent, (statement.switchCases[0].mask ? "' " : "") + std::string(".判断结束"));
+			appendControlLine(indent, (statement.switchCases[0].mask && !resolver.IsIdeDisplay() ? "' " : "") + std::string(".判断结束"));
 			break;
 		}
 		}
@@ -7614,6 +7661,12 @@ bool BuildBundleFromSections(
 		return false;
 	}
 	timer.Record("document");
+	Document displayedDocument;
+	displayedDocument.dependencies = document.dependencies;
+	resolver.SetIdeDisplay(true);
+	BuildProgramPages(sections, anonymousTypeHints, options, displayedDocument, resolver);
+	resolver.SetIdeDisplay(false);
+	size_t displayedPageIndex = 0;
 
 	ProjectBundle bundle;
 	bundle.sourcePath = sourcePath;
@@ -7750,6 +7803,7 @@ bool BuildBundleFromSections(
 					file.logicalName + ".txt"),
 				usedRelativePaths);
 			file.content = JoinPageLines(page.lines);
+			file.identityDisplay = JoinPageLines(displayedDocument.pages.at(displayedPageIndex++).lines);
 			bundle.sourceFiles.push_back(std::move(file));
 
 			SnapshotClassDef pageSnapshot;
@@ -7781,6 +7835,7 @@ bool BuildBundleFromSections(
 				methodSnapshot.memoryAddress = functionInfo->header.dwUnk;
 				methodSnapshot.attr = functionInfo->attr;
 				methodSnapshot.returnType = functionInfo->returnType;
+				methodSnapshot.unresolvedVariables = resolver.UnresolvedVariables(functionInfo->header.dwId);
 				for (const auto& param : functionInfo->params) {
 					methodSnapshot.paramIds.push_back(param.marker);
 					methodSnapshot.paramTypes.push_back(param.dataType);

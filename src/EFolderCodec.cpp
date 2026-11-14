@@ -2,6 +2,7 @@
 #include "SourceTextCodec.h"
 #include "LongTextConstantCodec.h"
 #include "SourceCallBindingCodec.h"
+#include "SourceIdentityCodec.h"
 
 #include <Windows.h>
 
@@ -23,7 +24,7 @@ namespace e2txt {
 
 namespace {
 
-constexpr std::int32_t kBundleDirectoryFormatVersion = 6;
+constexpr std::int32_t kBundleDirectoryFormatVersion = 7;
 
 using json = nlohmann::json;
 
@@ -385,7 +386,11 @@ json ResourceMetaToJson(const BundleBinaryResource& resource)
 
 json NativeMethodSnapshotToJson(const BundleNativeMethodSnapshot& snapshot)
 {
+	json unresolved = json::array();
+	for (const auto& item : snapshot.unresolvedVariables)
+		unresolved.push_back({ { "id", item.id }, { "name", LocalToUtf8Text(item.name) } });
 	return json{
+		{ "unresolvedVariables", std::move(unresolved) },
 		{ "returnType", snapshot.returnType },
 		{ "name", LocalToUtf8Text(snapshot.name) },
 		{ "textDigest", snapshot.textDigest },
@@ -556,6 +561,8 @@ BundleNativeMethodSnapshot NativeMethodSnapshotFromJson(const json& item)
 {
 	BundleNativeMethodSnapshot snapshot;
 	snapshot.returnType = item.value("returnType", 0);
+	for (const auto& value : item.value("unresolvedVariables", json::array()))
+		snapshot.unresolvedVariables.push_back({ value.at("id").get<std::int32_t>(), Utf8ToLocalText(value.at("name").get<std::string>()) });
 	snapshot.name = Utf8ToLocalText(item.value("name", ""));
 	snapshot.textDigest = item.value("textDigest", "");
 	snapshot.id = item.value("id", 0);
@@ -1464,6 +1471,8 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 	metaJson["constantTextFormat"] = "ide-long-text-v1";
 	metaJson["programCallFormat"] = "provenance-v1";
 	json callBindings = {{"formatVersion", 1}, {"pages", json::object()}};
+	json identityBindings = {{"formatVersion", 1}, {"pages", json::object()}};
+	metaJson["programIdentityFormat"] = "native-views-v1";
 	metaJson["sourceFileKind"] = SourceFileKindToText(bundle.sourceFileKind);
 	metaJson["projectSubsystem"] = ProjectSubsystemToText(bundle.projectSubsystem);
 	if (bundle.systemInfo) metaJson["systemInfo"] = ProjectSystemInfoToJson(*bundle.systemInfo);
@@ -1509,8 +1518,13 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 		std::string displayed;
 		std::string bareCalls;
 		const bool hasBindings = source_text::RenderCallBindings(file.content, bareCalls);
-		const bool nativeLiterals = source_text::RenderIdeProgram(bareCalls, displayed);
-		const auto outputText = nativeLiterals ? displayed : NormalizeCrLf(bareCalls);
+		std::string identityDisplay = bareCalls;
+		if (!file.identityDisplay.empty()) source_text::RenderCallBindings(file.identityDisplay, identityDisplay);
+		const bool hasIdentityBindings = identityDisplay != bareCalls;
+		if (hasIdentityBindings) identityBindings["pages"][LocalToUtf8Text(file.key)] = {
+			{ "canonical", LocalToUtf8Text(bareCalls) }, { "displayed", LocalToUtf8Text(identityDisplay) } };
+		const bool nativeLiterals = source_text::RenderIdeProgram(identityDisplay, displayed);
+		const auto outputText = nativeLiterals ? displayed : NormalizeCrLf(identityDisplay);
 		if (hasBindings) callBindings["pages"][LocalToUtf8Text(file.key)] = LocalToUtf8Text(file.content);
 		// 源码换行使用 CRLF；字面量中的 LF/CR 字节不可被整文件规范化改变。
 		if (!WriteUtf8TextFileBom(root / file.relativePath, LocalToUtf8Text(outputText))) {
@@ -1521,10 +1535,15 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 		auto metadata = FileMetaToJson(file);
 		metadata["literalFormat"] = nativeLiterals ? "ide" : "legacy";
 		metadata["callBindings"] = hasBindings;
+		metadata["identityBindings"] = hasIdentityBindings;
 		metaJson["sourceFiles"].push_back(std::move(metadata));
 		persistedBundle.sourceFiles.push_back(file);
 	}
 
+	if (!WriteUtf8TextFileBom(root / "project" / ".source_identity.json", NormalizeCrLf(DumpJson(identityBindings)))) {
+		if (outError) *outError = "write_source_identity_failed";
+		return false;
+	}
 	if (!WriteUtf8TextFileBom(root / "project" / ".call_bindings.json", NormalizeCrLf(DumpJson(callBindings)))) {
 		if (outError) *outError = "write_call_bindings_failed";
 		return false;
@@ -1945,6 +1964,50 @@ bool BundleDirectoryCodec::ReadBundle(const std::string& inputDir, ProjectBundle
 	}
 
 
+	const auto identityFormat = metaJson.value("programIdentityFormat", "legacy");
+	if ((bundle.bundleFormatVersion >= 7 && identityFormat != "native-views-v1") ||
+		(identityFormat != "legacy" && identityFormat != "native-views-v1")) {
+		if (outError) *outError = "unsupported_program_identity_format";
+		return false;
+	}
+	if (identityFormat == "native-views-v1") {
+		json identities;
+		if (!ReadJsonFile(root / "project" / ".source_identity.json", identities) ||
+			!identities.is_object() || identities.value("formatVersion", 0) != 1 ||
+			!identities.contains("pages") || !identities["pages"].is_object()) {
+			if (outError) *outError = "read_source_identity_failed";
+			return false;
+		}
+		for (const auto& item : metaJson.value("sourceFiles", json::array())) {
+			if (!item.contains("identityBindings") || !item["identityBindings"].is_boolean() ||
+				item.value("identityBindings", false) != identities["pages"].contains(item.value("key", ""))) {
+				if (outError) *outError = "inconsistent_source_identity";
+				return false;
+			}
+		}
+		for (auto& file : bundle.sourceFiles) {
+			const auto key = LocalToUtf8Text(file.key);
+			std::string origin, display;
+			if (identities["pages"].contains(key)) {
+				const auto& entry = identities["pages"][key];
+				if (!entry.is_object() || !entry.contains("canonical") || !entry["canonical"].is_string() ||
+					!entry.contains("displayed") || !entry["displayed"].is_string()) {
+					if (outError) *outError = "invalid_source_identity_page:" + file.relativePath;
+					return false;
+				}
+				origin = Utf8ToLocalText(entry["canonical"].get<std::string>());
+				display = Utf8ToLocalText(entry["displayed"].get<std::string>());
+			}
+			// 更新依赖/资源时继续输出用户当前的显示视图，不能回退到内部别名。
+			file.identityDisplay = file.content;
+			std::string restored, identityError;
+			if (!source_text::RestoreIdentityProgram(origin, display, file.content, restored, identityError)) {
+				if (outError) *outError = file.relativePath + ":" + identityError;
+				return false;
+			}
+			file.content = std::move(restored);
+		}
+	}
 	const auto programCallFormat = metaJson.value("programCallFormat", "legacy");
 	if ((bundle.bundleFormatVersion >= 6 && programCallFormat != "provenance-v1") ||
 		(programCallFormat != "legacy" && programCallFormat != "provenance-v1")) {

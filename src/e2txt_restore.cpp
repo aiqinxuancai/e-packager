@@ -384,6 +384,14 @@ public:
 		WriteU8(0);
 	}
 
+	void WriteCommentBStr(const std::optional<std::string>& comment)
+	{
+		// IDE 以 BSTR 内容长度区分无注释与空注释。只有终止符（长度 1）
+		// 不显示注释；显式空注释须含一个 NUL 内容字节，再追加终止符。
+		WriteBStr(comment.has_value() && comment->empty()
+			? std::make_optional(std::string(1, '\0')) : comment);
+	}
+
 	void WriteTextArray(const std::vector<std::string>& values)
 	{
 		WriteI16(static_cast<std::int16_t>(values.size()));
@@ -2259,7 +2267,7 @@ private:
 	std::vector<const RestoreDependencyInfo*> m_supportLibraryOrder;
 };
 
-std::optional<std::pair<std::string, std::string>> SplitFixedCodeComment(const std::string& text)
+std::optional<std::pair<std::string, std::optional<std::string>>> SplitFixedCodeComment(const std::string& text)
 {
 	bool asciiQuote = false;
 	bool chineseQuote = false;
@@ -2278,7 +2286,7 @@ std::optional<std::pair<std::string, std::string>> SplitFixedCodeComment(const s
 		else if (!asciiQuote && token == "”") chineseQuote = false;
 		pos += length;
 	}
-	return std::make_pair(text, std::string());
+	return std::make_pair(text, std::optional<std::string>{});
 }
 
 struct BodyStatement;
@@ -2305,8 +2313,9 @@ struct BodyStatement {
 	bool mask = false;
 	bool maskOnEnd = false;
 	std::string code;
-	std::string fixedComment;
-	std::string fixedEndComment;
+	// 无注释与显式空注释对应不同的原生 BSTR，不能合并为空字符串。
+	std::optional<std::string> fixedComment;
+	std::optional<std::string> fixedEndComment;
 	std::string endCode;
 	std::vector<BodyStatement> block;
 	std::vector<BodyStatement> elseBlock;
@@ -2647,7 +2656,7 @@ public:
 		const std::int16_t libraryId,
 		const std::int32_t methodId,
 		const bool mask,
-		const std::string& comment)
+		const std::optional<std::string>& comment)
 	{
 		WriteFixedCall(type, libraryId, methodId, mask, comment);
 	}
@@ -2772,7 +2781,7 @@ private:
 		const std::int16_t libraryId,
 		const std::int32_t methodId,
 		const bool mask,
-		const std::string& comment)
+		const std::optional<std::string>& comment)
 	{
 		m_lineOffset.WriteI32(static_cast<std::int32_t>(m_expressionData.position()));
 		m_expressionData.WriteU8(type);
@@ -2780,7 +2789,7 @@ private:
 		m_expressionData.WriteI16(libraryId);
 		m_expressionData.WriteI16(static_cast<std::int16_t>(mask ? 0x20 : 0));
 		m_expressionData.WriteBStr(std::nullopt);
-		m_expressionData.WriteBStr(comment.empty() ? std::nullopt : std::make_optional(comment));
+		m_expressionData.WriteCommentBStr(comment);
 		m_expressionData.WriteU8(0x36);
 		m_expressionData.WriteU8(0x01);
 	}
@@ -3156,7 +3165,7 @@ bool ParseBodyBlock(
 			statement.kind = BodyStatementKind::DoWhileLoop;
 			statement.mask = mask;
 			const auto split = SplitFixedCodeComment(code);
-			statement.fixedComment = split.has_value() ? split->second : std::string();
+			statement.fixedComment = split.has_value() ? split->second : std::nullopt;
 			++index;
 			if (!ParseBodyBlock(lines, index, expectedIndent + 1, { ".循环判断尾*" }, statement.block, outError, outErrorLineIndex)) {
 				return false;
@@ -3184,10 +3193,7 @@ bool ParseBodyBlock(
 				}
 				return false;
 			}
-			statement.endCode = endSplit->first.substr(1);
-			if (statement.fixedComment.empty()) {
-				statement.fixedComment = endSplit->second;
-			}
+			statement.endCode = TrimAsciiCopy(endCode).substr(1);
 			++index;
 			outStatements.push_back(std::move(statement));
 			continue;
@@ -3281,6 +3287,9 @@ bool ParseBodyBlock(
 		outStatements.push_back(BodyStatement{ BodyStatementKind::Raw, mask, false, code });
 		++index;
 	}
+	// 与空子程序一致，IDE 的空分支/循环体也需要一个原生空白行用于光标和流程线。
+	// 直接让流程首尾相邻会生成可解析但编辑器无法安全显示的零行块。
+	if (expectedIndent > 0 && outStatements.empty()) outStatements.emplace_back();
 	return true;
 }
 
@@ -4614,13 +4623,13 @@ void WriteNativeCallHeader(
 	const std::int32_t methodId,
 	const std::int16_t libraryId,
 	const std::int16_t flags,
-	const std::string& comment = {})
+	const std::optional<std::string>& comment = std::nullopt)
 {
 	writer.WriteI32(methodId);
 	writer.WriteI16(libraryId);
 	writer.WriteI16(flags);
 	writer.WriteBStr(std::nullopt);
-	writer.WriteBStr(comment.empty() ? std::nullopt : std::make_optional(comment));
+	writer.WriteCommentBStr(comment);
 }
 
 std::string StripOuterParentheses(std::string expression)
@@ -5761,7 +5770,7 @@ bool WriteBlockWithStructuredControlEncoding(
 					header.variableReferences,
 					header.constantReferences);
 			}
-			else if (statement.mask || PreserveUnencodedSource(statement.code, encodeError)) {
+			else if (!statement.mask && PreserveUnencodedSource(statement.code, encodeError)) {
 				writer.WriteCurrentLineOffset();
 				writer.WriteUnexaminedCallPublic(0x6C, 0, 1, statement.mask, statement.code);
 			}
@@ -5799,7 +5808,7 @@ bool WriteBlockWithStructuredControlEncoding(
 					header.variableReferences,
 					header.constantReferences);
 			}
-			else if (statement.mask || PreserveUnencodedSource(statement.code, encodeError)) {
+			else if (!statement.mask && PreserveUnencodedSource(statement.code, encodeError)) {
 				writer.WriteCurrentLineOffset();
 				writer.WriteUnexaminedCallPublic(0x6B, 0, 0, statement.mask, statement.code);
 			}
@@ -5841,7 +5850,7 @@ bool WriteBlockWithStructuredControlEncoding(
 					header.variableReferences,
 					header.constantReferences);
 			}
-			else if (statement.mask || PreserveUnencodedSource(statement.code, encodeError)) {
+			else if (!statement.mask && PreserveUnencodedSource(statement.code, encodeError)) {
 				writer.WriteCurrentLineOffset();
 				writer.WriteUnexaminedCallPublic(0x70, 0, 3, statement.mask, statement.code);
 			}
@@ -5885,7 +5894,7 @@ bool WriteBlockWithStructuredControlEncoding(
 					tail.variableReferences,
 					tail.constantReferences);
 			}
-			else if (statement.maskOnEnd || PreserveUnencodedSource(statement.endCode, encodeError)) {
+			else if (!statement.maskOnEnd && PreserveUnencodedSource(statement.endCode, encodeError)) {
 				writer.WriteCurrentLineOffset();
 				writer.WriteUnexaminedCallPublic(0x71, 0, 6, statement.maskOnEnd, statement.endCode);
 			}
@@ -5917,7 +5926,7 @@ bool WriteBlockWithStructuredControlEncoding(
 					header.variableReferences,
 					header.constantReferences);
 			}
-			else if (statement.mask || PreserveUnencodedSource(statement.code, encodeError)) {
+			else if (!statement.mask && PreserveUnencodedSource(statement.code, encodeError)) {
 				writer.WriteCurrentLineOffset();
 				writer.WriteUnexaminedCallPublic(0x70, 0, 7, statement.mask, statement.code);
 			}
@@ -5955,7 +5964,7 @@ bool WriteBlockWithStructuredControlEncoding(
 					header.variableReferences,
 					header.constantReferences);
 			}
-			else if (statement.mask || PreserveUnencodedSource(statement.code, encodeError)) {
+			else if (!statement.mask && PreserveUnencodedSource(statement.code, encodeError)) {
 				writer.WriteCurrentLineOffset();
 				writer.WriteUnexaminedCallPublic(0x70, 0, 9, statement.mask, statement.code);
 			}
@@ -5995,7 +6004,7 @@ bool WriteBlockWithStructuredControlEncoding(
 						header.variableReferences,
 						header.constantReferences);
 				}
-				else if (caseItem.mask || PreserveUnencodedSource(caseItem.code, encodeError)) {
+				else if (!caseItem.mask && PreserveUnencodedSource(caseItem.code, encodeError)) {
 					writer.WriteCurrentLineOffset();
 					writer.WriteUnexaminedCallPublic(0x6E, 0, 2, caseItem.mask, caseItem.code);
 				}
@@ -11343,6 +11352,19 @@ bool BuildRestoreModel(
 			}
 			for (size_t localIndex = 0; localIndex < parsedMethod.locals.size() && localIndex < method.locals.size(); ++localIndex) {
 				addNativeObjectVariable(parsedMethod.locals[localIndex].name, method.locals[localIndex].id, method.locals[localIndex].dataType);
+			}
+			// 缺失声明的引用来自原生符号身份，而非按占位名称猜测 ID。
+			// 仅补充当前方法已存在的引用，不覆盖用户声明，不复用任何方法体字节。
+			if (identityNativeMethodSnapshot != nullptr) {
+				for (const auto& reference : identityNativeMethodSnapshot->unresolvedVariables) {
+					const auto [entry, inserted] = nativeObjectEncodeContext.variablesByName.try_emplace(
+						TypeResolver::NormalizeTypeName(reference.name), NativeObjectVariableSymbol{ reference.id, 0 });
+					if (!inserted && entry->second.id != reference.id) {
+						if (outError != nullptr) *outError = "native_identity_name_conflict: " +
+							parsedMethod.name + ":" + reference.name;
+						return false;
+					}
+				}
 			}
 			const bool canReuseIdentityNativeMethodSnapshot =
 				identityNativeMethodSnapshot != nullptr &&

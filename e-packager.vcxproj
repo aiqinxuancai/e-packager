@@ -182,6 +182,7 @@
     <ClCompile Include="src\SourceTextCodec.cpp" />
     <ClCompile Include="src\LongTextConstantCodec.cpp" />
     <ClCompile Include="src\SourceCallBindingCodec.cpp" />
+    <ClCompile Include="src\SourceIdentityCodec.cpp" />
     <ClCompile Include="src\SourcePreflightValidator.cpp" />
     <ClCompile Include="src\SourceValidationCommand.cpp" />
     <ClCompile Include="src\SourceSemanticValidator.cpp" />
@@ -236,6 +237,7 @@
     <ClInclude Include="src\SourceTextCodec.h" />
     <ClInclude Include="src\LongTextConstantCodec.h" />
     <ClInclude Include="src\SourceCallBindingCodec.h" />
+    <ClInclude Include="src\SourceIdentityCodec.h" />
     <ClInclude Include="src\SourcePreflightValidator.h" />
     <ClInclude Include="src\SourceValidationCommand.h" />
     <ClInclude Include="src\SourceSemanticValidator.h" />
